@@ -266,6 +266,7 @@ public static class AppActions
     public const string Publish = "app.build.publish";
     public const string PublishAgain = "app.build.publishAgain";
     public const string RunProgram = "app.run";
+    public const string RunSelectedProjects = "app.run.selectedProjects";
     public const string Debug = "app.debug";
 
     // Run of a Godot game from the scene open (or the scene a script open runs in): no key of Rider's.

@@ -270,11 +270,15 @@ public sealed partial class BuildRunController
     public bool IsBuilding => building is not null;
 
     /// <summary>Whether a program Run started runs, in the Run window or the terminal, or an AppHost it started.</summary>
-    public bool IsRunning => session.Aspire.IsRunning || RunsInConsole || copyRuns.Any(c => c.Run.IsRunning);
+    public bool IsRunning => session.Aspire.IsRunning || RunsInConsole || copyRuns.Any(c => c.Run.IsRunning) || parallelProjectRuns.Any(c => c.Run.IsRunning);
 
     /// <summary>The copies of a Godot game Run runs side by side, each in a tab of the Terminal window, by its configuration's
     /// name (<see cref="GameCopies"/>): Stop ends them together.</summary>
     private readonly List<(string Configuration, int Copy, TerminalRun Run)> copyRuns = [];
+
+    /// <summary>Independent executable projects started together from the Explorer: each owns a terminal tab and ends
+    /// independently, without taking the Run window's one program.</summary>
+    private readonly List<(string Configuration, TerminalRun Run)> parallelProjectRuns = [];
 
     /// <summary>The copies of a game Run runs now, each in its tab of the Terminal window.</summary>
     public IReadOnlyList<TerminalRun> CopyRuns => [.. copyRuns.Select(c => c.Run)];
@@ -1368,6 +1372,105 @@ public sealed partial class BuildRunController
             copyRuns.RemoveAll(c => c.Run == run);
             RunningChanged?.Invoke(this, EventArgs.Empty);
         }
+    }
+
+    /// <summary>Runs several executable projects from one solution independently. Each is built (when its configuration
+    /// asks for it) and started in its own Terminal tab; none takes the Run console or stops another project.</summary>
+    public async Task<string?> RunProjectsAsync(IReadOnlyList<RunConfiguration> configurations, CancellationToken cancellation = default)
+    {
+        RunConfiguration[] chosen = [.. configurations
+            .Where(c => !c.IsContainer && !c.Aspire && !c.GodotEditor && !c.GodotInEditor && !c.RunsGodot(session.Projects))
+            .DistinctBy(c => c.Project, PathNames.Comparer)];
+        if (chosen.Length < 2)
+        {
+            return Said("Select at least two executable projects to run together");
+        }
+        if (chosen.FirstOrDefault(c => c.WhyNotHere(session.Projects) is not null) is { } unsupported)
+        {
+            return Said(unsupported.WhyNotHere(session.Projects)!);
+        }
+        if (parts.Work.Begin(AppActions.RunProgram, $"Preparing {chosen.Length} projects to run together…") is not { } work)
+        {
+            return Said(ActionWork.Busy(parts.Work.Of(AppActions.RunProgram)!));
+        }
+        using (work)
+        using (cancellation.Register(work.Cancel))
+        using (BackgroundWork.Scope())
+        {
+            if (await parts.Editors.SaveAllLandedAsync(work, work.Stopping) is { } unsaved)
+            {
+                return Said(unsaved);
+            }
+
+            List<(RunConfiguration Configuration, LaunchPlan Plan)> prepared = [];
+            foreach (RunConfiguration configuration in chosen)
+            {
+                if (Checkpoint(work, configuration.Name) is { } stopped)
+                {
+                    return Said(stopped);
+                }
+                (LaunchPlan? plan, string? problem, _) = await PrepareAsync(configuration, null, work,
+                    build: configuration.BuildBeforeLaunch, collects: false);
+                if (plan is null)
+                {
+                    return Said($"{configuration.Name} could not be prepared: {problem}");
+                }
+                if (plan.WhyNot("run", built: true) is { } why)
+                {
+                    return Said(why);
+                }
+                prepared.Add((configuration, plan));
+            }
+
+            List<string> started = [];
+            foreach ((RunConfiguration configuration, LaunchPlan plan) in prepared)
+            {
+                if (Checkpoint(work, configuration.Name) is { } stopped)
+                {
+                    return Said(started.Count == 0 ? stopped : $"{stopped}; {Plural.Listed(started)} are already running");
+                }
+                work.Say($"Starting {configuration.Name} in its own terminal…");
+                ProcessStartInfo start = plan.Start();
+                ChildProcesses.WithVariables(start, plan.Environment);
+                TerminalRun run;
+                try
+                {
+                    run = await parts.InTerminal(configuration.Name, start);
+                }
+                catch (LaunchException failed)
+                {
+                    return Said(started.Count == 0 ? failed.Message
+                        : $"{configuration.Name} did not start ({failed.Message}); {Plural.Listed(started)} are running");
+                }
+                run.StartedBy = Mcp.AgentCall.Current?.Connection;
+                parallelProjectRuns.Add((configuration.Name, run));
+                started.Add(configuration.Name);
+                RunningChanged?.Invoke(this, EventArgs.Empty);
+                parts.OpenBrowser(plan, run.Ended);
+                IdeErrors.Observe(ParallelProjectEnded(configuration.Name, run));
+            }
+            parts.Say($"Running {Plural.Listed(started)} independently, each in its own Terminal tab",
+                StatusPlace.Window(parts.Dock, ToolWindowIds.Terminal));
+            return null;
+        }
+    }
+
+    private async Task ParallelProjectEnded(string name, TerminalRun run)
+    {
+        int code = await run.Ended;
+        parallelProjectRuns.RemoveAll(c => c.Run == run);
+        RunningChanged?.Invoke(this, EventArgs.Empty);
+        parts.Say(RunEnded(name, code), StatusPlace.Window(parts.Dock, ToolWindowIds.Terminal));
+    }
+
+    private Task EndParallelProjectRunsAsync()
+    {
+        TerminalRun[] ending = [.. parallelProjectRuns.Select(c => c.Run)];
+        foreach (TerminalRun run in ending)
+        {
+            run.Stop();
+        }
+        return Task.WhenAll(ending.Select(run => run.Ended));
     }
 
     /// <summary>Run Another Copy: one more copy of the chosen configuration's game run beside the copies Run runs now (or
@@ -2740,10 +2843,11 @@ public sealed partial class BuildRunController
         Task ran = session.RunProgram.IsRunning ? session.RunProgram.Ended : Task.CompletedTask;
         session.RunProgram.Stop();
         Task copies = EndCopyRunsAsync();
+        Task parallel = EndParallelProjectRunsAsync();
         session.Profiled?.Run.Kill();
         session.Builder.Stop();
         Task played = parts.StopInGodotEditor?.Invoke() ?? Task.CompletedTask;
-        return Task.WhenAll(containers, aspire, ran, copies, played);
+        return Task.WhenAll(containers, aspire, ran, copies, parallel, played);
     }
 
     /// <summary>Rerun's stop: Run's own start under way and the program it started (in the Run window or the terminal, or its
@@ -2763,6 +2867,7 @@ public sealed partial class BuildRunController
     public bool IsRunningConfiguration(string name) =>
         RunsInConsole && (Containers?.Plan.Name ?? ran) == name
         || copyRuns.Any(c => c.Configuration == name && c.Run.IsRunning)
+        || parallelProjectRuns.Any(c => c.Configuration == name && c.Run.IsRunning)
         || session.Debug.CopiesOf(name).Any(c => debugged.ContainsKey(c.Tab.Name))
         || session.Profiled is { Run.HasExited: false } profiled && profiled.Name == name;
 

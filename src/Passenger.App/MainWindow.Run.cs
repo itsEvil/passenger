@@ -291,6 +291,28 @@ public partial class MainWindow
     /// could not, which the status bar says too.</summary>
     public Task<string?> RunAsync(string? arguments = null) => buildRun.RunAsync(arguments);
 
+    /// <summary>Runs the executable projects selected in the Explorer at the same time, each in its own Terminal tab.</summary>
+    public Task<string?> RunSelectedProjectsAsync()
+    {
+        RunConfiguration[] selected = [.. SelectedProjects()
+            .Select(path => session.Configurations.All.FirstOrDefault(c => PathNames.Same(c.Project, path)
+                && !c.IsContainer && !c.Aspire && !c.GodotEditor && !c.GodotInEditor && !c.RunsGodot(session.Projects)))
+            .OfType<RunConfiguration>()
+            .DistinctBy(c => c.Project, PathNames.Comparer)];
+        return selected.Length < 2
+            ? Task.FromResult<string?>("Select at least two executable projects in the Explorer")
+            : buildRun.RunProjectsAsync(selected);
+    }
+
+    /// <summary>Why Run Selected Projects is unavailable: it needs at least two selected executable projects.</summary>
+    public string? WhyNotRunSelectedProjects() => SelectedProjects()
+        .Select(path => session.Configurations.All.FirstOrDefault(c => PathNames.Same(c.Project, path)
+            && !c.IsContainer && !c.Aspire && !c.GodotEditor && !c.GodotInEditor && !c.RunsGodot(session.Projects)))
+        .OfType<RunConfiguration>()
+        .Select(c => c.Project)
+        .Distinct(PathNames.Comparer)
+        .Take(2).Count() >= 2 ? null : "Select at least two executable projects in the Explorer";
+
     /// <summary>Debugs the chosen configuration as Debug does: null once its session is open, else what stopped it.</summary>
     public Task<string?> DebugAsync(string? arguments = null) => buildRun.DebugAsync(arguments);
 
