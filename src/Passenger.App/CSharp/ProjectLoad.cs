@@ -13,7 +13,15 @@ public sealed record ServerSaid(string Text, ProblemSeverity? Severity, ProjectL
 /// <summary>A warning or error the language server met loading a project (a package with a known vulnerability, an SDK
 /// that cannot be found): the project file, canonical, and what MSBuild or NuGet said, less its repeat of the
 /// file.</summary>
-public sealed record ProjectLoadProblem(string Project, ProblemSeverity Severity, string Message);
+public sealed record ProjectLoadProblem(string Project, ProblemSeverity Severity, string Message)
+{
+    /// <summary>Whether it was met restoring the project's packages, once a load had taken the project in; else met loading it.</summary>
+    public bool Restoring { get; init; }
+
+    /// <summary>Whether the load it was met in took in nothing of the project, as the server takes nothing of a load that
+    /// met an error: an error met loading, not restoring.</summary>
+    public bool FailedLoad => Severity == ProblemSeverity.Error && !Restoring;
+}
 
 /// <summary>The project Roslyn's server makes for the C# files no project of the folder holds (one opened before its project
 /// loads, or outside every project): <c>Canonical.csproj</c> in a folder of its own under the temp folder's
@@ -49,6 +57,14 @@ internal enum LoadReportKind
     /// <summary>A restore's failure (<see cref="RestoreReports"/>), its project's errors: the server restores once the batch
     /// that loaded the project has ended, so no batch's end follows to say it.</summary>
     RestoreFailed,
+
+    /// <summary>A restore of the person's projects the server runs once a batch ended began (not of its own project), of the
+    /// project or solution it names.</summary>
+    Restoring,
+
+    /// <summary>A restore the server ran once a batch ended finished: the projects it restored load again once the files it
+    /// wrote are heard, a batch whose end follows.</summary>
+    Restored,
 }
 
 /// <summary>A line Roslyn's project system logs as it loads projects: "Warning while loading P: message" and "Error while
@@ -82,6 +98,14 @@ internal sealed partial record LoadReport(LoadReportKind Kind, ProjectLoadProble
         {
             return new LoadReport(LoadReportKind.Loaded, null, PathNames.Canonical(loaded.Groups["path"].Value.Trim()));
         }
+        if (RestoringLine().Match(logged) is { Success: true } restoring)
+        {
+            return new LoadReport(LoadReportKind.Restoring, null, PathNames.Canonical(restoring.Groups["path"].Value.Trim()));
+        }
+        if (RestoredLine().IsMatch(logged))
+        {
+            return new LoadReport(LoadReportKind.Restored, null, null);
+        }
         return BatchLine().IsMatch(logged) ? new LoadReport(LoadReportKind.BatchEnded, null, null) : null;
     }
 
@@ -94,6 +118,12 @@ internal sealed partial record LoadReport(LoadReportKind Kind, ProjectLoadProble
     [GeneratedRegex(@"^\s*(?:\[[^\]]*\]\s*)*Completed \(re\)load of \d+ project\(s\)")]
     private static partial Regex BatchLine();
 
+    [GeneratedRegex(@"^\s*(?:\[[^\]]*\]\s*)*Restoring .+?: Running dotnet restore on (?<path>.+)$")]
+    private static partial Regex RestoringLine();
+
+    [GeneratedRegex(@"^\s*(?:\[[^\]]*\]\s*)*Restore complete\s*$")]
+    private static partial Regex RestoredLine();
+
     [GeneratedRegex(@"\s+")]
     private static partial Regex Spaces();
 }
@@ -102,7 +132,8 @@ internal sealed partial record LoadReport(LoadReportKind Kind, ProjectLoadProble
 /// start ("Running dotnet restore on PATH"), dotnet restore's output, and "Failed to run restore on PATH" when it failed. A
 /// restore that fails before it writes a project's assets (a nuget.config that does not read) leaves no load to report
 /// its errors, so they are read here: MSBuild's and NuGet's errors, each project's joined, by the project each names, else
-/// the path restored. The server's English resources, as <see cref="LoadReport"/>'s; heard on the server's thread.</summary>
+/// the path restored, each a report naming that path. The server's English resources, as <see cref="LoadReport"/>'s; heard
+/// on the server's thread.</summary>
 internal sealed partial class RestoreReports
 {
     private readonly Lock gate = new();
@@ -110,9 +141,9 @@ internal sealed partial class RestoreReports
     /// <summary>The errors each restore under way has said, by the name its lines are said under, under <see cref="gate"/>.</summary>
     private readonly Dictionary<string, List<(string? Project, string Message)>> errors = new(StringComparer.Ordinal);
 
-    /// <summary>The problems a logged line ends a failed restore with, one per project with its errors joined; none for
-    /// any other line, and none of the server's own project (<see cref="CanonicalProject"/>).</summary>
-    public IReadOnlyList<ProjectLoadProblem> Hear(string logged)
+    /// <summary>The reports a logged line ends a failed restore with, one per project with its errors joined, each naming
+    /// the path restored; none for any other line, and none of the server's own project (<see cref="CanonicalProject"/>).</summary>
+    public IReadOnlyList<LoadReport> Hear(string logged)
     {
         if (StageLine().Match(logged) is not { Success: true } line)
         {
@@ -149,8 +180,9 @@ internal sealed partial class RestoreReports
                 each.Add((restored, "dotnet restore ended with an error; the C# language server's log has what it said"));
             }
             return [.. each.Where(e => !CanonicalProject.IsAbout(e.Project)).GroupBy(e => e.Project, StringComparer.Ordinal)
-                .Select(g => new ProjectLoadProblem(PathNames.Canonical(g.Key), ProblemSeverity.Error,
-                    $"Restore failed: {string.Join(" ", g.Select(e => e.Message).Where(m => m.Length > 0).Distinct(StringComparer.Ordinal))}"))];
+                .Select(g => new LoadReport(LoadReportKind.RestoreFailed, new ProjectLoadProblem(PathNames.Canonical(g.Key), ProblemSeverity.Error,
+                    $"Restore failed: {string.Join(" ", g.Select(e => e.Message).Where(m => m.Length > 0).Distinct(StringComparer.Ordinal))}") { Restoring = true },
+                    PathNames.Canonical(restored)))];
         }
     }
 

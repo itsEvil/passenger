@@ -10,7 +10,7 @@ the solution restores, Roslyn's language server carries, the container tools car
 
 What `just publish` carries for macOS, Windows and Linux: the app, the debugger beside it under `debugger/`, the
 project host under `host/` (MSBuild's evaluation in a process of its own, run on the .NET it carries with the installed
-SDK's MSBuild, of which it carries nothing), Roslyn's language server under `roslyn/` and Passenger's own extension to
+SDK's MSBuild, of which it carries nothing), the .NET MAUI previewer under `mauipreview/` (its own process, on that .NET), Roslyn's language server under `roslyn/` and Passenger's own extension to
 it under `roslyn-extension/` (compiled against the server's assemblies and carrying none), the JavaScript, TypeScript,
 HTML, CSS, JSON, Dockerfile and YAML language servers' npm packages under `web/` (listed below), on Windows what Velopack's installer
 adds to it (`just package-win`), and in the Linux archive Passenger's own launcher, install script, desktop entry and
@@ -25,14 +25,16 @@ out; dbgshim's musl Linux natives are the container tools' (below), which the ap
 | `Grpc.Net.Client`, `Grpc.Net.Common`, `Grpc.Core.Api` | Native Aspire interactions and resource commands | Apache-2.0 | Copyright 2019 The gRPC Authors |
 | `Microsoft.Extensions.Logging.Abstractions` | gRPC client's logging contracts | MIT | © Microsoft Corporation. All rights reserved. |
 | The .NET runtime (`Microsoft.NETCore.App`) | the app and the debugger are self-contained; Roslyn's server and the project host run on that .NET | MIT | © Microsoft Corporation. All rights reserved. |
-| `Avalonia`, `Avalonia.Desktop`, `Avalonia.Native`, `Avalonia.Win32`, `Avalonia.X11`, `Avalonia.FreeDesktop`, `Avalonia.FreeDesktop.AtSpi`, `Avalonia.Remote.Protocol`, `Avalonia.Themes.Fluent`, `Avalonia.Skia`, `Avalonia.HarfBuzz`, `Avalonia.Headless` | the UI, and the headless platform the screenshots draw on, `Avalonia.Headless` carried beside the inspector too (`inspector/`) for an Avalonia app a Passenger nobody sees runs | MIT | Copyright 2013-2026 © The AvaloniaUI Project |
-| `Avalonia.Markup.Xaml.Loader` | XAML Hot Reload's compiler, carried beside the inspector into an Avalonia app Passenger runs or debugs (`inspector/`) | MIT | Copyright 2013-2026 © The AvaloniaUI Project |
+| `Avalonia`, `Avalonia.Desktop`, `Avalonia.Native`, `Avalonia.Win32`, `Avalonia.X11`, `Avalonia.FreeDesktop`, `Avalonia.FreeDesktop.AtSpi`, `Avalonia.Remote.Protocol`, `Avalonia.Themes.Fluent`, `Avalonia.Skia`, `Avalonia.HarfBuzz`, `Avalonia.Headless` | the UI, and the headless platform the screenshots draw on, `Avalonia.Headless` carried beside the inspector too (`inspector/`, and older Avalonia 12s' builds under `inspector/avalonia/`) for an Avalonia app a Passenger nobody sees runs | MIT | Copyright 2013-2026 © The AvaloniaUI Project |
+| `Avalonia.Markup.Xaml.Loader` | XAML Hot Reload's compiler, carried beside the inspector into an Avalonia app Passenger runs or debugs (`inspector/`, and older Avalonia 12s' builds under `inspector/avalonia/`) | MIT | Copyright 2013-2026 © The AvaloniaUI Project |
 | `Avalonia.Controls.WebView` | an HTML file's preview beside its text, in the system's own web view (WebView2, WKWebView, WebKitGTK) | MIT | Copyright 2019-2026 © AvaloniaUI OÜ |
 | `Avalonia.Angle.Windows.Natives` | ANGLE's OpenGL ES (`av_libglesv2.dll`), Windows only | BSD-3-Clause (the package's LICENSE) | Copyright 2018 The ANGLE Project Authors |
 | `MicroCom.Runtime` | Avalonia's COM interop | MIT | Copyright 2021 © Nikita Tsukanov |
 | `Tmds.DBus.Protocol` | Avalonia's D-Bus client, for Linux desktops | MIT | Tom Deseyn |
 | `SkiaSharp`, `SkiaSharp.NativeAssets.macOS`, `SkiaSharp.NativeAssets.Win32`, `SkiaSharp.NativeAssets.Linux` | drawing, with Skia (BSD-3-Clause) | MIT | © Microsoft Corporation. All rights reserved. |
 | `HarfBuzzSharp`, `HarfBuzzSharp.NativeAssets.macOS`, `HarfBuzzSharp.NativeAssets.Win32`, `HarfBuzzSharp.NativeAssets.Linux` | text shaping, with HarfBuzz (Old MIT) | MIT | © Microsoft Corporation. All rights reserved. |
+| `Avalonia.Controls.Maui` | the .NET MAUI previewer (`mauipreview/`): Avalonia's backend for .NET MAUI, which draws a MAUI page's controls with Avalonia's, headless, on every system, with its own notice of the ASP.NET Core table its Essentials part derives from (Apache-2.0), which the previewer never uses | MIT | Copyright 2025-2026 © The AvaloniaUI Project |
+| `Microsoft.Maui.Controls.Core`, `Microsoft.Maui.Controls.Xaml`, `Microsoft.Maui.Core`, `Microsoft.Maui.Essentials`, `Microsoft.Maui.Graphics`, `Microsoft.Maui.Graphics.Skia` | the .NET MAUI previewer (`mauipreview/`): MAUI's controls, layout and runtime XAML loader, which a MAUI project's page is made and laid out with; with Avalonia's Skia, SkiaSharp's 4 line and HarfBuzzSharp's beside them (above), and Avalonia's own assemblies again | MIT | © Microsoft Corporation. All rights reserved. |
 | `Svg.Skia`, `Svg.Model`, `Svg.Animation`, `Svg.SceneGraph`, `ShimSkiaSharp` | an SVG file's picture beside its text, drawn with Skia | MIT | Copyright © Wiesław Šoltés 2026 |
 | `Svg.Custom` | Svg.Skia's model of an SVG document, a build of SVG.NET's (https://github.com/svg-net/SVG) | MS-PL | Copyright © Wiesław Šoltés 2026 |
 | `ExCSS` | Svg.Custom's reading of an SVG's CSS | MIT | no copyright line; its author: Tyler Brinks |
@@ -41,6 +43,9 @@ out; dbgshim's musl Linux natives are the container tools' (below), which the ap
 | `Microsoft.CodeAnalysis.CSharp`, `Microsoft.CodeAnalysis.Common` | Roslyn: colour before the server answers, and the debugger's expressions | MIT | © Microsoft Corporation. All rights reserved. |
 | `Tint` | TextMate grammar tokenization and colour mapping | MIT | Copyright (c) 2026 Sébastien Ros |
 | `GregsEx` | Tint's managed Oniguruma-compatible regular expressions | MIT | Copyright (c) 2026 Sébastien Ros |
+| `Gherkin` | a .feature file read in every language Gherkin's keywords are written in | MIT | Copyright © Cucumber Ltd, Gaspar Nagy |
+| `Cucumber.Messages` | the Gherkin reader's message types | MIT | Copyright © Cucumber Ltd, TechTalk |
+| `Cucumber.CucumberExpressions` | a step definition's Cucumber Expression matched to a step's text | MIT | Copyright © Cucumber Ltd, Gaspar Nagy |
 | `roslyn-language-server.osx-arm64`, `roslyn-language-server.osx-x64`, `roslyn-language-server.win-x64`, `roslyn-language-server.win-arm64`, `roslyn-language-server.linux-x64`, `roslyn-language-server.linux-arm64` | Roslyn's language server, one per system, copied under `roslyn/` with the package's own `ThirdPartyNotices.rtf`, less four assemblies under Visual Studio's terms; what it carries is listed below | MIT | © Microsoft Corporation. All rights reserved. |
 | `StreamJsonRpc` | JSON-RPC with the language server, the debug adapter and Microsoft.Testing.Platform's test hosts | MIT | © Microsoft Corporation. All rights reserved. |
 | `Microsoft.VisualStudio.Threading.Only` | StreamJsonRpc's, whose NonConcurrentSynchronizationContext keeps the language server's and the test hosts' messages in order, and whose JoinableTaskFactory runs async work to its end where a caller must stay synchronous | MIT | © Microsoft Corporation. All rights reserved. |
@@ -217,25 +222,33 @@ Packages the build or the tests use that no app carries.
 | `Avalonia.Fonts.Inter` | Inter 3.019, which `Avalonia.Headless` names and the tests' Avalonia apps take; the app leaves its files out and carries its own Inter (below) | MIT | Copyright 2013-2026 © The AvaloniaUI Project |
 | `Avalonia.Templates` | Avalonia's dotnet new templates, downloaded for the tests' local feed, from which they install them as New Solution does (`AvaloniaApp.Feed`); Passenger never carries them, and installs them only when asked. The package names no licence; its repository's (AvaloniaUI/Avalonia.Templates) is MIT | MIT | Copyright (c) 2023 .NET Foundation and Contributors All Rights Reserved |
 | `CommunityToolkit.Mvvm` | the MVVM Toolkit at the version Avalonia's MVVM template writes, downloaded for the tests' package cache, which an app of theirs restores with its generators; Passenger never carries it | MIT | (c) .NET Foundation and Contributors. All rights reserved. |
+| `ReactiveUI`, `ReactiveUI.Core`, `Splat`, `Splat.Builder`, `Splat.Core`, `Splat.Logging` | ReactiveUI and what it depends on, whose view models the XAML tests' Avalonia apps bind to: restored for the tests' package cache (tests/AvaloniaGraphs); Passenger never carries them | MIT | Copyright (c) .NET Foundation and Contributors |
+| `ReactiveUI.SourceGenerators`, `ReactiveUI.Binding` | ReactiveUI's source generators, which make the `[Reactive]` properties and `[ReactiveCommand]` commands those apps bind to, and its bindings: restored for the tests' package cache (tests/AvaloniaGraphs); Passenger never carries them | MIT | Copyright (c) 2026 ReactiveUI and Contributors |
+| `ReactiveUI.Disposables`, `ReactiveUI.Primitives`, `ReactiveUI.Primitives.Core` | ReactiveUI's dependencies, restored for the tests' package cache (tests/AvaloniaGraphs) | MIT | Copyright (c) ReactiveUI Association Inc 2026 |
 | `Aspire.ProjectTemplates` | Official Aspire starter templates, downloaded for the tests' private template hive; not shipped | MIT | © Microsoft Corporation. All rights reserved. |
-| `Aspire.Hosting`, `Aspire.Hosting.AppHost`, `Aspire.AppHost.Sdk`, `Aspire.Dashboard.Sdk.linux-x64`, `Aspire.Dashboard.Sdk.linux-arm64`, `Aspire.Dashboard.Sdk.osx-x64`, `Aspire.Dashboard.Sdk.osx-arm64`, `Aspire.Dashboard.Sdk.win-x64`, `Aspire.Dashboard.Sdk.win-arm64`, `Aspire.Hosting.Orchestration.linux-x64`, `Aspire.Hosting.Orchestration.linux-arm64`, `Aspire.Hosting.Orchestration.osx-x64`, `Aspire.Hosting.Orchestration.osx-arm64`, `Aspire.Hosting.Orchestration.win-x64`, `Aspire.Hosting.Orchestration.win-arm64`, `Aspire.Cli.linux-x64`, `Aspire.Cli.linux-arm64`, `Aspire.Cli.osx-x64`, `Aspire.Cli.osx-arm64` | official starters' hosting and build tools, restored for the tests' local feed, and the aspire CLI the tests run in a home of their own, never carried by Passenger | MIT | © Microsoft Corporation. All rights reserved. |
+| `Aspire.Hosting`, `Aspire.Hosting.AppHost`, `Aspire.Hosting.Dotnet`, `Aspire.AppHost.Sdk`, `Aspire.Dashboard.Sdk.linux-x64`, `Aspire.Dashboard.Sdk.linux-arm64`, `Aspire.Dashboard.Sdk.osx-x64`, `Aspire.Dashboard.Sdk.osx-arm64`, `Aspire.Dashboard.Sdk.win-x64`, `Aspire.Dashboard.Sdk.win-arm64`, `Aspire.Hosting.Orchestration.linux-x64`, `Aspire.Hosting.Orchestration.linux-arm64`, `Aspire.Hosting.Orchestration.osx-x64`, `Aspire.Hosting.Orchestration.osx-arm64`, `Aspire.Hosting.Orchestration.win-x64`, `Aspire.Hosting.Orchestration.win-arm64`, `Aspire.Cli.linux-x64`, `Aspire.Cli.linux-arm64`, `Aspire.Cli.osx-x64`, `Aspire.Cli.osx-arm64` | official starters' hosting and build tools, restored for the tests' local feed, and the aspire CLI the tests run in a home of their own, never carried by Passenger | MIT | © Microsoft Corporation. All rights reserved. |
 | `Microsoft.AspNetCore.OpenApi`, `Microsoft.Extensions.AmbientMetadata.Application`, `Microsoft.Extensions.ApiDescription.Server`, `Microsoft.Extensions.Compliance.Abstractions`, `Microsoft.Extensions.DependencyInjection.AutoActivation`, `Microsoft.Extensions.Diagnostics.ExceptionSummarization`, `Microsoft.Extensions.Http.Diagnostics`, `Microsoft.Extensions.Http.Resilience`, `Microsoft.Extensions.Resilience`, `Microsoft.Extensions.ServiceDiscovery`, `Microsoft.Extensions.ServiceDiscovery.Abstractions`, `Microsoft.Extensions.Telemetry`, `Microsoft.Extensions.Telemetry.Abstractions`, `Microsoft.OpenApi`, `Microsoft.Win32.SystemEvents`, `System.IO.Hashing` | official starters' dependencies, restored for the tests' local feed | MIT | © Microsoft Corporation. All rights reserved. |
 | `Microsoft.Extensions.Caching.Abstractions`, `Microsoft.Extensions.Configuration.CommandLine`, `Microsoft.Extensions.Configuration.EnvironmentVariables`, `Microsoft.Extensions.Configuration.FileExtensions`, `Microsoft.Extensions.Configuration.Json`, `Microsoft.Extensions.Configuration.UserSecrets`, `Microsoft.Extensions.Diagnostics`, `Microsoft.Extensions.Diagnostics.Abstractions`, `Microsoft.Extensions.Diagnostics.HealthChecks`, `Microsoft.Extensions.Diagnostics.HealthChecks.Abstractions`, `Microsoft.Extensions.FileProviders.Abstractions`, `Microsoft.Extensions.FileProviders.Physical`, `Microsoft.Extensions.Hosting`, `Microsoft.Extensions.Hosting.Abstractions`, `Microsoft.Extensions.Http`, `Microsoft.Extensions.Logging.Debug`, `Microsoft.Extensions.Logging.EventLog`, `Microsoft.Extensions.Logging.EventSource` | an AppHost's dependencies at the tests' target, which the test project's own restore prunes, restored for the tests' local feed (tests/AspireGraphs) | MIT | © Microsoft Corporation. All rights reserved. |
 | `Grpc.AspNetCore`, `Grpc.AspNetCore.Server`, `Grpc.AspNetCore.Server.ClientFactory`, `Grpc.Net.ClientFactory` | Aspire hosting's gRPC server dependencies, restored for the tests' local feed | Apache-2.0 | Copyright 2019 gRPC Authors |
 | `Grpc.Tools` | Aspire hosting's build-time protocol compiler, restored for the tests' local feed and never run; Passenger's own protocol C# is checked in (`just aspire-protocol`) | Apache-2.0 | Copyright 2018 The gRPC Authors |
 | `ModelContextProtocol` | Aspire hosting's MCP dependency, restored for the tests' local feed | Apache-2.0 | © Model Context Protocol a Series of LF Projects, LLC. |
 | `OpenTelemetry`, `OpenTelemetry.Api`, `OpenTelemetry.Api.ProviderBuilderExtensions`, `OpenTelemetry.Exporter.OpenTelemetryProtocol`, `OpenTelemetry.Extensions.Hosting`, `OpenTelemetry.Instrumentation.AspNetCore`, `OpenTelemetry.Instrumentation.Http`, `OpenTelemetry.Instrumentation.Runtime` | official starters' telemetry dependencies, restored for the tests' local feed | Apache-2.0 | Copyright OpenTelemetry Authors |
+| `Aspire.Hosting.Azure.Functions`, `Aspire.Hosting.Azure`, `Aspire.Hosting.Azure.Storage`, `Azure.Provisioning`, `Azure.Provisioning.KeyVault`, `Azure.Provisioning.Storage`, `Azure.ResourceManager`, `Azure.ResourceManager.Authorization`, `Azure.ResourceManager.KeyVault`, `Azure.ResourceManager.Resources.Deployments`, `Azure.Security.KeyVault.Secrets`, `Azure.Storage.Blobs`, `Azure.Storage.Common`, `Azure.Storage.Files.DataLake`, `Azure.Storage.Queues` | Aspire's Azure Functions hosting and what it depends on: the graph of the AppHost the Aspire Functions tests write, restored for the tests' local feed (tests/AspireGraphs); Passenger never carries them | MIT | © Microsoft Corporation. All rights reserved. |
+| `AspNetCore.HealthChecks.Azure.Storage.Blobs`, `AspNetCore.HealthChecks.Azure.Storage.Queues` | Aspire's Azure Functions hosting's health checks, restored for the tests' local feed (tests/AspireGraphs) | Apache-2.0 | no copyright line; its authors: Xabaril Contributors |
+| `Semver` | Aspire's Azure hosting's dependency, restored for the tests' local feed (tests/AspireGraphs) | MIT | Copyright © 2013-2024 Jeff Walker, Max Hauser |
+| `Azure.Functions.Sdk`, `Microsoft.Azure.Functions.Worker`, `Microsoft.Azure.Functions.Worker.Core`, `Microsoft.Azure.Functions.Worker.Grpc`, `Microsoft.Azure.Functions.Worker.Extensions.Abstractions`, `Microsoft.Azure.Functions.Worker.Extensions.Http`, `Microsoft.Azure.Functions.Worker.Sdk.Analyzers`, `Microsoft.Azure.Functions.Worker.Sdk.Generators` | the Azure Functions app (.NET isolated worker) the Aspire Functions tests write, its MSBuild SDK and the analyzers and generators it adds: restored for the tests' local feed (tests/AspireGraphs); Passenger never carries them | MIT | © Microsoft Corporation. All rights reserved. |
 | `AspNetCore.HealthChecks.Uris` | Aspire hosting's health checks, restored for the tests' local feed | Apache-2.0 | no copyright line; its authors: Xabaril Contributors |
 | `KubernetesClient` | Aspire hosting's DCP client, restored for the tests' local feed | Apache-2.0 | 2017 The Kubernetes Project Authors |
 | `Fractions` | Aspire hosting's dependency, restored for the tests' local feed | BSD-2-Clause (the package's license.txt) | Copyright (c) 2013-2022, Daniel Mueller; the nuspec states Copyright 2013-2023 Daniel Mueller |
 | `Hex1b` | Aspire hosting's terminal dependency, restored for the tests' local feed | MIT | Copyright (c) 2024 Mitch Denny |
 | `Polly.RateLimiting` | starters' resilience dependency, restored for the tests' local feed | BSD-3-Clause | Copyright (c) 2024, App vNext |
 | `Polly.Core` | starters' resilience dependency, restored for the tests' local feed | BSD-3-Clause | Copyright (c) 2015-2026, App vNext |
-| `Microsoft.EntityFrameworkCore`, `Microsoft.EntityFrameworkCore.Abstractions`, `Microsoft.EntityFrameworkCore.Analyzers`, `Microsoft.EntityFrameworkCore.Relational`, `Microsoft.EntityFrameworkCore.Sqlite`, `Microsoft.EntityFrameworkCore.Sqlite.Core`, `Microsoft.EntityFrameworkCore.Design`, `Microsoft.Data.Sqlite.Core`, `Microsoft.Extensions.Caching.Memory`, `Microsoft.Extensions.DependencyModel`, `Microsoft.CodeAnalysis.CSharp.Workspaces`, `Microsoft.CodeAnalysis.Workspaces.Common`, `Microsoft.CodeAnalysis.Workspaces.MSBuild`, `System.Composition` | EF Core with SQLite and the Design package dotnet ef loads, and what they depend on: the graph of the projects the Migrations window's tests write, restored for the tests' local feed (tests/EfGraphs), `Microsoft.Extensions.DependencyModel` also NUnit's adapter's dependency, downloaded for the tests' package cache (tests/UnitTestGraphs); Passenger never carries them | MIT | © Microsoft Corporation. All rights reserved. |
+| `Microsoft.EntityFrameworkCore`, `Microsoft.EntityFrameworkCore.Abstractions`, `Microsoft.EntityFrameworkCore.Analyzers`, `Microsoft.EntityFrameworkCore.Relational`, `Microsoft.EntityFrameworkCore.Sqlite`, `Microsoft.EntityFrameworkCore.Sqlite.Core`, `Microsoft.EntityFrameworkCore.Design`, `Microsoft.Data.Sqlite.Core`, `Microsoft.Extensions.Caching.Memory`, `Microsoft.Extensions.DependencyModel`, `Microsoft.CodeAnalysis.CSharp.Workspaces`, `Microsoft.CodeAnalysis.Workspaces.Common`, `Microsoft.CodeAnalysis.Workspaces.MSBuild`, `System.Composition` | EF Core with SQLite and the Design package dotnet ef loads, and what they depend on: the graph of the projects the Migrations window's tests write, restored for the tests' local feed (tests/EfGraphs), `Microsoft.Extensions.DependencyModel` also NUnit's adapter's dependency, downloaded for the tests' package cache (tests/UnitTestGraphs); the two Workspaces packages and System.Composition also the unit tests' Roslyn workspaces; Passenger never carries them | MIT | © Microsoft Corporation. All rights reserved. |
 | `dotnet-ef` | EF Core's command-line tool at the tests' EF Core version, the one before and EF Core 11's, downloaded for the tests' local feed, from which the Migrations window's tests install it as a local tool; Passenger never carries it, and installs it only when asked | MIT | © Microsoft Corporation. All rights reserved. |
 | `Mono.TextTemplating` | the EF Core Design package's template engine, restored for the tests' local feed | MIT | no copyright line; its author: Mikayla Hutchinson |
 | `SQLitePCLRaw.bundle_e_sqlite3`, `SQLitePCLRaw.lib.e_sqlite3`, `SQLitePCLRaw.provider.e_sqlite3` | SQLite for EF Core's SQLite provider, restored for the tests' local feed | Apache-2.0 | Copyright 2014-2024 SourceGear, LLC |
 | `SQLitePCLRaw.config.e_sqlite3` | SQLite's configuration for EF Core 11's SQLite provider, restored for the tests' local feed (tests/EfGraphs) | Apache-2.0 | Copyright 2014-2026 SourceGear, LLC |
+| `Microsoft.Maui.Controls`, `Microsoft.Maui.Controls.Build.Tasks`, `Microsoft.Maui.Resizetizer` | .NET MAUI's controls and their XAML source generator, which the MAUI XAML tests' app builds against without MAUI's workload: restored for the tests' package cache (tests/MauiGraphs); Passenger carries only the controls' own assemblies, in its MAUI previewer (above) | MIT | © Microsoft Corporation. All rights reserved. |
 | `gdUnit4.api`, `gdUnit4.test.adapter` | GdUnit4's API and its VSTest adapter, which the Godot tests write into a game: downloaded for the tests' package cache (tests/GodotGraphs); Passenger never carries them | MIT | © 2026 Mike Schulze |
 | `Chickensoft.GoDotTest` | GoDotTest, the test runner inside a Godot C# game, which the Godot tests write into a game: downloaded for the tests' package cache (tests/GodotGraphs); Passenger never carries it | MIT | © 2023 Chickensoft |
 | `Chickensoft.Log`, `Chickensoft.Collections` | GoDotTest's dependencies, downloaded for the tests' package cache (tests/GodotGraphs) | MIT | © 2025 Chickensoft |
@@ -311,6 +324,7 @@ licence its package.json states and the copyright line its licence file (else it
 | `is-glob`, `is-extglob` | eslint's | MIT | Copyright (c) 2014-2017, Jon Schlinkert. |
 | `word-wrap` | optionator's | MIT | Copyright (c) 2014-2016, Jon Schlinkert |
 | `minimatch` | eslint's globs | BlueOak-1.0.0 | no copyright line; its author: Isaac Z. Schlueter <i@izs.me> |
+| `@isaacs/nonrecursive-glob-match` | minimatch's matcher of one path segment, for the tests alone: never carried by the app | BlueOak-1.0.0 | no copyright line or author; its publisher: Isaac Z. Schlueter <i@izs.me> |
 | `brace-expansion`, `balanced-match` | minimatch's | MIT | Copyright Julian Gruber <julian@juliangruber.com> |
 | `optionator`, `levn`, `prelude-ls`, `type-check` | eslint's options | MIT | Copyright (c) George Zahariev |
 | `deep-is` | optionator's | MIT | Copyright (c) 2012, 2013 Thorsten Lorenz <thlorenz@gmx.de> |
@@ -360,6 +374,20 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
+
+## The debug relay's linked objects
+
+The debug relay under `debugger/relay/<rid>/` (`libpassenger-debug.so`, Passenger's own `src/Passenger.DebugRelay`,
+which a Debug app on an Android device loads) is linked by `tools/debug-relay.sh` with objects from .NET's Android
+workload, its runtime packs `Microsoft.Android.Runtime.CoreCLR.37.android-arm64` and
+`Microsoft.Android.Runtime.CoreCLR.37.android-x64` (MIT, © Microsoft Corporation. All rights reserved.), which carry
+them under their own notices:
+
+- `crtbegin_so.o` and `crtend_so.o`, Android's C library start and end of a shared library (google/bionic,
+  https://android.googlesource.com/platform/bionic/): Copyright (C) 2006 The Android Open Source Project, Apache-2.0.
+- `libclang_rt.builtins-aarch64-android.a` and `libclang_rt.builtins-x86_64-android.a`, LLVM's compiler-rt builtins
+  (https://github.com/llvm/llvm-project): Apache-2.0 WITH LLVM-exception, whose exception lets a binary carry them
+  without their notice; named here all the same.
 
 ## SharpDbg and ICorDebugSharp
 
@@ -494,6 +522,137 @@ and `analyzer/warnings`, at the same commit.
 ```
 Copyright (c) 2014-present Godot Engine contributors (see AUTHORS.md).
 Copyright (c) 2007-2014 Juan Linietsky, Ariel Manzur.
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
+
+## Reqnroll's step matching
+
+`src/Passenger.Workspace/Gherkin/StepExpressions.cs` is a port to C# of how Reqnroll makes a step definition's expression
+into the regular expression it matches a step with, from https://github.com/reqnroll/Reqnroll at its tag v3.3.4 (commit
+33eeea2298e62d53355ecc36e487b1fcbc0d9270): `Reqnroll/Bindings/CucumberExpressions/CucumberExpressionDetector.cs` (whether an
+expression is a Cucumber Expression), `ReqnrollCucumberExpression.cs` (its `{string}`),
+`CucumberExpressionParameterTypeRegistry.cs` and `UserDefinedCucumberExpressionParameterTypeTransformation.cs` (the
+parameter types, a transformation's regular expression), `Reqnroll/Bindings/RegexFactory.cs` (a regular expression
+anchored to the whole step) and `Reqnroll/Bindings/StepDefinitionRegexCalculator.cs` (a method named for its step).
+`StepMatcher.cs` beside it follows the matching rules of `Reqnroll/Infrastructure/StepDefinitionMatchService.cs` and
+`Reqnroll/Bindings/BindingScope.cs` at the same commit: the order of its checks and how a scope's fit is counted.
+`GherkinDialects.cs` beside them holds `ReqnrollProvider`, a port of `Reqnroll/Parser/ReqnrollGherkinDialectProvider.cs` at
+the same commit: a `# language:` naming a region Gherkin lacks read in its language's keywords under the name written.
+`FeatureReading.cs` beside them tells a scenario an outline as `Reqnroll.Parser/ReqnrollGherkinParser.cs`'s
+`CreateScenario` builds one at the same commit: wherever it has examples, whatever its keyword. `GeneratorChecks.cs`
+beside them refuses a feature Gherkin reads as that file's `CheckSemanticErrors` does at the same commit, by its four
+checks in `Reqnroll.Parser/SemanticValidators/` (`DuplicateScenariosValidator.cs`, `DuplicateExamplesValidator.cs`,
+`MissingExamplesValidator.cs` and `DuplicateExamplesColumnHeadersValidator.cs`), in their words at the places they name.
+`StepConversions.cs` beside them is a port of `Reqnroll/Bindings/StepArgumentTypeConverter.cs` at the same commit (which
+text a step definition's parameter takes: its transformations, an enum, a Guid as
+`Reqnroll/Assist/ValueRetrievers/GuidValueRetriever.cs` reads one, and .NET's own converters in the binding culture).
+`TableColumns.cs` beside them is a port of `Reqnroll/Assist/TEHelpers.cs` and `Reqnroll/Assist/TableExtensionMethods.cs`
+at the same commit (which of a table's names a member takes, a table read by its header or its first column), with
+`ToIdentifier` and its table of accented letters from `Reqnroll/Tracing/CodeFormattingExtensions.cs`.
+
+```
+BSD 3-Clause License
+
+Copyright (c) 2024-2025, Reqnroll
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are met:
+
+1. Redistributions of source code must retain the above copyright notice, this
+   list of conditions and the following disclaimer.
+
+2. Redistributions in binary form must reproduce the above copyright notice,
+   this list of conditions and the following disclaimer in the documentation
+   and/or other materials provided with the distribution.
+
+3. Neither the name of the copyright holder nor the names of its
+   contributors may be used to endorse or promote products derived from
+   this software without specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+```
+
+## Reqnroll for Visual Studio's table layout
+
+`src/Passenger.Workspace/Gherkin/GherkinFormatter.cs` keeps the text a table's row holds after its last bar after its
+aligned cells, trimmed and one cell padding from the bar, as `GetUnfinishedTableCell` and `FormatTable` of
+`Reqnroll.VisualStudio/Editor/Services/Formatting/GherkinDocumentFormatter.cs` keep it, from
+https://github.com/reqnroll/Reqnroll.VisualStudio at its tag v2026.1.477 (commit
+fb6134a5d5ebe8a98b681d7669a51f40c73e3ab6); `tests/Passenger.UnitTests/Gherkin/GherkinFormatterTests.cs` takes its rows
+for that from `Should_not_remove_unfinished_cells_when_formatting_table` in
+`Tests/Reqnroll.VisualStudio.Tests/Editor/Services/GherkinDocumentFormatterTests.cs` at the same commit.
+
+```
+BSD 3-Clause License
+
+Copyright (c) 2019-2024, Gaspar Nagy (Spec Solutions), Reqnroll
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are met:
+
+1. Redistributions of source code must retain the above copyright notice, this
+   list of conditions and the following disclaimer.
+
+2. Redistributions in binary form must reproduce the above copyright notice,
+   this list of conditions and the following disclaimer in the documentation
+   and/or other materials provided with the distribution.
+
+3. Neither the name of the copyright holder nor the names of its
+   contributors may be used to endorse or promote products derived from
+   this software without specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+```
+
+## .NET MAUI's SceneDelegate
+
+The SceneDelegate Make the Mobile Edits writes beside a .NET MAUI app's Apple head's Info.plist
+(`MobileHeads.DelegateText` in `src/Passenger.App/Mobile/MobileHeads.cs`), and the scene configuration it names there, are
+those of .NET MAUI's own templates, `content/templates/maui-mobile/Platforms/iOS/SceneDelegate.cs` and its `Info.plist` in
+Microsoft.Maui.Templates.net11 11.0.0, from https://github.com/dotnet/maui (commit
+4e6582f7397a5736bc85984228c549d09a85a1de), under the MIT License below.
+
+```
+The MIT License (MIT)
+
+Copyright (c) .NET Foundation and Contributors
+
+All rights reserved.
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -681,13 +840,14 @@ WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 ## Unicode Character Database
 
-`src/Passenger.Terminal/WideCharacters.cs`, the characters the terminal draws two columns wide, is derived from the
+`src/Passenger.Text/WideCharacters.cs`, the characters the terminal and Vim mode count two columns wide, is derived from the
 Unicode Character Database 16.0.0's `EastAsianWidth.txt` and `emoji/emoji-data.txt`
 (https://www.unicode.org/Public/16.0.0/ucd/), written by `tools/unicode-widths.py`.
-`src/Passenger.Workspace/GDScript/UnicodeIdentifiers.cs`, what a GDScript identifier's spoof check reads, is derived from
-Unicode 17.0.0's `security/IdentifierStatus.txt` and `security/confusables.txt` (UTS #39) and its Character Database's
-`Scripts.txt`, `ScriptExtensions.txt`, `PropertyValueAliases.txt`, `UnicodeData.txt` and `PropList.txt`
-(https://www.unicode.org/Public/17.0.0/), written by `tools/unicode-identifiers.py`.
+`src/Passenger.Workspace/GDScript/UnicodeIdentifiers.cs`, the characters a GDScript identifier is made of and what its
+spoof check reads, is derived from Unicode 17.0.0's `security/IdentifierStatus.txt` and `security/confusables.txt` (UTS
+#39) and its Character Database's `Scripts.txt`, `ScriptExtensions.txt`, `PropertyValueAliases.txt`, `UnicodeData.txt`,
+`PropList.txt` and `DerivedCoreProperties.txt` (https://www.unicode.org/Public/17.0.0/), written by
+`tools/unicode-identifiers.py`.
 `src/Passenger.Workspace/GDScript/IdentifierSpoofing.cs` is a port to C# of International Components for Unicode (ICU)
 78.3's spoof check, `icu4c/source/i18n/uspoof.cpp` (`checkImpl`) and `uspoof_impl.cpp` (its script sets, restriction
 level, numerics and hidden overlay) of https://github.com/unicode-org/icu at tag release-78.3, under the same licence.
@@ -741,6 +901,33 @@ The attribute ordering rule groups Reformat Code puts XAML's attributes in when 
 defaults, its `AttributeOrderingRuleGroups` in `src/XamlStyler/Options/StylerOptions.cs`
 (https://github.com/Xavalon/XamlStyler), as are the names of the options Passenger shares with it (Enable attribute
 reordering, Remove ending tag of empty element); (c) Xavalon. All rights reserved., under the Apache License 2.0 below.
+
+## Rust's batch file command line
+
+How `WindowsCommandLine.ThroughCmd` (`src/Passenger.Core/WindowsCommandLine.cs`) runs a .cmd or .bat through cmd.exe
+follows the Rust standard library's `make_bat_command_line` (https://github.com/rust-lang/rust): cmd's switches, a word
+quoted where cmd would read it, a quote in it doubled, each `%` followed by `%cd:~,%`, and a line break refused.
+Under the MIT licence (Rust's is MIT or Apache 2.0, at one's choice):
+
+```
+Copyright (c) The Rust Project Contributors
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of this
+software and associated documentation files (the "Software"), to deal in the Software
+without restriction, including without limitation the rights to use, copy, modify, merge,
+publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons
+to whom the Software is furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all copies or
+substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED,
+INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR
+PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE
+FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR
+OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
+```
 
 ## MSBuild's schemas
 
@@ -892,6 +1079,11 @@ And one that colours .http and .rest files: `http.tmLanguage.json`, REST Client'
 `syntaxes/http.tmLanguage.json` of Huachao/vscode-restclient (https://github.com/Huachao/vscode-restclient, MIT,
 Copyright (c) 2016 - present Huachao Mao) at commit 0773d56b, unchanged.
 
+And one that colours Gherkin's .feature files (Reqnroll's and SpecFlow's tests): `feature.tmLanguage.json`, the file
+`syntaxes/feature.tmLanguage.json` of the Cucumber (Gherkin) Full Support extension, alexkrechik/VSCucumberAutoComplete
+(https://github.com/alexkrechik/VSCucumberAutoComplete, MIT, Copyright (c) 2018 Alexander Krechik) at commit 7722cc93,
+its 3.1.1, unchanged.
+
 And three that colour Godot's files, from the Godot Engine's own VS Code extension, godotengine/godot-vscode-plugin
 (https://github.com/godotengine/godot-vscode-plugin, MIT, Copyright (c) 2016-2022 The Godot Engine community) at its
 tag 2.7.1 (commit 7317ea20), its `syntaxes/` folder, unchanged: `GDScript.tmLanguage.json` (GDScript's .gd files),
@@ -923,6 +1115,7 @@ Copyright (c) 2016 .NET Foundation
 Copyright (c) 2016 - present Huachao Mao
 Copyright (c) 2016-2022 The Godot Engine community
 Copyright (c) 2015-present MagicStack Inc.  http://magic.io
+Copyright (c) 2018 Alexander Krechik
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal

@@ -14,7 +14,8 @@ using Passenger.App.Workspace;
 namespace Passenger.App.State;
 
 /// <summary>The IDE's own state, in one folder: the app's documents at its top (the settings, the layout a folder
-/// without its own opens on, the recent solutions, the release last announced, Find in Files' mask, Rename's options),
+/// without its own opens on, where the window last stood, the recent solutions, the release last announced, Find in
+/// Files' mask, Rename's options, the folders trusted),
 /// and each folder's under <c>workspaces/&lt;name&gt;-&lt;hash&gt;/</c>, held only while a window has the folder open. Only
 /// the windows a person uses keep one, all of a process's windows over the same folder sharing it (<see cref="Open"/>), so
 /// each document is held once and what one window keeps another reads at once; a headless IDE starts on the defaults.</summary>
@@ -38,6 +39,7 @@ public sealed class StateStore
         this.key = key;
         Settings = SettingsStore.Kept(new StateDocument<AppSettings>(Path.Combine(root, SettingsFile)));
         Layout = new(Path.Combine(root, "layout.json"));
+        Placement = new(Path.Combine(root, "windowPlacement.json"));
         Recent = new(Path.Combine(root, "recentSolutions.json"));
         Updates = new(Path.Combine(root, "updates.json"));
         Find = new(Path.Combine(root, "find.json"));
@@ -45,6 +47,7 @@ public sealed class StateStore
         Previews = new(Path.Combine(root, "previews.json"));
         LiveTree = new(Path.Combine(root, "liveTree.json"));
         Dotnet = new(Path.Combine(root, "dotnet.json"));
+        Trust = new(Path.Combine(root, "trust.json"));
         // Before this process writes any: a change is written a moment after it is made, and only through this store.
         UsedBefore = new[] { Path.Combine(root, SettingsFile), Layout.Path, Recent.Path, Updates.Path }.Any(File.Exists)
             || Directory.Exists(Path.Combine(root, "workspaces"));
@@ -59,9 +62,26 @@ public sealed class StateStore
     public const string Variable = "PASSENGER_SETTINGS";
 
     /// <summary>The folder: PASSENGER_SETTINGS names it, else the user's local application data.</summary>
-    public static string DefaultRoot => Environment.GetEnvironmentVariable(Variable) is { Length: > 0 } folder
-        ? folder
-        : Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Passenger");
+    public static string DefaultRoot => Named ?? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Passenger");
+
+    /// <summary>The state folder made the person's alone as Passenger starts (<see cref="Containers.OwnFiles.Folder"/>, one an
+    /// earlier Passenger made put right), its logs with all they hold (<see cref="Containers.OwnFiles.Tree"/>): Local History
+    /// in it keeps copies of a folder's files, .env and appsettings among them, and the logs what programs said.</summary>
+    public static void Own()
+    {
+        try
+        {
+            Containers.OwnFiles.Folder(DefaultRoot);
+            Containers.OwnFiles.Tree(IdeLog.Folder);
+        }
+        catch (Exception refused) when (refused is IOException or UnauthorizedAccessException)
+        {
+            Console.Error.WriteLine($"passenger: the state folder {DefaultRoot} could not be made the person's alone: {refused.Message}");
+        }
+    }
+
+    /// <summary>The folder PASSENGER_SETTINGS names, or null where it names none.</summary>
+    public static string? Named => Environment.GetEnvironmentVariable(Variable) is { Length: > 0 } folder ? folder : null;
 
     public string Root { get; }
 
@@ -102,14 +122,17 @@ public sealed class StateStore
     /// <summary>The tool windows' layout as it was changed last, which a folder with none of its own opens on.</summary>
     public StateDocument<DockLayout> Layout { get; }
 
+    /// <summary>Where the person's window last stood, which the next start's window opens at.</summary>
+    public StateDocument<WindowPlacementState> Placement { get; }
+
     /// <summary>The folders and solutions opened lately, which a start reopens.</summary>
     public StateDocument<RecentSolutionsState> Recent { get; }
 
     /// <summary>The newest release the window has said is out, which it says once.</summary>
     public StateDocument<UpdatesState> Updates { get; }
 
-    /// <summary>Find in Files' file mask, the masks used lately and whether directories are searched recursively, which
-    /// every folder shares.</summary>
+    /// <summary>Find in Files' file mask, the masks used lately and whether directories are searched recursively, and the
+    /// side of a search's usages the Find window shows alone, which every folder shares.</summary>
     public StateDocument<FindSettingsState> Find { get; }
 
     /// <summary>Rename's options as they were left, which every folder shares.</summary>
@@ -123,6 +146,9 @@ public sealed class StateStore
 
     /// <summary>What the person said of the machine's .NET: the installations whose off-PATH word they hid.</summary>
     public StateDocument<DotnetState> Dotnet { get; }
+
+    /// <summary>The folders the person trusted, and those they opened without trusting.</summary>
+    public StateDocument<TrustState> Trust { get; }
 
     /// <summary>A folder's own documents, held for a window that has the folder open or is opening it until it lets them go
     /// (<see cref="LetGo"/>); every window holding the folder shares them.</summary>
@@ -160,6 +186,7 @@ public sealed class StateStore
     {
         Settings.Flush();
         Layout.Flush();
+        Placement.Flush();
         Recent.Flush();
         Updates.Flush();
         Find.Flush();
@@ -167,11 +194,17 @@ public sealed class StateStore
         Previews.Flush();
         LiveTree.Flush();
         Dotnet.Flush();
+        Trust.Flush();
         foreach ((ProjectState documents, _) in projects.Values)
         {
             documents.Flush();
         }
     }
+
+    /// <summary>Writes, for 2 s at most, each change still waiting, of any document: one set a moment before, whose timer
+    /// the process would not wait for, or one whose write failed (a program holding its file sharing no deletion).
+    /// Passenger's last wait as it ends, after which no try would come.</summary>
+    public static void LandWaiting() => StateFile.LandWaiting();
 
     /// <summary>The step from a file written before documents had versions to the first version, which has its shape.</summary>
     public static void Unversioned(JsonObject document)

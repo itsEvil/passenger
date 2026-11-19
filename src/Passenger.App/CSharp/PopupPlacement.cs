@@ -1,4 +1,7 @@
+using System.Runtime.CompilerServices;
 using Avalonia;
+using Avalonia.Automation;
+using Avalonia.Automation.Peers;
 using Avalonia.Controls;
 using Avalonia.Input;
 using Avalonia.Interactivity;
@@ -10,7 +13,9 @@ namespace Passenger.App.CSharp;
 
 /// <summary>Where the code assistance's popups sit: on the layer over the active editor's window, placed at a line of
 /// the editor and kept inside it, and the one list of choices or rename box open at a time, which a press in its window
-/// outside it dismisses and whose answer is carried out as background work.</summary>
+/// outside it dismisses and whose answer is carried out as background work. Each is what a screen reader meets it as
+/// (<see cref="IHeardPopup"/>), and what it says reaches the reader through the window's <see cref="Announcer"/>
+/// (<see cref="Tell"/>).</summary>
 internal sealed class PopupPlacement
 {
     private readonly AssistContext context;
@@ -38,6 +43,9 @@ internal sealed class PopupPlacement
     /// <summary>The size of the layer the popups are placed in.</summary>
     public Size Room => layer.Bounds.Size;
 
+    /// <summary>The widest a popup placed at a line is shown whole in the editor (<see cref="Place(Control, Point, bool)"/>).</summary>
+    public double Widest => Math.Max(0, layer.Bounds.Width - RightEdge);
+
     /// <summary>The list of choices or the rename box open, null with none.</summary>
     public Control? Modal => modal;
 
@@ -54,9 +62,36 @@ internal sealed class PopupPlacement
     public void Add(Control popup)
     {
         popup.IsVisible = false;
+        Heard(popup);
         cards.Add(popup);
         layer.Children.Add(popup);
     }
+
+    /// <summary>A popup as a screen reader meets it: the role and name it gives (<see cref="IHeardPopup"/>), set only where
+    /// they differ, so placing it again costs nothing.</summary>
+    private static void Heard(Control popup)
+    {
+        if (popup is not IHeardPopup heard)
+        {
+            return;
+        }
+        if (AutomationProperties.GetControlTypeOverride(popup) != heard.Role)
+        {
+            AutomationProperties.SetControlTypeOverride(popup, heard.Role);
+        }
+        if (AutomationProperties.GetName(popup) != heard.Called)
+        {
+            AutomationProperties.SetName(popup, heard.Called);
+        }
+    }
+
+    /// <summary>Tells a screen reader what a popup says (<see cref="Announcer.Tell"/>), words about one thing that changes
+    /// (<paramref name="about"/>: a list's choice) in place of those it told before and not yet heard.</summary>
+    public void Tell(string words, Urgency urgency, object about) => Announcer.Of(TopLevel.GetTopLevel(layer))?.Tell(words, urgency, about);
+
+    /// <summary>A list's choice as it is said: its words, its kind where it has one, and where it stands in the list.</summary>
+    public static string Chosen(string words, string? kind, int at, int count) =>
+        string.IsNullOrEmpty(kind) ? $"{words}, item {at + 1} of {count}" : $"{words}, {kind}, item {at + 1} of {count}";
 
     /// <summary>Whether the modal last asked for was refused to an agent's action, answered as dismissed without showing.</summary>
     private bool refused;
@@ -79,41 +114,131 @@ internal sealed class PopupPlacement
     public void Place(Control popup, int offset, bool above) => Place(popup, Editor.PointOf(offset), above);
 
     /// <summary>Puts a popup under the line at <paramref name="at"/> (its top), or over it when asked
-    /// or when there is no room below, kept inside the editor.</summary>
+    /// or when there is no room below, kept inside the editor. A card or the colour picker (<see cref="IHeldToEditor"/>) is
+    /// held to the editor's width (<see cref="Widest"/>), and one that fits neither under nor over its line goes where there
+    /// is more room, moved in as far as it must to show whole, though it then hides some of the line.</summary>
     public void Place(Control popup, Point at, bool above)
     {
-        at = InLayer(at);
-        popup.Measure(Size.Infinity);
+        if (cards.Contains(popup))
+        {
+            OnLayer(popup);
+        }
+        PlaceOn(popup, Editor, layer, at, above);
+    }
+
+    /// <summary>Puts a card under a line of an editor no group shows, a diff's side, as at the active editor's
+    /// (<see cref="Place(Control, Point, bool)"/>): on <paramref name="onto"/>, the layer over a diff's own window, else
+    /// over the editors.</summary>
+    public void Place(Control popup, Passenger.Editor.CodeEditor editor, Canvas? onto, Point at, bool above)
+    {
+        onto ??= layer;
+        OnLayer(popup, onto);
+        PlaceOn(popup, editor, onto, at, above);
+    }
+
+    /// <summary>A card put back on the layer over the editors (<paramref name="onto"/> null), or onto another window's, from
+    /// the one it stands on: a card shown over a diff window's side comes back for the editors'.</summary>
+    public void OnLayer(Control popup, Canvas? onto = null)
+    {
+        onto ??= layer;
+        if (popup.Parent != onto)
+        {
+            (popup.Parent as Panel)?.Children.Remove(popup);
+            onto.Children.Add(popup);
+        }
+    }
+
+    private void PlaceOn(Control popup, Passenger.Editor.CodeEditor editor, Canvas onto, Point at, bool above)
+    {
+        Heard(popup);
+        at = editor.TranslatePoint(at, onto) ?? at;
+        (popup as IHeldToEditor)?.Within(Math.Max(0, onto.Bounds.Width - RightEdge));
+        // A list shown again measures as its last rows did until a layout pass measures the rows it shows now.
+        if (popup.IsAttachedToVisualTree())
+        {
+            popup.UpdateLayout();
+        }
+        else
+        {
+            popup.Measure(Size.Infinity);
+        }
         Size size = popup.DesiredSize;
-        Size room = layer.Bounds.Size;
-        double lineHeight = Editor.LineHeight;
-        double x = Math.Clamp(at.X - 4, 0, Math.Max(0, room.Width - size.Width - 8));
+        Size room = onto.Bounds.Size;
+        double lineHeight = editor.LineHeight;
+        double x = Math.Clamp(at.X - 4, 0, Math.Max(0, room.Width - size.Width - RightEdge));
         double below = at.Y + lineHeight + 2;
         double over = at.Y - size.Height - 2;
         double y = above ? (over >= 0 ? over : below) : (below + size.Height <= room.Height || over < 0 ? below : over);
+        if (popup is IHeldToEditor && over < 0 && below + size.Height > room.Height)
+        {
+            y = Math.Clamp(room.Height - below >= at.Y ? below : over, 0, Math.Max(0, room.Height - size.Height));
+        }
         Canvas.SetLeft(popup, x);
         Canvas.SetTop(popup, y);
+        lines.AddOrUpdate(popup, new StrongBox<double>(at.Y));
     }
 
-    /// <summary>A card to the right of a popup, at its top; to its left when the right has no room.</summary>
-    public void PlaceBeside(Control card, Control beside)
+    /// <summary>A card beside a popup, at its top: to its right where it fits there whole, else to the side with more room,
+    /// narrowed to that room so its words wrap rather than run past the editor's edge, which cuts what the layer shows.
+    /// Where neither side has room enough for words to read, above or below the popup and the line it was placed at,
+    /// where there is more room, as wide as the editor allows; raised where it would end past the editor's foot.</summary>
+    public void PlaceBeside(InfoCard card, Control beside)
     {
+        card.Within(double.PositiveInfinity);
         card.Measure(Size.Infinity);
-        double left = Canvas.GetLeft(beside);
         double width = card.DesiredSize.Width;
-        // A popup just shown has no bounds until the next layout: its measure says how wide it will be.
+        // A popup just shown has no bounds until the next layout: its measure says how big it will be.
         if (beside.Bounds.Width == 0)
         {
             beside.Measure(Size.Infinity);
         }
-        double x = left + (beside.Bounds.Width > 0 ? beside.Bounds.Width : beside.DesiredSize.Width) + 4;
-        if (x + width > layer.Bounds.Width && left - width - 4 >= 0)
+        Size popup = beside.Bounds.Width > 0 ? beside.Bounds.Size : beside.DesiredSize;
+        Rect room = new Rect(layer.Bounds.Size).Deflate(Edge);
+        double left = Canvas.GetLeft(beside);
+        double top = Canvas.GetTop(beside);
+        double toRight = room.Right - (left + popup.Width + Gap);
+        double toLeft = left - Gap - room.X;
+        bool right = width <= toRight || (width > toLeft && toRight >= toLeft);
+        double side = right ? toRight : toLeft;
+        double x;
+        double y;
+        if (width <= side || side >= LeastBeside)
         {
-            x = left - width - 4;
+            card.Within(side);
+            card.Measure(Size.Infinity);
+            x = right ? left + popup.Width + Gap : left - Gap - card.DesiredSize.Width;
+            y = top;
+        }
+        else
+        {
+            card.Within(room.Width);
+            card.Measure(Size.Infinity);
+            // Over or under the popup and its line together, so the card hides neither the choices nor what is typed.
+            (double lineTop, double lineBottom) = lines.TryGetValue(beside, out StrongBox<double>? line) ? (line.Value, line.Value + Editor.LineHeight) : (top, top);
+            double bandTop = Math.Min(top, lineTop);
+            double bandBottom = Math.Max(top + popup.Height, lineBottom);
+            double under = room.Bottom - (bandBottom + Gap);
+            double over = bandTop - Gap - room.Y;
+            x = Math.Clamp(left, room.X, Math.Max(room.X, room.Right - card.DesiredSize.Width));
+            y = card.DesiredSize.Height <= under || under >= over ? bandBottom + Gap : bandTop - Gap - card.DesiredSize.Height;
         }
         Canvas.SetLeft(card, x);
-        Canvas.SetTop(card, Canvas.GetTop(beside));
+        Canvas.SetTop(card, Math.Max(room.Y, Math.Min(y, room.Bottom - card.DesiredSize.Height)));
     }
+
+    /// <summary>How far a popup placed at a line keeps from the editor's right edge.</summary>
+    private const double RightEdge = 8;
+
+    /// <summary>How far a card sits from the popup it describes, and from the editor's edge.</summary>
+    private const double Gap = Gaps.Tight;
+    private const double Edge = 4;
+
+    /// <summary>The narrowest a card beside a popup is made, its words a few to a line; narrower, it goes over or under it.</summary>
+    private const double LeastBeside = 200;
+
+    /// <summary>The top of the line each popup placed at a line was placed at, in the layer's coordinates, kept no longer
+    /// than the popup.</summary>
+    private readonly ConditionalWeakTable<Control, StrongBox<double>> lines = [];
 
     /// <summary>The popups go to the layer over the active editor's window, an editor window's when it has the active
     /// group, since a popup is placed in its layer's coordinates and one window's cannot reach another's.</summary>
@@ -123,12 +248,11 @@ internal sealed class PopupPlacement
         {
             return;
         }
+        layer = context.Editors.AssistLayer;
         foreach (Control popup in cards)
         {
-            layer.Children.Remove(popup);
-            context.Editors.AssistLayer.Children.Add(popup);
+            OnLayer(popup);
         }
-        layer = context.Editors.AssistLayer;
     }
 
     public void ShowModal(ChoicePopup popup, int offset, string what, Func<Choice?, Task> done)
@@ -140,7 +264,22 @@ internal sealed class PopupPlacement
         Open(popup, () => IdeErrors.Observe(Carried(what, () => done(null))));
         Place(popup, offset, above: false);
         popup.Done += (_, choice) => IdeErrors.Observe(Carried(what, () => done(choice)));
+        // Its choice is said as completion's is: by its title as it opens, and at once as the keys move it.
+        if (popup.ChosenAt >= 0)
+        {
+            Tell($"{popup.Title}, {ChoiceSaid(popup)}", Urgency.Polite, popup);
+        }
+        popup.Moved += (_, _) =>
+        {
+            if (popup.ChosenAt >= 0)
+            {
+                Tell(ChoiceSaid(popup), Urgency.Assertive, popup);
+            }
+        };
     }
+
+    private static string ChoiceSaid(ChoicePopup popup) =>
+        Chosen(popup.Titles[popup.ChosenAt], popup.Details[popup.ChosenAt], popup.ChosenAt, popup.Titles.Count);
 
     public void ShowModal(RenameBox box, int offset, Func<string?, Task> done)
     {
@@ -251,4 +390,21 @@ internal sealed class PopupPlacement
     private static bool KeysElsewhere(Control open) =>
         TopLevel.GetTopLevel(open) is { } window && window.FocusManager?.GetFocusedElement() is Visual focused
         && focused != window && focused != open && !open.IsVisualAncestorOf(focused);
+}
+
+/// <summary>A popup placed at a line as a screen reader meets it, given it as it is put on the layer or placed
+/// (<see cref="PopupPlacement.Place(Control, Point, bool)"/>): what kind of thing it is, and what it is called.</summary>
+internal interface IHeardPopup
+{
+    AutomationControlType Role { get; }
+
+    string Called { get; }
+}
+
+/// <summary>A popup placed at a line that is held to the editor (<see cref="PopupPlacement.Place(Control, Point, bool)"/>):
+/// narrowed to its width, and moved in to show whole where it fits neither under nor over its line.</summary>
+internal interface IHeldToEditor
+{
+    /// <summary>Held to a room narrower than it would be; as wide as it is of itself in a wider one.</summary>
+    void Within(double room);
 }

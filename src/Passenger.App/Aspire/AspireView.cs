@@ -36,13 +36,13 @@ public sealed class AspireView : DockPanel, IDisposable
     private const string TelemetryTab = AspireModel.TelemetryTab;
     private const string StatsTab = AspireModel.StatsTab;
 
-    private readonly TextBlock status = new() { Classes = { StyleClasses.Muted }, Margin = new Thickness(8, 0), VerticalAlignment = VerticalAlignment.Center, TextTrimming = TextTrimming.CharacterEllipsis };
+    private readonly TextBlock status = new() { Classes = { StyleClasses.Muted }, Margin = new Thickness(Gaps.Normal, 0), VerticalAlignment = VerticalAlignment.Center, TextTrimming = TextTrimming.CharacterEllipsis };
     private readonly TextBlock empty = new() { Classes = { StyleClasses.EmptyText } };
     private readonly List<(Button Button, string Action)> tools = [];
     private readonly Button commands;
     private readonly ContentControl page = new();
     private readonly ContentControl appHostConsole = new();
-    private readonly TextBlock readiness = new() { Classes = { StyleClasses.Muted }, Margin = new Thickness(8, 6), TextWrapping = TextWrapping.Wrap };
+    private readonly TextBlock readiness = new() { Classes = { StyleClasses.Muted }, Margin = new Thickness(Gaps.Normal, Gaps.Small), TextWrapping = TextWrapping.Wrap };
     private readonly IReadOnlyDictionary<string, ToggleButton> tabs;
     private readonly Dictionary<string, Control> pages;
     private readonly TextBlock consoleStatus = Said();
@@ -64,7 +64,7 @@ public sealed class AspireView : DockPanel, IDisposable
     public AspireView(AspireModel model)
     {
         this.model = model;
-        AppSelector = new ComboBox { MaxWidth = 300, MinWidth = 200, VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(0, 0, 6, 0) };
+        AppSelector = new ComboBox { MaxWidth = 300, MinWidth = 200, VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(0, 0, Gaps.Small, 0) };
         AutomationProperties.SetName(AppSelector, "Aspire AppHost");
         ToolTip.SetTip(AppSelector, "Running AppHost (every request uses its absolute project path)");
         ToolFlow bar = RunWindowFrame.Tools(AppSelector);
@@ -86,7 +86,7 @@ public sealed class AspireView : DockPanel, IDisposable
         ToolFlow.SetFills(status, new ToolLayout.Fills(120));
         bar.Children.Add(status);
 
-        ResourceList = new ListBox
+        ResourceList = new TreeList
         {
             Classes = { StyleClasses.Tree },
         };
@@ -149,7 +149,7 @@ public sealed class AspireView : DockPanel, IDisposable
     public ComboBox AppSelector { get; }
 
     /// <summary>The resources, each a row (<see cref="AspireRow"/>) at its depth.</summary>
-    public ListBox ResourceList { get; }
+    public TreeList ResourceList { get; }
 
     /// <summary>The chosen resource's Details tab.</summary>
     public AspireDetailsPane Details { get; }
@@ -564,7 +564,7 @@ public sealed class AspireView : DockPanel, IDisposable
             return;
         }
         AspireResource resource = selected.Resource;
-        string? none = resource.State is "Running" ? null : Refusals.NotRunning(resource.DisplayName);
+        string? none = resource.State is AspireStates.Running ? null : Refusals.NotRunning(resource.DisplayName);
         Metrics.Show(resource.DisplayName, none is null ? model.ProgramOf?.Invoke(selected) : null, none);
     }
 
@@ -589,20 +589,19 @@ public sealed class AspireView : DockPanel, IDisposable
             Health = AspireDetailsPane.Health(resource),
             Links = [.. AspireModel.Links(resource).Take(3).Select(url => new RunLink(url.Authority, url, url.AbsoluteUri))],
             Detail = resource.Source is { } source ? Path.IsPathFullyQualified(source) ? Path.GetFileName(source) : source
-                : AspireJson.String(resource.Data, "resourceType"),
+                : resource.TypeShown,
             Tip = resource.ToString(),
         };
     }
 
-    /// <summary>A resource's state as the dot says it: Aspire's own style of it first (an error's red), then running (unhealthy
-    /// while a health report fails), starting or stopping between states, the rest stopped.</summary>
-    private static RunState StateOf(AspireResource resource) => (resource.State, AspireJson.String(resource.Data, "stateStyle")) switch
-    {
-        (_, "error") or ("FailedToStart" or "RuntimeUnhealthy", _) => RunState.Failed,
-        ("Running", _) => resource.HealthStatus == "Unhealthy" ? RunState.Unhealthy : RunState.Running,
-        ("Starting" or "Waiting" or "Stopping" or "Building" or "Activating", _) => RunState.Between,
-        _ => RunState.Stopped,
-    };
+    /// <summary>A resource's state as the dot says it: failed first (red), as Aspire's own style of it says or its state does
+    /// (<see cref="AspireStates.IsFailed"/>), then running (unhealthy while a health report fails), between states, the rest
+    /// stopped.</summary>
+    private static RunState StateOf(AspireResource resource) =>
+        AspireJson.String(resource.Data, "stateStyle") == "error" || AspireStates.IsFailed(resource.State) ? RunState.Failed
+        : resource.State == AspireStates.Running ? resource.HealthStatus == "Unhealthy" ? RunState.Unhealthy : RunState.Running
+        : AspireStates.IsBetween(resource.State) ? RunState.Between
+        : RunState.Stopped;
 
     /// <summary>A row's menu: the service actions first (greyed with why on a resource that is no .NET service), then its
     /// commands, then its address, source and container.</summary>

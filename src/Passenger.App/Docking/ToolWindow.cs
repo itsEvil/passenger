@@ -7,25 +7,14 @@ using Avalonia.VisualTree;
 
 namespace Passenger.App.Docking;
 
-/// <summary>Where a tool window docks: each side's upper or lower half, the bottom's left or right half. A place shows
-/// one of its windows at a time.</summary>
-public enum ToolAnchor
-{
-    LeftTop,
-    LeftBottom,
-    RightTop,
-    RightBottom,
-    BottomLeft,
-    BottomRight,
-}
-
-/// <summary>How a tool window stands: in its place, in a window kept over the IDE's, or in a window of its own the
-/// system manages like any other.</summary>
+/// <summary>How a tool window stands: in its place, in a window kept over the IDE's, in a window of its own the
+/// system manages like any other, or as a tab among the editors.</summary>
 public enum ToolMode
 {
     Docked,
     Floating,
     Windowed,
+    Editor,
 }
 
 /// <summary>A tool window (Explorer, Debug, Unit Tests): its content, its button on a stripe, and where it docks.
@@ -88,49 +77,50 @@ public sealed class ToolWindow([IdentifierOf(typeof(ToolWindowIds))] string id, 
         }, RoutingStrategies.Bubble, handledEventsToo: true);
 
     /// <summary>Gives its view the keys, as its action does once it shows: back to what in it had them last, still shown (a
-    /// list's row, or its item's row, still chosen: <see cref="ListKeys.Hold(RowWithKeys)"/>), else to the first of its
-    /// search boxes and lists (a list's chosen row, the first chosen where none is), else to the
-    /// first text it shows that takes them (a console), else to the view itself until they leave it, so what is typed next
-    /// never goes to the file.</summary>
-    internal void TakeKeys()
+    /// list's row, or its item's row, still chosen: <see cref="ListKeys.Hold(RowWithKeys, NavigationMethod)"/>), else to its
+    /// first search box or list (its chosen row, the first where none is), else to the first text that takes them (a
+    /// console), else to the view itself until they leave it, so what is typed next never goes to the file. Given them as by
+    /// Tab (<paramref name="method"/>), what takes them draws the ring round it; false where nothing in it could.</summary>
+    internal bool TakeKeys(NavigationMethod method = NavigationMethod.Unspecified)
     {
         Control view = Content;
         if (TopLevel.GetTopLevel(view) is null)
         {
-            return;
+            return false;
         }
         view.UpdateLayout();
-        if (hadRow is { } row ? Shown(row.List) && ListKeys.Hold(row) : hadKeys is { } had && Shown(had) && had.Focus())
+        if (hadRow is { } row ? Shown(row.List) && ListKeys.Hold(row, method) : hadKeys is { } had && Shown(had) && had.Focus(method))
         {
-            return;
+            return true;
         }
         List<Control> shown = [.. view.GetVisualDescendants().OfType<Control>().Where(c => c.IsEffectivelyVisible && c.IsEffectivelyEnabled)];
         foreach (Control each in shown)
         {
             switch (each)
             {
-                case TextBox { IsReadOnly: false, Focusable: true } search when search.Focus():
-                    return;
-                case ListBox { ItemCount: > 0 } list when ListKeys.Hold(list, chooseFirst: true):
-                    return;
+                case TextBox { IsReadOnly: false, Focusable: true } search when search.Focus(method):
+                    return true;
+                case ListBox { ItemCount: > 0 } list when ListKeys.Hold(list, chooseFirst: true, method):
+                    return true;
             }
         }
-        if (shown.FirstOrDefault(c => c.Focusable && c is not (Button or ComboBox or Thumb)) is { } text && text.Focus())
+        if (shown.FirstOrDefault(c => c.Focusable && c is not (Button or ComboBox or Thumb)) is { } text && text.Focus(method))
         {
-            return;
+            return true;
         }
         if (view.Focusable)
         {
-            view.Focus();
-            return;
+            return view.Focus(method);
         }
         // Focusable only while it holds them, so a press on its toolbar never takes them from the editor.
         view.Focusable = true;
         view.LostFocus += LetGo;
-        if (!view.Focus())
+        if (!view.Focus(method))
         {
             LetGo(view, new RoutedEventArgs());
+            return false;
         }
+        return true;
 
         void LetGo(object? sender, RoutedEventArgs e)
         {
@@ -176,6 +166,10 @@ public sealed class ToolWindow([IdentifierOf(typeof(ToolWindowIds))] string id, 
     /// it again from inside.</summary>
     public Action? Activate { get; init; }
 
+    /// <summary>Whether a show the person asks for (its stripe's button, its tab, a move) gives it the keys as its action
+    /// does: the terminal's, shown to be typed into. A layout showing it, or an attached agent's call, never does.</summary>
+    public bool TakesKeysAsShown { get; init; }
+
     /// <summary>What is chosen in it (its rows), for actions that run on them while it has the keys.</summary>
     public Func<object?>? Chosen { get; init; }
 
@@ -191,6 +185,15 @@ public sealed class ToolWindow([IdentifierOf(typeof(ToolWindowIds))] string id, 
 
     /// <summary>Open in the layout the IDE starts with (the Explorer), and so after Restore Default Layout.</summary>
     public bool OpenAtFirst { get; init; }
+
+    /// <summary>What it serves, declared as it is made: every folder, or kinds of project the open folder must hold one of
+    /// for it to show (<see cref="Unserved"/>).</summary>
+    public required ToolWindowServes Serves { get; init; }
+
+    /// <summary>Why it serves nothing in the open folder (<see cref="ToolWindowServes.WhyNot"/>), which keeps it off the
+    /// stripes, its place and its tabs, its action greyed saying so, its place in the layout kept; null while it serves the
+    /// folder, as a window of every folder always does.</summary>
+    public string? Unserved { get; internal set; }
 
     /// <summary>The action that shows it, as the dock adds it: an agent's shows it with the keys left where they are.</summary>
     internal IdeAction? ShowAction(DockHost dock) => Action is { } id
@@ -208,6 +211,7 @@ public sealed class ToolWindow([IdentifierOf(typeof(ToolWindowIds))] string id, 
         {
             Menus = Menus,
             FromTerminal = true,
+            WhyNot = _ => Unserved,
         }
         : null;
 
@@ -217,7 +221,7 @@ public sealed class ToolWindow([IdentifierOf(typeof(ToolWindowIds))] string id, 
         internal set => Set(ref anchor, value);
     }
 
-    /// <summary>Docked, floating or windowed; its button stays on its anchor's stripe whatever the mode.</summary>
+    /// <summary>Docked, floating, windowed or an editor tab; its button stays on its anchor's stripe whatever the mode.</summary>
     public ToolMode Mode { get; internal set; }
 
     /// <summary>Where its own window last stood, floating or windowed, in screen pixels.</summary>
@@ -232,6 +236,11 @@ public sealed class ToolWindow([IdentifierOf(typeof(ToolWindowIds))] string id, 
         get => isShown;
         internal set => Set(ref isShown, value);
     }
+
+    /// <summary>Off its stripe and its place's tabs, closed by its × while the dock takes closed windows off
+    /// (<see cref="DockHost.ClosesOffStripe"/>) or unchecked on its stripe's checklist, until it is opened or checked
+    /// again.</summary>
+    public bool IsClosed { get; internal set; }
 
     /// <summary>The name a menu gives a place: "Left Top", "Bottom Right".</summary>
     public static string Name(ToolAnchor anchor) => anchor switch

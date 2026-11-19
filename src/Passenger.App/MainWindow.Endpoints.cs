@@ -33,6 +33,7 @@ public partial class MainWindow
             return view;
         }, Docking.ToolAnchor.RightTop)
         {
+            Serves = ToolWindowServes.WebRequests,
             Action = AppActions.ShowEndpoints,
             Menus = [new MenuPlace("Tools", 0, 3)],
             Chosen = () => endpoints?.Chosen,
@@ -87,6 +88,7 @@ public partial class MainWindow
             endpoints?.Reload(session.Folder);
         }
         RouteFilesChanged(changes);
+        StepFilesChanged(changes);
     }
 
     /// <summary>Opens a request in the Interactive Test dialog, its variables those of the environment chosen as it sends.</summary>

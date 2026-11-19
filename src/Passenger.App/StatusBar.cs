@@ -1,4 +1,5 @@
 using Avalonia.Controls;
+using Avalonia.Media;
 using Passenger.App.Docking;
 using Passenger.App.Run;
 using Passenger.App.ToolWindows;
@@ -32,13 +33,15 @@ public delegate void StatusSay(string said, StatusPlace? more = null);
 /// something else is said, and a link to where it has more to see while it has a place, its whole text on hover), and
 /// the file shown's place (its path while nothing is said), caret, line separator, encoding, indent and language with
 /// the language server's state, each of the file's a widget a click acts on. It says what it is told; what an operation came to is the operation's own answer, never
-/// read back from here. A UI-thread object of the window.</summary>
+/// read back from here. What it is told is heard through the window's <see cref="Announcer"/>, what it shows of its own
+/// accord (the file's path, Vim's command line, words put back) is not. A UI-thread object of the window.</summary>
 public sealed class StatusBar
 {
     private readonly Button message;
     private readonly TextBlock text;
     private readonly PathIcon icon;
     private readonly WorkingRing working;
+    private readonly TextBlock vimMode;
     private readonly Button caretButton;
     private readonly TextBlock caret;
     private readonly Button indentButton;
@@ -48,21 +51,24 @@ public sealed class StatusBar
     private readonly TextBlock lineEnding;
     private readonly Button encoding;
     private readonly TextBlock encodingText;
+    private readonly Announcer announcer;
 
-    /// <summary>What was said through <see cref="Say(string, ProblemSeverity?, StatusPlace?)"/>, with its mark and place;
+    /// <summary>What was said through <see cref="Say(string, ProblemSeverity?, StatusPlace?, Urgency)"/>, with its mark and place;
     /// anything else said takes the icon and the place away.</summary>
     private (string Text, StatusPlace? Place)? standing;
 
     /// <summary>The file and folder the message line last followed (<see cref="ShowFile"/>); null before the first.</summary>
     private (OpenDocument? File, string? Folder)? shownFile;
 
-    public StatusBar(Button message, TextBlock text, PathIcon icon, WorkingRing working, Button caretButton, TextBlock caret, Button indentButton, TextBlock indent,
-        TextBlock language, Button lineSeparator, TextBlock lineEnding, Button encoding, TextBlock encodingText)
+    public StatusBar(Button message, TextBlock text, PathIcon icon, WorkingRing working, TextBlock vimMode, Button caretButton, TextBlock caret, Button indentButton,
+        TextBlock indent, TextBlock language, Button lineSeparator, TextBlock lineEnding, Button encoding, TextBlock encodingText, Announcer announcer)
     {
+        this.announcer = announcer;
         this.message = message;
         this.text = text;
         this.icon = icon;
         this.working = working;
+        this.vimMode = vimMode;
         this.caretButton = caretButton;
         this.caret = caret;
         this.indentButton = indentButton;
@@ -72,6 +78,7 @@ public sealed class StatusBar
         this.lineEnding = lineEnding;
         this.encoding = encoding;
         this.encodingText = encodingText;
+        Announcer.Live(text, Urgency.Polite);
         text.PropertyChanged += (_, e) =>
         {
             if (e.Property != TextBlock.TextProperty)
@@ -88,11 +95,19 @@ public sealed class StatusBar
         message.Click += (_, _) => Place?.Go();
     }
 
-    /// <summary>What the status bar says now, for the person: told by whatever finished last.</summary>
+    /// <summary>What the status bar says now, for the person: told by whatever finished last, and heard.</summary>
     public string? Text
     {
         get => text.Text;
-        set => text.Text = value;
+        set => Tell(value, Urgency.Polite);
+    }
+
+    /// <summary>Says something, heard the way <paramref name="urgency"/> says; the same words said again keep their mark
+    /// and place.</summary>
+    public void Tell(string? said, Urgency urgency)
+    {
+        text.Text = said;
+        Heard(said, urgency);
     }
 
     /// <summary>Whether what it says is an error, a warning or neither, as its icon shows it.</summary>
@@ -101,8 +116,23 @@ public sealed class StatusBar
     /// <summary>Where a click on what it says goes, while it says it; null when it goes nowhere.</summary>
     public StatusPlace? Place => standing?.Place;
 
-    /// <summary>Says something, an error or a warning with its icon, and where a click on it shows more.</summary>
-    public void Say(string said, ProblemSeverity? severity, StatusPlace? more = null)
+    /// <summary>Says something, an error or a warning with its icon, and where a click on it shows more: heard at once for
+    /// an error, else the way <paramref name="urgency"/> says.</summary>
+    public void Say(string said, ProblemSeverity? severity, StatusPlace? more = null, Urgency urgency = Urgency.Polite)
+    {
+        Show(said, severity, more);
+        Heard(said, severity == ProblemSeverity.Error ? Urgency.Assertive : urgency);
+    }
+
+    /// <summary>What is said heard, the status bar's words marked as read so.</summary>
+    private void Heard(string? said, Urgency urgency)
+    {
+        Announcer.Live(text, urgency);
+        announcer.Tell(said, urgency);
+    }
+
+    /// <summary>Shows something said, unheard: words put back, or a stage heard only where it is not a tick.</summary>
+    private void Show(string said, ProblemSeverity? severity, StatusPlace? more)
     {
         standing = (said, more);
         text.Text = said;
@@ -127,10 +157,22 @@ public sealed class StatusBar
     {
         if (said.Text is not { } words)
         {
-            Text = null;
+            text.Text = null;
             return;
         }
-        Say(words, said.Severity, said.Place);
+        Show(words, said.Severity, said.Place);
+    }
+
+    /// <summary>Where what it says ends, as a caret's rectangle in <paramref name="over"/>'s coordinates: where an input
+    /// method's window opens for Vim mode's command line shown there; null while it is out of sight or in another window.</summary>
+    public Avalonia.Rect? EndIn(Avalonia.Visual over)
+    {
+        if (!text.IsEffectivelyVisible)
+        {
+            return null;
+        }
+        double end = Math.Min(text.TextLayout.WidthIncludingTrailingWhitespace, text.Bounds.Width);
+        return Avalonia.VisualExtensions.TranslatePoint(text, new Avalonia.Point(end, 0), over) is { } at ? new Avalonia.Rect(at, new Avalonia.Size(1, text.Bounds.Height)) : null;
     }
 
     /// <summary>The words a link while they have a place (the hand, the link's look under the pointer, a key's reach), and
@@ -150,7 +192,9 @@ public sealed class StatusBar
         working.IsVisible = latest is not null;
         if (!change.Ended)
         {
-            Say(change.Work.Stage, null);
+            Show(change.Work.Stage, null, null);
+            Announcer.Live(text, Urgency.Polite);
+            announcer.TellStage(change.Work.Stage);
         }
     }
 
@@ -192,9 +236,11 @@ public sealed class StatusBar
     /// <summary>The file's language, with the language server's state or work beside it as the window words it.</summary>
     public void ShowLanguage(string label) => language.Text = label;
 
-    /// <summary>The caret's line and column, the carets there are, or what is selected; nothing with no file shown.</summary>
+    /// <summary>The caret's line and column, the carets there are, or what is selected, with Vim's mode before it while Vim
+    /// mode is on; nothing with no file shown.</summary>
     public void ShowCaret(CodeEditor? editor)
     {
+        ShowVimMode(editor);
         caretButton.IsVisible = editor is not null;
         if (editor is null)
         {
@@ -213,6 +259,65 @@ public sealed class StatusBar
         string position = $"{at.Line + 1}:{at.Column + 1}";
         caret.Text = carets > 1 ? $"{carets} carets" : selected > 0 ? $"{position} ({selected} chars)" : position;
     }
+
+    /// <summary>Vim's mode in the editor shown, with the keys of a command typed so far ("NORMAL 2d"); nothing with Vim mode
+    /// off. Worded again only when either changes.</summary>
+    private void ShowVimMode(CodeEditor? editor)
+    {
+        ShowCommandLine(editor?.VimCommandLine);
+        (VimMode? Mode, string Pending) now = (editor?.VimModeShown, editor?.VimPending ?? string.Empty);
+        if (now == shownMode)
+        {
+            return;
+        }
+        shownMode = now;
+        vimMode.IsVisible = now.Mode is not null;
+        string words = now.Mode switch
+        {
+            VimMode.Normal => "NORMAL",
+            VimMode.Insert => "INSERT",
+            VimMode.Visual => "VISUAL",
+            VimMode.VisualLine => "VISUAL LINE",
+            VimMode.VisualBlock => "VISUAL BLOCK",
+            VimMode.Replace => "REPLACE",
+            _ => string.Empty,
+        };
+        vimMode.Text = now.Pending.Length > 0 ? $"{words} {now.Pending}" : words;
+    }
+
+    /// <summary>Vim mode's command line in the place of what the status bar says, what it said put back once the line
+    /// closes unless the command said something of its own. A line longer than the bar is cut at its start, so what is
+    /// being typed stays in sight.</summary>
+    private void ShowCommandLine(string? line)
+    {
+        if (line == shownLine)
+        {
+            return;
+        }
+        if (shownLine is null)
+        {
+            coveredBy = Said;
+        }
+        text.TextTrimming = line is null ? TextTrimming.CharacterEllipsis : TextTrimming.LeadingCharacterEllipsis;
+        if (line is not null)
+        {
+            text.Text = line;
+            icon.IsVisible = false;
+        }
+        else if (text.Text == shownLine && coveredBy is { } covered)
+        {
+            SayAgain(covered);
+        }
+        shownLine = line;
+    }
+
+    /// <summary>The command line shown, and what the status bar said before it.</summary>
+    private string? shownLine;
+
+    private (string? Text, ProblemSeverity? Severity, StatusPlace? Place)? coveredBy;
+
+    /// <summary>The Vim mode and command the status bar words.</summary>
+    private (VimMode? Mode, string Pending) shownMode = (null, string.Empty);
 
     /// <summary>What the caret's words say: a move that changes none of it words nothing again.</summary>
     private (TextPosition At, int Carets, int Selected) shownCaret;

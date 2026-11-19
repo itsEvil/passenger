@@ -17,7 +17,7 @@ public interface IOwnKeys
 }
 
 /// <summary>The IDE's keys and mouse gestures in each window it opens but a dialog (the main window, an editor, floating
-/// tool, diff, merge or changes window, a test's frame): the main window's one keymap before any control, Escape closing
+/// tool, diff or merge window, a test's frame): the main window's one keymap before any control, Escape closing
 /// what is over it first, a part's own keys left to it (<see cref="IOwnKeys"/>), its popups over it. Of the UI thread.</summary>
 /// <param name="main">The main window, whose popups' layer is its own.</param>
 /// <param name="keys">The main window's keymap, which runs in each.</param>
@@ -27,17 +27,27 @@ public interface IOwnKeys
 /// <param name="activity">A key or a click, in any of them.</param>
 /// <param name="left">One of them was left, perhaps for another program.</param>
 public sealed class IdeKeys(Window main, KeymapDispatcher keys, PopupHost popups, Func<TopLevel, bool> dismissed, Action<TopLevel, object?, KeyEventArgs> pressed,
-    Action<TopLevel, string> sideClicked, Action activity, Action left)
+    Action<CodeEditor> typingRefused, Action<TopLevel, string> sideClicked, Action activity, Action left)
 {
     /// <summary>The window a key is being handled in, while it is: what an action it runs acts on there.</summary>
     public TopLevel? Pressing { get; private set; }
 
+    /// <summary>The modifiers held with the key being handled, while it is: what an action it runs may wait to see let go.</summary>
+    public KeyModifiers PressedWith { get; private set; }
+
     /// <summary>Takes a window in as the IDE's own, before it shows: its keys, its chords and double taps (forgotten on a
-    /// click, a move of the focus or the window left; a double tap on any other key too, wherever it goes), its activity,
-    /// its popups, and the gestures of its editors and of the side buttons.</summary>
+    /// click, a move of the focus or the window left; a double tap on any other key too, wherever it goes), what its
+    /// editors refuse typed, its activity, its popups, and the gestures of its editors and of the side buttons.</summary>
     public void Attach(TopLevel window)
     {
         window.AddHandler(InputElement.KeyDownEvent, (_, e) => OnKeyDown(window, e), RoutingStrategies.Tunnel);
+        window.AddHandler(CodeEditor.TypingRefusedEvent, (_, e) =>
+        {
+            if (e.Source is CodeEditor editor)
+            {
+                typingRefused(editor);
+            }
+        });
         window.AddHandler(InputElement.KeyDownEvent, (_, e) =>
         {
             keys.Heard(e);
@@ -73,6 +83,7 @@ public sealed class IdeKeys(Window main, KeymapDispatcher keys, PopupHost popups
     private void OnKeyDown(TopLevel window, KeyEventArgs e)
     {
         Pressing = window;
+        PressedWith = e.KeyModifiers;
         popups.WorkIn(window);
         try
         {
@@ -96,6 +107,7 @@ public sealed class IdeKeys(Window main, KeymapDispatcher keys, PopupHost popups
         finally
         {
             Pressing = null;
+            PressedWith = KeyModifiers.None;
         }
     }
 

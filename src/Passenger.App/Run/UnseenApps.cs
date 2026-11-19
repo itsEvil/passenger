@@ -6,18 +6,15 @@ namespace Passenger.App.Run;
 /// <summary>Where a desktop app runs that a Passenger nobody sees launches (<see cref="LaunchPlan.Unseen"/>), so no window
 /// of it reaches the person's screen: an Avalonia app on Avalonia's headless platform, which its inspector gives it before
 /// its Main (<see cref="Passenger.Inspector.Wire.UnseenVariable"/>); on Windows every desktop app on a desktop of its own
-/// too (<see cref="ChildProcesses.OnDesktopOfItsOwn"/>); elsewhere any other desktop app is refused, saying why. Which app
-/// that is, is read from what the plan starts (<see cref="DesktopPrograms"/>). A program with no windows of its own (a
-/// console's, a web app's) runs as it is; on Linux one not read as a desktop app finds no display (<see cref="NoDisplay"/>).</summary>
+/// too (<see cref="ChildProcesses.OnDesktopOfItsOwn"/>); a Mac Catalyst app opened hidden (<see cref="Devices.MacCatalystApps"/>);
+/// elsewhere any other desktop app is refused, saying why. Which app that is, is read from what the plan starts
+/// (<see cref="DesktopPrograms"/>). A program with no windows of its own (a console's, a web app's) runs as it is; on Linux
+/// one not read as a desktop app finds no display (<see cref="NoDisplay"/>).</summary>
 public static class UnseenApps
 {
     /// <summary>Whether a plan's program starts on a desktop of its own: on Windows a desktop app a Passenger nobody sees
     /// launches outside the Terminal, whose tab starts what it runs itself.</summary>
     public static bool TakesOwnDesktop(LaunchPlan plan) => OperatingSystem.IsWindows() && plan.Console != ConsoleKind.Terminal && Hidden(plan) is not null;
-
-    /// <summary>The file of the Avalonia app a plan starts where nobody is to see it, which takes the inspector whichever
-    /// program the plan names; null for any other plan.</summary>
-    public static string? Inspected(LaunchPlan plan) => Hidden(plan) is { Called: DesktopPrograms.Avalonia, PastHooks: null } app ? app.File : null;
 
     /// <summary>Why a plan's program cannot run here where nobody sees it, its windows bound for the person's screen; null
     /// where it can (an Avalonia app headless, a desktop app on Windows on a desktop of its own), or where people see the
@@ -42,11 +39,10 @@ public static class UnseenApps
             + $"sees opens none there. {unseen}; a person's Passenger (--mcp-attach) runs it on their screen";
     }
 
-    /// <summary>What desktop app a plan starts where nobody is to see it, its apphost read as the assembly it runs; null for a
-    /// plan people see run, a Godot game's (whose launch hides it itself), or a program with no windows of its own.</summary>
+    /// <summary>What desktop app a plan starts where nobody is to see it (<see cref="LaunchPlan.DesktopApp"/>); null
+    /// for a plan people see run, a Godot game's or a Mac Catalyst app's (whose launch hides it itself), or a program with
+    /// no windows of its own.</summary>
     private static DesktopProgram? Hidden(LaunchPlan plan) =>
-        plan.Unseen && plan.Godot is null
-            ? DesktopPrograms.Started(plan.ByAppHost && plan.Built is { } assembly ? assembly : plan.Program, plan.Arguments, plan.WorkingDirectory, plan.Built, plan.Target,
-                plan.DesktopProject, plan.NamedProject)
-            : null;
+        // An app on a device or an emulator opens its windows there, never on this machine's screen.
+        plan.Unseen && plan.Godot is null && plan.Device is null && plan.MacCatalyst is null ? plan.DesktopApp() : null;
 }

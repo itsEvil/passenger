@@ -59,6 +59,10 @@ public partial class MainWindow
     /// <summary>Whether Alt went down alone and nothing else has come since: its release takes the bar.</summary>
     private bool altAlone;
 
+    /// <summary>Whether Alt is held: Windows repeats a held Alt's press, which keeps what a press or another key since its
+    /// first made of it, so Alt released after an Alt-drag never takes the bar.</summary>
+    private bool altHeld;
+
     /// <summary>The bar's titles and button a key moves among, as shown, in order.</summary>
     private List<Button> BarStops() =>
         [.. MainMenuPlace.Children.OfType<Button>().Where(b => b.Tag is string && b.IsHitTestVisible), .. MenuButton.IsHitTestVisible ? [MenuButton] : Array.Empty<Button>()];
@@ -69,6 +73,10 @@ public partial class MainWindow
     /// back when the bar has them. F10 stays Step Over, as the Visual Studio keymap has it.</summary>
     private void OnBarKeyUp(object? sender, KeyEventArgs e)
     {
+        if (e.Key is Key.LeftAlt or Key.RightAlt)
+        {
+            altHeld = false;
+        }
         if (e.Key is not (Key.LeftAlt or Key.RightAlt) || !altAlone || !MainMenuPlace.ShowsBar)
         {
             return;
@@ -89,7 +97,9 @@ public partial class MainWindow
     /// or Space open the title's menu; Escape gives the keys back to what had them.</summary>
     private void OnBarKeyDown(object? sender, KeyEventArgs e)
     {
-        altAlone = e.Key is Key.LeftAlt or Key.RightAlt && (e.KeyModifiers & ~KeyModifiers.Alt) == KeyModifiers.None;
+        bool alt = e.Key is Key.LeftAlt or Key.RightAlt;
+        altAlone = alt && (e.KeyModifiers & ~KeyModifiers.Alt) == KeyModifiers.None && (!altHeld || altAlone);
+        altHeld = alt || altHeld && (e.KeyModifiers & KeyModifiers.Alt) != 0;
         if (!MainMenuPlace.ShowsBar || e.Handled && barMenu is not { IsOpen: true })
         {
             return;
@@ -293,9 +303,9 @@ public partial class MainWindow
         };
     }
 
-    /// <summary>The menus again, with the shortcuts in force now (after Settings changed the keymap). The window keeps
-    /// the one menu bar it was first given and only its items change, since macOS's menu exporter refuses a second
-    /// NativeMenu for the same window.</summary>
+    /// <summary>The menus again, with the shortcuts in force now (after Settings changed the keymap), the application
+    /// menu's too. The window keeps the one menu bar it was first given and only its items change, since macOS's menu
+    /// exporter refuses a second NativeMenu for the same window.</summary>
     private void BuildMenuBar()
     {
         bool first = menuBar is null;
@@ -310,6 +320,7 @@ public partial class MainWindow
         {
             NativeMenu.SetMenu(this, menuBar);
         }
+        FollowApplicationMenu();
     }
 
     private NativeMenuItemBase NativeEntry(MenuEntry entry, ActionContext context)
@@ -398,11 +409,14 @@ public partial class MainWindow
         flyout.ShowAt(MenuButton);
     }
 
-    /// <summary>What a listed submenu holds as it opens: every tool window the dock has, the recent solutions, or the
-    /// solution windows open.</summary>
+    /// <summary>What a listed submenu holds as it opens: every tool window the dock has, one serving nothing in the open folder
+    /// greyed with its action's why; the recent solutions; or the solution windows open.</summary>
     private IReadOnlyList<ListedItem> Listed(string submenu) => submenu switch
     {
-        MainMenu.ToolWindows => [.. Dock.Windows.OrderBy(w => w.Title, StringComparer.Ordinal).Select(w => new ListedItem(w.Title, () => ShowToolWindow(w.Id)))],
+        MainMenu.ToolWindows => [.. Dock.Windows.OrderBy(w => w.Title, StringComparer.Ordinal).Select(w => new ListedItem(w.Title, () => ShowToolWindow(w.Id))
+        {
+            WhyNot = w.Action is { } shows ? actions!.WhyNot(shows, actions.Context()) : w.Unserved,
+        })],
         MainMenu.RecentSolutions => [.. RecentMenu().Select(r => new ListedItem(r.Title, r.Open))],
         MainMenu.OpenSolutionWindows => SolutionWindows(),
         _ => throw new InvalidOperationException($"No window lists a submenu called {submenu}"),
@@ -411,6 +425,8 @@ public partial class MainWindow
     private static NativeMenuItem NativeListed(ListedItem item) => new(NativeWords(item.Title))
     {
         Command = new MenuCommand(item.Run),
+        IsEnabled = item.WhyNot is null,
+        ToolTip = item.WhyNot,
         ToggleType = item.Checked is null ? MenuItemToggleType.None : MenuItemToggleType.Radio,
         IsChecked = item.Checked == true,
     };
@@ -444,7 +460,11 @@ public partial class MainWindow
 
     /// <summary>A menu item a list gives: its title, what choosing it does, and whether it is the one checked (null for a
     /// list that checks none).</summary>
-    private sealed record ListedItem(string Title, Action Run, bool? Checked = null);
+    private sealed record ListedItem(string Title, Action Run, bool? Checked = null)
+    {
+        /// <summary>Why it cannot be chosen, which greys it and is its tip; null where it can.</summary>
+        public string? WhyNot { get; init; }
+    }
 
     /// <summary>Where an inline list's items stand in their native menu, and how many there are.</summary>
     private sealed class InlineList(string title, int start)
@@ -541,7 +561,9 @@ public partial class MainWindow
             Header = listed.Title,
             ToggleType = listed.Checked is null ? MenuItemToggleType.None : MenuItemToggleType.Radio,
             IsChecked = listed.Checked == true,
+            IsEnabled = listed.WhyNot is null,
         };
+        ToolTip.SetTip(item, listed.WhyNot);
         item.Click += (_, _) => listed.Run();
         return item;
     }
@@ -561,32 +583,27 @@ public partial class MainWindow
         return Request(action, context);
     }
 
-    /// <summary>An editing action on a text box (a search field, a dialog's), as a native Edit menu sends it there.</summary>
+    /// <summary>The editing actions a text box with the keys (a search field, a dialog's) takes itself, as a native Edit menu
+    /// sends them there; the rest go to the editor shown.</summary>
+    private static readonly Dictionary<string, Action<TextBox>> TextBoxEdits = new(StringComparer.Ordinal)
+    {
+        [EditorActions.Undo] = box => box.Undo(),
+        [EditorActions.Redo] = box => box.Redo(),
+        [EditorActions.Cut] = box => box.Cut(),
+        [EditorActions.Copy] = box => box.Copy(),
+        [EditorActions.Paste] = box => box.Paste(),
+        [EditorActions.SelectAll] = box => box.SelectAll(),
+    };
+
+    /// <summary>Runs an editing action on a text box, where it takes it (<see cref="TextBoxEdits"/>).</summary>
     private static bool Edit(TextBox box, string action)
     {
-        switch (action)
+        if (!TextBoxEdits.TryGetValue(action, out Action<TextBox>? edit))
         {
-            case EditorActions.Undo:
-                box.Undo();
-                return true;
-            case EditorActions.Redo:
-                box.Redo();
-                return true;
-            case EditorActions.Cut:
-                box.Cut();
-                return true;
-            case EditorActions.Copy:
-                box.Copy();
-                return true;
-            case EditorActions.Paste:
-                box.Paste();
-                return true;
-            case EditorActions.SelectAll:
-                box.SelectAll();
-                return true;
-            default:
-                return false;
+            return false;
         }
+        edit(box);
+        return true;
     }
 
     /// <summary>A menu item's command: runs its action; whether it can is the item's IsEnabled, set as its menu opens.</summary>

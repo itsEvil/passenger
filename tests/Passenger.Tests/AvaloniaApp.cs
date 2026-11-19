@@ -71,10 +71,13 @@ internal static class AvaloniaApp
 
     /// <summary>The project file of an app of tests/Debuggees made a desktop app as a person's is: on the desktop's own
     /// platforms (Avalonia.Desktop), with no headless platform of its own unless it takes that package too.</summary>
-    public static string DesktopProject(params string[] more)
+    public static string DesktopProject(params string[] more) => DesktopProjectOn(Version, more);
+
+    /// <summary><see cref="DesktopProject"/> on another Avalonia, one tests/AvaloniaGraphs restores.</summary>
+    public static string DesktopProjectOn(string avalonia, params string[] more)
     {
         string packages = string.Concat(new[] { "Avalonia", "Avalonia.Themes.Fluent", "Avalonia.Fonts.Inter", "Avalonia.Desktop" }.Concat(more)
-            .Select(p => $"    <PackageReference Include=\"{p}\" Version=\"{Version}\" />\n"));
+            .Select(p => $"    <PackageReference Include=\"{p}\" Version=\"{avalonia}\" />\n"));
         return TestProjects.Console("<Nullable>enable</Nullable>", "<ImplicitUsings>enable</ImplicitUsings>").With($"  <ItemGroup>\n{packages}  </ItemGroup>\n");
     }
 
@@ -116,6 +119,66 @@ internal static class AvaloniaApp
         string code = File.ReadAllText(program);
         File.WriteAllText(program, string.Join('\n', code.Split('\n').Where(line => !line.Contains("WithDeveloperTools", StringComparison.Ordinal)
             && line.Trim() is not ("#if DEBUG" or "#endif"))));
+    }
+
+    /// <summary>Makes Avalonia's cross-platform solution (<c>dotnet new avalonia.xplat</c>) in a folder, its projects named
+    /// after <paramref name="name"/> (<c>name.Android</c> beside the shared <c>name</c>), and takes Avalonia Accelerate's
+    /// developer tools out of it as New Solution does; nothing restored.</summary>
+    public static async Task CreateCrossPlatformAsync(string folder, string name)
+    {
+        ChildResult made = await Run(["new", "avalonia.xplat", "--output", folder, "--name", name, "--avalonia-version", Version, "--no-update-check",
+            "--debug:custom-hive", await Hive.Value], null);
+        Assert.True(made.Succeeded, $"dotnet new avalonia.xplat did not make the test's solution (exit code {made.ExitCode}):\n{made.Output}{made.Error}");
+        Passenger.App.Templates.DeveloperTools.TakeOut(folder);
+    }
+
+    /// <summary>Avalonia's cross-platform solution made in a folder (<see cref="CreateCrossPlatformAsync"/>), its Android
+    /// head (<c>name.Android</c>, its application <c>com.CompanyName.name</c>) taken to the first .NET whose Android apps run
+    /// on CoreCLR and restored from nuget.org, as no restore of the solution's brings Avalonia's Android packages: the head's
+    /// project, and why it did not restore, or null.</summary>
+    public static async Task<(string Project, string? Unrestored)> CreateAndroidHeadAsync(string folder, string name)
+    {
+        await CreateCrossPlatformAsync(folder, name);
+        string project = Path.Combine(folder, $"{name}.Android", $"{name}.Android.csproj");
+        // The template's head is .NET 10's, on Mono; on CoreCLR from .NET 11, whose Android workload takes API 24 at least.
+        File.WriteAllText(project, File.ReadAllText(project).Replace("net10.0-android", $"net{Passenger.App.Mobile.MobilePlatforms.FirstOnCoreClr}.0-android", StringComparison.Ordinal)
+            .Replace("<SupportedOSPlatformVersion>23<", "<SupportedOSPlatformVersion>24<", StringComparison.Ordinal));
+        TestFolders.Write(folder, "nuget.config", TestRun.FromNuGetOrg);
+        ChildResult restored = await ChildProcesses.RunAsync(ChildProcesses.DotnetCommand(["restore", project], Path.GetDirectoryName(project)!), limit: Limit * 2);
+        return (project, restored.Succeeded ? null
+            : $"The app's Android head does not restore here from nuget.org: {restored.Output.Split('\n').FirstOrDefault(l => l.Contains(": error ", StringComparison.Ordinal))?.Trim() ?? restored.FirstLine}");
+    }
+
+    /// <summary>Avalonia's cross-platform solution made in a folder (<see cref="CreateCrossPlatformAsync"/>), its iOS head
+    /// (<c>name.iOS</c>, its bundle <c>companyName.name</c>) taken to the first .NET whose iOS apps run on CoreCLR, at the
+    /// least iOS that .NET's workload builds for and with the scene manifest Xcode's SDK from 27 asks of an app, and restored
+    /// from nuget.org, as no restore of the solution's brings Avalonia's iOS packages: the head's project, and why it did not
+    /// restore, or null.</summary>
+    public static async Task<(string Project, string? Unrestored)> CreateIosHeadAsync(string folder, string name)
+    {
+        await CreateCrossPlatformAsync(folder, name);
+        string project = Path.Combine(folder, $"{name}.iOS", $"{name}.iOS.csproj");
+        string ios = $"net{Passenger.App.Mobile.MobilePlatforms.FirstOnCoreClr}.0-ios";
+        Rewrite(project, ("net10.0-ios", ios), ("<SupportedOSPlatformVersion>13.0<", "<SupportedOSPlatformVersion>15.0<"));
+        // Avalonia's app delegate hands iOS its scene delegate, which iOS asks for only of an app whose manifest says it has scenes.
+        Rewrite(Path.Combine(folder, $"{name}.iOS", "Info.plist"), ("<string>13.0</string>", "<string>15.0</string>"), ("\t<key>MinimumOSVersion</key>",
+            "\t<key>UIApplicationSceneManifest</key>\n\t<dict>\n\t\t<key>UIApplicationSupportsMultipleScenes</key>\n\t\t<false/>\n\t</dict>\n\t<key>MinimumOSVersion</key>"));
+        TestFolders.Write(folder, "nuget.config", TestRun.FromNuGetOrg);
+        ChildResult restored = await ChildProcesses.RunAsync(ChildProcesses.DotnetCommand(["restore", project], Path.GetDirectoryName(project)!), limit: Limit * 2);
+        return (project, restored.Succeeded ? null
+            : $"The app's iOS head does not restore here from nuget.org: {restored.Output.Split('\n').FirstOrDefault(l => l.Contains(": error ", StringComparison.Ordinal))?.Trim() ?? restored.FirstLine}");
+
+        static void Rewrite(string file, params (string Was, string Now)[] changes)
+        {
+            string text = File.ReadAllText(file);
+            string lineEnd = text.Contains("\r\n", StringComparison.Ordinal) ? "\r\n" : "\n";
+            foreach ((string was, string now) in changes)
+            {
+                Assert.True(text.Contains(was, StringComparison.Ordinal), $"The template's {Path.GetFileName(file)} no longer has {was}:\n{text}");
+                text = text.Replace(was, now.Replace("\n", lineEnd, StringComparison.Ordinal), StringComparison.Ordinal);
+            }
+            File.WriteAllText(file, text);
+        }
     }
 
     /// <summary>A value the test project's build put in the assembly (Passenger.Tests.csproj).</summary>

@@ -117,6 +117,110 @@ public sealed class ContainerServicesTests(ContainerRunDebuggingTests.Tools tool
         window.Close();
     }
 
+    /// <summary>A Docker Compose project's (.dcproj) services built from a Dockerfile of their own, outside their projects'
+    /// folders, are its .NET services: one whose shared Dockerfile publishes and runs the assembly its build's arguments name
+    /// (internal-api, Api), one its compose file labels with its project (web), so Debug Service on the Containers window's
+    /// row restarts internal-api held and stops in its Main; one no project is known for says how to name it. Detach with
+    /// internal-api's tab chosen lets go of it alone, the run going on, and with none chosen lets go of the run whole.</summary>
+    [AvaloniaFact]
+    public void A_Docker_Compose_projects_services_built_from_a_shared_Dockerfile_or_labelled_with_their_project_are_debugged_from_the_Containers_window()
+    {
+        Assert.SkipWhen(tools.WhyNot is not null, tools.WhyNot ?? string.Empty);
+        (string folder, string project) = ContainerRunsTests.Shop("dcservices");
+        foreach (string app in (string[])["Web", "Api"])
+        {
+            TestFolders.Write(folder, $"{app}/Program.cs", Program);
+        }
+        TestFolders.Write(folder, "docker/configuration/dotnet-api/Dockerfile", """
+            FROM mcr.microsoft.com/dotnet/aspnet:10.0 AS base
+            USER $APP_UID
+            WORKDIR /app
+            EXPOSE 8080
+
+            FROM mcr.microsoft.com/dotnet/sdk:10.0 AS build
+            ARG ASSEMBLY_NAME
+            ARG PROJECT_FOLDER=.
+            WORKDIR /src
+            COPY . .
+            RUN dotnet publish "$PROJECT_FOLDER/$ASSEMBLY_NAME.csproj" -c Release -o /app/publish
+
+            FROM base AS final
+            ARG ASSEMBLY_NAME
+            ENV ENTRY_ASSEMBLY=${ASSEMBLY_NAME}
+            WORKDIR /app
+            COPY --from=build /app/publish .
+            ENTRYPOINT exec dotnet "$ENTRY_ASSEMBLY.dll"
+
+            """);
+        TestFolders.Write(folder, "docker/configuration/web/Dockerfile", $"FROM mcr.microsoft.com/dotnet/aspnet:10.0 AS base\nWORKDIR /app\nEXPOSE 8080\n\nFROM base AS final\nCMD [\"sleep\", \"600\"]\n");
+        TestFolders.Write(folder, "docker/configuration/worker/Dockerfile", $"FROM {Docker.Image}\nCMD [\"sleep\", \"600\"]\n");
+        TestFolders.Write(folder, "docker-compose.yml", $$"""
+            services:
+              internal-api:
+                build:
+                  context: .
+                  dockerfile: ./docker/configuration/dotnet-api/Dockerfile
+                  args: { ASSEMBLY_NAME: Api, PROJECT_FOLDER: Api }
+                ports: ["8080"]
+              web:
+                build: { context: ., dockerfile: docker/configuration/web/Dockerfile }
+                labels: { com.microsoft.visual-studio.project-name: Web }
+                ports: ["8080"]
+              worker:
+                build: { context: ., dockerfile: docker/configuration/worker/Dockerfile }
+
+            """);
+        File.Delete(Path.Combine(folder, "compose.yaml"));
+        TestFolders.Write(folder, "docker-compose-api.dcproj", $"""
+            <Project Sdk="Microsoft.Docker.Sdk">
+              <PropertyGroup>
+                <DockerComposeProjectName>{project}</DockerComposeProjectName>
+              </PropertyGroup>
+            </Project>
+
+            """);
+        TestFolders.Write(folder, "Shop.slnx", "<Solution>\n  <Project Path=\"Web/Web.csproj\" />\n  <Project Path=\"Api/Api.csproj\" />\n  <Project Path=\"docker-compose-api.dcproj\" />\n</Solution>\n");
+        MainWindow window = ContainerRunsTests.Open(folder);
+        window.Debugger.Breakpoints.Toggle(Source(folder, "Api"), InMain);
+        Assert.True(window.SelectConfiguration("docker-compose-api"), $"No configuration of the .dcproj: [{string.Join(", ", window.Configurations.Select(c => c.Name))}]");
+        try
+        {
+            Ui.Launched(window, window.RunAsync(), "the Docker Compose project's services to come up", TimeSpan.FromMinutes(5));
+            Assert.Equal([("internal-api", "Api.csproj"), ("web", "Web.csproj")],
+                window.Builds.Containers!.Plan.Dotnet.Select(d => (d.Service, Path.GetFileName(d.Project))).OrderBy(d => d.Service, StringComparer.Ordinal));
+            Assert.StartsWith("worker is not a .NET service of docker-compose-api: no project of the solution is known to run it; choose its project in a copy of docker-compose-api",
+                window.Builds.WhyNotOnService(AppActions.ServiceDebug, "worker"), StringComparison.Ordinal);
+            ContainersView view = Shown(window);
+
+            Act(window, view, project, "internal-api", AppActions.ServiceDebug);
+            DebugTab api = ContainerRunDebuggingTests.Tab(window, "internal-api");
+            ContainerRunDebuggingTests.StoppedAt(window, api, Source(folder, "Api"), InMain, "internal-api, made again held, to stop in Main");
+            ContainerRunDebuggingTests.Resume(window, api);
+
+            // Its debug tab chosen, Detach lets go of internal-api alone, the run going on; with none chosen, of the run whole.
+            string apiStarted = ContainerRunsTests.Started(project, "internal-api");
+            Assert.True(window.Perform(AppActions.Detach), "Detach did not run on internal-api's tab");
+            Ui.WaitFor(() => !api.IsLive, "internal-api's session to be let go of");
+            Assert.Equal("Detached from internal-api of docker-compose-api: the debugger let go of it alone, and the run goes on as it was", window.Status);
+            Assert.Contains("Detached from internal-api of docker-compose-api", ContainerRunsTests.Run(window), StringComparison.Ordinal);
+            Assert.True(window.IsRunning && window.Builds.Containers is not null, "Detach of one service let go of the run");
+            Assert.Equal(apiStarted, ContainerRunsTests.Started(project, "internal-api"));
+            Assert.True(window.Perform(AppActions.Detach), "Detach did not run on the run");
+            Ui.WaitFor(() => !window.IsRunning, "the run to be let go of whole");
+            Assert.Equal("Detached from docker-compose-api: its containers run on until the Containers window stops them or the folder closes", window.Status);
+            Assert.All(ContainerRunsTests.States(project).Values, state => Assert.Equal("running", state));
+
+        }
+        catch
+        {
+            Docker.Stopped(window, project, "Stop to take every container down");
+            throw;
+        }
+        // Let go of, its containers are the folder's: the close of a window nobody sees takes them down unasked.
+        window.Close();
+        Docker.TakenDown(project, "the window's close to take down the containers of the run let go of");
+    }
+
     /// <summary>A container run's .NET services followed by the Requests window through Passenger's tools in their
     /// containers (trace --requests), each request listed with the service that served it; a route's request sent from the
     /// folder's code goes to the port the engine published for its service; and the window hidden ends the tools through
@@ -264,9 +368,9 @@ public sealed class ContainerServicesTests(ContainerRunDebuggingTests.Tools tool
             ContainersView view = Shown(window);
             foreach (string service in (string[])["web", "api"])
             {
-                Ui.WaitFor(() => view.Rows.Any(r => r.Service == service && r.LeftUnstarted && r.Detail == "Not started"), $"{service}'s row, not started");
+                Ui.WaitFor(() => view.Rows.Any(r => r.Project?.Name == project && r.Service == service && r.LeftUnstarted && r.Detail == "Not started"), $"{service}'s row, not started");
             }
-            Assert.True(view.Choose(r => r.Service == "web" && r.LeftUnstarted), "web's row could not be chosen");
+            Assert.True(view.Choose(r => r.Project?.Name == project && r.Service == "web" && r.LeftUnstarted), "web's row could not be chosen");
             Ui.Settle();
             Assert.Equal(Refusals.NotStarted("web of Later", ContainerRun.StartsService), window.Actions.WhyNot(AppActions.ServiceAttach, window.Actions.Context()));
             Assert.Equal(Refusals.NotStarted($"{project}/web", ContainerRun.StartsService), window.Actions.WhyNot(AppActions.ContainerStop, window.Actions.Context()));
@@ -276,7 +380,7 @@ public sealed class ContainerServicesTests(ContainerRunDebuggingTests.Tools tool
             Assert.Contains("web of Later started, without the debugger", window.Status, StringComparison.Ordinal);
             Assert.DoesNotContain(window.Debugger.Tabs, t => t.Name == "web" && t.IsLive);
             Assert.Equal("web 1", Answered(Request(project, "web"), project, "web"));
-            Ui.WaitFor(() => view.Rows.Any(r => r.Service == "web" && !r.LeftUnstarted && r.Containers.Any(c => c.IsRunning)), "web's row to be its running container's");
+            Ui.WaitFor(() => view.Rows.Any(r => r.Project?.Name == project && r.Service == "web" && !r.LeftUnstarted && r.Containers.Any(c => c.IsRunning)), "web's row to be its running container's");
 
             TestFolders.Write(folder, "Web/Message.cs", "public static class Message\n{\n    public const string Text = \"web 2\";\n}\n");
             Assert.True(window.Perform(AppActions.Rerun), "Rerun did not run");

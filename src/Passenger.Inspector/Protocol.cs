@@ -1,11 +1,11 @@
 using System.Text.Json;
 using System.Text.Json.Serialization;
 
-// What Passenger and its inspector inside an Avalonia app (src/Passenger.Inspector) or a WPF app
-// (src/Passenger.Inspector.Wpf) say to each other, compiled into all three: one JSON object a line over the socket
-// Passenger names in the app's environment. The messages are the same for both (a WPF dependency property is a
-// property, its value sources take the same words); what one framework has not (Avalonia's overlays, frames and binding
-// values) the other's inspector refuses. Passenger asks (Request) and the app answers each by its id (Reply); the app
+// What Passenger and its inspector inside an Avalonia app (src/Passenger.Inspector), a WPF app
+// (src/Passenger.Inspector.Wpf) or a .NET MAUI app (src/Passenger.Inspector.Maui) say to each other, compiled into all
+// four: one JSON object a line over the socket Passenger names in the app's environment. The messages are the same for
+// each (a WPF dependency property or a MAUI bindable one is a property, its value sources take the same words); what one
+// framework has not (Avalonia's overlays, frames and binding values) another's inspector refuses. Passenger asks (Request) and the app answers each by its id (Reply); the app
 // also tells without being asked (a Reply with an Event): hello once its UI runs, treeChanged as controls come and go,
 // picked when the person points at one, bindingFailed as a binding fails (from before hello), untold when it could not
 // tell all it had. While the app is paused its binding values are read through the debugger's evaluation of
@@ -22,12 +22,24 @@ public static class Wire
     [IdentifierHome]
     public const string SocketVariable = "PASSENGER_INSPECTOR";
 
+    /// <summary>What begins <see cref="SocketVariable"/>'s value where the app listens rather than connects: an app on a
+    /// device, whose abstract socket of this name Passenger reaches through adb's forward, on an iOS simulator, whose
+    /// loopback port of this number it reaches as it is, or a Mac Catalyst app, at the Unix socket of this path in its
+    /// container.</summary>
+    public const char Listens = '@';
+
+    /// <summary>The app's environment where it listens (<see cref="Listens"/>): the line Passenger first writes, which only the
+    /// launch that put it there knows.</summary>
+    [IdentifierHome]
+    public const string TokenVariable = "PASSENGER_INSPECTOR_TOKEN";
+
     /// <summary>The app's environment: Avalonia's renderer debug overlays its windows show from the launch on, as
     /// <see cref="Request.Overlays"/> names them, joined by commas.</summary>
     [IdentifierHome]
     public const string OverlaysVariable = "PASSENGER_INSPECTOR_OVERLAYS";
 
-    /// <summary>A WPF app's environment: the launched project's folder, where its XAML is when its build's symbols do not say.</summary>
+    /// <summary>A WPF or MAUI app's environment: the launched project's folder, where its XAML is when its build's symbols do
+    /// not say (a MAUI app's places are relative to it).</summary>
     [IdentifierHome]
     public const string ProjectVariable = "PASSENGER_INSPECTOR_PROJECT";
 
@@ -244,10 +256,15 @@ public static class InputKinds
 }
 
 /// <summary>A key and the modifiers held with it.</summary>
-public sealed record Chord(string Key, IReadOnlyList<Modifier> Modifiers);
+public sealed record Chord(string Key, IReadOnlyList<Modifier> Modifiers)
+{
+    /// <summary>The character the key types on a US keyboard with the Shift held, where nothing else is: what the app's text
+    /// input takes when nothing takes the key itself.</summary>
+    public string? Text { get; init; }
+}
 
-/// <summary>A modifier held with a key, a click or a scroll; Primary is the platform's command key (Cmd on macOS, Ctrl
-/// elsewhere, and in a WPF app).</summary>
+/// <summary>A modifier held with a key, a click or a scroll; Primary is the command key of the system the window's
+/// program runs on (<see cref="HeldModifiers.Held"/>).</summary>
 [JsonConverter(typeof(JsonStringEnumConverter<Modifier>))]
 public enum Modifier
 {
@@ -256,6 +273,16 @@ public enum Modifier
     Alt,
     Meta,
     Primary,
+}
+
+/// <summary>What the modifiers an agent names hold.</summary>
+public static class HeldModifiers
+{
+    /// <summary>The modifier held for one an agent names, read where the input is given: Primary as the command key of the
+    /// system that program runs on (<see cref="Passenger.Core.CommandKey"/>), Meta on Apple's and Control elsewhere,
+    /// whether its windows are on a screen or headless; any other as it is.</summary>
+    public static Modifier Held(this Modifier modifier) =>
+        modifier != Modifier.Primary ? modifier : Passenger.Core.CommandKey.IsCmd ? Modifier.Meta : Modifier.Control;
 }
 
 /// <summary>What an input did: its window, where in it the pointer acted, the element there (the one that took it, or the
@@ -323,7 +350,8 @@ public sealed record Untold(int Bindings, int Messages);
 /// serve it when it cannot (another major version of Avalonia, none at all).</summary>
 public sealed record Hello(int Protocol, int ProcessId, string? Avalonia, string? Problem)
 {
-    /// <summary>From a WPF app's inspector: WPF and its version ("WPF 10.0.1"), where an Avalonia app says its Avalonia.</summary>
+    /// <summary>From a WPF or MAUI app's inspector: the framework and its version ("WPF 10.0.1", "MAUI 11.0.0"), where an
+    /// Avalonia app says its Avalonia.</summary>
     public string? Framework { get; init; }
 
     /// <summary>Whether the app draws on Avalonia's headless platform, where nobody sees it.</summary>
@@ -355,6 +383,10 @@ public sealed record BindingFailure(int Id, string Level, string Control, string
 [JsonConverter(typeof(AppTreeJson))]
 public sealed record AppTree(IReadOnlyList<Element> Roots)
 {
+    /// <summary>With an agent's look, each type the tree names by the types it derives from directly (more than one where
+    /// types of one name derive from others), as the tree names them, so a query by a type finds what derives from it.</summary>
+    public IReadOnlyDictionary<string, IReadOnlyList<string>>? Bases { get; init; }
+
     /// <summary>The elements of <paramref name="level"/> and all they hold, each before what it holds, in tree order, with
     /// its depth (<paramref name="depth"/> for the level's own) and whether what it holds is walked: where it holds any and
     /// <paramref name="into"/>, asked as it is reached, says so (always by default). A walk with its own stack, so no tree
@@ -527,6 +559,7 @@ internal sealed class AppTreeJson : JsonConverter<AppTree>
 {
     private const string Elements = "elements";
     private const string Held = "held";
+    private const string Bases = "bases";
 
     public override void Write(Utf8JsonWriter writer, AppTree value, JsonSerializerOptions options)
     {
@@ -545,6 +578,20 @@ internal sealed class AppTreeJson : JsonConverter<AppTree>
             writer.WriteNumberValue(count);
         }
         writer.WriteEndArray();
+        if (value.Bases is { } bases)
+        {
+            writer.WriteStartObject(Bases);
+            foreach ((string type, IReadOnlyList<string> derivedFrom) in bases)
+            {
+                writer.WriteStartArray(type);
+                foreach (string each in derivedFrom)
+                {
+                    writer.WriteStringValue(each);
+                }
+                writer.WriteEndArray();
+            }
+            writer.WriteEndObject();
+        }
         writer.WriteEndObject();
     }
 
@@ -552,6 +599,7 @@ internal sealed class AppTreeJson : JsonConverter<AppTree>
     {
         List<Element> elements = [];
         List<int> held = [];
+        Dictionary<string, IReadOnlyList<string>>? bases = null;
         Expect(ref reader, JsonTokenType.StartObject);
         while (reader.Read() && reader.TokenType == JsonTokenType.PropertyName)
         {
@@ -574,13 +622,38 @@ internal sealed class AppTreeJson : JsonConverter<AppTree>
                     }
                 }
             }
+            else if (name == Bases)
+            {
+                bases = BasesRead(ref reader);
+            }
             else
             {
                 reader.Skip();
             }
         }
         Expect(ref reader, JsonTokenType.EndObject);
-        return new AppTree(Assembled(elements, held));
+        return new AppTree(Assembled(elements, held)) { Bases = bases };
+    }
+
+    /// <summary>Each type a tree names with the names of the types it derives from directly.</summary>
+    private static Dictionary<string, IReadOnlyList<string>> BasesRead(ref Utf8JsonReader reader)
+    {
+        Dictionary<string, IReadOnlyList<string>> bases = new(StringComparer.Ordinal);
+        Expect(ref reader, JsonTokenType.StartObject);
+        while (reader.Read() && reader.TokenType == JsonTokenType.PropertyName)
+        {
+            string type = reader.GetString()!;
+            reader.Read();
+            Expect(ref reader, JsonTokenType.StartArray);
+            List<string> derivedFrom = [];
+            while (reader.Read() && reader.TokenType != JsonTokenType.EndArray)
+            {
+                derivedFrom.Add(reader.TokenType == JsonTokenType.String ? reader.GetString()! : throw new JsonException($"An app's tree named what {type} derives from by no name"));
+            }
+            bases[type] = derivedFrom;
+        }
+        Expect(ref reader, JsonTokenType.EndObject);
+        return bases;
     }
 
     private static void Expect(ref Utf8JsonReader reader, JsonTokenType token)

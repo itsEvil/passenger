@@ -15,18 +15,18 @@
     <meta property="og:url" content="https://passenger-ide.net/agents">
     <meta property="og:title" content="Passenger: a C# and .NET MCP server for coding agents">
     <meta property="og:description" content="Give Claude Code, Codex or OpenCode a whole C# IDE: Passenger's MCP server builds, debugs, profiles and drives your app or Godot game. How to set it up.">
-    <meta property="og:image" content="https://passenger-ide.net/images/social-f846e4c2.png">
+    <meta property="og:image" content="https://passenger-ide.net/images/social-77a92101.png">
     <meta property="og:image:type" content="image/png">
     <meta property="og:image:width" content="1200">
     <meta property="og:image:height" content="630">
-    <meta property="og:image:alt" content="A Godot game's GDScript in Passenger, each member's value after its line as the game plays, beside the words: Now for Godot 4 games. The free IDE for C# and .NET.">
+    <meta property="og:image:alt" content="C# code in Passenger's debugger, stopped at a breakpoint with each line's values beside it, beside the words: Built on .NET 11. The free IDE for C# and .NET.">
     <meta name="twitter:card" content="summary_large_image">
     <meta name="twitter:site" content="@Zaneris">
     <meta name="twitter:creator" content="@Zaneris">
     <meta name="twitter:title" content="Passenger: a C# and .NET MCP server for coding agents">
     <meta name="twitter:description" content="Give Claude Code, Codex or OpenCode a whole C# IDE: Passenger's MCP server builds, debugs, profiles and drives your app or Godot game. How to set it up.">
-    <meta name="twitter:image" content="https://passenger-ide.net/images/social-f846e4c2.png">
-    <meta name="twitter:image:alt" content="A Godot game's GDScript in Passenger, each member's value after its line as the game plays, beside the words: Now for Godot 4 games. The free IDE for C# and .NET.">
+    <meta name="twitter:image" content="https://passenger-ide.net/images/social-77a92101.png">
+    <meta name="twitter:image:alt" content="C# code in Passenger's debugger, stopped at a breakpoint with each line's values beside it, beside the words: Built on .NET 11. The free IDE for C# and .NET.">
     <meta name="theme-color" content="#0F131C" media="(prefers-color-scheme: dark)">
     <meta name="theme-color" content="#FFFFFF" media="(prefers-color-scheme: light)">
     <meta name="theme-color" content="#2F6BF2">
@@ -81,6 +81,9 @@
                         would: a picture of each window, the tree of its controls with their text and state, and clicks,
                         typing, keys and scrolling sent to the window, which never takes your focus or moves your pointer. It
                         reads the app's binding errors and can break on a property's change.</p>
+                    <p>A .NET MAUI app it sees and taps where it runs, on an Android device or emulator, an iOS simulator or
+                        the Mac: its pages and their controls, a picture of its window, and taps that run as a finger's
+                        do.</p>
                     <h3>It plays the game it builds</h3>
                     <p>A Godot game is tried the same way: its scene tree and values, a picture of its frame, clicks and
                         keys, a breakpoint's stop in C# or GDScript, and every copy running. On macOS, on Windows, and on
@@ -125,7 +128,7 @@
                 <div>
                     <dt>The app</dt>
                     <dd>Its windows, controls and their details, pictures, clicks, typing, keys, scrolling and binding
-                        errors.</dd>
+                        errors, on the desktop or a device.</dd>
                 </div>
                 <div>
                     <dt>Godot</dt>
@@ -152,12 +155,17 @@
                     <p>The agent joins the Passenger window you have open over the folder it works in. Its breakpoints and
                         stops show in your editor, its runs in your Run window, and the status bar names what it is doing. Set
                         it up before Passenger is even running: the agent has its tools from the start, and its first call
-                        opens the folder in Passenger, starting it if need be. It never joins a window on another folder.</p>
+                        opens the folder in Passenger, starting it if need be. It never joins a window on another folder,
+                        and its tools reach only the folder you have open and, once you trust it, the projects its solution
+                        names beside it.</p>
                     <p>The window asks before it lets an agent in, through a socket in your own user's folder: Allow, Don't
                         allow, or Always for this folder (or turn on Settings &rsaquo; MCP Server &rsaquo; Enable MCP
-                        Server). Either way, the first time an agent uses a tool that changes anything, runs code in a paused
-                        program or opens another folder in your window, Passenger asks you. A question nobody answers closes
-                        after two minutes, and the agent is told so.</p>
+                        Server). Either way, Passenger asks you before each call of a tool that changes anything, runs code
+                        in a paused program or opens another folder in your window, showing what the agent gave it: Allow
+                        Once for that call, or Allow for This Session for every call of that tool until the agent
+                        disconnects. An agent about to make several changes can ask once for every tool, which Allow for
+                        This Session lets it use unasked until it disconnects; Deny keeps each tool asking. A question
+                        nobody answers closes after two minutes, and the agent is told so.</p>
                 </div>
                 <div>
                     <h3><code>--mcp FOLDER</code>: one of its own</h3>
@@ -281,6 +289,7 @@ args = ["--mcp-attach"]</pre>
             <a href="/godot">Godot</a>
             <a href="/containers">Containers and Aspire</a>
             <a href="/linux">Linux</a>
+            <a href="/accessibility">Accessibility</a>
             <a href="https://github.com/Zaneris/passenger/blob/main/LICENSE">Licence</a>
             <a href="https://github.com/Zaneris/passenger/blob/main/THIRD_PARTY_NOTICES.md">Third-party notices</a>
         </nav>

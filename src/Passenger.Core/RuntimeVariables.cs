@@ -32,8 +32,21 @@ public static class RuntimeVariables
     /// as each module loads.</summary>
     public const string ModifiableAssemblies = "DOTNET_MODIFIABLE_ASSEMBLIES";
 
+    /// <summary>"1" lets the runtime load the profiler <see cref="Profiler"/> names as it starts.</summary>
+    public const string EnableProfiling = "DOTNET_ENABLE_PROFILING";
+
+    /// <summary>The class id of the profiler the runtime loads, from the library <see cref="ProfilerPath"/> names.</summary>
+    public const string Profiler = "DOTNET_PROFILER";
+
+    /// <summary>The library the runtime loads its profiler from.</summary>
+    public const string ProfilerPath = "DOTNET_PROFILER_PATH";
+
     /// <summary>"0" has the runtime collect garbage with the workstation collector, "1" with the server one.</summary>
     public const string GcServer = "DOTNET_gcServer";
+
+    /// <summary>How the host rolls a program forward onto a later framework than it names (Major, LatestPatch), over its
+    /// runtime configuration's rollForward.</summary>
+    public const string RollForward = "DOTNET_ROLL_FORWARD";
 
     /// <summary>"1" lets the host roll a program forward onto a prerelease runtime when no release one will do.</summary>
     public const string RollForwardToPrerelease = "DOTNET_ROLL_FORWARD_TO_PRERELEASE";
@@ -58,7 +71,12 @@ public static class RuntimeVariables
     /// <summary>What a 32-bit apphost before .NET 6 reads on 64-bit Windows in <see cref="Root"/>'s place.</summary>
     public const string RootX86 = "DOTNET_ROOT(x86)";
 
+    /// <summary>"1" lets .NET's console write a program's colours (Console.ForegroundColor, the console logger's) into a
+    /// pipe, as it does into a terminal: a console of Passenger's reads them.</summary>
+    public const string AnsiColorRedirection = "DOTNET_SYSTEM_CONSOLE_ALLOW_ANSI_COLOR_REDIRECTION";
+
     /// <summary>"1" has WPF record where in its XAML each object was made (VisualDiagnostics.GetXamlSourceInfo) and
-    /// raise BindingDiagnostics.BindingFailed; read as WPF first loads XAML, so it stays in the environment.</summary>
+    /// raise BindingDiagnostics.BindingFailed, and .NET MAUI record its XAML's places too (Microsoft.Maui.VisualDiagnostics);
+    /// read as either first loads XAML, so it stays in the environment.</summary>
     public const string XamlDiagnosticsSourceInfo = "ENABLE_XAML_DIAGNOSTICS_SOURCE_INFO";
 }

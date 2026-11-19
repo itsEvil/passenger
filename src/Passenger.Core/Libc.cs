@@ -36,6 +36,16 @@ public static partial class Libc
     [LibraryImport("libc", EntryPoint = "close", SetLastError = true)]
     public static partial int Close(int descriptor);
 
+    /// <summary>FIOCLEX: macOS's _IO('f', 1), Linux's 0x5451.</summary>
+    private static readonly nuint CloseOnExecRequest = OperatingSystem.IsMacOS() ? 0x20006601u : 0x5451u;
+
+    /// <summary>Marks a descriptor to close as the process becomes another program, through ioctl, which takes no third
+    /// argument here: fcntl's is variadic, which arm64 macOS passes on the stack, where a fixed signature never puts it.</summary>
+    public static bool CloseOnExec(int descriptor) => Control(descriptor, CloseOnExecRequest) == 0;
+
+    [LibraryImport("libc", EntryPoint = "ioctl", SetLastError = true)]
+    private static partial int Control(int descriptor, nuint request);
+
     /// <summary>getxattr: a file's extended attribute named by <paramref name="name"/>'s NUL-ended bytes, its link followed,
     /// read into <paramref name="value"/>; its length (with no value, the length it needs), or -1. macOS's takes a place in
     /// a resource fork and options beside Linux's, given neither.</summary>
@@ -97,6 +107,44 @@ public static partial class Libc
 
     [LibraryImport("libc", EntryPoint = "getpwuid_r")]
     private static unsafe partial int GetPasswordEntry(uint uid, byte* entry, byte* strings, nuint size, IntPtr* result);
+
+    /// <summary>A group's entry's name and the members it lists (getgrgid_r's gr_name and gr_mem; a user whose own group it
+    /// is goes unlisted); null for a group the system knows not. struct group is a name, a password, the id and the
+    /// members, 32 bytes on macOS and Linux alike.</summary>
+    public static unsafe (string? Name, IReadOnlyList<string> Members)? Group(uint gid)
+    {
+        // ERANGE, the same on both: its strings need more room.
+        const int TooSmall = 34;
+        byte* entry = stackalloc byte[32];
+        for (int size = 4096; size <= 1 << 20; size *= 4)
+        {
+            byte[] strings = new byte[size];
+            IntPtr result;
+            fixed (byte* text = strings)
+            {
+                int failed = GetGroupEntry(gid, entry, text, (nuint)strings.Length, &result);
+                if (failed == TooSmall)
+                {
+                    continue;
+                }
+                if (failed != 0 || result == IntPtr.Zero)
+                {
+                    return null;
+                }
+                IntPtr name = Marshal.ReadIntPtr((IntPtr)entry);
+                List<string> members = [];
+                for (IntPtr* member = (IntPtr*)Marshal.ReadIntPtr((IntPtr)entry, 24); member is not null && *member != IntPtr.Zero; member++)
+                {
+                    members.Add(Marshal.PtrToStringUTF8(*member) ?? string.Empty);
+                }
+                return (name == IntPtr.Zero ? null : Marshal.PtrToStringUTF8(name), members);
+            }
+        }
+        return null;
+    }
+
+    [LibraryImport("libc", EntryPoint = "getgrgid_r")]
+    private static unsafe partial int GetGroupEntry(uint gid, byte* entry, byte* strings, nuint size, IntPtr* result);
 
     /// <summary>geteuid: the user this process acts as.</summary>
     [LibraryImport("libc", EntryPoint = "geteuid")]

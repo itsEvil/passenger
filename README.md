@@ -1,14 +1,15 @@
 # Passenger
 
-**Now for Godot 4 games.** The free IDE for C# and .NET: run, debug, profile and Hot Reload Godot games in C# and
-GDScript, their scenes and scripts checked as Godot reads them and the running game beside your code. Blazor WebAssembly
-now debugs in the browser, Avalonia and WPF take XAML Hot Reload, and your coding agent can drive it all. Free and open
-source under MIT, for Windows, macOS and Linux ([installing](#installing)).
+**Debugger, profiler and Hot Reload, built in.** The free IDE for C# and .NET: stop at a breakpoint and read every
+line's values, change the code while it runs, see where the time and memory go, watch your XAML take shape as you type,
+and debug every service of a compose file or an Aspire app. Your coding agent can use all of it too. Built on .NET 11,
+it reads C# 15 and steps runtime async as written ([.NET 11](#net-11-and-c-15)). Free and open source under MIT, for
+Windows, macOS and Linux ([installing](#installing)).
 
 <p align="center">
   <a href="https://passenger-ide.net">Website</a> •
   <a href="https://passenger-ide.net/#download">Download</a> •
-  <a href="docs/release-notes/0.3.0.md">What's new in 0.3.0</a> •
+  <a href="docs/release-notes/0.4.0.md">What's new in 0.4.0</a> •
   <a href="#what-it-does">What it does</a> •
   <a href="#installing">Installing</a> •
   <a href="#your-coding-agent-using-the-ide-as-you-do">Your coding agent</a> •
@@ -17,15 +18,13 @@ source under MIT, for Windows, macOS and Linux ([installing](#installing)).
 </p>
 
 <picture>
-  <source media="(prefers-color-scheme: light)" srcset="site/images/godot-live-tree-light.webp">
-  <img src="site/images/godot-live-tree-dark.webp" alt="A running Godot game's Live Visual Tree in Passenger: its scene's nodes as they are, a plant chosen with its properties and values, beside the plant's GDScript with each member's value after its line">
+  <source media="(prefers-color-scheme: light)" srcset="site/images/debugger-light.webp">
+  <img src="site/images/debugger-dark.webp" alt="Passenger stopped at a breakpoint in a C# method: the values each line used after it, and the Debug window's frames and variables">
 </picture>
 
 Tools like these are usually found in paid IDEs or add-ons. In Passenger they are part of the IDE, free and open source
 under MIT, for work and personal projects alike, with no account, no licence key and no telemetry:
 
-- **Godot 4 games, in C# and GDScript:** the game run, debugged, profiled and Hot Reloaded, its C# checked against its
-  scenes, its GDScript and shaders read as Godot reads them, and the running game's tree and values beside the code.
 - **A debugger with Hot Reload:** your edits put in the running program, the values methods returned, Smart Step Into,
   decompiled libraries, and several programs debugged at once.
 - **CPU and memory profiling:** call trees, flame graphs, and heap snapshots compared.
@@ -33,51 +32,39 @@ under MIT, for work and personal projects alike, with no account, no licence key
   Live Visual Tree, and XAML Hot Reload.
 - **An IDE your agent can drive:** Claude Code, Codex, OpenCode or any MCP agent builds, tests, debugs and profiles
   through Passenger, and tries the app or game it builds.
+- **Live requests with their SQL,** N+1s marked, and **EF Core migrations** with what would stop `dotnet ef` fixed
+  first.
+- **Debugging in containers and under Aspire:** every .NET service of a compose file, a Dockerfile or an AppHost
+  debugged, reloaded and profiled where it runs, Aspire's metrics charted.
 - **Blazor WebAssembly, debugged in the browser,** beside the server's code, Hot Reload keeping the page up.
 - **Failed tests, pictured:** a failed Avalonia headless test (xUnit v3) carries a picture of each window as it was, in
   a Unit Tests window that runs xUnit, NUnit, MSTest and TUnit, and Godot's GdUnit4, GUT and GoDotTest.
 - **Local History and a three-way merge:** every version of your files Passenger has seen, and Git's conflicts merged.
-- **Debugging in containers and under Aspire:** every .NET service of a compose file, a Dockerfile or an AppHost
-  debugged, reloaded and profiled where it runs, Aspire's metrics charted.
-- **Live requests with their SQL,** N+1s marked, and **EF Core migrations** with what would stop `dotnet ef` fixed
-  first.
+- **Godot 4 games, in C# and GDScript:** the game run, debugged, profiled and Hot Reloaded, its C# checked against its
+  scenes, its GDScript and shaders read as Godot reads them, and the running game's tree and values beside the code.
 
 Coming from Visual Studio? Its keys are the default, and VS Code's and IntelliJ IDEA's are a setting away, each as
 Rider's keymaps have it. On a Mac, where Visual Studio for Mac was retired in August 2024, Passenger is a full .NET IDE
-that runs natively on Apple Silicon.
+that runs natively on Apple Silicon and Intel Macs.
 
 What comes next is in the [milestones](https://github.com/Zaneris/passenger/milestones), the release in progress among
 them. The pictures here are of sample projects committed to this repository, in your system's light or dark.
 
 ## What it does
 
-### Godot 4
+### .NET 11 and C# 15
 
-A Godot 4 game, in C# or in GDScript alone, runs, debugs, profiles and Hot Reloads on the Godot Settings › Godot names
-or the one found. A breakpoint in C# or GDScript stops the game and a saved script reloads in it; Run Current Scene
-plays the scene open, Run Another Copy plays up to 16 copies for multiplayer, and on Windows, macOS and Linux under X11
-the game can draw in a pane beside its code. New Project makes a game, Publish exports it through its presets, and
-`project.godot` opens as a page of its settings.
-
-The game's C# is read against its scenes: `GetNode<T>` paths and types, `res://` and `uid://` paths, `[Export]` values,
-signals and their handlers, and every string Godot takes (input actions, groups, animations, autoloads, shader
-parameters, translations, layers, theme items) complete, are checked and rename, and a scene is marked where Godot would
-not load it, with fixes. GDScript is read by Passenger's port of Godot's parser and analyzer: Godot's warnings and
-errors with their fixes, completion, the hover, Find Usages, refactorings that reach C# and the scenes, and Reformat
-Code by Godot's style guide, mostly without starting Godot. Shaders are checked as Godot's compiler checks them, every
-error and warning at once.
-
-<picture>
-  <source media="(prefers-color-scheme: light)" srcset="site/images/gdscript-light.webp">
-  <img src="site/images/gdscript-dark.webp" alt="A GDScript in Passenger with its code help open and a Godot warning marked in Godot's own words, no Godot editor running">
-</picture>
-
-While the game runs, the Live Visual Tree shows its scene tree and values, tuned while it plays and kept into the scene,
-a node picked by clicking in the game; its members' values show after their lines, and its errors stay pinned to them
-after the run. A profile holds GDScript's functions and Godot's frame times beside the C# in one call tree. GdUnit4, GUT
-and GoDotTest tests run and debug in the Unit Tests window, GdUnit4's engine tests on Godot 4.7 for now. Passenger's addon for Godot's editor debugs in Passenger the
-game Godot's own Play starts, and Passenger becomes Godot's script editor in one step. The website's
-[Godot page](https://passenger-ide.net/godot) has the rest.
+Passenger is built on .NET 11 and runs on its own copy of it, carried inside it; your projects can target .NET 8 or
+later. C# 15 reads as C# 15: a union is coloured where you declare it and shows in the debugger as the value it holds,
+a collection expression's `with(…)` arguments build with no preview error, and project files complete `net11.0` and
+`LangVersion` 15. Code compiled with .NET 11's runtime async steps as you wrote it: Step Over an `await` stops on the
+method's next line once it goes on, whichever thread it goes on, and Step Out stops in the caller that awaited it,
+showing the value the method returned. Live metrics, the Requests window and an agent's telemetry read a .NET 11
+program from its start, where an older one is first left a few seconds, and a memory snapshot reads its heap. Under Hot
+Reload a debugged web app's open pages follow your edits through the .NET 11 SDK's browser refresh, the Migrations
+window runs EF Core 11's `dotnet ef` with the defaults `.config/dotnet-ef.json` names, and a project built for .NET 10
+and .NET 11 runs its tests under each. Open a .NET 11 project without its SDK and Passenger offers to install it into
+your own folder.
 
 ### Debugging
 
@@ -179,8 +166,8 @@ connection string its AppHost never gives it is marked, with a fix that adds the
 The Requests window shows each request a running web app serves and the database commands it ran, with their times and
 rows, an N+1 or a slow query marked, for Run, Debug and Profile and for the services of a compose run or an AppHost:
 Passenger reads ASP.NET Core's and EF Core's own events, only while you look. The Migrations window lists each
-DbContext's migrations and whether the database has them, and fixes what would stop `dotnet ef` (the tool, the Design
-package, a provider behind) before it runs. The Endpoints window lists your `.http` files' requests and each web
+DbContext's migrations and whether the database has them, in the environment you choose (its run's, Staging, one you
+type), and fixes what would stop `dotnet ef` (the tool, the Design package, a provider behind) before it runs. The Endpoints window lists your `.http` files' requests and each web
 project's routes, read from its code with no build, and makes requests from the app's OpenAPI document. Turn on Collect
 logs and traces and a run's OpenTelemetry logs and traces show beside its console.
 
@@ -189,6 +176,34 @@ logs and traces and a run's OpenTelemetry logs and traces show beside its consol
   <img src="site/images/requests-dark.webp" alt="Passenger's Requests window following an Aspire app's ASP.NET Core API as it runs, under the minimal API handler that loops over the plants: each GET /plants/thirsty request marked N+1, its repeated SQL query marked ×6 with its reads and times">
 </picture>
 
+### Godot 4
+
+A Godot 4 game, in C# or in GDScript alone, runs, debugs, profiles and Hot Reloads on the Godot Settings › Godot names
+or the one found. A breakpoint in C# or GDScript stops the game and a saved script reloads in it; Run Current Scene
+plays the scene open, Run Another Copy plays up to 16 copies for multiplayer, and on Windows, macOS and Linux under X11
+the game can draw in a pane beside its code. New Project makes a game, Publish exports it through its presets, and
+`project.godot` opens as a page of its settings.
+
+The game's C# is read against its scenes: `GetNode<T>` paths and types, `res://` and `uid://` paths, `[Export]` values,
+signals and their handlers, and every string Godot takes (input actions, groups, animations, autoloads, shader
+parameters, translations, layers, theme items) complete, are checked and rename, and a scene is marked where Godot would
+not load it, with fixes. GDScript is read by Passenger's port of Godot's parser and analyzer: Godot's warnings and
+errors with their fixes, completion, the hover, Find Usages, refactorings that reach C# and the scenes, and Reformat
+Code by Godot's style guide, mostly without starting Godot. Shaders are checked as Godot's compiler checks them, every
+error and warning at once.
+
+<picture>
+  <source media="(prefers-color-scheme: light)" srcset="site/images/gdscript-light.webp">
+  <img src="site/images/gdscript-dark.webp" alt="A GDScript in Passenger with its code help open and a Godot warning marked in Godot's own words, no Godot editor running">
+</picture>
+
+While the game runs, the Live Visual Tree shows its scene tree and values, tuned while it plays and kept into the scene,
+a node picked by clicking in the game; its members' values show after their lines, and its errors stay pinned to them
+after the run. A profile holds GDScript's functions and Godot's frame times beside the C# in one call tree. GdUnit4, GUT
+and GoDotTest tests run and debug in the Unit Tests window, GdUnit4's engine tests on Godot 4.7 for now. Passenger's addon for Godot's editor debugs in Passenger the
+game Godot's own Play starts, and Passenger becomes Godot's script editor in one step. The website's
+[Godot page](https://passenger-ide.net/godot) has the rest.
+
 ### The editor and C#
 
 A text control of its own over an immutable rope: multiple carets, folding, soft wrap, Extend Selection, live, postfix
@@ -196,8 +211,8 @@ and surround templates, inlay hints, and splits and tabs in windows of their own
 file's size. C# comes from Roslyn: diagnostics, completion, quick fixes and refactorings (Change Signature, Extract
 Interface, Move, Pull Members Up, Safe Delete and more), Go to Declaration, Implementation and Base Symbols, Find
 Usages, call and type hierarchies and decompiled library sources, and Problems lists the whole solution's without a
-build. .NET 11 and C# 15 as they ship: a file-based program (`dotnet run app.cs`) opens as a project of its own, a
-solution filter (`.slnf`) loads only the projects it names, and a union's value shows in the debugger as what it holds.
+build. A file-based program (`dotnet run app.cs`) opens as a project of its own, and a solution filter (`.slnf`) loads
+only the projects it names.
 
 <picture>
   <source media="(prefers-color-scheme: light)" srcset="site/images/editor-light.webp">
@@ -245,12 +260,12 @@ in each look's colours.
 
 [passenger-ide.net](https://passenger-ide.net/#download) has each system's download:
 
-- **macOS:** a disk image for Macs with Apple Silicon. Drag Passenger onto Applications.
+- **macOS:** a disk image for Macs with Apple Silicon, or one for Intel Macs. Drag Passenger onto Applications.
 - **Windows:** an installer for x64 or Arm64, which installs for you alone, with no administrator.
 - **Linux:** an archive for x64 or Arm64. Unpack it and run its `install.sh`, for you alone or with `--system` for
   everyone; the command is `passenger-ide`, so it never meets Phusion Passenger's `passenger`. Its
-  [Linux page](https://passenger-ide.net/linux) names the libraries it needs, and `install.sh` names your
-  distribution's font package where it finds no font.
+  [Linux page](https://passenger-ide.net/linux) names the libraries it needs; `install.sh` names your distribution's
+  font package where it finds no font, and refreshes fontconfig's cache where it lists none of those installed.
 
 A copy the installer, the disk image or `install.sh` put in place updates itself, then shows what's new. Passenger
 needs:
@@ -290,8 +305,11 @@ There are two ways in, each a flag on Passenger's own executable:
   of Passenger's windows), so its breakpoints and stops show in your editor and its runs in your Run window; its first
   call opens the folder in Passenger, starting it if need be, and it never joins a window on another folder. The window
   asks you before it lets an agent in (Allow, Don't allow, or Always for this folder), unless you have turned on
-  Settings | MCP Server | Enable MCP Server, and asks again the first time the agent uses a tool that changes anything.
-  A question not answered within two minutes comes back to the agent as nobody having answered.
+  Settings | MCP Server | Enable MCP Server, and asks again before each call of a tool that changes anything: Allow Once
+  for that call, or Allow for This Session for every call of that tool until the agent disconnects. An agent about to
+  make several changes can ask once for every tool, which Allow for This Session lets it use unasked until it
+  disconnects; Deny keeps each tool asking. A question not answered within two minutes comes back to the agent as nobody
+  having answered.
 - **`--mcp FOLDER`** starts a Passenger of the agent's own with no window, over a folder or solution, for work it does
   alone. It asks nothing, so it suits an agent you leave to work while you are away.
 
@@ -332,8 +350,8 @@ files under the agent's IDE.
 
 ## Building
 
-Building needs the .NET 11 SDK (11.0.100-rc.3 or later, as [`global.json`](global.json) asks, until .NET 11 ships in
-November 2026) and [just](https://github.com/casey/just). The tests need more:
+Building needs the .NET 11 SDK (11.0.100 or a later 11.0 SDK, as [`global.json`](global.json) asks) and
+[just](https://github.com/casey/just). The tests need more:
 
 - **the .NET 10 SDK** beside it, since the programs the debugger's tests debug ([`tests/Debuggees`](tests/Debuggees))
   and most projects the tests write run on .NET 10;
@@ -351,13 +369,14 @@ November 2026) and [just](https://github.com/casey/just). The tests need more:
 
 ```sh
 just build                 # Debug build; warnings are errors
-just run [PATH]            # run it on a folder or solution (--theme dark|light, --look passenger, harbour, sorbet…)
+just run [PATH]            # run it on a folder or solution (--theme dark|light, --look passenger, cubicle, harbour… or SOURCE::NAME)
 just test [FILTER]         # every test, the IDE driven whole on Avalonia's headless platform, or those matching;
                            # the results in artifacts/test-results
 just screenshot shell.png  # draw the main window to a PNG off-screen (--size 1600x1000 --scale 2)
 just mcp [FOLDER]          # Passenger as an MCP server over a folder, from a clone of the last build
-just publish osx-arm64     # a self-contained Release build (win-x64, win-arm64, linux-x64, linux-arm64 too)
-just package-mac           # the macOS disk image, Apple Silicon; signed with PASSENGER_SIGN_IDENTITY, else ad hoc
+just publish osx-arm64     # a self-contained Release build (osx-x64, win-x64, win-arm64, linux-x64, linux-arm64 too)
+just package-mac           # the macOS disk image, Apple Silicon (or osx-x64, Intel); signed with
+                           # PASSENGER_SIGN_IDENTITY, else ad hoc
 just package-win win-x64   # the Windows installer (or win-arm64), unsigned unless tools/package-win.sh's variables sign it
 just package-linux         # the Linux archive with its install.sh (linux-x64, or linux-arm64), as site/linux.html uses it
 just container-tools       # the tools Passenger debugs and profiles with inside a Linux container, where a build finds them

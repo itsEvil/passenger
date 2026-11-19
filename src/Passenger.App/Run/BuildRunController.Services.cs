@@ -137,11 +137,13 @@ public sealed partial class BuildRunController
             run.Debugged.Add(name);
             // Followed since its build saved the files, or a copy of those its run keeps: its session takes them, else they end here.
             using BuiltEdits? edits = builtEdits.Remove(service.Name, out BuiltEdits? built) ? built : run.KeptFor(service) is { } kept ? session.Debug.Copied(kept) : null;
+            // Built as its run builds, the folder's choice when it started where the run names none of its own.
+            ProgramBuild? builds = (run.Workspace ?? session.Workspace) is { } runs ? new ProgramBuild(name, service.Project, runs) : null;
             refused = purpose == RunStart.HotReload
                 ? await session.Debug.AttachForHotReloadAsync(program.Id, name, (line, error) => run.Say(service, line, error), program.Place, stop, edits, program.Handlers,
-                    program.Browser, program.App)
+                    program.Browser, program.App, builds)
                 : await session.Debug.AttachAsync(program.Id, name, hotReload: program.HotReload, place: program.Place, group: run.Group, app: program.App, edits: edits,
-                    handlers: program.Handlers, browser: program.Browser);
+                    handlers: program.Handlers, browser: program.Browser, builds: builds);
             if (refused is null)
             {
                 DebugTab? tab = purpose == RunStart.HotReload ? null : session.Debug.Tabs.LastOrDefault(t => t.Name == name && t.IsLive);
@@ -162,8 +164,8 @@ public sealed partial class BuildRunController
     {
         LaunchPlan paged = plan with { Name = name, Page = PageOf(plan) };
         IReadOnlyList<Passenger.Workspace.ProjectModel> projects = session.Projects;
-        string? setting = parts.Settings().DebugBrowser;
-        (Debugging.BrowserDebugging? inBrowser, string? notInBrowser) = await BackgroundWork.Run(() => Debugging.BrowserDebugging.For(paged, projects, setting));
+        PageBrowser? named = PageBrowsers.Of(paged.BrowserLine, paged.Name, parts.Settings().Browser);
+        (Debugging.BrowserDebugging? inBrowser, string? notInBrowser) = await BackgroundWork.Run(() => Debugging.BrowserDebugging.For(paged, projects, named));
         if (session.IsEnded || session.Debug.SessionNamed(name) is not { State: not DebugState.Ended } server)
         {
             return;
@@ -300,7 +302,11 @@ public sealed partial class BuildRunController
         }
         if (name is null || run.ServiceNamed(name) is not { } service)
         {
-            return (null, name is null ? $"No .NET service of {run.Name} is chosen" : $"{name} is not a .NET service of {run.Name}");
+            return (null, name is null ? $"No .NET service of {run.Name} is chosen"
+                // One of its compose files whose project nothing named: the person names it, as a copy of the configuration keeps.
+                : run is ContainerRun { Plan.Backing: var backing } && backing.Contains(name)
+                    ? $"{name} is not a .NET service of {run.Name}: no project of the solution is known to run it; choose its project in a copy of {run.Name} (Run > Edit Configurations)"
+                : $"{name} is not a .NET service of {run.Name}");
         }
         // One it left unstarted is acted on too: its Debug, Run and Profile start it later.
         return service.Starts ? (service, null)
@@ -321,9 +327,9 @@ public sealed partial class BuildRunController
 
     /// <summary>A .NET service the run left unstarted (Don't start) started later by its action, the rest left as they run:
     /// its project built here first where its program runs that build (fast mode; as deployed its image is built as it
-    /// starts), containers of it Passenger did not make asked about first, then started held as chosen (once for the profiler
-    /// when <paramref name="profiled"/>) and attached to where held; the run's from then on (Stop takes it down, Rerun keeps
-    /// it started). Null once started, else why not.</summary>
+    /// starts), containers of it Passenger did not make for the folder asked about first, then started held as chosen (once
+    /// for the profiler when <paramref name="profiled"/>) and attached to where held; the run's from then on (Stop takes it
+    /// down, Rerun keeps it started). Null once started, else why not.</summary>
     private async Task<string?> StartLaterAsync(ServiceRun run, IRunService service, Working work, string why, bool profiled = false)
     {
         if (run.WhyNotStartedLater(service) is { } unfit)
@@ -336,7 +342,7 @@ public sealed partial class BuildRunController
             {
                 work.Say($"Building {Path.GetFileNameWithoutExtension(service.Project)}…");
                 BuildOutcome built = await BuildForAsync([service.Project], work.Stopping, work,
-                    reading: () => FollowBuilt(Reattached(run, [service]).Select(a => (a.Service.Name, a.HotReload))));
+                    reading: () => FollowBuilt(Reattached(run, [service]).Select(a => (a.Service.Name, a.HotReload))), configured: run.Workspace);
                 work.Stopping.ThrowIfCancellationRequested();
                 if (!built.Succeeded)
                 {
@@ -632,7 +638,7 @@ public sealed partial class BuildRunController
                     return false;
                 }
                 List<string> projects = [.. services.Select(s => s.Project).Distinct(StringComparer.Ordinal)];
-                if (run.BuildsBeforeRestart && !(await BuildForAsync(projects, work.Stopping, work, reading: () => FollowBuilt(again))).Succeeded)
+                if (run.BuildsBeforeRestart && !(await BuildForAsync(projects, work.Stopping, work, reading: () => FollowBuilt(again), configured: run.Workspace)).Succeeded)
                 {
                     return false;
                 }

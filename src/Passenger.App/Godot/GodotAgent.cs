@@ -1,3 +1,5 @@
+using Avalonia.Input;
+
 namespace Passenger.App.Godot;
 
 /// <summary>Passenger's helper in a Godot game it debugs (<c>PassengerAgent.gd</c>, carried in the App): a node of
@@ -18,6 +20,9 @@ public static partial class GodotAgent
     /// <summary>The message it sends as it leaves the game's tree, freed by the game or taken out of it: it answers nothing
     /// it was asked and has yet to answer, nor anything sent to it after.</summary>
     public const string Gone = "passenger:gone";
+
+    /// <summary>The message it sends as its script is set on its node, which Godot has then taken into the game's tree.</summary>
+    public const string Here = "passenger:here";
 
     /// <summary>The message it sends as the game, holding the keys in Passenger's Game window, hears the keys that hand them
     /// back (<see cref="KeysBack"/>'s call set them).</summary>
@@ -48,22 +53,41 @@ public static partial class GodotAgent
     /// <summary>Whether a place an error was raised at is the helper's script.</summary>
     public static bool Raised(GodotError error) => IsScript(error.File) || error.Frames.Any(f => IsScript(f.File));
 
+    /// <summary>Whether an error the game raised is Godot refusing to add a node to a parent setting up its children, the one
+    /// refusal a node made a moment before can meet, as the helper's node is refused while a node's _ready, or a call through
+    /// the nodes, runs under the root. Godot's other refusals of add_child are about a node already placed, the game's.</summary>
+    public static bool Unplaced(GodotError error) =>
+        error.Function == GodotWords.AddChildFunction && error.File.Replace('\\', '/').EndsWith(GodotWords.NodeSource, StringComparison.Ordinal)
+        && error.Said.Contains(GodotWords.BusyParent, StringComparison.Ordinal);
+
+    /// <summary>What a call on the helper says once Godot refused the helper's node.</summary>
+    public static string NotPlaced(string game) => $"{game} was setting up the nodes under its root (running a node's _ready, or a call through them) as "
+        + "Passenger's helper came in, and Godot adds no node to a parent then: the helper comes in on a later call, once the game runs on";
+
     /// <summary>Whether a script's file, as Godot names it, is the helper's.</summary>
     public static bool IsScript(string file) => file.EndsWith(FileName, StringComparison.Ordinal);
 
-    /// <summary>A key as Godot names it (<c>OS.find_keycode_from_string</c>), from Avalonia's name for it as app_key reads one.</summary>
-    public static string KeyName(string avalonia) => avalonia switch
+    /// <summary>A key as Godot names it (<c>OS.find_keycode_from_string</c>), from Avalonia's: a key that types a character
+    /// by the one it types without Shift, as Godot's key codes name a key on a US keyboard whatever Shift holds.</summary>
+    public static string KeyName(Key key) => key switch
     {
-        "Back" => "Backspace",
-        "Return" => "Enter",
-        "OemPlus" => "Plus",
-        "OemMinus" => "Minus",
-        "OemComma" => "Comma",
-        "OemPeriod" => "Period",
-        "Next" => "PageDown",
-        "Prior" => "PageUp",
-        ['D', >= '0' and <= '9'] digit => digit[1..],
-        _ => avalonia,
+        Key.Back => "Backspace",
+        Key.Enter => "Enter",
+        Key.PageDown => "PageDown",
+        Key.PageUp => "PageUp",
+        Key.OemPlus => "Equal",
+        Key.OemMinus => "Minus",
+        Key.OemComma => "Comma",
+        Key.OemPeriod => "Period",
+        Key.OemQuestion => "Slash",
+        Key.OemSemicolon => "Semicolon",
+        Key.OemQuotes => "Apostrophe",
+        Key.OemOpenBrackets => "BracketLeft",
+        Key.OemCloseBrackets => "BracketRight",
+        Key.OemPipe => "Backslash",
+        Key.OemTilde => "QuoteLeft",
+        >= Key.D0 and <= Key.D9 => ((char)('0' + (key - Key.D0))).ToString(),
+        _ => key.ToString(),
     };
 
     /// <summary>A node path from its text: "/root", "..", "../PassengerAgent".</summary>

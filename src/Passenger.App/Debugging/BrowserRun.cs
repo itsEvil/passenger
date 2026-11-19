@@ -44,11 +44,13 @@ public sealed partial class BrowserRun : IAsyncDisposable
     public Task Ended { get; }
 
     /// <summary>Starts the browser on a blank page, then the proxy, and opens the page's conversation through it; what each
-    /// writes goes to the IDE's log. Throws <see cref="InvalidOperationException"/> saying which would not start.</summary>
-    public static async Task<BrowserRun> StartAsync(BrowserDebugging debugging, string profiles, Action<string> say, CancellationToken cancel)
+    /// writes goes to the IDE's log. <paramref name="networkEnded"/> is called, on any thread, each time the browser says its
+    /// network service ended (<see cref="ChromiumBrowsers.NetworkServiceEnded"/>). Throws
+    /// <see cref="InvalidOperationException"/> saying which would not start.</summary>
+    public static async Task<BrowserRun> StartAsync(BrowserDebugging debugging, string profiles, Action<string> say, Action networkEnded, CancellationToken cancel)
     {
         string profile = Path.Combine(profiles, "browser");
-        (Process browser, int port)? started = await StartBrowserAsync(debugging.Browser, profile, cancel);
+        (Process browser, int port)? started = await StartBrowserAsync(debugging.Browser, profile, networkEnded, cancel);
         string? apart = null;
         if (started is null)
         {
@@ -56,7 +58,7 @@ public sealed partial class BrowserRun : IAsyncDisposable
             apart = Path.Combine(profiles, $"browser-{Guid.NewGuid():N}");
             try
             {
-                started = await StartBrowserAsync(debugging.Browser, apart, cancel)
+                started = await StartBrowserAsync(debugging.Browser, apart, networkEnded, cancel)
                     ?? throw new InvalidOperationException($"{debugging.Browser.Name} ended as it started, with no remote debugging");
             }
             catch
@@ -102,11 +104,13 @@ public sealed partial class BrowserRun : IAsyncDisposable
 
     /// <summary>What every browser Passenger starts is given beyond its debugging: no first-run pages or questions, its
     /// background networking, component and extension updates, sync, pings, metrics reports, domain reliability, Safe
-    /// Browsing's own checks and the features that ask Google's servers left off: as little of its own reaching out as its
-    /// flags turn off.</summary>
+    /// Browsing's own checks and the features that ask Google's servers left off, and the machine's updater never woken
+    /// (Chrome otherwise starts it 19 s after its own start, and every five hours after): as little of its own reaching
+    /// out as its flags turn off.</summary>
     public static readonly IReadOnlyList<string> Quiet =
     [
         "--no-first-run", "--no-default-browser-check", "--disable-search-engine-choice-screen", "--disable-background-networking", "--disable-component-update",
+        "--disable-updater-scheduler",
         "--disable-sync", "--no-pings", "--metrics-recording-only", "--disable-domain-reliability", "--disable-client-side-phishing-detection",
         "--disable-default-apps", "--disable-component-extensions-with-background-pages",
         "--disable-features=OptimizationHints,MediaRouter,Translate,AutofillServerCommunication,CertificateTransparencyComponentUpdater,InterestFeedContentSuggestions",
@@ -116,7 +120,7 @@ public sealed partial class BrowserRun : IAsyncDisposable
     /// (DevToolsActivePort in the profile); null where it ended at once with exit code 0, handing its page to another browser
     /// on that profile. One that ended otherwise throws <see cref="InvalidOperationException"/> with its own last words, and
     /// where the system refused its sandbox, what lets Chromium run. Given up or failed, it leaves no browser running.</summary>
-    private static async Task<(Process Browser, int Port)?> StartBrowserAsync(ChromiumFound found, string profile, CancellationToken cancel)
+    private static async Task<(Process Browser, int Port)?> StartBrowserAsync(ChromiumFound found, string profile, Action networkEnded, CancellationToken cancel)
     {
         Containers.OwnFiles.Folder(profile);
         string written = Path.Combine(profile, "DevToolsActivePort");
@@ -170,6 +174,10 @@ public sealed partial class BrowserRun : IAsyncDisposable
             {
                 refused.TrySetResult();
             }
+            else if (ChromiumBrowsers.NetworkServiceEnded(line))
+            {
+                networkEnded();
+            }
         }
         Task heard = ChildProcesses.Hear(browser, Heard, Heard, longest: 2000);
         IdeErrors.Observe(heard);
@@ -204,7 +212,7 @@ public sealed partial class BrowserRun : IAsyncDisposable
                 }
                 await Task.Delay(TimeSpan.FromMilliseconds(100), cancel);
             }
-            throw new InvalidOperationException($"{found.Name} did not start its remote debugging within {Waits.Of(StartLimit).TotalSeconds:0} s");
+            throw new InvalidOperationException($"{found.Name} did not start its remote debugging within {Durations.Said(Waits.Of(StartLimit))}");
         }
         finally
         {
@@ -283,7 +291,7 @@ public sealed partial class BrowserRun : IAsyncDisposable
         catch (TimeoutException)
         {
             ChildProcesses.Kill(proxy);
-            throw new InvalidOperationException($".NET's browser debug proxy did not listen within {Waits.Of(StartLimit).TotalSeconds:0} s");
+            throw new InvalidOperationException($".NET's browser debug proxy did not listen within {Durations.Said(Waits.Of(StartLimit))}");
         }
         catch
         {

@@ -1,6 +1,7 @@
 using System.Reflection.PortableExecutable;
 using System.Text;
 using Passenger.Core;
+using Passenger.Host;
 using Passenger.Packages;
 using Passenger.Workspace;
 
@@ -25,11 +26,20 @@ public static class DesktopPrograms
 
     private const string MacApp = "a native macOS app";
 
+    private const string Maui = "a .NET MAUI app";
+
+    /// <summary>The assembly found beside an Avalonia app: its Application, its windows and their controls, which a program
+    /// taking Avalonia.Base alone (Avalonia's geometry, colours, values) has none of.</summary>
+    public const string AvaloniaAssembly = "Avalonia.Controls.dll";
+
     /// <summary>The package a project takes Avalonia by, or a package named under it.</summary>
     private const string AvaloniaPackage = "Avalonia";
 
     /// <summary>The packages of an Avalonia head that runs in a browser or on a device, where no inspector reaches it.</summary>
     private static readonly string[] AvaloniaElsewhere = ["Avalonia.Browser", "Avalonia.Android", "Avalonia.iOS"];
+
+    /// <summary>The packages that bring Avalonia's desktop platforms (X11, Win32, macOS), a MAUI app's Avalonia head's too.</summary>
+    private static readonly string[] AvaloniaDesktop = ["Avalonia.Desktop", "Avalonia.Controls.Maui.Desktop"];
 
     /// <summary>What a <c>dotnet run</c> of a project no window has loaded is, nothing having been read of it.</summary>
     public const string UnreadProject = "a project not loaded here, so of no known kind";
@@ -41,7 +51,7 @@ public static class DesktopPrograms
     /// it, and the package a project takes the framework by, or a package named under it.</summary>
     private static readonly (string File, string Called, string Package)[] Frameworks =
     [
-        ("Avalonia.Base.dll", Avalonia, AvaloniaPackage), ("Microsoft.WinUI.dll", "a WinUI app", "Microsoft.WindowsAppSDK"), ("Microsoft.Maui.dll", "a .NET MAUI app", "Microsoft.Maui.Controls"),
+        (AvaloniaAssembly, Avalonia, AvaloniaPackage), ("Microsoft.WinUI.dll", "a WinUI app", "Microsoft.WindowsAppSDK"), ("Microsoft.Maui.dll", Maui, "Microsoft.Maui.Controls"),
         ("Uno.UI.dll", "an Uno Platform app", "Uno.WinUI"), ("Eto.dll", "an Eto.Forms app", "Eto.Forms"), ("GtkSharp.dll", "a GTK app", "GtkSharp"),
     ];
 
@@ -70,7 +80,7 @@ public static class DesktopPrograms
             {
                 return WindowsDesktop;
             }
-            if (folder.EndsWith(MacBundleFolder, StringComparison.Ordinal))
+            if (MacBundles.Of(file) is not null)
             {
                 return MacApp;
             }
@@ -89,8 +99,8 @@ public static class DesktopPrograms
         }
     }
 
-    /// <summary>Where a Mac's app bundle keeps its program.</summary>
-    private static readonly string MacBundleFolder = Path.Join(".app", "Contents", "MacOS");
+    /// <summary>Whether a program's file is an Avalonia app's, <see cref="AvaloniaAssembly"/> beside it.</summary>
+    public static bool BesideAvalonia(string file) => File.Exists(Path.Combine(Path.GetDirectoryName(file)!, AvaloniaAssembly));
 
     private static bool OpensWindows(string library)
     {
@@ -150,6 +160,16 @@ public static class DesktopPrograms
         (OfProject(project, projects) == Avalonia && !project.Packages.Any(p => AvaloniaElsewhere.Contains(p.Name, StringComparer.OrdinalIgnoreCase)))
         || project.WithReferenced(projects).Any(p => p.Evaluated?.Dependencies.Any(d => FrameworkNames.UsesWpf(d.FrameworkReferences)) == true);
 
+    /// <summary>Whether Passenger's inspector looks into the app a project builds, by what it and the projects it references
+    /// say: an Avalonia or WPF app of this computer's desktop (<see cref="TakesXaml"/>), or a .NET MAUI app.</summary>
+    public static bool Inspected(ProjectModel project, IReadOnlyList<ProjectModel> projects) =>
+        TakesXaml(project, projects) || OfProject(project, projects) == Maui;
+
+    /// <summary>Whether a framework's own packages, as evaluated, bring Avalonia's desktop platforms (<see cref="AvaloniaDesktop"/>),
+    /// so its app runs on this computer's desktop.</summary>
+    public static bool TakesAvaloniaDesktop(FrameworkDependencies framework) =>
+        framework.Packages.Any(p => AvaloniaDesktop.Contains(p.Name, StringComparer.OrdinalIgnoreCase));
+
     /// <summary>Whether a restore resolved Avalonia for this computer's desktop, whichever package or project brought it.</summary>
     public static bool RestoredXaml(RestoredVersions restored) => restored.Holds(AvaloniaPackage) && !AvaloniaElsewhere.Any(restored.Holds);
 
@@ -184,10 +204,10 @@ public static class DesktopPrograms
     }
 
     /// <summary>The desktop app a start runs, or null for a start that runs none: <paramref name="program"/> with its
-    /// <paramref name="arguments"/> in <paramref name="folder"/>, read before the project's <paramref name="built"/> program
-    /// it may wrap; a <c>dotnet run</c> runs what its project builds, <paramref name="target"/>, or <paramref name="other"/>,
-    /// a project it names in that one's place. A file no build has made yet, and a project named, is what the project says
-    /// it is, <paramref name="declared"/>.</summary>
+    /// <paramref name="arguments"/> in <paramref name="folder"/>, read before the project's <paramref name="built"/> program a
+    /// script may wrap, where another .NET program is what runs; a <c>dotnet run</c> runs what its project builds,
+    /// <paramref name="target"/>, or <paramref name="other"/>, a project it names in that one's place. A file no build has
+    /// made yet, and a project named, is what the project says it is, <paramref name="declared"/>.</summary>
     public static DesktopProgram? Started(string program, IReadOnlyList<string> arguments, string folder, string? built, string? target, string? declared, string? other = null)
     {
         if (IsDotnet(program) && arguments is [("run" or "watch") and var command, ..])
@@ -196,9 +216,17 @@ public static class DesktopPrograms
                 ? new DesktopProgram(own, runs, $"dotnet {command} starts it without the inspector that puts it on Avalonia's headless platform, which a configuration naming no program gives it")
                 : null;
         }
-        if (Runs(program, arguments, folder) is { } file && Of(file) is { } called)
+        if (Runs(program, arguments, folder) is { } file)
         {
-            return new DesktopProgram(called, file, HooksOff(file));
+            if (Of(file) is { } called)
+            {
+                return new DesktopProgram(called, file, HooksOff(file));
+            }
+            // A .NET program (an assembly, an apphost) takes a hook given to the start out of whatever it starts in turn.
+            if ((built is null || !PathNames.Same(file, built)) && (IsDotnet(program) || RuntimeConfig.Read(file) is not null))
+            {
+                return null;
+            }
         }
         return built is not null && (Of(built) ?? declared) is { } wrapped ? new DesktopProgram(wrapped, built, HooksOff(built)) : null;
     }

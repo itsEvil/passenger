@@ -29,16 +29,25 @@ public partial class MainWindow
         {
             return null;
         }
-        Navigation.FindChoices choices = new(on ?? KeptScope(), Projects, session.FindScope.RecentDirectories, ScopeNames(), findSettings.RecentFileMasks);
+        Navigation.FindChoices choices = new(on ?? KeptScope(), SearchedProjects, session.FindScope.RecentDirectories, ScopeNames(), findSettings.RecentFileMasks);
         Navigation.FindInFilesPopup popup = new((query, scope, cancellation) => SearchFiles(query, scope, cancellation, FileSearch.MostMatches), Editors.TextOf, path => Editors.ParseOptions(path), replace, navigator.SelectedWord(), choices, settings.Ligatures);
         popup.ScopeChanged += (_, scope) => KeepFindScope(scope, closing: false);
         // However it closes: a match chosen, Escape, a click outside.
         popup.DetachedFromVisualTree += (_, _) => KeepFindScope(popup.Scope, closing: true);
         popup.ReplaceRequested += (_, asked) => IdeErrors.Observe(ReplaceAllAsync(popup, asked));
+        popup.FindWindowRequested += (_, asked) =>
+        {
+            popups.Close();
+            KeepMatches(asked.Text, asked.Found, withKeys: true);
+        };
         popups.Show(popup, match =>
         {
             if (match is not null)
             {
+                if (settings.FindResultsIn() == FindResults.FindWindow)
+                {
+                    KeepMatches(popup.Text, popup.Found, withKeys: false);
+                }
                 NavigateTo(match.Path, new TextPosition(match.Line, match.Column));
                 if (Editors.Active?.Path == match.Path)
                 {
@@ -48,6 +57,23 @@ public partial class MainWindow
             }
         });
         return popup;
+    }
+
+    /// <summary>A search's matches in a tab of the Find window, to go back to: with the keys where asked for there, else shown
+    /// behind the match gone to.</summary>
+    private void KeepMatches(string text, FilesFound found, bool withKeys)
+    {
+        string title = $"Occurrences of '{text}'";
+        Find.ShowMatches(title, [.. found.Matches.Select(m => new ToolWindows.Usage(m.Path, m.Line, m.Column, m.Length, m.LineText, Passenger.Languages.CSharp.UsageKind.Other, ProjectNameOf(m.Path)))]);
+        if (withKeys)
+        {
+            Dock.Activate(ToolWindowIds.Find);
+        }
+        else
+        {
+            Dock.Show(ToolWindowIds.Find);
+        }
+        status.Text = $"{title}: {Plural.Of(found.Matches.Count, "match", "matches")} kept in the Find window";
     }
 
     /// <summary>The scope Find in Files takes on rows of the Solution view: the solution's, a project's, a folder's as
@@ -103,7 +129,7 @@ public partial class MainWindow
     {
         string? active = Editors.Active?.Path;
         FindScopeState last = session.FindScope;
-        string? project = last.Scope == SearchScopeKind.Project && Projects.Any(p => p.Path == last.Project) ? last.Project
+        string? project = last.Scope == SearchScopeKind.Project && SearchedProjects.Any(p => p.Path == last.Project) ? last.Project
             : (active is null ? null : ProjectOf(active)?.Path) ?? last.Project;
         string? directory = last.Scope == SearchScopeKind.Directory && last.Directory is not null ? last.Directory
             : (active is null ? null : Path.GetDirectoryName(active)) ?? last.Directory ?? Folder;
@@ -145,14 +171,32 @@ public partial class MainWindow
         }
     }
 
-    /// <summary>The files a scope searches: the project's own (a project nested in its folder has its own), the
-    /// directory's, a named scope's, or every file of the folder; each passing the mask.</summary>
+    /// <summary>The projects Find in Files' Project scope offers: the folder's, then the solution's shared projects.</summary>
+    private IReadOnlyList<ProjectModel> SearchedProjects =>
+        [.. Projects, .. session.Workspace?.Solution?.Projects.Where(p => SharedProjects.Is(p.Path)) ?? []];
+
+    /// <summary>A shared project's files, as its items file names them, read as the search reads them.</summary>
+    private static IEnumerable<string> SharedFiles(string shproj)
+    {
+        foreach (Passenger.Host.EvaluatedItem item in SharedProjects.ItemsOf(SharedProjects.ItemsFileOf(shproj)))
+        {
+            if (File.Exists(item.Path))
+            {
+                yield return item.Path;
+            }
+        }
+    }
+
+    /// <summary>The files a scope searches: the project's own (a project nested in its folder has its own), a shared
+    /// project's its items file names, the directory's, a named scope's, or every file of the folder; each passing the mask.</summary>
     private SearchPlace Place(SearchScope scope)
     {
         FileMask? mask = FileMask.Parse(scope.Mask);
         SearchPlace Named(IReadOnlyList<string> files) => new(false, [], true, [], files, mask);
         switch (scope.Kind)
         {
+            case SearchScopeKind.Project when scope.Project is { } shared && SharedProjects.Is(shared):
+                return new SearchPlace(false, [], true, [], SharedFiles(shared), mask);
             case SearchScopeKind.Project:
                 if (Projects.FirstOrDefault(p => p.Path == scope.Project) is not { } project)
                 {

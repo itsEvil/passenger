@@ -68,6 +68,158 @@ public sealed class ProjectWindowsTests : ProjectWindowsFolders
         first.Close();
     }
 
+    /// <summary>A second window closed with a file open and tool windows shown (the Terminal's shell, Git, Problems, Local
+    /// History, Find): the window and its session go, held by nothing the first window or the process keeps.</summary>
+    [AvaloniaFact]
+    public void A_window_closed_is_let_go_with_its_session()
+    {
+        File.WriteAllText(Path.Combine(beta, "One.cs"), "class One { }\n");
+        MainWindow first = Started(LaunchOptions.Empty with { Folder = alpha }, languageServer: false);
+        try
+        {
+            (WeakReference<MainWindow> window, WeakReference<ProjectSession> session) = OpenedAndClosed(first, beta);
+            Ui.Collected(window, "the closed window to be let go: held by the process or the window still open, each window closed "
+                + "would keep its editors, tool windows and their output for good");
+            Ui.Collected(session, "the closed window's session to be let go: its workspace, Git, index and services kept for good");
+        }
+        finally
+        {
+            first.Close();
+        }
+    }
+
+    /// <summary>A second window on a folder with a file open and tool windows shown, then closed: held only weakly here.</summary>
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
+    private static (WeakReference<MainWindow> Window, WeakReference<ProjectSession> Session) OpenedAndClosed(MainWindow first, string folder)
+    {
+        MainWindow second = InNewWindow(first, folder);
+        second.OpenFile(Path.Combine(folder, "One.cs"));
+        Ui.Settle();
+        foreach (string shown in new[] { AppActions.ShowTerminal, AppActions.ShowGit, AppActions.ShowProblems, AppActions.ShowLocalHistory, AppActions.ShowFind })
+        {
+            Assert.True(second.Perform(shown), $"{shown} could not run in the second window");
+            Ui.Settle();
+        }
+        WeakReference<ProjectSession> session = new(second.Session);
+        second.Close();
+        Ui.Settle();
+        Assert.Equal([first], PassengerApp.Windows);
+        return (new WeakReference<MainWindow>(second), session);
+    }
+
+    /// <summary>A second window closed just after an agent's edit in it, which keeps the file for the agent's next call: the
+    /// window goes at once, held by nothing the kept file's idle wait carries (#1445).</summary>
+    [AvaloniaFact]
+    public void A_window_closed_after_an_agents_call_kept_its_file_is_let_go()
+    {
+        File.WriteAllText(Path.Combine(beta, "One.cs"), "class One { }\n");
+        MainWindow first = Started(LaunchOptions.Empty with { Folder = alpha }, languageServer: false);
+        try
+        {
+            Ui.Collected(AgentKept(first, beta), "the window closed after an agent's call to be let go well before the two minutes its kept file waits: "
+                + "held by that wait, each window an agent worked in would be kept two minutes after it closed", TimeSpan.FromSeconds(20));
+        }
+        finally
+        {
+            first.Close();
+        }
+    }
+
+    /// <summary>A second window on a folder, an agent's edit made in it, then closed: held only weakly here.</summary>
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
+    private static WeakReference<MainWindow> AgentKept(MainWindow first, string folder)
+    {
+        MainWindow second = InNewWindow(first, folder);
+        Passenger.App.Mcp.PassengerTools agent = new(second);
+        Ui.Await(agent.Edit("One.cs", "class One { }", "class One { int count; }"), "the agent's edit, which keeps One.cs for its next call");
+        second.Close();
+        Ui.Settle();
+        return new WeakReference<MainWindow>(second);
+    }
+
+    /// <summary>A second window on a C# project closed once its language server has loaded and before any file is coloured,
+    /// none being open: the window goes at once, held by nothing the wait for the server's first colours leaves (#1445).</summary>
+    [AvaloniaFact]
+    public void A_window_closed_before_its_csharp_servers_first_colours_is_let_go()
+    {
+        Project(beta, "Beta");
+        Restore.Run(beta);
+        string gamma = TestFolders.Create("gamma-");
+        MainWindow first = Started(LaunchOptions.Empty with { Folder = gamma });
+        try
+        {
+            Ui.Collected(Uncoloured(first, beta), "the window closed before its C# server coloured a file to be let go well before the ten minutes that wait gives it: "
+                + "held by the wait, each such window would be kept ten minutes after it closed", TimeSpan.FromSeconds(20));
+        }
+        finally
+        {
+            first.Close();
+        }
+    }
+
+    /// <summary>A second window on a C# project, its language server loaded with no file open, then closed: held only weakly
+    /// here.</summary>
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
+    private static WeakReference<MainWindow> Uncoloured(MainWindow first, string folder)
+    {
+        MainWindow second = InNewWindow(first, folder);
+        Ui.WaitFor(() => second.CSharpService is { IsReady: true }, () => $"the C# language server to load {folder} ({second.CSharpService?.State})", TimeSpan.FromMinutes(2));
+        Assert.Empty(second.EditorArea.Documents);
+        second.Close();
+        Ui.Settle();
+        return new WeakReference<MainWindow>(second);
+    }
+
+    /// <summary>A second window on a solution of two C# projects whose language server ends as it loads the project of the
+    /// file shown (its design-time build held off), before the other is opened, then closed with the server started again in
+    /// its place: the window goes at once, held by nothing the wait for that first load leaves (#1445).</summary>
+    [AvaloniaFact]
+    public void A_window_whose_first_projects_load_never_ended_is_let_go_once_closed()
+    {
+        string shop = TestFolders.Create("shop-");
+        TestFolders.Write(shop, "Shop.slnx", "<Solution>\n  <Project Path=\"App/App.csproj\" />\n  <Project Path=\"Other/Other.csproj\" />\n</Solution>\n");
+        TestFolders.Write(shop, "App/App.csproj", TestProjects.Console("<ImplicitUsings>enable</ImplicitUsings>"));
+        TestFolders.Write(shop, "App/Program.cs", "Console.WriteLine(\"app\");\n");
+        TestFolders.Write(shop, "Other/Other.csproj", "<Project Sdk=\"Microsoft.NET.Sdk\">\n</Project>\n");
+        TestFolders.Write(shop, "Other/OtherCode.cs", "class OtherCode\n{\n}\n");
+        string gamma = TestFolders.Create("gamma-");
+        MainWindow first = Started(LaunchOptions.Empty with { Folder = gamma });
+        try
+        {
+            Ui.Collected(Unloaded(shop), "the window closed after its first projects' load never ended to be let go well before the five minutes that load is waited for: "
+                + "held by the wait, each such window would be kept five minutes after it closed", TimeSpan.FromSeconds(30));
+        }
+        finally
+        {
+            first.Close();
+        }
+    }
+
+    /// <summary>A second window opened on a solution, its projects' design-time builds held off so the language server's load
+    /// of the file shown's project waits, that server ended, then the window closed: held only weakly here.</summary>
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
+    private WeakReference<MainWindow> Unloaded(string folder)
+    {
+        string canonical = PathNames.Canonical(folder);
+        MainWindow second = new() { Width = 1200, Height = 800, StateFolder = settings };
+        second.Show();
+        second.OpenFolder(Path.Combine(canonical, "Shop.slnx"));
+        IDisposable held = second.Session.DesignTimeBuilds.HoldOff([canonical]).Held;
+        second.OpenFile(Path.Combine(canonical, "App", "Program.cs"));
+        // Not settled: the server's load waits for the build held off.
+        Ui.PumpUntil(() => second.CSharpService?.Session is not null, $"the C# language server to start on {folder}", TimeSpan.FromMinutes(2));
+        Passenger.Lsp.RoslynSession loading = second.CSharpService!.Session!;
+        Assert.False(loading.IsLoaded, "The server loaded the project whose build was held off");
+        // Ended as it loads, it never says the first projects loaded.
+        OwnProcess.Of(loading.Server.ProcessId).Kill(alone: true);
+        Ui.PumpUntil(() => loading.Server.HasExited && second.CSharpService?.Session is { } again && again != loading, "the server ended and another started in its place",
+            TimeSpan.FromMinutes(2));
+        second.Close();
+        held.Dispose();
+        Ui.Settle();
+        return new WeakReference<MainWindow>(second);
+    }
+
     /// <summary>A folder opened over another in its window: every session the window had before it (the empty one it began
     /// with, the first folder's) goes, held by nothing the window keeps for the sessions after them.</summary>
     [AvaloniaFact]
@@ -190,8 +342,9 @@ public sealed class ProjectWindowsTests : ProjectWindowsFolders
         Assert.Equal(Shortcut.Parse(OperatingSystem.IsMacOS() ? "meta shift alt BACK_QUOTE" : "control alt OPEN_BRACKET"), AppActions.Keymap().ShortcutsFor(AppActions.PreviousProjectWindow)[0]);
 
         NativeMenuItemBase[] items = [.. Ui.Submenu(first.MenuBar, "Window").Items];
-        string[] tail = [.. items.TakeLast(5).Select(i => (i as NativeMenuItem)?.Header ?? "-")];
-        Assert.Equal(["Next Solution Window", "Previous Solution Window", "-", alphaName, betaName], tail);
+        // The keys' way round this window's regions, then the way between the windows, then the windows, each a group.
+        string[] tail = [.. items.TakeLast(8).Select(i => (i as NativeMenuItem)?.Header ?? "-")];
+        Assert.Equal(["Next Region", "Previous Region", "-", "Next Solution Window", "Previous Solution Window", "-", alphaName, betaName], tail);
         NativeMenuItem[] listed = [.. items.TakeLast(2).Cast<NativeMenuItem>()];
         Assert.True(listed[0].IsChecked && !listed[1].IsChecked, "The Window menu does not check the window it is in");
 
@@ -437,25 +590,25 @@ public sealed class ProjectWindowDebuggingTests : ProjectWindowsFolders
         Restore.Run(alpha);
         Restore.Run(beta);
         MainWindow window = Started(LaunchOptions.Empty with { Folder = alpha }, languageServer: false);
-        int running = 0;
-        int debugged = 0;
+        OwnProcess running = default;
+        OwnProcess debugged = default;
         try
         {
             Assert.True(window.Perform(AppActions.RunProgram), "Run could not run in the first folder");
-            running = Processes.WrittenId(Path.Combine(alpha, "run.pid"), "the first folder's program to run");
+            running = OwnProcess.Of(Processes.WrittenId(Path.Combine(alpha, "run.pid"), "the first folder's program to run"));
             Ui.WaitFor(() => window.BottomPanel.Problems.Problems.Any(p => p.Message.Contains("alpha warns", StringComparison.Ordinal)), "the first folder's build warning in Problems");
             Ui.WaitFor(() => Output(window).Contains("alpha runs", StringComparison.Ordinal), "the first folder's program's output in the Run window");
             window.Debugger.Breakpoints.Toggle(PathNames.Canonical(program), 3);
             Assert.True(window.Perform(AppActions.Debug), "Debug could not run in the first folder");
-            debugged = Processes.WrittenId(Path.Combine(alpha, "debugged.pid"), "the first folder's program to start under the debugger");
+            debugged = OwnProcess.Of(Processes.WrittenId(Path.Combine(alpha, "debugged.pid"), "the first folder's program to start under the debugger"));
             Ui.WaitFor(() => window.Debugger.Session is { State: Passenger.App.Debugging.DebugState.Paused } && window.BottomPanel.Debug.Frames.Count > 0,
                 "the debugged program to stop at its breakpoint", TimeSpan.FromMinutes(2));
 
             Assert.Null(window.Open(beta));
             Ui.ClickButton(Asked(window), OpenProjectDialog.ThisWindow);
             Ui.WaitFor(() => window.Folder == PathNames.Canonical(beta), "the second folder to open in the window");
-            Assert.True(Processes.Gone(running), "The first folder's program still runs after the second folder opened in its window");
-            Assert.True(Processes.Gone(debugged), "The first folder's debugged program still runs after the second folder opened in its window");
+            Assert.True(Processes.Gone(running.Id), "The first folder's program still runs after the second folder opened in its window");
+            Assert.True(Processes.Gone(debugged.Id), "The first folder's debugged program still runs after the second folder opened in its window");
             Assert.False(window.Runner.IsRunning || window.Debugger.IsDebugging, "The window still runs or debugs the first folder's program");
             Assert.Equal(string.Empty, Output(window));
             Assert.Equal(string.Empty, window.BottomPanel.Debug.Console.Document.Snapshot.ToString());
@@ -469,10 +622,101 @@ public sealed class ProjectWindowDebuggingTests : ProjectWindowsFolders
         }
         finally
         {
-            Processes.Kill(running);
-            Processes.Kill(debugged);
+            running.Kill();
+            debugged.Kill();
             window.Close();
         }
+    }
+
+    /// <summary>A program debugged with Hot Reload, held at its start so its update handlers' hook never reaches the window;
+    /// another folder opened over it in its window, then the window closed: the window goes, held by nothing the first
+    /// folder's debugger left listening for the program (#1450).</summary>
+    [AvaloniaFact]
+    public void A_window_that_debugged_with_hot_reload_then_opened_another_folder_is_let_go_once_closed()
+    {
+        using Debugging.Helpers.StartHold hold = new();
+        string gamma = Folders();
+        MainWindow first = Started(LaunchOptions.Empty with { Folder = gamma }, languageServer: false);
+        try
+        {
+            Ui.Collected(Debugged(first, hold, then: beta), "the window that debugged a program with Hot Reload, then opened another folder and closed, to be let go: "
+                + "held by the first folder's update handlers' hook, still waiting for its program, each such window would be kept for good");
+        }
+        finally
+        {
+            first.Close();
+        }
+    }
+
+    /// <summary>A program debugged with Hot Reload, held at its start so its update handlers' hook never reaches the window,
+    /// and the window closed as it debugs: the window goes, held by nothing its debugger left listening for the program
+    /// (#1450).</summary>
+    [AvaloniaFact]
+    public void A_window_closed_as_it_debugs_with_hot_reload_is_let_go()
+    {
+        using Debugging.Helpers.StartHold hold = new();
+        string gamma = Folders();
+        MainWindow first = Started(LaunchOptions.Empty with { Folder = gamma }, languageServer: false);
+        try
+        {
+            Ui.Collected(Debugged(first, hold, then: null), "the window closed as it debugged a program with Hot Reload to be let go: "
+                + "held by its update handlers' hook, still waiting for its program, each such window would be kept for good");
+        }
+        finally
+        {
+            first.Close();
+        }
+    }
+
+    /// <summary>Alpha and Beta, each a console project restored, and an empty folder for the window that stays open.</summary>
+    private string Folders()
+    {
+        Project(alpha, "Alpha");
+        Project(beta, "Beta");
+        Restore.Run(alpha);
+        Restore.Run(beta);
+        return TestFolders.Create("gamma-");
+    }
+
+    /// <summary>A window on alpha opened from <paramref name="first"/> that debugs its program with Hot Reload, the program
+    /// held at its start; then, with <paramref name="then"/>, that folder opened over it in the window; then the window
+    /// closed: held only weakly here.</summary>
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
+    private WeakReference<MainWindow> Debugged(MainWindow first, Debugging.Helpers.StartHold hold, string? then)
+    {
+        MainWindow window = InNewWindow(first, alpha);
+        OwnProcess program = default;
+        try
+        {
+            window.SetConfigurations([new RunConfiguration
+            {
+                Name = "Alpha held",
+                Project = Path.Combine(PathNames.Canonical(alpha), "Alpha.csproj"),
+                Environment = new Dictionary<string, string>(hold.Environment),
+            }], "Alpha held");
+            Task<int> held = hold.Held(TimeSpan.FromMinutes(3));
+            // Not settled: the start holds the window's background work for as long as the debugger waits for the program.
+            Assert.True(window.Perform(AppActions.Debug), $"Debug did not start: {Ui.Said(window)}");
+            program = OwnProcess.Of(Ui.AwaitPumped(held, "the build, then the program's runtime to come to the hold", TimeSpan.FromMinutes(3)));
+            Assert.Equal(Passenger.App.Debugging.DebugState.Starting, window.Debugger.Session?.State);
+            if (then is not null)
+            {
+                Assert.Null(window.Open(then));
+                // Not settled: the start under way holds the window's background work until leaving the folder stops it.
+                Ui.PumpUntil(() => window.Asking is not null, "the window to ask where the other folder opens", TimeSpan.FromSeconds(30));
+                Ui.Click(window.Asking!.GetVisualDescendants().OfType<Button>().Single(b => b.IsEffectivelyVisible && b.Content as string == OpenProjectDialog.ThisWindow), settle: false);
+                Ui.WaitFor(() => window.Folder == PathNames.Canonical(then), "the other folder to open in the window");
+                Assert.True(Processes.Gone(program.Id), "The program debugged in the first folder still runs after another folder opened in its window");
+            }
+        }
+        finally
+        {
+            window.Close();
+            program.Kill();
+        }
+        Ui.Settle();
+        Assert.Equal([first], PassengerApp.Windows);
+        return new WeakReference<MainWindow>(window);
     }
 }
 
@@ -492,10 +736,11 @@ public abstract class ProjectWindowsFolders : IDisposable
 
     /// <summary>The window a person starts, as the app makes it: its layout and settings kept in the test's state folder,
     /// then the command line taken; with no C# language server for a test that asks nothing of C#
-    /// (<paramref name="languageServer"/>), in whatever folder the window opens.</summary>
-    protected MainWindow Started(LaunchOptions options, bool languageServer = true)
+    /// (<paramref name="languageServer"/>), in whatever folder the window opens; asking what a person sees asked where
+    /// <paramref name="seen"/>, as the run's windows are otherwise nobody's (<see cref="MainWindow.Unseen"/>).</summary>
+    protected MainWindow Started(LaunchOptions options, bool languageServer = true, bool seen = false)
     {
-        MainWindow window = new() { Width = 1200, Height = 800, StateFolder = settings, StartsLanguageServer = languageServer };
+        MainWindow window = new() { Width = 1200, Height = 800, StateFolder = settings, StartsLanguageServer = languageServer, Unseen = !seen && PassengerApp.ShowsNoWindow };
         window.Show();
         window.KeepLayout();
         window.KeepSettings();

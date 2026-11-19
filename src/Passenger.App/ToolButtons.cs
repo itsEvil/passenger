@@ -46,7 +46,7 @@ public static class ToolButtons
         {
             Classes = { StyleClasses.Outcome },
             Focusable = false,
-            Content = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 5, Children = { mark, count } },
+            Content = new StackPanel { Orientation = Orientation.Horizontal, Spacing = Gaps.Tight, Children = { mark, count } },
         };
         return Tip(button, tip);
     }
@@ -54,13 +54,24 @@ public static class ToolButtons
     /// <summary>A toolbar's button that stays pressed while what it turns on is on (Mute Breakpoints, Select Element).</summary>
     public static ToggleButton Toggle(string icon, string tip) => Made(new ToggleButton(), icon, tip);
 
-    /// <summary>Gives a button with no words on it its tip, and those words as the name a screen reader says for it.</summary>
-    public static T Tip<T>(T button, string tip)
+    /// <summary>Gives a button with no words on it its tip, and those words as the name a screen reader says for it; with
+    /// <paramref name="keys"/>, the keys that do the same, which the tip names after its words as every tip does.</summary>
+    public static T Tip<T>(T button, string tip, string? keys = null)
         where T : Control
     {
-        ToolTip.SetTip(button, tip);
+        ToolTip.SetTip(button, ActionTips.Named(tip, keys));
         AutomationProperties.SetName(button, tip);
         return button;
+    }
+
+    /// <summary>Greys a button while it can't act, its tip saying why: after an icon's name, as a refusal follows what it
+    /// stopped ("Delete: main is checked out"), or alone on a button of words, which names itself; null gives it back its
+    /// <paramref name="tip"/> while it can act, else its name alone. A screen reader names it as before.</summary>
+    public static void Grey(Button button, string? why, string? tip = null)
+    {
+        string? name = AutomationProperties.GetName(button);
+        button.IsEnabled = why is null;
+        ToolTip.SetTip(button, why is null ? tip ?? name : name is null ? why : $"{name}: {why}");
     }
 
     private static T Made<T>(T button, string icon, string tip)

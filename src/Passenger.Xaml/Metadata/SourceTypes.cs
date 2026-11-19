@@ -2,6 +2,7 @@ using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.CSharp;
 using Microsoft.CodeAnalysis.CSharp.Syntax;
 using Microsoft.CodeAnalysis.Text;
+using Passenger.Core;
 using Passenger.Languages.CSharp;
 using Passenger.Xaml.Syntax;
 
@@ -199,7 +200,7 @@ public sealed class SourceTypes
                 switch (member)
                 {
                     case PropertyDeclarationSyntax property:
-                        bool writable = property.AccessorList?.Accessors.Any(a => a.IsKind(SyntaxKind.SetAccessorDeclaration) && IsAccessible(a.Modifiers, inherit: true)) == true;
+                        bool writable = property.AccessorList?.Accessors.Any(a => (a.IsKind(SyntaxKind.SetAccessorDeclaration) || a.IsKind(SyntaxKind.InitAccessorDeclaration)) && IsAccessible(a.Modifiers, inherit: true)) == true;
                         members.Add(new ClrMember(type, property.Identifier.ValueText, MemberKind.Property, Reference(property.Type, inside), isStatic, visible, writable,
                             attributes: memberAttributes, place: Place(property.Identifier), constant: isStatic ? Given(property) : null));
                         break;

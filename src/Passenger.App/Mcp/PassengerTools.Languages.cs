@@ -39,6 +39,9 @@ public sealed partial class PassengerTools
     /// <summary>A Godot shader or shader include, read against Godot's shading language and checked by Godot's compiler.</summary>
     private sealed record ShaderServed(OpenDocument Document) : Served(Document, "Godot shader");
 
+    /// <summary>A .feature file, which Passenger's own reading of Gherkin answers for (<see cref="Bdd.FeatureChecks"/>).</summary>
+    private sealed record FeatureServed(OpenDocument Document) : Served(Document, "Gherkin");
+
     /// <summary>A GDScript no Godot server serves, which Passenger's own reading answers for (<see cref="WebDocument.AskServer"/>).</summary>
     private sealed record ScriptServed(OpenDocument Document, WebDocument Web) : Served(Document, "GDScript");
 
@@ -52,6 +55,9 @@ public sealed partial class PassengerTools
     private const string ShaderHas = "definition goes to a uniform, varying, function, struct or constant, an include's too, and from an #include to "
         + "its file; symbol_info says what a built-in, mode, hint or declaration is; usages lists a uniform's uses, the scenes and C# naming it; "
         + "outline gives its declarations; diagnostics Godot's compiler's errors";
+
+    private const string FeatureHas = "definition goes from a step to its step definition and from a header to its hooks; usages lists a step's "
+        + "definition's steps; rename renames a step; code_actions defines a missing step; format lays the file out; outline gives its scenarios";
 
     private const string GodotHas = "definition goes from a res:// path or ExtResource to its file, from a node path to its node, and from a "
         + "connection's method or signal to its code; rename renames a node's name in its scenes and the code's GetNode paths; outline gives its nodes";
@@ -101,13 +107,19 @@ public sealed partial class PassengerTools
         {
             return new ShaderServed(document);
         }
+        if (Bdd.FeatureChecks.IsFeature(document.Path))
+        {
+            // Its steps are matched once the C# server has read the step definitions.
+            await When(() => Session.CSharp is not { } csharp || csharp.IsReady, ServerLimit, cancel, ServerState());
+            return new FeatureServed(document);
+        }
         if (document.Language.Service == Languages.LanguageService.CSharp)
         {
             (_, LspDocument lsp) = await Code(path, cancel, takenIn);
             return new ServerServed(document, document.Language.Name, lsp);
         }
         throw new InvalidOperationException($"Passenger has no code help for {LanguageOf(document)} files such as {name}: the code tools answer C#, Razor, "
-            + "XAML, JavaScript, TypeScript, HTML, CSS, SCSS, Less, JSON, YAML, Dockerfiles, MSBuild files and Godot's scenes and shaders");
+            + "XAML, JavaScript, TypeScript, HTML, CSS, SCSS, Less, JSON, YAML, Dockerfiles, MSBuild files, Gherkin's .feature files and Godot's scenes and shaders");
     }
 
     /// <summary>An MSBuild file's elements, indented, each with its line: a property or metadata with its value as written,
@@ -248,9 +260,18 @@ public sealed partial class PassengerTools
     private static async Task<XamlSymbol?> XamlSymbolAt(XamlServed xaml, int offset) =>
         await BackgroundWork.Run(() => XamlNavigation.At(xaml.File, offset)) is { Targets.Count: > 0 } symbol ? symbol : null;
 
-    /// <summary>Find Usages in XAML: an element's name in its file and its code-behind, a resource key in the project's XAML.</summary>
+    /// <summary>Find Usages in XAML: an element's name in its file, its code-behind and a MAUI page's expressions, a resource
+    /// key in the project's XAML, and from a name in an expression what the C# it reads is, as Find Usages finds them.</summary>
     private async Task<IReadOnlyList<Place>> XamlUsages(XamlServed xaml, int offset, CancellationToken cancel)
     {
+        if (XamlExpressions.At(xaml.File, offset) is ({ } expression, _) && XamlExpressions.Is(xaml.File, expression.Attribute))
+        {
+            await ExpressionSettledAsync(xaml, offset, cancel);
+            if (await window.Assist.Languages.Xaml.ExpressionUsesAsync(xaml.Xaml, offset) is { } read)
+            {
+                return read.Uses.Count > 0 ? await Places(read.Uses, cancel) : read.None is { } none ? throw new InvalidOperationException(none) : [];
+            }
+        }
         if (await XamlSymbolAt(xaml, offset) is not { } symbol)
         {
             return [];
@@ -268,13 +289,41 @@ public sealed partial class PassengerTools
     /// through it, as a C# symbol's usages are, and before it has loaded none are.</summary>
     private Task CodeBehindRead(CancellationToken cancel) => When(() => Session.CSharp is not { } csharp || csharp.IsReady, ServerLimit, cancel, ServerState());
 
-    /// <summary>Rename in XAML: an element's name, in its file and where its code-behind uses its field; a type or member of
-    /// the folder's C# a name leads to, from its declaration (<see cref="XamlAssist.DeclaredRenameAsync"/>); saved.</summary>
+    /// <summary>Waits, for a place in a MAUI page's C# expression, as a question of the page's C# waits (<see cref="Code"/>),
+    /// the expression being answered from the code MAUI's generator makes: until the server holds the C# files come under
+    /// the projects the page sees (<see cref="TakenInAsync"/>), a file a rename moved among them, and answers for the code
+    /// as its projects stand (<see cref="ServerSettledAsync"/>); at once anywhere else.</summary>
+    private async Task ExpressionSettledAsync(Served served, int offset, CancellationToken cancel)
+    {
+        if (served is not XamlServed xaml || XamlExpressions.At(xaml.File, offset) is not ({ } expression, _) || !XamlExpressions.Is(xaml.File, expression.Attribute))
+        {
+            return;
+        }
+        bool takenIn = await TakenInAsync(xaml.Document.Path, cancel);
+        await ServerSettledAsync(xaml.Document.Path, _ => true, cancel);
+        if (!takenIn)
+        {
+            await TakenInAsync(xaml.Document.Path, cancel);
+        }
+    }
+
+    /// <summary>Rename in XAML: an element's name, from it or a MAUI expression reading it, in its file and where its
+    /// code-behind uses its field; a type or member of the folder's C# a name or an expression leads to, from its
+    /// declaration (<see cref="CodeActions.RenameDeclaredAsync"/>); saved. Asked once the server holds the C# files come
+    /// under the projects the page sees (<see cref="TakenInAsync"/>), as a rename in C# is.</summary>
     private async Task<string> XamlRename(XamlServed xaml, int offset, string newName, bool renameFiles, Patience patience, CancellationToken cancel)
     {
         await CodeBehindRead(cancel);
+        await TakenInAsync(xaml.Document.Path, cancel);
+        await ExpressionSettledAsync(xaml, offset, cancel);
         // Read against the C# as it stands: the agent's own rename a moment before may have written it.
         await Session.Xaml.CurrentAsync();
+        if (await window.Assist.Languages.Xaml.ExpressionRenamedAsync(xaml.Xaml, offset) is ({ } read, var declared))
+        {
+            return declared is null ? await ElementRenamed(xaml, read, newName, patience, cancel)
+                : read == newName ? $"{newName} is its name already"
+                : await SymbolRenamed(await window.Assist.Actions.RenameDeclaredAsync(declared, read, newName, renameFiles, patience), cancel);
+        }
         XamlFile file = await xaml.Xaml.FileAsync() ?? xaml.File;
         XamlSymbol? symbol = await BackgroundWork.Run(() => XamlNavigation.At(file, offset));
         if (symbol is { Named: null } && XamlAssist.DeclarationOf(symbol) is not null)
@@ -286,15 +335,18 @@ public sealed partial class PassengerTools
             return await SymbolRenamed(await window.Assist.Languages.Xaml.DeclaredRenameAsync(symbol, newName, renameFiles, patience)
                 ?? throw new InvalidOperationException(XamlAssist.XamlRenamesWhat), cancel);
         }
-        if (symbol is not { Named: { } named })
-        {
-            throw new InvalidOperationException($"{XamlAssist.XamlRenamesWhat}: put the place on one, or a use of it");
-        }
-        if (named.Value == newName)
+        return symbol is { Named: { } named } ? await ElementRenamed(xaml, named.Value, newName, patience, cancel)
+            : throw new InvalidOperationException($"{XamlAssist.XamlRenamesWhat}: put the place on one, or a use of it");
+    }
+
+    /// <summary>An element of a XAML file renamed (<see cref="XamlAssist.XamlRenameAsync"/>); saved.</summary>
+    private async Task<string> ElementRenamed(XamlServed xaml, string old, string newName, Patience patience, CancellationToken cancel)
+    {
+        if (old == newName)
         {
             return $"{newName} is its name already";
         }
-        if (await window.Assist.Languages.Xaml.XamlRenameAsync(xaml.Document.Path, named.Value, newName, patience) is not { } renamed)
+        if (await window.Assist.Languages.Xaml.XamlRenameAsync(xaml.Document.Path, old, newName, patience) is not { } renamed)
         {
             throw new InvalidOperationException($"{Path.GetFileName(xaml.Document.Path)} is no longer XAML Passenger reads");
         }
@@ -303,7 +355,7 @@ public sealed partial class PassengerTools
             throw new InvalidOperationException(refused);
         }
         await SaveLandedAsync(cancel);
-        return $"Renamed {named.Value} to {newName} in {Plural.Of(renamed.Files.Count, "file")}: {string.Join(", ", renamed.Files.Select(f => Relative(f.Path)))}";
+        return $"Renamed {old} to {newName} in {Plural.Of(renamed.Files.Count, "file")}: {AgentAnswers.Named([.. renamed.Files.Select(f => Relative(f.Path))], "file", FilesOfTheChange)}";
     }
 
     /// <summary>A XAML file's elements, indented, each with what names it (x:Class, x:Name, x:Key, a style's selector or
@@ -385,7 +437,7 @@ public sealed partial class PassengerTools
                 throw new InvalidOperationException(problem);
             }
             await SaveLandedAsync(CancellationToken.None);
-            return $"Applied '{fix.Title}' to {string.Join(", ", made.Files.Select(f => Relative(f.Path)).Distinct())}";
+            return $"Applied '{fix.Title}' to {AgentAnswers.Named([.. made.Files.Select(f => Relative(f.Path)).Distinct()], "file", FilesOfTheChange)}";
         }
         WorkspaceEdits.ApplyTo(Editors, document, now.Edits ?? [new TextEdit(now.Range.Start, now.Range.Length, now.Text)]);
         await SaveLandedAsync(CancellationToken.None);
@@ -449,7 +501,7 @@ public sealed partial class PassengerTools
                     throw new InvalidOperationException($"{what} was not applied: {refused}");
                 }
                 await SaveLandedAsync(CancellationToken.None);
-                return $"Applied {what} to {string.Join(", ", changes.Select(c => Relative(c.Path)).Distinct())}";
+                return $"Applied {what} to {AgentAnswers.Named([.. changes.Select(c => Relative(c.Path)).Distinct()], "file", FilesOfTheChange)}";
         }
         Func<string, string?> texts = Editors.Texts().Text;
         if (chosen.Made is ExtractableValue value)

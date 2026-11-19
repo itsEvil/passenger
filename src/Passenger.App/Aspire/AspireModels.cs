@@ -22,9 +22,13 @@ public sealed class AspireResource(JsonElement data)
         .Where(property => property.Name == "resource.uid" && property.Value.ValueKind == JsonValueKind.String)
         .Select(property => property.Value.GetString()).FirstOrDefault();
     public string Generation => $"{Uid}\n{AspireJson.String(Data, "creationTimestamp")}\n{AspireJson.String(Data, "startTimestamp")}";
+    [IdentifierOf(typeof(AspireStates))]
     public string? State => AspireJson.String(Data, "state");
     public string? HealthStatus => AspireJson.String(Data, "healthStatus");
     public string? Source => AspireJson.String(Data, "source");
+
+    /// <summary>Its type in the AppHost's own words for people (a Node.js app's "Node.js"), else its type's name.</summary>
+    public string? TypeShown => AspireJson.String(Data, "resourceTypeDisplayName") ?? AspireJson.String(Data, "resourceType") ?? AspireJson.String(Data, "type");
 
     /// <summary>Whether it is the resource a name means: its own name, its display name, or the name with DCP's suffix after
     /// a dash, never a sibling whose name begins with the name and a dash (api and api-worker).</summary>

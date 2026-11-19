@@ -9,11 +9,17 @@ namespace Passenger.App;
 [IdentifierHome]
 public static class AppActions
 {
-    public const string Open = "app.open";
+    /// <summary>A solution or project to open as the workspace: Rider's Open Solution (RiderOpenSolution), Ctrl+Shift+O in
+    /// every keymap but VS Code's on Windows, which gives it Ctrl+K, Ctrl+O.</summary>
+    public const string OpenSolution = "app.openSolution";
 
-    /// <summary>A folder to open: the system's panel takes files or folders, not both, so Open takes the solution or
-    /// project files and this the folder. Rider's keymaps have no keys for it.</summary>
+    /// <summary>A folder to open: the system's panel takes files or folders, not both. Rider's keymaps have no keys for
+    /// it.</summary>
     public const string OpenFolder = "app.openFolder";
+
+    /// <summary>A file to open in the editor, never as the workspace: IntelliJ's Open (OpenFile), which Rider's Visual Studio
+    /// and VS Code keymaps give Ctrl+O (Cmd+O on the Mac) and IntelliJ IDEA's none.</summary>
+    public const string OpenFile = "app.openFile";
 
     /// <summary>Rider's New Solution (RiderNewSolution), which its keymaps give no keys.</summary>
     public const string NewSolution = "app.newSolution";
@@ -46,6 +52,11 @@ public static class AppActions
     public const string CloseTab = "app.closeTab";
     public const string NextTab = "app.nextTab";
     public const string PreviousTab = "app.previousTab";
+
+    // Rider's Switcher: Ctrl+Tab, and Ctrl+Shift+Tab going the other way, in $default's and Mac OS X 10.5+'s own lists,
+    // which every keymap here takes; Control on the Mac too.
+    public const string Switcher = "app.switcher";
+    public const string SwitcherBackward = "app.switcherBackward";
     public const string GoToFile = "app.goToFile";
     public const string GoToLine = "app.goToLine";
     public const string GoToSymbol = "app.goToSymbol";
@@ -126,9 +137,22 @@ public static class AppActions
     // The Godot found's export templates installed from a .tpz the person picks: no key of Rider's.
     public const string InstallGodotTemplates = "app.godot.installTemplates";
 
+    // The open folder trusted, so its code runs: no key of Rider's.
+    public const string TrustFolder = "app.trustFolder";
+
     // The .NET SDK installed into the person's own folder, and put on their shell's PATH: no key of Rider's.
     public const string InstallDotnetSdk = "app.dotnet.install";
     public const string AddDotnetToPath = "app.dotnet.addToPath";
+
+    // What a mobile project needs: the .NET workloads it lacks, and the Android SDK and JDK through the Android workload's installer: no keys of Rider's.
+    public const string InstallWorkloads = "app.dotnet.installWorkloads";
+    public const string InstallAndroidDependencies = "app.android.install";
+
+    // The edits a mobile project's heads need to build here, made to its project and Info.plist: no key of Rider's.
+    public const string MakeMobileEdits = "app.mobile.makeEdits";
+
+    // A Mac Catalyst head's Debug build kept whole of .NET's own assemblies, for Passenger's inspector and update handlers' hook: no key of Rider's.
+    public const string KeepAssembliesWhole = "app.mobile.keepAssembliesWhole";
 
     // The Endpoints window over the folder's .http files, and Test of the request chosen there: no key of Rider's.
     public const string ShowEndpoints = "app.showEndpoints";
@@ -154,6 +178,7 @@ public static class AppActions
     public const string ScriptMigrations = "app.migrations.script";
     public const string BundleMigrations = "app.migrations.bundle";
     public const string MigrationsFix = "app.migrations.fix";
+    public const string MigrationsEnvironment = "app.migrations.environment";
 
     // The Containers window over the person's container engine and its actions on the row chosen there: no keys of Rider's,
     // whose Services window has none in its Visual Studio keymaps.
@@ -201,6 +226,7 @@ public static class AppActions
         ["app.aspire.attach"] = ServiceAttach,
         ["app.aspire.runWithoutDebugger"] = ServiceRun,
         ["app.aspire.profile"] = ServiceProfile,
+        ["app.open"] = OpenSolution,
     };
 
     /// <summary>An action's id now, for one it had before (<see cref="Formerly"/>), else the id itself.</summary>
@@ -220,6 +246,9 @@ public static class AppActions
     // The file shown chosen in the Explorer: Rider's LocateInSolutionView in its Visual Studio keymaps (its own descriptor's
     // Alt+Shift+L), SelectInProjectView in its VS Code keymaps (Ctrl+K, E; Cmd+K, E on macOS), no key in IntelliJ IDEA's.
     public const string SelectOpenedFile = "app.explorer.selectOpenedFile";
+
+    // The Explorer switched between the solution's projects and the folder's files on disk: no key of Rider's.
+    public const string SwitchExplorerView = "app.explorer.switchView";
 
     // The Explorer's own actions, on the row its menu opened on or the one chosen while it has the keys: NewFile, NewDir,
     // Class/Interface, the solution's own, Add Reference, Docker Support and Compose, Aspire Orchestration, NuGet, Manage
@@ -241,10 +270,13 @@ public static class AppActions
     public const string AddDockerCompose = "app.explorer.addDockerCompose";
     public const string AddAspireOrchestration = "app.explorer.addAspireOrchestration";
     public const string ManageNuGet = "app.explorer.manageNuGet";
+    public const string ManageNuGetForSolution = "app.explorer.manageNuGetForSolution";
     public const string ManageUserSecrets = "app.explorer.manageUserSecrets";
     public const string EditProjectFile = "app.explorer.editProjectFile";
     public const string UnloadProject = "app.explorer.unloadProject";
     public const string ReloadProject = "app.explorer.reloadProject";
+    public const string IncludeInProject = "app.explorer.includeInProject";
+    public const string ExcludeFromProject = "app.explorer.excludeFromProject";
     public const string CompareFiles = "app.explorer.compareFiles";
     public const string CopyPath = "app.explorer.copyPath";
     public const string RevealInFileManager = "app.explorer.reveal";
@@ -276,6 +308,12 @@ public static class AppActions
     public const string RunAnotherCopy = "app.run.anotherCopy";
     public const string DebugAnotherCopy = "app.debug.anotherCopy";
 
+    // Run, Debug or Profile again in a tab of the Terminal window, of a program whose output in the Run or Debug window said
+    // it needs a terminal: no keys of Rider's.
+    public const string RunInTerminal = "app.run.inTerminal";
+    public const string DebugInTerminal = "app.debug.inTerminal";
+    public const string ProfileInTerminal = "app.profile.inTerminal";
+
     // Run, Debug and Profile of the program at hand (a gutter icon's, an Explorer row's, the open file's): no keys, Rider's
     // RunClass key being Attach to Process's in its Visual Studio keymap.
     public const string RunHere = "app.run.here";
@@ -285,6 +323,12 @@ public static class AppActions
     public const string StopAll = "app.stopAll";
     public const string Rerun = "app.rerun";
     public const string EditConfigurations = "app.editConfigurations";
+
+    // Where the chosen configuration's app runs (a device, an emulator or a simulator), the widget beside the configuration's.
+    public const string ChooseRunTarget = "app.chooseRunTarget";
+
+    // The build configuration and platform every build takes, the widget before the run configuration's: no keys of Rider's.
+    public const string ChooseBuildConfiguration = "app.chooseBuildConfiguration";
 
     // One of the folder's own run configurations saved as a launch profile of its project: no keys of Rider's.
     public const string SaveAsLaunchProfile = "app.saveAsLaunchProfile";
@@ -317,6 +361,8 @@ public static class AppActions
     public const string RestartCSharpServer = "app.restartCSharpServer";
     public const string ShowDebug = "app.showDebug";
     public const string HideToolWindow = "app.hideToolWindow";
+    public const string CloseToolWindow = "app.closeToolWindow";
+    public const string DockToolWindow = "app.dockToolWindow";
     public const string Back = "app.back";
     public const string Forward = "app.forward";
 
@@ -344,6 +390,14 @@ public static class AppActions
 
     // Passenger's own, for a GDScript: the style guide's Code order, kept out of Reformat Code; no keymap gives it keys.
     public const string OrderScriptParts = "app.code.orderScriptParts";
+
+    // Reqnroll's Find Unused Step Definitions, which its Visual Studio extension gives no keys either.
+    public const string FindUnusedStepDefinitions = "app.code.findUnusedStepDefinitions";
+
+    // The Step Library window over the folder's step definitions, and Insert Step into Feature of the one chosen there: no
+    // keys of Rider's.
+    public const string ShowStepLibrary = "app.showStepLibrary";
+    public const string InsertStep = "app.steps.insert";
 
     // Rider's ReformatWithPrettierAction (its Visual Studio keymaps give its keys to VcsShowPrevChangeMarker) and
     // Javascript.Linters.EsLint.Fix, which it names Fix ESLint Problems; both in the editor's menu.
@@ -386,6 +440,11 @@ public static class AppActions
     public const string NextError = "app.code.nextError";
     public const string PreviousError = "app.code.previousError";
     public const string FocusEditor = "app.focusEditor";
+
+    // The keys to the window's next and previous region (the toolbar, each tool window shown, the editor, the status bar),
+    // which no keymap of Rider's has an action for: Ctrl+Alt+` (Ctrl+Cmd+` on the Mac), Shift for back, in every keymap.
+    public const string NextRegion = "app.nextRegion";
+    public const string PreviousRegion = "app.previousRegion";
 
     // The debugger's, on the active editor and the session.
     public const string ToggleBreakpoint = "app.debug.toggleBreakpoint";
@@ -502,6 +561,7 @@ public static class AppActions
     public const string CommitSigning = "app.vcs.commitSigning";
     public const string CommitRefresh = "app.vcs.refreshChanges";
     public const string NuGetRefresh = "app.nuget.refresh";
+    public const string NuGetUpdateAll = "app.nuget.updateAll";
     public const string LiveTreeRefresh = "app.liveTree.refresh";
 
     // The breakpoints' windows, the window's to show.
@@ -611,7 +671,12 @@ public static class AppActions
     public static Keymap Keymap(KeymapPreset preset, IReadOnlyDictionary<string, string[]> overrides)
     {
         // A chord no keymap here takes and a game is unlikely to want, as the game hears it while it has the keys.
-        Keymap keymap = Base(preset).Bind(GameKeys, "control F11");
+        Keymap keymap = Base(preset).Bind(GameKeys, "control F11")
+            .Bind(NextRegion, OperatingSystem.IsMacOS() ? "control meta BACK_QUOTE" : "control alt BACK_QUOTE")
+            .Bind(PreviousRegion, OperatingSystem.IsMacOS() ? "control meta shift BACK_QUOTE" : "control alt shift BACK_QUOTE")
+            // The Switcher's keys are the same in every keymap of Rider's (Switcher).
+            .Bind(Switcher, "control TAB")
+            .Bind(SwitcherBackward, "control shift TAB");
         foreach ((string action, string[] shortcuts) in overrides)
         {
             List<Shortcut> keys = [];
@@ -652,7 +717,8 @@ public static class AppActions
         if (OperatingSystem.IsMacOS())
         {
             return keymap
-                .Bind(Open, "meta O")
+                .Bind(OpenSolution, "control shift O")
+                .Bind(OpenFile, "meta O")
                 .Bind(NewProject, "meta shift N")
                 .Bind(NewItem, "meta N", "alt INSERT")
                 .Bind(Save, "meta S")
@@ -783,7 +849,8 @@ public static class AppActions
                 .Bind(PreviousProjectWindow, "meta shift alt BACK_QUOTE");
         }
         return keymap
-            .Bind(Open, "control O")
+            .Bind(OpenSolution, "control shift O")
+            .Bind(OpenFile, "control O")
             .Bind(NewProject, "control shift N")
             .Bind(NewItem, "control N")
             .Bind(Save, "control S")
@@ -922,7 +989,8 @@ public static class AppActions
         if (OperatingSystem.IsMacOS())
         {
             return keymap
-                .Bind(Open, "meta O")
+                .Bind(OpenSolution, "control shift O")
+                .Bind(OpenFile, "meta O")
                 // VS Code's Ctrl+W, Switch Window; Cmd+Q is the application menu's Quit, as in the Visual Studio keymap.
                 .Bind(NextProjectWindow, "control W")
                 .Bind(PreviousProjectWindow, "meta alt shift BACK_QUOTE")
@@ -1038,7 +1106,8 @@ public static class AppActions
                 .Bind(RecentChanges, "alt shift C");
         }
         return keymap
-            .Bind(Open, "control O")
+            .Bind(OpenSolution, "control K , control O")
+            .Bind(OpenFile, "control O")
             // VS Code's Ctrl+W closes the editor here, its Switch Window macOS's Ctrl+W; Next Project Window has no key.
             .Bind(Save, "control S")
             .Bind(SaveAll, "control K , S")
@@ -1164,7 +1233,7 @@ public static class AppActions
         {
             // Cmd+Q, Exit's here, is the application menu's Quit, as in the other keymaps.
             return keymap
-                .Bind(Open, "control shift O")
+                .Bind(OpenSolution, "control shift O")
                 .Bind(NextProjectWindow, "meta alt BACK_QUOTE")
                 .Bind(PreviousProjectWindow, "meta alt shift BACK_QUOTE")
                 .Bind(SaveAll, "meta S")
@@ -1282,7 +1351,7 @@ public static class AppActions
                 .Bind(RecentChanges, "alt shift C");
         }
         return keymap
-            .Bind(Open, "control shift O")
+            .Bind(OpenSolution, "control shift O")
             .Bind(NextProjectWindow, "control alt CLOSE_BRACKET")
             .Bind(PreviousProjectWindow, "control alt OPEN_BRACKET")
             .Bind(SaveAll, "control S")

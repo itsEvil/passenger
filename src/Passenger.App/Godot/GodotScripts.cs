@@ -32,12 +32,13 @@ public static class GodotScripts
     /// person's editor (<see cref="GodotIdeLink"/>).</summary>
     public static bool Headless(int port) => HeadlessPorts.ContainsKey(port);
 
-    /// <summary>The Godot project a file is in: the nearest folder above it holding a project.godot; null for none.</summary>
+    /// <summary>The Godot project a file is in: the nearest folder above it holding a project.godot, in the person's folders
+    /// (<see cref="FoldersUp"/>); null for none.</summary>
     public static string? ProjectOf(string path)
     {
-        for (string? folder = Path.GetDirectoryName(path); folder is not null; folder = Path.GetDirectoryName(folder))
+        foreach (string folder in Path.GetDirectoryName(path) is { } start ? FoldersUp.From(start) : [])
         {
-            if (File.Exists(Path.Combine(folder, GodotProject.FileName)))
+            if (FoldersUp.Found(folder, GodotProject.FileName) is { } project && File.Exists(project))
             {
                 return folder;
             }
@@ -791,7 +792,7 @@ public static class GodotScripts
             || FileIdentity.Told && identities.GetValueOrDefault(name) is { } was && FileIdentity.Of(path) == was || persons.Value is not null;
 
         /// <summary>What tells a file as it stands from itself as it stood, without reading it.</summary>
-        private static (ulong? Identity, DateTime Written) Stamp(string path) => (FileIdentity.Of(path), File.GetLastWriteTimeUtc(path));
+        private static (ulong? Identity, DateTime Written) Stamp(string path) => (FileIdentity.Of(path), FileStamp.WrittenAt(path));
 
         /// <summary>Waits as a change found does (<see cref="Settle"/>, at most) for the folder's watcher to say Godot saved
         /// project.godot, where it changed with no such word yet: a run's last save is heard a moment after the run ends.</summary>

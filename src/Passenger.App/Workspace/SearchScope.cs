@@ -76,8 +76,9 @@ public sealed class FileMask
     /// <summary>Whether a file's name passes the mask.</summary>
     public bool Matches(string name) => (included?.IsMatch(name) ?? true) && !(excluded?.IsMatch(name) ?? false);
 
+    /// <summary>The wildcards as one pattern, on the linear engine: a mask of many stars matches a long name at once.</summary>
     private static Regex? Compiled(List<string> patterns) =>
-        patterns.Count == 0 ? null : new Regex($"^(?:{string.Join('|', patterns)})$", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+        patterns.Count == 0 ? null : new Regex($"^(?:{string.Join('|', patterns)})$", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant | RegexOptions.NonBacktracking);
 
     /// <summary>A wildcard as a pattern: every character itself but * and ?.</summary>
     private static string Pattern(string wildcard)
@@ -134,8 +135,9 @@ public sealed record SearchPlace(bool All, IReadOnlyList<string> Folders, bool R
     private bool Passes(string path) => Mask?.Matches(Path.GetFileName(path)) ?? true;
 }
 
-/// <summary>What Find in Files keeps for every folder, in the store's find.json: the file mask (null while it is off),
-/// the masks used lately, the latest first, and whether a directory is searched with its subdirectories.</summary>
+/// <summary>What Find in Files and Find Usages keep for every folder, in the store's find.json: the file mask (null while
+/// it is off), the masks used lately, the latest first, whether a directory is searched with its subdirectories, and the
+/// side of a search's usages the Find window shows alone (null for both).</summary>
 public sealed record FindSettingsState : IStateDocument<FindSettingsState>
 {
     /// <summary>The most masks kept.</summary>
@@ -147,13 +149,16 @@ public sealed record FindSettingsState : IStateDocument<FindSettingsState>
 
     public bool Recursive { get; init; } = true;
 
+    public ToolWindows.UsageSide? UsagesAlone { get; init; }
+
     public static IReadOnlyList<Action<JsonObject>> Upgrades { get; } = [StateStore.Unversioned];
 
-    /// <summary>A blank mask is none, and a recent one blank or twice is left out.</summary>
+    /// <summary>A blank mask is none, a recent one blank or twice is left out, and a side this build does not have is both.</summary>
     public FindSettingsState Clamped() => this with
     {
         FileMask = string.IsNullOrWhiteSpace(FileMask) ? null : FileMask,
         RecentFileMasks = [.. (RecentFileMasks ?? []).Where(m => !string.IsNullOrWhiteSpace(m)).Distinct(StringComparer.Ordinal).Take(RecentLimit)],
+        UsagesAlone = UsagesAlone is { } side && Enum.IsDefined(side) ? side : null,
     };
 }
 

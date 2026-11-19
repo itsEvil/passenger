@@ -244,6 +244,27 @@ public sealed partial class FileTests : IDisposable
         Assert.Empty(Directory.EnumerateFiles(folder, "*" + FileText.SaveSuffix));
     }
 
+    /// <summary>A save of a file another program reads sharing its deletion (a scanner, an indexer) lands at once as a new
+    /// file in its place, that program reading on in the file it opened, never a write into the file it reads.</summary>
+    [AvaloniaFact]
+    public void A_file_another_program_reads_sharing_its_deletion_is_saved_at_once_and_that_program_reads_on_in_the_old_one()
+    {
+        string path = Path.Combine(folder, "One.cs");
+        File.WriteAllText(path, "class One { }\n");
+        MainWindow window = Open();
+        Edit(window, "One.cs", "public ");
+        using (FileStream reading = new(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
+        {
+            Ui.Press(window, Ui.Shortcut(AppActions.Save));
+            Assert.True(File.ReadAllText(path) == "public class One { }\n",
+                $"The save did not land while another program read One.cs sharing its deletion: it holds '{File.ReadAllText(path)}', {window.Status}");
+            using StreamReader opened = new(reading);
+            Assert.True(opened.ReadToEnd() == "class One { }\n", "The save wrote into the file another program was reading, which saw the bytes change under it");
+        }
+        Assert.Empty(Directory.EnumerateFiles(folder, "*" + FileText.SaveSuffix));
+        window.Close();
+    }
+
     /// <summary>Windows refuses a save while another program holds the file sharing neither writes nor its deletion, as a
     /// build reading it does: the save lands once the program lets go, the window's thread running on meanwhile, a save
     /// made meanwhile landing after it, and Local History keeping each one's old bytes.</summary>
@@ -265,7 +286,7 @@ public sealed partial class FileTests : IDisposable
             Ui.PumpUntil(() => !window.EditorArea.Active!.IsModified, "the window to take the second save", TimeSpan.FromSeconds(10));
             Assert.True(File.ReadAllText(path) == "class One { }\n", "A save landed in a file another program held, sharing no writes");
         }
-        Ui.WaitFor(() => File.ReadAllText(path) == "sealed public class One { }\n", () => $"the saves to land once the file was let go: '{File.ReadAllText(path)}', {window.Status}");
+        Ui.WaitFor(() => Ui.Shared(path) == "sealed public class One { }\n", () => $"the saves to land once the file was let go: '{Ui.Shared(path)}', {window.Status}");
         Assert.Empty(Directory.EnumerateFiles(folder, "*" + FileText.SaveSuffix));
         Passenger.App.History.LocalHistory history = window.LocalHistory!;
         string canonical = PathNames.Canonical(path);
@@ -507,6 +528,37 @@ public sealed partial class FileTests : IDisposable
         window.Close();
     }
 
+    /// <summary>A file whose access control list is just what its folder gives a new file, its entries unmarked as a folder
+    /// whose own list is not marked auto-inherited gives them: a save moves the new file into place, never through
+    /// ReplaceFile, which holds the file from every other program's read while it replaces it.</summary>
+    [AvaloniaFact]
+    [System.Runtime.Versioning.SupportedOSPlatform("windows")]
+    public void A_save_on_Windows_of_a_file_with_only_the_access_control_list_its_folder_gives_moves_it_into_place()
+    {
+        Assert.SkipUnless(OperatingSystem.IsWindows(), "ReplaceFile and an access control list's marks of inheritance are Windows'");
+        string plain = Path.Combine(folder, "Plain");
+        Directory.CreateDirectory(plain);
+        using (System.Security.Principal.WindowsIdentity me = System.Security.Principal.WindowsIdentity.GetCurrent())
+        {
+            // Not marked auto-inherited, as a list an older tool set is kept: a file made in the folder takes its entries unmarked.
+            System.Security.AccessControl.RawSecurityDescriptor unmarked = new($"D:(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;{me.User})");
+            byte[] given = new byte[unmarked.BinaryLength];
+            unmarked.GetBinaryForm(given, 0);
+            Assert.True(SetFileSecurity(plain, DaclSecurityInformation, given), $"The folder's list was refused: {System.Runtime.InteropServices.Marshal.GetLastPInvokeError()}");
+        }
+        string path = Path.Combine(plain, "Plain.cs");
+        File.WriteAllText(path, "class Plain { }\n");
+        Assert.True(Unmarked(path), "The folder gave its new file a list marked inherited, so nothing here asks for a move");
+        MainWindow window = Open();
+        Edit(window, Path.Combine("Plain", "Plain.cs"), "public ");
+        Ui.Press(window, Ui.Shortcut(AppActions.Save));
+
+        Assert.Equal("public class Plain { }\n", File.ReadAllText(path));
+        Assert.False(window.EditorArea.Active!.IsModified, $"The file was not saved: {window.Status}");
+        Assert.True(Unmarked(path), "The save went through ReplaceFile (its list came back marked auto-inherited), which holds the file from every other program's read meanwhile, though a move loses nothing it has");
+        window.Close();
+    }
+
     [Gate]
     [AvaloniaFact]
     public void A_read_only_file_is_never_written_by_a_save_and_its_first_edit_and_each_save_ask_to_make_it_writable()
@@ -645,6 +697,30 @@ public sealed partial class FileTests : IDisposable
 
     [System.Runtime.InteropServices.LibraryImport("libc", EntryPoint = "getxattr", StringMarshalling = System.Runtime.InteropServices.StringMarshalling.Utf8)]
     private static partial nint GetXattr(string path, string name, byte[]? value, nuint size);
+
+    /// <summary>DACL_SECURITY_INFORMATION: a file's access control list alone.</summary>
+    private const uint DaclSecurityInformation = 0x4;
+
+    /// <summary>Whether a file's access control list, as stored, is neither marked auto-inherited nor holds an entry marked
+    /// inherited, as one ReplaceFile writes always is.</summary>
+    [System.Runtime.Versioning.SupportedOSPlatform("windows")]
+    private static bool Unmarked(string path)
+    {
+        byte[] descriptor = new byte[4096];
+        Assert.True(GetFileSecurity(path, DaclSecurityInformation, descriptor, (uint)descriptor.Length, out uint _),
+            $"{Path.GetFileName(path)}'s access control list could not be read: {System.Runtime.InteropServices.Marshal.GetLastPInvokeError()}");
+        System.Security.AccessControl.RawSecurityDescriptor security = new(descriptor, 0);
+        return !security.ControlFlags.HasFlag(System.Security.AccessControl.ControlFlags.DiscretionaryAclAutoInherited)
+            && security.DiscretionaryAcl is { } list && list.Cast<System.Security.AccessControl.GenericAce>().All(e => !e.IsInherited);
+    }
+
+    [System.Runtime.InteropServices.LibraryImport("advapi32.dll", EntryPoint = "GetFileSecurityW", SetLastError = true, StringMarshalling = System.Runtime.InteropServices.StringMarshalling.Utf16)]
+    [return: System.Runtime.InteropServices.MarshalAs(System.Runtime.InteropServices.UnmanagedType.Bool)]
+    private static partial bool GetFileSecurity(string path, uint asked, byte[] descriptor, uint length, out uint needed);
+
+    [System.Runtime.InteropServices.LibraryImport("advapi32.dll", EntryPoint = "SetFileSecurityW", SetLastError = true, StringMarshalling = System.Runtime.InteropServices.StringMarshalling.Utf16)]
+    [return: System.Runtime.InteropServices.MarshalAs(System.Runtime.InteropServices.UnmanagedType.Bool)]
+    private static partial bool SetFileSecurity(string path, uint given, byte[] descriptor);
 
     private static string? EncodingShown(MainWindow window) => Avalonia.Controls.ControlExtensions.FindControl<Avalonia.Controls.TextBlock>(window, "EncodingText")!.Text;
 

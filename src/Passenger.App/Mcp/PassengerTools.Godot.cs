@@ -31,7 +31,7 @@ public sealed partial class PassengerTools
         GodotGame? meant = app switch
         {
             null => !Session.Inspecting.Any(a => a.App.State is LiveAppState.Waiting or LiveAppState.Connected) ? chosen : null,
-            "ide" => null,
+            OwnWindows => null,
             "run" => RunApp() is null && chosen.Debugged is null && Session.Profiled is null ? chosen : null,
             "debug" => DebugApp() is null && chosen.Debugged is not null ? chosen : null,
             "profile" => Session.ProfiledApp is null && Session.Profiled is not null && chosen.Debugged is null ? chosen : null,
@@ -54,7 +54,7 @@ public sealed partial class PassengerTools
                 await game.FirstSceneAsync(AppUiLimit, cancel);
                 return game;
             case LiveAppState.Waiting:
-                throw new TimeoutException($"{game.Name} has not connected to Passenger, its remote debugger, in {AppUiLimit.TotalSeconds:0} s");
+                throw new TimeoutException($"{game.Name} has not connected to Passenger, its remote debugger, in {Durations.Said(AppUiLimit)}");
             default:
                 throw new InvalidOperationException($"{game.Name} has ended: run or debug_start starts it again");
         }
@@ -69,22 +69,29 @@ public sealed partial class PassengerTools
         using IDisposable asking = GodotGame.Within(GameLimit);
         GodotNode root = await game.SceneTreeAsync();
         Dictionary<long, List<object?>> drawn = [];
+        Dictionary<string, IReadOnlyList<string>>? bases = null;
         string? unplaced = null;
         try
         {
-            if (await game.AskAsync("layout", properties.Select(p => (object?)p).ToList()) is [List<object?> nodes])
+            if (await game.AskAsync("layout", properties.Select(p => (object?)p).ToList()) is [List<object?> nodes, ..] answer)
             {
                 foreach (List<object?> node in nodes.OfType<List<object?>>().Where(n => n is [long, ..] && n.Count >= 9))
                 {
                     drawn[(long)node[0]!] = node;
                 }
+                // Each script and engine class by what it derives from directly, as the tree names their types.
+                bases = answer is [_, List<object?> derived]
+                    ? derived.OfType<List<object?>>().Where(pair => pair is [string, string])
+                        .GroupBy(pair => TypeOf((string)pair[0]!), StringComparer.Ordinal)
+                        .ToDictionary(names => names.Key, names => (IReadOnlyList<string>)[.. names.Select(pair => TypeOf((string)pair[1]!)).Distinct()], StringComparer.Ordinal)
+                    : null;
             }
         }
         catch (LiveAppException failed)
         {
             unplaced = failed.Message;
         }
-        return (new AppTree([Of(root)]), unplaced, root);
+        return (new AppTree([Of(root)]) { Bases = bases }, unplaced, root);
 
         Element Of(GodotNode node)
         {
@@ -126,7 +133,7 @@ public sealed partial class PassengerTools
     /// <summary>The game's tree, flattened, and its window named (else its root).</summary>
     private async Task<(List<AppNode> Nodes, AppNode Window)> GameTreeOf(GodotGame game, string? window)
     {
-        List<AppNode> nodes = AppQuery.Flatten((await GameTreeAsync(game, [])).Tree.Roots);
+        List<AppNode> nodes = AppQuery.Flatten((await GameTreeAsync(game, [])).Tree);
         return (nodes, await GameWindowAsync(game, nodes, window));
     }
 
@@ -172,7 +179,7 @@ public sealed partial class PassengerTools
     {
         using IDisposable asking = GodotGame.Within(GameLimit);
         (AppTree tree, _, GodotNode root) = await GameTreeAsync(game, []);
-        List<AppNode> nodes = AppQuery.Flatten(tree.Roots);
+        List<AppNode> nodes = AppQuery.Flatten(tree);
         AppNode chosen = await GameWindowAsync(game, nodes, window);
         List<AppNode> found = AppQuery.Find(Within(nodes, window is null ? null : chosen), control);
         if (found.Count == 0)
@@ -302,14 +309,15 @@ public sealed partial class PassengerTools
 
     private static long GameModifiers(IReadOnlyList<string>? names) => GameModifiers(Modifiers(names) ?? []);
 
-    /// <summary>Modifiers as the helper takes them, Primary the command key of the system the game runs on.</summary>
-    private static long GameModifiers(IEnumerable<Modifier> held) => held.Aggregate(0L, (flags, one) => flags | (long)(one switch
+    /// <summary>Modifiers as the helper takes them, Primary the command key of the system the game runs on, this one
+    /// (<see cref="HeldModifiers.Held"/>).</summary>
+    private static long GameModifiers(IEnumerable<Modifier> held) => held.Aggregate(0L, (flags, one) => flags | (long)(one.Held() switch
     {
         Modifier.Shift => GodotAgent.Shift,
         Modifier.Control => GodotAgent.Control,
         Modifier.Alt => GodotAgent.Alt,
         Modifier.Meta => GodotAgent.Meta,
-        _ => OperatingSystem.IsMacOS() ? GodotAgent.Meta : GodotAgent.Control,
+        _ => throw new ArgumentException($"No modifier {one}"),
     }));
 
     private async Task<string> GameClickAsync(GodotGame game, string? control, double? x, double? y, string? window, string button, int count, IReadOnlyList<string>? modifiers)
@@ -365,9 +373,9 @@ public sealed partial class PassengerTools
     private async Task<string> GameKeyAsync(GodotGame game, string keys, string? control, string? window)
     {
         using IDisposable asking = GodotGame.Within(GameLimit);
-        IReadOnlyList<Chord> chords = Chords(keys);
+        List<Pressed> chords = Chords(keys);
         (List<AppNode> nodes, AppNode? element, AppNode target) = await GameTarget(game, control, window, needsPoint: false, null, null);
-        List<object?> pressed = [.. chords.Select(c => (object?)new List<object?> { GodotAgent.KeyName(c.Key), GameModifiers(c.Modifiers) })];
+        List<object?> pressed = [.. chords.Select(c => (object?)new List<object?> { GodotAgent.KeyName(c.Key), GameModifiers(c.Held), c.Text ?? string.Empty })];
         List<object?> said = await game.AskAsync("key", element?.Element.Id ?? 0L, target.Element.Id, pressed);
         InputDone done = GameDone(nodes, target, said);
         return $"Pressed {keys.Trim()} in {done.Focused ?? "the window, nothing having the focus"}{KeysHeld(element, done, said)}{Said(done)}";

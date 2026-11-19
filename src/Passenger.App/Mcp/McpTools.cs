@@ -54,6 +54,7 @@ public static class McpTools
     public const string Refactor = "refactor";
     public const string Rename = "rename";
     public const string ReplaceInFiles = "replace_in_files";
+    public const string RequestFullAccess = "request_full_access";
     public const string Run = "run";
     public const string SaveAll = "save_all";
     public const string Settings = "settings";
@@ -72,4 +73,20 @@ public static class McpTools
     public const string VcsStash = "vcs_stash";
     public const string VcsStatus = "vcs_status";
     public const string Workspace = "workspace";
+
+    /// <summary>The tools a window whose folder is not trusted refuses, each with why: those that run the open folder's code
+    /// (build it, run, debug, test or profile its programs, restore its packages, apply Hot Reload to them,
+    /// <see cref="Refusals.Untrusted"/>), and nuget_search, which asks the feeds the folder's nuget.config names
+    /// (<see cref="Refusals.UntrustedFeeds"/>).</summary>
+    public static IReadOnlyDictionary<string, string> Untrusted { get; } = new Dictionary<string, string>(StringComparer.Ordinal)
+    {
+        [Build] = Refusals.Untrusted,
+        [Run] = Refusals.Untrusted,
+        [DebugStart] = Refusals.Untrusted,
+        [TestsRun] = Refusals.Untrusted,
+        [Profile] = Refusals.Untrusted,
+        [HotReload] = Refusals.Untrusted,
+        [NugetInstall] = Refusals.Untrusted,
+        [NugetSearch] = Refusals.UntrustedFeeds,
+    };
 }

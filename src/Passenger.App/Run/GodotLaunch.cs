@@ -38,6 +38,10 @@ public static class GodotLaunch
         return $"{version}, a .NET build, which runs C#{(setting is null ? $", from {found.From}" : string.Empty)}: {found.Executable}";
     }
 
+    /// <summary>The configuration whose build Godot's editor and a game it runs load, whatever another build made: ExportDebug
+    /// and ExportRelease are an export's.</summary>
+    public const string RunsConfiguration = "Debug";
+
     /// <summary>Why no Godot runs a Godot project's game, in words for the person.</summary>
     public static string NotFound =>
         $"no Godot was found to run it: install Godot's .NET build, then choose its executable in {SettingsDialog.PlaceOfPage(SettingsDialog.GodotPage)}, set {GodotExecutables.Variable} to it, or put it on the PATH";
@@ -60,12 +64,12 @@ public static class GodotLaunch
     }
 
     /// <summary>The plan of a Godot project's configuration that names no program of its own, or Godot: its game, or its editor
-    /// on the scene of the file at hand (<see cref="GodotProject.SceneOf"/>), on the Godot found, its arguments after those that
-    /// start it, in its working folder or the Godot project's, headless where nobody sees it (<paramref name="unseen"/>); of
-    /// GDScript alone (no <paramref name="target"/>) on any Godot 4, nothing built. A <see cref="LaunchException"/> says why not:
-    /// no project.godot or Godot, a Godot.NET.Sdk (<paramref name="sdk"/>) newer than it, no scene, another assembly or folder.</summary>
+    /// on the scene at hand (<see cref="GodotProject.SceneOf"/>) given the .NET its builds of <paramref name="builtFor"/> need
+    /// (<see cref="GodotEditorDotnet"/>), on the Godot found, its own arguments last, in its working folder or the project's,
+    /// headless where nobody sees it (<paramref name="unseen"/>); of GDScript alone (no <paramref name="target"/>) on any Godot 4.
+    /// A <see cref="LaunchException"/> says why not: no project.godot or Godot, an SDK (<paramref name="sdk"/>) newer, no scene.</summary>
     internal static async Task<LaunchPlan> PlanAsync(RunConfiguration configuration, ProjectModel project, string folder, string? target, string? framework,
-        Func<string, string> expand, IReadOnlyDictionary<string, string> environment, string? setting, string? sdk, bool unseen, CancellationToken cancel, string? atHand = null)
+        Func<string, string> expand, IReadOnlyDictionary<string, string> environment, string? setting, string? sdk, bool unseen, CancellationToken cancel, string? atHand = null, string? builtFor = null)
     {
         GodotProject game = GodotProject.Read(folder)
             ?? throw new LaunchException($"{configuration.Name} cannot run: {folder} holds no {GodotProject.FileName}, which makes it the Godot project Godot runs");
@@ -155,6 +159,19 @@ public static class GodotLaunch
         }
         int leading = arguments.Count;
         arguments.AddRange(own);
+        // An editor builds the game's C# itself, with a dotnet the .NET it runs on may not suit.
+        GodotEditorDotnet.Given builds = target is not null && GodotExecutables.OpensEditor(arguments)
+            ? await BackgroundWork.Run(() => GodotEditorDotnet.For(found, environment, working, framework ?? builtFor, runsGame: true))
+            : GodotEditorDotnet.Given.AsItStands;
+        if (builds.Variables.Count > 0)
+        {
+            Dictionary<string, string> merged = new(environment, StringComparer.Ordinal);
+            foreach ((string name, string value) in builds.Variables)
+            {
+                merged[name] = value;
+            }
+            environment = merged;
+        }
         return new LaunchPlan
         {
             Name = configuration.Name,
@@ -178,6 +195,7 @@ public static class GodotLaunch
             GodotStretches = game.Stretches,
             ScriptsAlone = project.IsScriptGame,
             GameName = project.IsScriptGame ? project.Name : null,
+            Notes = builds.WhyNot is { } unbuilt ? [unbuilt] : [],
         };
     }
 

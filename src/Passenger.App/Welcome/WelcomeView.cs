@@ -14,8 +14,8 @@ using Passenger.Workspace;
 namespace Passenger.App.Welcome;
 
 /// <summary>The Welcome screen, a start page in the window while nothing is open: Passenger's mark and version, New
-/// Solution, Open, Open Folder and Clone Repository, and the folders, solutions and projects opened lately (each with what
-/// it opens as), newest first and narrowed as a search is typed. Up and Down
+/// Solution, Open Solution, Open Folder, Open File and Clone Repository, and the folders, solutions and projects opened
+/// lately (each with what it opens as), newest first and narrowed as a search is typed. Up and Down
 /// choose one from the search box or the list, Enter opens it, and Delete (Backspace on the Mac) or its menu removes it.
 /// One gone from disk is marked, and the window says so when it is opened (<see cref="Say"/>).</summary>
 public sealed class WelcomeView : UserControl
@@ -35,7 +35,7 @@ public sealed class WelcomeView : UserControl
         TextBlock subtitle = new()
         {
             Classes = { StyleClasses.WelcomeSubtitle },
-            Text = $"Version {Product.Version}. Start a new solution, open a solution, project or folder, or clone a repository.",
+            Text = $"Version {Product.Version}. Start a new solution, open a solution, project, folder or file, or clone a repository.",
             TextWrapping = TextWrapping.Wrap,
         };
         Grid hero = new() { Classes = { StyleClasses.WelcomeHero }, ColumnDefinitions = new ColumnDefinitions("Auto,*") };
@@ -46,18 +46,22 @@ public sealed class WelcomeView : UserControl
 
         NewSolutionButton = Action(IconKeys.Add, "New Solution", "From a template");
         NewSolutionButton.Click += (_, _) => NewSolutionRequested?.Invoke(this, EventArgs.Empty);
-        Button open = Action(IconKeys.Solution, "Open", "A solution or project");
-        open.Click += (_, _) => OpenRequested?.Invoke(this, EventArgs.Empty);
+        Button openSolution = Action(IconKeys.Solution, "Open Solution", "A solution or project");
+        openSolution.Click += (_, _) => OpenSolutionRequested?.Invoke(this, EventArgs.Empty);
         Button openFolder = Action(IconKeys.FolderOpen, "Open Folder", "A folder of code");
         openFolder.Click += (_, _) => OpenFolderRequested?.Invoke(this, EventArgs.Empty);
+        Button openFile = Action(IconKeys.DocumentText, "Open File", "Any file, on its own");
+        openFile.Click += (_, _) => OpenFileRequested?.Invoke(this, EventArgs.Empty);
         Button clone = Action(IconKeys.Branch, "Clone Repository", "From a Git URL");
         clone.Click += (_, _) => CloneRequested?.Invoke(this, EventArgs.Empty);
-        WrapPanel actions = new() { Classes = { StyleClasses.WelcomeActions }, Children = { NewSolutionButton, open, openFolder, clone } };
-        // Two or one across in a narrow page, so no tile is cut off at its edge.
+        WrapPanel actions = new() { Classes = { StyleClasses.WelcomeActions }, Children = { NewSolutionButton, openSolution, openFolder, openFile, clone } };
+        // As many across as fit whole, in rows as even as they go, so no tile is cut off at its edge or left alone in a row.
         actions.SizeChanged += (_, e) =>
         {
             double gap = actions.ItemSpacing;
-            int across = e.NewSize.Width >= 4 * ActionWidth + 3 * gap ? 4 : e.NewSize.Width >= 2 * ActionWidth + gap ? 2 : 1;
+            int fit = Math.Clamp((int)((e.NewSize.Width + gap) / (ActionWidth + gap)), 1, actions.Children.Count);
+            int rows = (actions.Children.Count + fit - 1) / fit;
+            int across = (actions.Children.Count + rows - 1) / rows;
             actions.ItemWidth = Math.Floor((e.NewSize.Width - (across - 1) * gap) / across);
         };
 
@@ -66,15 +70,24 @@ public sealed class WelcomeView : UserControl
         search.TextChanged += (_, _) => Filter();
         Grid bar = new() { Classes = { StyleClasses.WelcomeRecentBar }, ColumnDefinitions = new ColumnDefinitions("Auto,*"), Children = { recent, search } };
 
-        notice = new TextBlock { TextWrapping = TextWrapping.Wrap, IsVisible = false, Margin = new Thickness(4, 0, 4, 10) };
+        notice = new TextBlock { TextWrapping = TextWrapping.Wrap, IsVisible = false, Margin = new Thickness(Gaps.Tight, 0, Gaps.Tight, Gaps.Wide) };
         notice.Bind(TextBlock.ForegroundProperty, notice.GetResourceObservable(TokenKeys.Warning));
         list = new ListBox
         {
             Classes = { StyleClasses.Tree, StyleClasses.WelcomeList },
         };
         ReusedRows.Use(list, Row);
-        list.DoubleTapped += (_, _) => OpenChosen();
-        list.KeyDown += OnListKeyDown;
+        ListKeys.Act(list, new ListActs
+        {
+            Open = OpenChosen,
+            Remove = () =>
+            {
+                if (Selected is { } chosen)
+                {
+                    RemoveRequested?.Invoke(this, chosen);
+                }
+            },
+        });
         ListKeys.Search(search, list, OpenChosen);
         ListMenus.Attach(list, () => list.SelectedItem is not RecentRow chosen ? [] :
         [
@@ -95,7 +108,7 @@ public sealed class WelcomeView : UserControl
         page.Children.Add(new Border { Classes = { StyleClasses.WelcomeRecent }, Child = new Panel { Children = { list, empty } } });
         ScrollViewer scroller = new() { Content = page };
         scroller.SizeChanged += (_, e) => page.View = e.NewSize.Height - page.Margin.Top - page.Margin.Bottom;
-        Content = scroller;
+        Content = new Panel { Children = { scroller, new ThemeBackdrop(BackgroundPlaces.Welcome) } };
         Filter();
     }
 
@@ -141,8 +154,8 @@ public sealed class WelcomeView : UserControl
     /// <summary>The narrowest the hero is with the mark beside its words.</summary>
     private const double NarrowHero = 360;
 
-    /// <summary>The narrowest an action's tile is before the tiles go two or one across.</summary>
-    private const double ActionWidth = 160;
+    /// <summary>The narrowest an action's tile is, its name and hint whole beside its icon.</summary>
+    private const double ActionWidth = 200;
 
     /// <summary>One of the page's actions: its icon, its name, and in a few words what it opens.</summary>
     private static Button Action(string icon, string name, string hint)
@@ -163,10 +176,13 @@ public sealed class WelcomeView : UserControl
     /// <summary>A click on New Solution.</summary>
     public event EventHandler? NewSolutionRequested;
 
-    /// <summary>A click on Open, for a solution or project.</summary>
-    public event EventHandler? OpenRequested;
+    /// <summary>A click on Open Solution, for a solution or project.</summary>
+    public event EventHandler? OpenSolutionRequested;
 
     public event EventHandler? OpenFolderRequested;
+
+    /// <summary>A click on Open File, for a file to open in the editor.</summary>
+    public event EventHandler? OpenFileRequested;
 
     public event EventHandler? CloneRequested;
 
@@ -242,24 +258,6 @@ public sealed class WelcomeView : UserControl
         row.Name.Contains(word, StringComparison.OrdinalIgnoreCase) || row.Shown.Contains(word, StringComparison.OrdinalIgnoreCase)
         || FuzzyMatch.Score(word, row.Name) is not null;
 
-    private void OnListKeyDown(object? sender, KeyEventArgs e)
-    {
-        if (e.KeyModifiers != KeyModifiers.None || Selected is not { } chosen)
-        {
-            return;
-        }
-        if (e.Key == Key.Enter)
-        {
-            Chosen?.Invoke(this, chosen);
-            e.Handled = true;
-        }
-        else if (e.Key is Key.Delete or Key.Back)
-        {
-            RemoveRequested?.Invoke(this, chosen);
-            e.Handled = true;
-        }
-    }
-
     private void OpenChosen()
     {
         if (Selected is { } chosen)
@@ -279,7 +277,7 @@ public sealed class WelcomeView : UserControl
         DockPanel line = new() { Classes = { StyleClasses.WelcomeRow } };
         DockPanel.SetDock(badge, Dock.Left);
         line.Children.Add(badge);
-        TextBlock gone = new() { Text = "Missing", FontSize = 12, VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(10, 0, 4, 0) };
+        TextBlock gone = new() { Text = "Missing", FontSize = 12, VerticalAlignment = VerticalAlignment.Center, Margin = ListRow.Detail };
         gone.Bind(TextBlock.ForegroundProperty, gone.GetResourceObservable(TokenKeys.Warning));
         DockPanel.SetDock(gone, Dock.Right);
         line.Children.Add(gone);
@@ -287,7 +285,7 @@ public sealed class WelcomeView : UserControl
         Border kind = new() { Classes = { StyleClasses.WelcomeKind }, Child = kindText, VerticalAlignment = VerticalAlignment.Center };
         DockPanel.SetDock(kind, Dock.Right);
         line.Children.Add(kind);
-        line.Children.Add(new StackPanel { VerticalAlignment = VerticalAlignment.Center, Spacing = 2, Children = { name, where } });
+        line.Children.Add(new StackPanel { VerticalAlignment = VerticalAlignment.Center, Spacing = Gaps.Hair, Children = { name, where } });
         return line.Showing<RecentRow>(row =>
         {
             letters.Text = MainWindow.Initials(row.Name);

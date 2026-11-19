@@ -53,6 +53,10 @@ public static partial class ContainerLabels
 
     private static readonly object Watchdog = new();
 
+    /// <summary>This process's containers and networks the person chose to leave running as theirs, by short id, which the
+    /// watchdog's command passes over.</summary>
+    private static readonly SortedSet<string> Spared = new(StringComparer.Ordinal);
+
     /// <summary>The state folder's <c>containers.json</c>, the process's: whether anything was ever labelled for
     /// it.</summary>
     private static readonly Lazy<global::Passenger.App.State.StateDocument<ContainersState>> Kept =
@@ -62,9 +66,15 @@ public static partial class ContainerLabels
     /// then, so a person who never used containers here runs no docker command as Passenger starts. Any thread.</summary>
     public static bool EverLabelled => Kept.Value.Peek().Labelled;
 
-    /// <summary>Writes the record of a first labelling now, rather than a moment later: for a test that starts the next
-    /// Passenger at once.</summary>
-    public static void Flush() => Kept.Value.Flush();
+    /// <summary>Writes a change of the record still waiting now, on the caller's thread: as a window closes, and for a test
+    /// that starts the next Passenger at once. Any thread.</summary>
+    public static void Flush()
+    {
+        if (Kept.IsValueCreated)
+        {
+            Kept.Value.Flush();
+        }
+    }
 
     /// <summary>The state folder's label value: the first 16 hex digits of a SHA-256 of its path.</summary>
     public static string StateValue => StateValueOf(global::Passenger.App.State.StateStore.DefaultRoot);
@@ -104,7 +114,9 @@ public static partial class ContainerLabels
         TellWatchdog(engine);
         if (!Kept.Value.Value.Labelled)
         {
-            Kept.Value.Set(new ContainersState { Labelled = true });
+            Kept.Value.Set(Kept.Value.Value with { Labelled = true });
+            // At once: a start looks for what a crash left only where this is on disk.
+            IdeErrors.Observe(BackgroundWork.Run(Kept.Value.Flush));
         }
         List<string> words = ["--label", $"{State}={StateValue}", "--label", $"{Machine}={MachineValue}", "--label", $"{Process}={ProcessValue}"];
         if (folder is not null)
@@ -113,6 +125,20 @@ public static partial class ContainerLabels
         }
         return words;
     }
+
+    /// <summary>The <c>--filter</c> words for what this process made on this machine for a folder (<see cref="Arguments"/>),
+    /// of a Compose project where one is named: another window's run of a project of the same name, on a folder of the same
+    /// name, is never this one's. A null folder or project is any: the process's whole, as its end removes it.</summary>
+    public static string[] Ours(string? project, string? folder) =>
+    [
+        .. project is null ? [] : Filter(ComposeLabels.Project, project),
+        .. Filter(Machine, MachineValue),
+        .. Filter(Process, ProcessValue),
+        .. folder is null ? [] : Filter(Folder, FolderValue(folder)),
+    ];
+
+    /// <summary>The <c>--filter</c> words for what carries a label of that value.</summary>
+    private static string[] Filter(string label, string value) => ["--filter", $"label={label}={value}"];
 
     /// <summary>Containers made for this process that carry none of its labels (an Aspire AppHost's, made by its
     /// orchestrator), by id, and the networks made with them (its session network), by name, on the engine the IDE's
@@ -168,6 +194,42 @@ public static partial class ContainerLabels
         TellWatchdog(null);
     }
 
+    /// <summary>Containers and networks of this process (by the short id the engine lists them by) the person chose to leave
+    /// running as theirs: the watchdog's command passes them over, told again now, and the state's record keeps them, written
+    /// before the task ends, so the next start's clean-up passes them over too however soon this process ends
+    /// (<see cref="RemoveLeftoversAsync"/>). UI thread.</summary>
+    public static async Task LeaveToPersonAsync(ContainerEngine engine, IReadOnlyCollection<string> ids)
+    {
+        UiThread.Check();
+        lock (Watchdog)
+        {
+            Spared.UnionWith(ids);
+        }
+        ContainersState kept = Kept.Value.Value;
+        Kept.Value.Set(kept with { Left = [.. kept.Left.Union(ids, StringComparer.Ordinal)] });
+        TellWatchdog(engine);
+        await BackgroundWork.Run(Kept.Value.Flush);
+    }
+
+    /// <summary>What the person chose to leave running as theirs for a state folder (its <c>containers.json</c>, and for
+    /// this process's own, what it left since, which the file may not hold yet), by short id. Any thread.</summary>
+    public static IReadOnlyList<string> LeftIn(string stateFolder)
+    {
+        if (!PathNames.Same(stateFolder, global::Passenger.App.State.StateStore.DefaultRoot))
+        {
+            return new global::Passenger.App.State.StateDocument<ContainersState>(Path.Combine(stateFolder, "containers.json")).Peek().Left;
+        }
+        IReadOnlyList<string> written = Kept.Value.Peek().Left;
+        lock (Watchdog)
+        {
+            return [.. written.Union(Spared, StringComparer.Ordinal)];
+        }
+    }
+
+    /// <summary>Whether an engine's id (short or whole) is one of those left to the person.</summary>
+    private static bool IsLeft(string? id, IReadOnlyList<string> left) =>
+        id is { Length: > 0 } && left.Any(l => id.StartsWith(l, StringComparison.Ordinal) || l.StartsWith(id, StringComparison.Ordinal));
+
     /// <summary>Tells the watchdog the command that removes what this process made, when it changed: through the CLI as the
     /// engine's last state found it (else as it was told before), so finding it never waits on the caller's thread.</summary>
     private static void TellWatchdog(ContainerEngine? engine)
@@ -181,7 +243,7 @@ public static partial class ContainerLabels
             if (EndCommand() is { } end && end != toldWatchdog)
             {
                 toldWatchdog = end;
-                ChildProcesses.AtIdeEnd(end);
+                ChildProcesses.AtIdeEnd(nameof(ContainerLabels), end);
             }
         }
     }
@@ -209,9 +271,11 @@ public static partial class ContainerLabels
             {
                 docker += $" --context {Quoted(context)}";
             }
-            string labels = $"--filter {Quoted($"label={Process}={ProcessValue}")} --filter {Quoted($"label={Machine}={MachineValue}")}";
+            string labels = string.Join(' ', Ours(project: null, folder: null).Select(Quoted));
+            // What the person chose to leave running is listed with the rest and passed over by its id.
+            string spared = Spared.Count == 0 ? string.Empty : $" | grep -v -x -F{string.Concat(Spared.Select(id => $" -e {Quoted(id)}"))}";
             command.Append(CultureInfo.InvariantCulture,
-                $"{docker} rm -f $({docker} ps -aq {labels}){Named(Unlabelled)}; {docker} network rm $({docker} network ls -q {labels}){Named(UnlabelledNetworks)}");
+                $"{docker} rm -f $({docker} ps -aq {labels}{spared}){Named(Unlabelled)}; {docker} network rm $({docker} network ls -q {labels}{spared}){Named(UnlabelledNetworks)}");
         }
         foreach (MadeOn made in Elsewhere.Values)
         {
@@ -353,21 +417,22 @@ public static partial class ContainerLabels
             return removed;
         }
         string stateValue = StateValueOf(folder);
-        string filter = $"label={State}={stateValue}";
-        string machine = $"label={Machine}={MachineValue}";
+        string[] filters = [.. Filter(State, stateValue), .. Filter(Machine, MachineValue)];
+        // What the person chose to leave running as theirs is never a leftover.
+        IReadOnlyList<string> leftToPerson = LeftIn(folder);
         try
         {
-            IReadOnlyList<JsonElement> containers = await engine.JsonLinesAsync(["ps", "-a", "--filter", filter, "--filter", machine, "--format", "json"], cancel);
-            string[] gone = [.. containers.Select(ContainerInfo.Read).Where(c => IsLeftover(c.Labels.GetValueOrDefault(State), c.Labels.GetValueOrDefault(Machine),
-                c.Labels.GetValueOrDefault(Process), stateValue)).Select(c => c.Id)];
+            IReadOnlyList<JsonElement> containers = await engine.JsonLinesAsync(["ps", "-a", .. filters, "--format", "json"], cancel);
+            string[] gone = [.. containers.Select(ContainerInfo.Read).Where(c => !IsLeft(c.Id, leftToPerson) && IsLeftover(c.Labels.GetValueOrDefault(State),
+                c.Labels.GetValueOrDefault(Machine), c.Labels.GetValueOrDefault(Process), stateValue)).Select(c => c.Id)];
             if (gone.Length > 0)
             {
                 await engine.RunAsync(["rm", "-f", .. gone], ContainerEngine.AskLimit * 3, cancel);
                 removed.AddRange(gone);
             }
-            IReadOnlyList<JsonElement> networks = await engine.JsonLinesAsync(["network", "ls", "--filter", filter, "--filter", machine, "--format", "json"], cancel);
-            string[] left = [.. networks.Where(n => ContainerInfo.ReadLabels(n) is var labels && IsLeftover(labels.GetValueOrDefault(State),
-                    labels.GetValueOrDefault(Machine), labels.GetValueOrDefault(Process), stateValue))
+            IReadOnlyList<JsonElement> networks = await engine.JsonLinesAsync(["network", "ls", .. filters, "--format", "json"], cancel);
+            string[] left = [.. networks.Where(n => !IsLeft(ContainerInfo.IdOf(n), leftToPerson) && ContainerInfo.ReadLabels(n) is var labels
+                    && IsLeftover(labels.GetValueOrDefault(State), labels.GetValueOrDefault(Machine), labels.GetValueOrDefault(Process), stateValue))
                 .Select(ContainerInfo.IdOf).OfType<string>()];
             if (left.Length > 0)
             {

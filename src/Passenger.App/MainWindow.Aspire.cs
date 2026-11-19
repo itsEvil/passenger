@@ -88,7 +88,7 @@ public partial class MainWindow
         view.Metrics.Paused = MetricsPaused;
         view.BindActions(Actions, id => Request(id), RowMenuItem);
         view.RowChosen += (_, _) => lastServiceWindow = ToolWindowIds.Aspire;
-        view.Browse = Browse;
+        view.Browse = BrowsePage;
         view.LinkClicked += (_, link) => GoToAspireSource(link);
         view.AttachedToVisualTree += (_, _) => aspireDisplayChanged?.Invoke(this, EventArgs.Empty);
         view.DetachedFromVisualTree += (_, _) => aspireDisplayChanged?.Invoke(this, EventArgs.Empty);
@@ -266,7 +266,7 @@ public partial class MainWindow
                 }
                 model.SetAppHostConsole(model.SelectedApp is { } selected ? next.Aspire.FindApp(selected.AppHostPath)?.Console ?? next.Aspire.LastAppConsole : next.Aspire.LastAppConsole);
                 model.SetApps(next.Aspire.Apps.Select(app => new AspireApp(app.Configuration.Project,
-                    app.ProcessId ?? app.Runner.ProcessId ?? 0, app.IsTest ? "Testing" : app.Interactions is null ? "Starting" : "Running")).Concat(external));
+                    app.ProcessId ?? app.Runner.ProcessId ?? 0, app.IsTest ? "Testing" : app.Interactions is null ? AspireStates.Starting : AspireStates.Running)).Concat(external));
                 UpdateDisplay();
                 if (connected || previous != model.SelectedApp)
                 {
@@ -558,7 +558,7 @@ public partial class MainWindow
                 }
                 catch (TimeoutException)
                 {
-                    throw new InvalidOperationException($"{((IRunService)start).Name} did not stop within {limit.TotalSeconds:0} s of its AppHost's stop command");
+                    throw new InvalidOperationException($"{((IRunService)start).Name} did not stop within {Durations.Said(limit)} of its AppHost's stop command");
                 }
             }
         }
@@ -571,7 +571,7 @@ public partial class MainWindow
             IReadOnlyList<Passenger.Workspace.ProjectModel> projects = current.Projects;
             app.Rebuilt[start.Project] = await BackgroundWork.Run(() => BuiltInputs.Listed(start.Project, projects));
             // Its starts from now run this build: their sessions follow the edits from its save.
-            if (await buildRun.BuildForAsync(new BuildStep(start.Project, start.Plan.Framework), cancel, () => app.Rebuilding(start.Project, current.Debug.Kept()))
+            if (await buildRun.BuildForAsync(new BuildStep(start.Project, start.Plan.Framework), cancel, () => app.Rebuilding(start.Project, current.Debug.Kept()), app.Workspace)
                 is { Succeeded: false } failed)
             {
                 throw new InvalidOperationException(failed.Message);

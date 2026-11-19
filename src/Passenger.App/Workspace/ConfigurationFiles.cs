@@ -5,10 +5,12 @@ using Passenger.Workspace;
 
 namespace Passenger.App.Workspace;
 
-/// <summary>A project as its configuration is given before it runs: its file, its UserSecretsId as MSBuild evaluated it (else
-/// as its file sets it, read with the rest), the folders whose compose files may run it (its own up to the folder open) and
-/// those of the AppHosts that run it as a service, whose files are read off the UI thread.</summary>
-public sealed record ConfigurationProject(string Project, string? UserSecretsId, IReadOnlyList<string> ComposeFolders, IReadOnlyList<string> AppHostFolders)
+/// <summary>A program as its configuration is given before it runs: its file, its UserSecretsId as MSBuild evaluated it (else
+/// as its file sets it, read with the rest), the folders whose compose files may run it (its own up to the folder open),
+/// those of the AppHosts that run it as a service, whose files are read off the UI thread, and the projects whose code runs
+/// with it (<see cref="ProjectModel.CodeItRuns"/>), whose reads its keys are.</summary>
+public sealed record ConfigurationProject(string Project, string? UserSecretsId, IReadOnlyList<string> ComposeFolders, IReadOnlyList<string> AppHostFolders,
+    IReadOnlyList<string> Code)
 {
     public string Name => Path.GetFileNameWithoutExtension(Project);
 
@@ -19,9 +21,39 @@ public sealed record ConfigurationProject(string Project, string? UserSecretsId,
         UserSecrets.FileOf(UserSecrets.Of(Project, UserSecretsId, text)) is { } file ? PathNames.Canonical(file) : null;
 
     /// <summary>Its appsettings.json, there or not.</summary>
-    public string Settings => Path.Combine(Folder, "appsettings.json");
+    public string Settings => Path.Combine(Folder, AppSettingsFiles.Base);
 
     public string LaunchSettings => Run.LaunchProfile.SettingsIn(Folder);
+}
+
+/// <summary>A project's code as configuration reaches it: the project, whose reads the extension is asked for, and the
+/// configurations of the programs that run it (<see cref="ProjectModel.ProgramsRunning"/>), its own where it owns one, by
+/// name. A key is given where any of them gives it: which program runs a library's read is not known before it runs.</summary>
+public sealed record ConfiguredCode(string Project, IReadOnlyList<ConfigurationProject> Programs)
+{
+    /// <summary>The programs by name, as a choice is said: "Shop", "Admin or Shop".</summary>
+    public string Names => Plural.Either([.. Programs.Select(p => p.Name)]);
+
+    /// <summary>Whether a program is another project's than the code's, which what is said of it names.</summary>
+    public bool Apart(ConfigurationProject program) => !PathNames.Same(program.Project, Project);
+
+    /// <summary>A program's file as said of the code: its name, after the program's where that is another project
+    /// ("Shop's appsettings.json").</summary>
+    public string Of(ConfigurationProject program, string file) => Apart(program) ? $"{program.Name}'s {file}" : file;
+
+    /// <summary>Every key the programs' sources give (<see cref="ConfigurationFiles.Given"/>), each with the program it was
+    /// found for, a place two programs share once.</summary>
+    public IReadOnlyList<(ConfigurationProject Program, GivenKey Given)> Given(Func<string, string?> text) =>
+        [.. Programs.SelectMany(p => ConfigurationFiles.Given(p, text).Select(g => (p, g))).DistinctBy(g => (g.g.Key, g.g.By, g.g.File, g.g.Start))];
+
+    /// <summary>The keys the programs' files give that a read's key names, or a section's (any under it), the settings'
+    /// first, each with its program.</summary>
+    public IReadOnlyList<(ConfigurationProject Program, GivenKey Given)> Where(Func<string, string?> text, string key, bool section) =>
+        [.. Given(text).Where(g => g.Given.File is not null && ConfigurationFiles.Names(g.Given, key, section))];
+
+    /// <summary>The environments the programs run in (<see cref="ConfigurationFiles.Environments"/>), each once.</summary>
+    public IReadOnlyList<string> Environments(Func<string, string?> text) =>
+        [.. Programs.SelectMany(p => ConfigurationFiles.Environments(p.LaunchSettings, text)).Distinct(StringComparer.OrdinalIgnoreCase)];
 }
 
 /// <summary>What gives a configuration key: a settings file of the project's folder, a launch profile's variable, the
@@ -54,12 +86,6 @@ public sealed record GivenKey(string Key, GivenBy By, string? File, int Start, i
 /// inherits. What a key nothing gives is warned of against, completion leaves out as given, and Go to Declaration goes to.</summary>
 public static partial class ConfigurationFiles
 {
-    /// <summary>Whether a file is a settings file .NET's host reads: appsettings.json or appsettings.{anything}.json.</summary>
-    public static bool IsSettings(string path) =>
-        Path.GetFileName(path) is { } name && name.StartsWith("appsettings", StringComparison.OrdinalIgnoreCase)
-        && name.EndsWith(".json", StringComparison.OrdinalIgnoreCase)
-        && (name.Length == "appsettings.json".Length || name["appsettings".Length] == '.');
-
     /// <summary>The user secrets id whose secrets.json a file is, under the secrets' folder (<see cref="UserSecrets.Root"/>);
     /// null for any other file.</summary>
     public static string? SecretsIdOf(string path)
@@ -72,12 +98,12 @@ public static partial class ConfigurationFiles
         return PathNames.Same(PathNames.Canonical(root), PathNames.Canonical(UserSecrets.Root)) ? Path.GetFileName(folder) : null;
     }
 
-    /// <summary>The environments a project runs in from its launch profiles, as ASP.NET Core reads each
+    /// <summary>The environments a program runs in from its launch profiles' file, as ASP.NET Core reads each
     /// (<see cref="AspNetCoreVariables.EnvironmentOf"/>), Development for a profile that names none, or where it has none.</summary>
-    public static IReadOnlyList<string> Environments(ConfigurationProject project, Func<string, string?> text)
+    public static IReadOnlyList<string> Environments(string launchSettings, Func<string, string?> text)
     {
         HashSet<string> found = new(StringComparer.OrdinalIgnoreCase);
-        foreach (Run.LaunchProfile profile in Run.LaunchProfile.Parse(text(project.LaunchSettings)))
+        foreach (Run.LaunchProfile profile in Run.LaunchProfile.Parse(text(launchSettings)))
         {
             found.Add(AspNetCoreVariables.EnvironmentOf(profile.EnvironmentVariables.GetValueOrDefault, "Development"));
         }
@@ -88,7 +114,7 @@ public static partial class ConfigurationFiles
     public static IReadOnlyList<GivenKey> Given(ConfigurationProject project, Func<string, string?> text)
     {
         List<GivenKey> given = [];
-        foreach (string file in Environments(project, text).Select(e => $"appsettings.{e}.json").Prepend("appsettings.json"))
+        foreach (string file in AppSettingsFiles.Read(Environments(project.LaunchSettings, text)))
         {
             string path = Path.Combine(project.Folder, file);
             given.AddRange(Flatten(text(path), path, GivenBy.Settings));
@@ -129,14 +155,11 @@ public static partial class ConfigurationFiles
     }
 
     /// <summary>Whether the keys given hold one, letter case aside: the key itself with a value, or for a section any key under it.</summary>
-    public static bool Gives(IReadOnlyList<GivenKey> given, string key, bool section) =>
-        given.Any(g => g.Key.Equals(key, StringComparison.OrdinalIgnoreCase)
-            || section && g.Key.Length > key.Length && g.Key[key.Length] == ':' && g.Key.StartsWith(key, StringComparison.OrdinalIgnoreCase));
+    public static bool Gives(IReadOnlyList<GivenKey> given, string key, bool section) => given.Any(g => Names(g, key, section));
 
-    /// <summary>The keys given that a read's key names, or a section's (any under it), the settings' first.</summary>
-    public static IReadOnlyList<GivenKey> Where(IReadOnlyList<GivenKey> given, string key, bool section) =>
-        [.. given.Where(g => g.File is not null && (g.Key.Equals(key, StringComparison.OrdinalIgnoreCase)
-            || section && g.Key.Length > key.Length && g.Key[key.Length] == ':' && g.Key.StartsWith(key, StringComparison.OrdinalIgnoreCase)))];
+    /// <summary>Whether a key given is a read's, letter case aside: the key itself, or for a section one under it.</summary>
+    public static bool Names(GivenKey given, string key, bool section) => given.Key.Equals(key, StringComparison.OrdinalIgnoreCase)
+        || section && given.Key.Length > key.Length && given.Key[key.Length] == ':' && given.Key.StartsWith(key, StringComparison.OrdinalIgnoreCase);
 
     /// <summary>Whether a key of the code's (<c>*</c> for any item or dictionary key) names a key written in a file, segment by
     /// segment, letter case aside.</summary>

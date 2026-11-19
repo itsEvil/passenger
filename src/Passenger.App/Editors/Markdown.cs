@@ -1,32 +1,29 @@
 using System.Net;
+using System.Runtime.CompilerServices;
 using System.Text;
 using System.Text.RegularExpressions;
-using Avalonia;
-using Avalonia.Controls;
-using Avalonia.Controls.Documents;
-using Avalonia.Input;
-using Avalonia.Layout;
-using Avalonia.Media;
-using Avalonia.Media.TextFormatting;
-using Passenger.Editor;
-using System.Runtime.CompilerServices;
+using Passenger.Text;
 
 namespace Passenger.App.Editors;
 
-/// <summary>Markdown read into blocks and their words, as CommonMark's common part reads them (ATX headings, paragraphs,
+/// <summary>Markdown read into blocks and their words, as GitHub Flavored Markdown reads them (ATX headings, paragraphs,
 /// bullet and numbered lists to any depth, block quotes, fenced code, rules; code spans, strong, emphasis, links, images
-/// and autolinks) with GitHub's tables and task lists, and drawn as Passenger's own controls, styled in Shell.axaml, fenced
-/// code coloured as the editor colours its language. HTML comments are left out; what a link may open and whether an
-/// image is drawn are the page's (<see cref="MarkdownPage"/>): the notes' a web link alone and no image. Nothing is fetched.</summary>
+/// and autolinks) with GitHub's tables and task lists and the HTML a README may hold (Markdown.Html.cs), drawn by
+/// Markdown.Drawing.cs. HTML comments are left out; what a link may open and whether an image is drawn are the page's
+/// (<see cref="MarkdownPage"/>): the notes' a web link alone and no image. Nothing is fetched.</summary>
 internal static partial class Markdown
 {
     /// <summary>How deep quotes and lists are read inside one another, and emphasis and links, past what a page's width shows
     /// and short of what a control's layout reaches on a thread's stack: past it what is written reads as words.</summary>
     private const int DeepestNesting = 32;
 
-    /// <summary>Each heading level's class, the first level's first.</summary>
-    private static readonly string[] Headings =
-        [StyleClasses.MdHeading1, StyleClasses.MdHeading2, StyleClasses.MdHeading3, StyleClasses.MdHeading4, StyleClasses.MdHeading5, StyleClasses.MdHeading6];
+    /// <summary>Where words stand across their block: a table's column, or an HTML block's <c>align</c>.</summary>
+    internal enum Align
+    {
+        Left,
+        Center,
+        Right,
+    }
 
     internal abstract record Block;
 
@@ -41,7 +38,7 @@ internal static partial class Markdown
     internal sealed record Code(string Text, string Info = "") : Block;
 
     /// <summary>GitHub's table: each column's alignment (null for none), the header's cells and each row's, as written.</summary>
-    internal sealed record Table(IReadOnlyList<TextAlignment?> Aligns, IReadOnlyList<string> Header, IReadOnlyList<IReadOnlyList<string>> Rows) : Block;
+    internal sealed record Table(IReadOnlyList<Align?> Aligns, IReadOnlyList<string> Header, IReadOnlyList<IReadOnlyList<string>> Rows) : Block;
 
     internal sealed record Quote(IReadOnlyList<Block> Blocks) : Block;
 
@@ -60,12 +57,32 @@ internal static partial class Markdown
     /// <summary>A link's words and where it goes, as written: what it may open is the page's.</summary>
     internal sealed record Link(IReadOnlyList<Inline> Parts, string Target) : Inline;
 
-    /// <summary>An image's words, which stand for it where it is not drawn, and where its file is, as written.</summary>
-    internal sealed record Image(string Alt, string Target) : Inline;
+    /// <summary>An image's words, which stand for it where it is not drawn, and where its file is, as written; HTML's
+    /// <c>width</c> and <c>height</c>, and a <c>picture</c>'s sources for the light look and the dark, where it gave them.</summary>
+    internal sealed record Image(string Alt, string Target, double? Width = null, double? Height = null, string? Light = null, string? Dark = null) : Inline;
+
+    /// <summary>HTML's <c>br</c>: the words after it on a line of their own.</summary>
+    internal sealed record Break : Inline;
 
     /// <summary>A block of a text's top level with the lines it was read from (from zero, <see cref="End"/> past its last)
-    /// and those lines as written, by which a page tells a block that changed from one that did not.</summary>
-    internal sealed record Placed(Block Block, int Line, int End, string Source);
+    /// and those lines as written, by which a page tells a block that changed from one that did not; <see cref="Reach"/>
+    /// is past the last line reading it looked at, which a line after its own may be.</summary>
+    internal sealed record Placed(Block Block, int Line, int End, string Source)
+    {
+        public int Reach { get; init; } = End;
+    }
+
+    /// <summary>A text's top-level blocks as read, with the text, which reading it again once edited takes the blocks the
+    /// edit left alone from.</summary>
+    internal sealed class Parsed(Written text, IReadOnlyList<Placed> placed, int read)
+    {
+        public Written Text { get; } = text;
+
+        public IReadOnlyList<Placed> Placed { get; } = placed;
+
+        /// <summary>How many of the text's lines the read made strings of: all it read again.</summary>
+        public int Read { get; } = read;
+    }
 
     /// <summary>The blocks of a Markdown text.</summary>
     public static IReadOnlyList<Block> Parse(string text) =>
@@ -73,163 +90,339 @@ internal static partial class Markdown
 
     /// <summary>The blocks of a text's top level, each with its lines, which are the editor's: a "\r\n", a '\r' or a '\n'
     /// ends one.</summary>
-    public static IReadOnlyList<Placed> ParsePlaced(string text)
+    public static IReadOnlyList<Placed> ParsePlaced(string text) => ParsePlaced(text, null).Placed;
+
+    /// <summary><see cref="ParsePlaced(Written, Parsed?)"/> of a text as a string.</summary>
+    public static Parsed ParsePlaced(string text, Parsed? before) =>
+        before?.Text is WrittenString { Text: var was } && string.Equals(was, text, StringComparison.Ordinal) ? before : ParsePlaced(new WrittenString(text), before);
+
+    /// <summary><see cref="ParsePlaced(Written, Parsed?)"/> of a document's text read where it lies, no string of the whole
+    /// made: but for a text with a '\r' of its own, which ends a line here and not in the document, read as a string.</summary>
+    public static Parsed ParsePlaced(TextSnapshot text, Parsed? before)
     {
-        string[] written = EditorLines().Split(text);
-        List<(int Start, int End)> spans = [];
-        List<Block> blocks = Blocks([.. written.Select(Untabbed)], spans);
-        List<Placed> placed = new(blocks.Count);
-        for (int b = 0; b < blocks.Count; b++)
+        if (before?.Text is WrittenSnapshot { Snapshot: var was } && ReferenceEquals(was, text))
         {
-            (int start, int end) = spans[b];
-            placed.Add(new Placed(blocks[b], start, end, string.Join('\n', written, start, end - start)));
+            return before;
         }
-        return placed;
+        return WrittenSnapshot.HasLoneReturn(text) ? ParsePlaced(text.ToString(), before) : ParsePlaced(new WrittenSnapshot(text), before);
     }
 
-    /// <summary>Draws blocks into a panel, a control each; a link's click is handed to <paramref name="browse"/>, which
-    /// takes a web link alone, and no image is drawn.</summary>
-    public static void Render(IReadOnlyList<Block> blocks, Panel into, Action<Uri> browse) => Render(blocks, into, new MarkdownPage(browse), 0);
+    /// <summary>The last read of each document's text, which the preview and the outline both read again from.</summary>
+    private static readonly ConditionalWeakTable<TextDocument, Parsed> LastReads = new();
 
-    /// <summary>Draws blocks into a panel, a control each, as the page draws its links and images.</summary>
-    public static void Render(IReadOnlyList<Block> blocks, Panel into, MarkdownPage page, int depth = 0)
+    /// <summary>The blocks of a document's text as of a snapshot, read again from the last read of it, the preview's or the
+    /// outline's, where it changed.</summary>
+    public static Parsed ReadOf(TextDocument document, TextSnapshot text)
     {
-        foreach (Block block in blocks)
-        {
-            into.Children.Add(Control(block, page, depth));
-        }
+        Parsed read = ParsePlaced(text, LastReads.TryGetValue(document, out Parsed? before) ? before : null);
+        LastReads.AddOrUpdate(document, read);
+        return read;
     }
 
-    /// <summary>A block's control, as the page draws it.</summary>
-    public static Control Control(Block block, MarkdownPage page, int depth = 0) => block switch
+    /// <summary>The blocks of a text's top level, as <see cref="ParsePlaced(string)"/> reads them, those of the read of the
+    /// text before an edit (<paramref name="before"/>) taken where the edit cannot have changed them: each block whose
+    /// reading looked only at lines before the first the edit changed, and the blocks from one beginning where a block began
+    /// before, in the lines after the edit that it left as they were. Only the lines read between are made strings.</summary>
+    private static Parsed ParsePlaced(Written text, Parsed? before)
     {
-        Heading heading => MarkdownText.Of(Inlines(heading.Text), page, Headings[Math.Clamp(heading.Level, 1, 6) - 1]),
-        Paragraph paragraph => ParagraphOf(Inlines(paragraph.Text), page),
-        Listing listing => List(listing, page, depth),
-        Code code => MarkdownCode.Of(code),
-        Quote quote => QuoteOf(quote, page, depth),
-        Table table => TableOf(table, page),
-        _ => new Border { Classes = { StyleClasses.MdRule } },
-    };
-
-    /// <summary>A paragraph's words; where the page draws an image of it (a file inside the open folder), the image stands in
-    /// a row of its own between the words before and after it, no wider than the page.</summary>
-    private static Control ParagraphOf(IReadOnlyList<Inline> parts, MarkdownPage page)
-    {
-        if (page.ImageFile is not { } fileOf || !parts.Any(p => p is Image image && fileOf(image.Target) is not null))
+        TextLines lines = new(text);
+        List<Placed> placed = [];
+        int i = 0;
+        int resync = int.MaxValue;
+        int shift = 0;
+        int next = 0;
+        if (before is not null && text.Against(before.Text) is (int prefix, int unchanged))
         {
-            return MarkdownText.Of(parts, page, StyleClasses.MdText);
-        }
-        StackPanel rows = new() { Classes = { StyleClasses.MdItem } };
-        List<Inline> words = [];
-        WrapPanel? pictures = null;
-        foreach (Inline part in parts)
-        {
-            if (part is Image image && fileOf(image.Target) is { } file)
+            int changed = text.LineAfter(prefix) - 1;
+            while (next < before.Placed.Count && before.Placed[next].Reach <= changed)
             {
-                Flush();
-                if (pictures is null)
+                placed.Add(before.Placed[next]);
+                i = before.Placed[next++].End;
+            }
+            // A line of the unchanged end begins after a line break inside it, so it began a line before the edit too.
+            resync = text.LineAfter(unchanged);
+            shift = text.Lines - before.Text.Lines;
+        }
+        else
+        {
+            before = null;
+        }
+        while (i < text.Lines)
+        {
+            if (i >= resync && before is not null)
+            {
+                while (next < before.Placed.Count && before.Placed[next].Line < i - shift)
                 {
-                    pictures = new WrapPanel();
-                    rows.Children.Add(pictures);
+                    next++;
                 }
-                pictures.Children.Add(page.Picture(file, image.Alt));
-            }
-            else if (pictures is null || part is not Words { Text: var space } || !string.IsNullOrWhiteSpace(space))
-            {
-                // The spaces between images in a row are the row's gaps.
-                pictures = null;
-                words.Add(part);
-            }
-        }
-        Flush();
-        return rows;
-
-        void Flush()
-        {
-            if (words.Any(w => w is not Words { Text: var text } || !string.IsNullOrWhiteSpace(text)))
-            {
-                rows.Children.Add(MarkdownText.Of([.. words], page, StyleClasses.MdText));
-            }
-            words.Clear();
-        }
-    }
-
-    /// <summary>A list's items, each its bullet (or number, or a task's check) beside its blocks; a list inside one is
-    /// bulleted as the next depth.</summary>
-    private static StackPanel List(Listing listing, MarkdownPage page, int depth)
-    {
-        StackPanel list = new() { Classes = { StyleClasses.MdList } };
-        int number = listing.Start;
-        for (int index = 0; index < listing.Items.Count; index++)
-        {
-            Control mark;
-            if (listing.Checks?[index] is { } done)
-            {
-                // Drawn as the check it is, never one to click: the file's text is what says it is done.
-                PathIcon tick = new() { Classes = { StyleClasses.MdTick }, IsVisible = done };
-                tick.Bind(PathIcon.DataProperty, tick.GetResourceObservable(IconKeys.Check));
-                mark = new Border { Classes = { StyleClasses.Box, StyleClasses.MdTask }, Child = tick };
-                mark.Classes.Set(StyleClasses.Done, done);
-                Avalonia.Automation.AutomationProperties.SetName(mark, done ? "Done" : "Not done");
-                number++;
-            }
-            else
-            {
-                mark = new TextBlock
+                if (next < before.Placed.Count && before.Placed[next].Line == i - shift)
                 {
-                    Classes = { StyleClasses.MdMark },
-                    Text = listing.Ordered ? $"{number++}." : depth % 2 == 0 ? "•" : "◦",
-                    TextAlignment = listing.Ordered ? TextAlignment.Right : TextAlignment.Center,
-                };
+                    for (; next < before.Placed.Count; next++)
+                    {
+                        Placed kept = before.Placed[next];
+                        placed.Add(shift == 0 ? kept : kept with { Line = kept.Line + shift, End = kept.End + shift, Reach = kept.Reach + shift });
+                    }
+                    break;
+                }
             }
-            StackPanel content = new() { Classes = { StyleClasses.MdItem }, [Grid.ColumnProperty] = 1 };
-            Render(listing.Items[index], content, page, depth + 1);
-            list.Children.Add(new Grid { ColumnDefinitions = new ColumnDefinitions("Auto,*"), Children = { mark, content } });
-        }
-        return list;
-    }
-
-    private static Border QuoteOf(Quote quote, MarkdownPage page, int depth)
-    {
-        StackPanel content = new() { Classes = { StyleClasses.MdItem } };
-        Render(quote.Blocks, content, page, depth);
-        return new Border { Classes = { StyleClasses.MdQuote }, Child = content };
-    }
-
-    /// <summary>A table's cells in a grid, each column as wide as its widest cell up to the most a cell is drawn, its words
-    /// wrapping past that, the table scrolled across where the page is narrower than it.</summary>
-    private static Control TableOf(Table table, MarkdownPage page)
-    {
-        int columns = table.Aligns.Count;
-        Grid grid = new() { ColumnDefinitions = new ColumnDefinitions(string.Join(',', Enumerable.Repeat("Auto", columns))) };
-        IReadOnlyList<IReadOnlyList<string>> rows = [table.Header, .. table.Rows];
-        for (int row = 0; row < rows.Count; row++)
-        {
-            grid.RowDefinitions.Add(new RowDefinition(GridLength.Auto));
-            for (int column = 0; column < columns; column++)
+            int start = i;
+            lines.Reach = 0;
+            if (BlockAt(lines, ref i, 0) is { } block)
             {
-                MarkdownText words = MarkdownText.Of(Inlines(column < rows[row].Count ? rows[row][column] : ""), page, row == 0 ? StyleClasses.MdCellHead : StyleClasses.MdCellText);
-                words.TextAlignment = table.Aligns[column] ?? TextAlignment.Left;
-                // The rules between cells only: the table's frame draws its edges.
-                Border cell = new()
-                {
-                    Classes = { StyleClasses.MdCell },
-                    BorderThickness = new Thickness(0, 0, column < columns - 1 ? 1 : 0, row < rows.Count - 1 ? 1 : 0),
-                    Child = words,
-                    [Grid.RowProperty] = row,
-                    [Grid.ColumnProperty] = column,
-                };
-                cell.Classes.Set(StyleClasses.Head, row == 0);
-                grid.Children.Add(cell);
+                placed.Add(new Placed(block, start, i, Source(text, start, i)) { Reach = Math.Max(lines.Reach, i) });
             }
         }
-        return new ScrollViewer
+        return new Parsed(text, placed, lines.Made);
+    }
+
+    /// <summary>A block's lines as written, joined by '\n'.</summary>
+    private static string Source(Written text, int start, int end)
+    {
+        int from = text.Start(start);
+        int to = text.End(end - 1);
+        if (!text.Returns(from, to))
         {
-            HorizontalScrollBarVisibility = Avalonia.Controls.Primitives.ScrollBarVisibility.Auto,
-            VerticalScrollBarVisibility = Avalonia.Controls.Primitives.ScrollBarVisibility.Disabled,
-            Content = new Border { Classes = { StyleClasses.Box, StyleClasses.MdTable }, HorizontalAlignment = HorizontalAlignment.Left, Child = grid },
-        };
+            return text.Slice(from, to);
+        }
+        return string.Join('\n', Enumerable.Range(start, end - start).Select(line => text.Slice(text.Start(line), text.End(line))));
+    }
+
+    /// <summary>A text as the block reader reads it: its lines, the editor's ("\r\n", '\r' or '\n' ends one), where each
+    /// starts and ends, stretches of it, and how much of it another text of its kind begins and ends with alike.</summary>
+    internal abstract class Written
+    {
+        public abstract int Length { get; }
+
+        public abstract int Lines { get; }
+
+        public abstract int Start(int line);
+
+        /// <summary>Where a line ends, before its break.</summary>
+        public abstract int End(int line);
+
+        public abstract string Slice(int from, int to);
+
+        /// <summary>Whether a stretch holds a '\r'.</summary>
+        public abstract bool Returns(int from, int to);
+
+        /// <summary>The first line that starts past an offset; <see cref="Lines"/> where none does.</summary>
+        public abstract int LineAfter(int offset);
+
+        /// <summary>How many characters this and an earlier text begin with alike, and where in this one the end they share
+        /// alike after that begins; null for a text of another kind.</summary>
+        public abstract (int Prefix, int Unchanged)? Against(Written before);
+    }
+
+    private sealed class WrittenString : Written
+    {
+        private readonly int[] starts;
+
+        public WrittenString(string text)
+        {
+            Text = text;
+            List<int> found = [0];
+            ReadOnlySpan<char> rest = text;
+            int at = 0;
+            while (rest.IndexOfAny('\r', '\n') is int end and >= 0)
+            {
+                int after = end + (rest[end] == '\r' && end + 1 < rest.Length && rest[end + 1] == '\n' ? 2 : 1);
+                at += after;
+                found.Add(at);
+                rest = rest[after..];
+            }
+            starts = [.. found];
+        }
+
+        public string Text { get; }
+
+        public override int Length => Text.Length;
+
+        public override int Lines => starts.Length;
+
+        public override int Start(int line) => starts[line];
+
+        public override int End(int line)
+        {
+            if (line + 1 >= starts.Length)
+            {
+                return Text.Length;
+            }
+            int next = starts[line + 1];
+            return next >= 2 && Text[next - 1] == '\n' && Text[next - 2] == '\r' && next - 2 >= starts[line] ? next - 2 : next - 1;
+        }
+
+        public override string Slice(int from, int to) => Text[from..to];
+
+        public override bool Returns(int from, int to) => Text.AsSpan(from, to - from).Contains('\r');
+
+        public override int LineAfter(int offset) => Passenger.Core.Sorted.FirstAfter(starts.AsSpan(), offset);
+
+        public override (int Prefix, int Unchanged)? Against(Written before)
+        {
+            if (before is not WrittenString { Text: var was })
+            {
+                return null;
+            }
+            int prefix = Text.AsSpan().CommonPrefixLength(was);
+            ReadOnlySpan<char> text = Text.AsSpan(prefix);
+            ReadOnlySpan<char> other = was.AsSpan(prefix);
+            const int Stretch = 256;
+            int most = Math.Min(text.Length, other.Length);
+            int same = 0;
+            while (same + Stretch <= most && text[^(same + Stretch)..^same].SequenceEqual(other[^(same + Stretch)..^same]))
+            {
+                same += Stretch;
+            }
+            while (same < most && text[^(same + 1)] == other[^(same + 1)])
+            {
+                same++;
+            }
+            return (prefix, Text.Length - same);
+        }
+    }
+
+    /// <summary>A document's text read where the rope holds it, its lines the document's own: which are the editor's while
+    /// no '\r' stands alone (<see cref="HasLoneReturn"/>).</summary>
+    private sealed class WrittenSnapshot(TextSnapshot snapshot) : Written
+    {
+        /// <summary>How much of a text is compared or looked through at a time.</summary>
+        private const int Stretch = 1024;
+
+        public TextSnapshot Snapshot { get; } = snapshot;
+
+        public override int Length => Snapshot.Length;
+
+        public override int Lines => Snapshot.LineCount;
+
+        public override int Start(int line) => Snapshot.GetLineStart(line);
+
+        public override int End(int line) => Snapshot.GetLine(line).End;
+
+        public override string Slice(int from, int to) => Snapshot.GetText(from, to - from);
+
+        public override bool Returns(int from, int to) => IndexOfReturn(Snapshot, from, to) >= 0;
+
+        public override int LineAfter(int offset) => offset >= Snapshot.Length ? Snapshot.LineCount : Snapshot.GetLineFromOffset(offset) + 1;
+
+        public override (int Prefix, int Unchanged)? Against(Written before)
+        {
+            if (before is not WrittenSnapshot { Snapshot: var was })
+            {
+                return null;
+            }
+            Span<char> mine = stackalloc char[Stretch];
+            Span<char> theirs = stackalloc char[Stretch];
+            int most = Math.Min(Snapshot.Length, was.Length);
+            int prefix = 0;
+            while (prefix < most)
+            {
+                int take = Math.Min(Stretch, most - prefix);
+                Snapshot.CopyTo(prefix, mine[..take]);
+                was.CopyTo(prefix, theirs[..take]);
+                int alike = mine[..take].CommonPrefixLength(theirs[..take]);
+                prefix += alike;
+                if (alike < take)
+                {
+                    break;
+                }
+            }
+            int suffixMost = most - prefix;
+            int same = 0;
+            while (same < suffixMost)
+            {
+                int take = Math.Min(Stretch, suffixMost - same);
+                Snapshot.CopyTo(Snapshot.Length - same - take, mine[..take]);
+                was.CopyTo(was.Length - same - take, theirs[..take]);
+                int alike = 0;
+                while (alike < take && mine[take - 1 - alike] == theirs[take - 1 - alike])
+                {
+                    alike++;
+                }
+                same += alike;
+                if (alike < take)
+                {
+                    break;
+                }
+            }
+            return (prefix, Snapshot.Length - same);
+        }
+
+        /// <summary>Whether a '\r' stands in a text with no '\n' after it, which the editor's lines end at and the
+        /// document's do not.</summary>
+        public static bool HasLoneReturn(TextSnapshot text)
+        {
+            // A stretch read with the character after it, so a '\r' at its end is told by what follows.
+            Span<char> read = stackalloc char[Stretch + 1];
+            for (int at = 0; at < text.Length; at += Stretch)
+            {
+                int take = Math.Min(Stretch + 1, text.Length - at);
+                text.CopyTo(at, read[..take]);
+                ReadOnlySpan<char> looked = read[..Math.Min(Stretch, take)];
+                for (int r = looked.IndexOf('\r'); r >= 0; r = looked[(r + 1)..].IndexOf('\r') is int more and >= 0 ? r + 1 + more : -1)
+                {
+                    if (r + 1 >= take || read[r + 1] != '\n')
+                    {
+                        return true;
+                    }
+                }
+            }
+            return false;
+        }
+
+        /// <summary>Where the first '\r' of a stretch is, or -1.</summary>
+        private static int IndexOfReturn(TextSnapshot text, int from, int to)
+        {
+            Span<char> read = stackalloc char[Stretch];
+            for (int at = from; at < to; at += Stretch)
+            {
+                int take = Math.Min(Stretch, to - at);
+                text.CopyTo(at, read[..take]);
+                if (read[..take].IndexOf('\r') is int found and >= 0)
+                {
+                    return at + found;
+                }
+            }
+            return -1;
+        }
+    }
+
+    /// <summary>A text's lines, made strings (their tabs as spaces) only as reading asks for them, and how far it asked.</summary>
+    private sealed class TextLines(Written text) : IReadOnlyList<string>
+    {
+        private readonly Dictionary<int, string> made = [];
+
+        /// <summary>Past the last line asked for since it was set.</summary>
+        public int Reach { get; set; }
+
+        /// <summary>How many lines were made strings.</summary>
+        public int Made => made.Count;
+
+        public int Count => text.Lines;
+
+        public string this[int index]
+        {
+            get
+            {
+                ArgumentOutOfRangeException.ThrowIfNegative(index);
+                ArgumentOutOfRangeException.ThrowIfGreaterThanOrEqual(index, text.Lines);
+                Reach = Math.Max(Reach, index + 1);
+                if (!made.TryGetValue(index, out string? line))
+                {
+                    made[index] = line = Untabbed(text.Slice(text.Start(index), text.End(index)));
+                }
+                return line;
+            }
+        }
+
+        public IEnumerator<string> GetEnumerator()
+        {
+            for (int index = 0; index < Count; index++)
+            {
+                yield return this[index];
+            }
+        }
+
+        System.Collections.IEnumerator System.Collections.IEnumerable.GetEnumerator() => GetEnumerator();
     }
 
     /// <summary>Lines into blocks: each block begins where the last ended, a blank line or a line that starts another
@@ -268,6 +461,10 @@ internal static partial class Markdown
         if (Fence().Match(line) is { Success: true } fence)
         {
             return Fenced(lines, ref i, fence.Groups[1].Length, fence.Groups[2].Value, fence.Groups[3].Value);
+        }
+        if (HtmlBlockKind(line) is not 0 and var kind)
+        {
+            return HtmlFrom(lines, ref i, kind, depth);
         }
         if (HeadingLine().Match(line) is { Success: true } heading)
         {
@@ -308,7 +505,7 @@ internal static partial class Markdown
 
     /// <summary>The columns' alignments of a table whose header row is at a line (its next line the delimiter row, of as
     /// many cells, both with a pipe), or null when no table begins there.</summary>
-    private static IReadOnlyList<TextAlignment?>? TableAt(IReadOnlyList<string> lines, int i)
+    private static IReadOnlyList<Align?>? TableAt(IReadOnlyList<string> lines, int i)
     {
         if (i + 1 >= lines.Count || !lines[i].Contains('|', StringComparison.Ordinal) || !lines[i + 1].Contains('|', StringComparison.Ordinal)
             || !DelimiterRow().IsMatch(lines[i + 1]))
@@ -320,13 +517,13 @@ internal static partial class Markdown
         {
             return null;
         }
-        return [.. delimiters.Select(d => d.StartsWith(':') && d.EndsWith(':') ? TextAlignment.Center
-            : d.EndsWith(':') ? TextAlignment.Right
-            : d.StartsWith(':') ? TextAlignment.Left
-            : (TextAlignment?)null)];
+        return [.. delimiters.Select(d => d.StartsWith(':') && d.EndsWith(':') ? Align.Center
+            : d.EndsWith(':') ? Align.Right
+            : d.StartsWith(':') ? Align.Left
+            : (Align?)null)];
     }
 
-    private static Table TableFrom(IReadOnlyList<string> lines, ref int i, IReadOnlyList<TextAlignment?> aligns)
+    private static Table TableFrom(IReadOnlyList<string> lines, ref int i, IReadOnlyList<Align?> aligns)
     {
         List<string> header = Cells(lines[i]);
         i += 2;
@@ -399,6 +596,7 @@ internal static partial class Markdown
                 Emphasis emphasis => Plain(emphasis.Parts),
                 Link link => Plain(link.Parts),
                 Image image => image.Alt,
+                Break => " ",
                 _ => "",
             });
         }
@@ -424,10 +622,11 @@ internal static partial class Markdown
         return slug.ToString();
     }
 
-    /// <summary>Whether a line begins another block, which ends the paragraph before it.</summary>
+    /// <summary>Whether a line begins another block, which ends the paragraph before it: an HTML block of every kind but
+    /// a lone tag's (GFM's seventh) too.</summary>
     private static bool Interrupts(string line) =>
         HeadingLine().IsMatch(line) || Fence().IsMatch(line) || RuleLine().IsMatch(line) || QuoteLine().IsMatch(line)
-        || Marker().IsMatch(line) || line.TrimStart().StartsWith("<!--", StringComparison.Ordinal);
+        || Marker().IsMatch(line) || line.TrimStart().StartsWith("<!--", StringComparison.Ordinal) || HtmlBlockKind(line) is not (0 or LoneTag);
 
     /// <summary>The line after an HTML comment that begins at a line, however many lines it runs over.</summary>
     private static int AfterComment(IReadOnlyList<string> lines, int i)
@@ -512,7 +711,7 @@ internal static partial class Markdown
                     }
                     if (next < lines.Count && Indent(lines[next]) >= content)
                     {
-                        item.AddRange(lines.Skip(i).Take(next - i).Select(_ => string.Empty));
+                        item.AddRange(Enumerable.Repeat(string.Empty, next - i));
                         i = next;
                         continue;
                     }
@@ -562,13 +761,14 @@ internal static partial class Markdown
         return spaced.ToString();
     }
 
-    /// <summary>A block's words: code spans first, then links, strong and emphasis, an escaped mark as itself.</summary>
+    /// <summary>A block's words: code spans first, then links, the HTML a README's words may hold (<see cref="HtmlAt"/>),
+    /// strong and emphasis, an escaped mark as itself.</summary>
     internal static IReadOnlyList<Inline> Inlines(string text, int depth = 0)
     {
         List<Inline> parts = [];
         StringBuilder words = new();
-        // A mark with no close from here on has none further on, so it is looked for once, however many stand in the text.
-        HashSet<(char Mark, int Width)>? unclosed = null;
+        // Where each run of * or _ closes, found as an earlier one's close was looked for: the text is looked through once.
+        Dictionary<(int At, int Width), int>? closes = null;
         int i = 0;
         while (i < text.Length)
         {
@@ -607,6 +807,13 @@ internal static partial class Markdown
                 i += auto.Length;
                 continue;
             }
+            if (c == '<' && depth < DeepestNesting && RuntimeHelpers.TryEnsureSufficientExecutionStack() && HtmlAt(text, i, depth) is ({ } html, int after))
+            {
+                Flush();
+                parts.AddRange(html);
+                i = after;
+                continue;
+            }
             if (depth < DeepestNesting && RuntimeHelpers.TryEnsureSufficientExecutionStack() && (c == '[' || (c == '!' && i + 1 < text.Length && text[i + 1] == '[')))
             {
                 bool image = c == '!';
@@ -622,9 +829,10 @@ internal static partial class Markdown
             {
                 int run = Run(text, i, c);
                 int width = run >= 2 ? 2 : 1;
-                if (depth < DeepestNesting && RuntimeHelpers.TryEnsureSufficientExecutionStack() && Opens(text, i, width, c) && unclosed?.Contains((c, width)) != true)
+                if (depth < DeepestNesting && RuntimeHelpers.TryEnsureSufficientExecutionStack() && Opens(text, i, run, c))
                 {
-                    int close = DelimiterClose(text, i + width, c, width);
+                    closes ??= [];
+                    int close = closes.TryGetValue((i, width), out int found) ? found : DelimiterClose(text, i, c, width, closes);
                     if (close >= 0)
                     {
                         Flush();
@@ -633,7 +841,6 @@ internal static partial class Markdown
                         i = close + width;
                         continue;
                     }
-                    (unclosed ??= []).Add((c, width));
                 }
                 words.Append(c, run);
                 i += run;
@@ -657,6 +864,9 @@ internal static partial class Markdown
 
     /// <summary>Whether a backslash before a character makes it itself: ASCII's punctuation and symbols.</summary>
     private static bool Escapable(char c) => c < 128 && (char.IsPunctuation(c) || char.IsSymbol(c));
+
+    /// <summary>Punctuation as GFM's emphasis reads it: ASCII's punctuation and symbols, and Unicode's punctuation.</summary>
+    private static bool Punctuation(char c) => Escapable(c) || char.IsPunctuation(c);
 
     /// <summary>A web address a link may open: http or https alone.</summary>
     internal static Uri? Web(string target) =>
@@ -689,16 +899,42 @@ internal static partial class Markdown
         return -1;
     }
 
-    /// <summary>Whether a run of * or _ can open emphasis there: words follow it, and an underscore does not stand inside a word.</summary>
-    private static bool Opens(string text, int at, int width, char c) =>
-        at + width < text.Length && !char.IsWhiteSpace(text[at + width])
-        && (c == '*' || at == 0 || !char.IsLetterOrDigit(text[at - 1]));
+    /// <summary>Whether a run of * or _ (<paramref name="run"/> long from <paramref name="at"/>) can open emphasis, as GFM
+    /// rules: left-flanking, and an underscore's not right-flanking unless punctuation stands before it.</summary>
+    private static bool Opens(string text, int at, int run, char c) =>
+        LeftFlanking(text, at, at + run) && (c == '*' || !RightFlanking(text, at, at + run) || (at > 0 && Punctuation(text[at - 1])));
 
-    /// <summary>Where emphasis opened at <paramref name="from"/> closes: the same mark after words, a code span passed over; -1 for none.</summary>
-    private static int DelimiterClose(string text, int from, char c, int width)
+    /// <summary>Whether a run of * or _ can close emphasis, as GFM rules: right-flanking, and an underscore's not
+    /// left-flanking unless punctuation follows it.</summary>
+    private static bool Closes(string text, int at, int run, char c) =>
+        RightFlanking(text, at, at + run) && (c == '*' || !LeftFlanking(text, at, at + run) || (at + run < text.Length && Punctuation(text[at + run])));
+
+    /// <summary>Whether a delimiter run from <paramref name="start"/> to <paramref name="end"/> is left-flanking: no white
+    /// space after it, and punctuation after it only where white space or punctuation (or the text's start) stands before it.</summary>
+    private static bool LeftFlanking(string text, int start, int end) =>
+        end < text.Length && !char.IsWhiteSpace(text[end])
+        && (!Punctuation(text[end]) || start == 0 || char.IsWhiteSpace(text[start - 1]) || Punctuation(text[start - 1]));
+
+    /// <summary>Whether a delimiter run is right-flanking: no white space before it, and punctuation before it only where
+    /// white space or punctuation (or the text's end) follows it.</summary>
+    private static bool RightFlanking(string text, int start, int end) =>
+        start > 0 && !char.IsWhiteSpace(text[start - 1])
+        && (!Punctuation(text[start - 1]) || end == text.Length || char.IsWhiteSpace(text[end]) || Punctuation(text[end]));
+
+    /// <summary>Where emphasis opened at <paramref name="opener"/> closes: the first run of the same mark and width after
+    /// the opening run that can close and closes none opened since; an escaped mark, a code span, an autolink and an HTML
+    /// tag passed over, as they bind before emphasis. -1 for none. Where each run opened since closes goes into
+    /// <paramref name="closes"/>, so no run's close is looked for twice.</summary>
+    private static int DelimiterClose(string text, int opener, char c, int width, Dictionary<(int At, int Width), int> closes)
     {
-        for (int at = from + 1; at < text.Length; at++)
+        List<int> opened = [];
+        for (int at = opener + Run(text, opener, c); at < text.Length; at++)
         {
+            if (text[at] == '\\' && at + 1 < text.Length && Escapable(text[at + 1]))
+            {
+                at++;
+                continue;
+            }
             if (text[at] == '`')
             {
                 int run = Run(text, at, '`');
@@ -706,7 +942,12 @@ internal static partial class Markdown
                 at = close < 0 ? at + run - 1 : close + run - 1;
                 continue;
             }
-            if (text[at] != c || char.IsWhiteSpace(text[at - 1]))
+            if (text[at] == '<' && ((Autolink().Match(text, at) is { Success: true } auto && auto.Index == at ? at + auto.Length : TagAt(text, at)?.End) is int after))
+            {
+                at = after - 1;
+                continue;
+            }
+            if (text[at] != c)
             {
                 continue;
             }
@@ -716,12 +957,24 @@ internal static partial class Markdown
                 at += length - 1;
                 continue;
             }
-            int after = at + width;
-            if (c == '_' && after < text.Length && char.IsLetterOrDigit(text[after]))
+            if (Closes(text, at, length, c))
             {
-                continue;
+                if (opened.Count == 0)
+                {
+                    return at;
+                }
+                closes[(opened[^1], width)] = at;
+                opened.RemoveAt(opened.Count - 1);
             }
-            return at;
+            else if (Opens(text, at, length, c))
+            {
+                opened.Add(at);
+            }
+            at += length - 1;
+        }
+        foreach (int unclosed in opened)
+        {
+            closes[(unclosed, width)] = -1;
         }
         return -1;
     }
@@ -784,9 +1037,6 @@ internal static partial class Markdown
     [GeneratedRegex(@"^ {0,3}\|?[ ]*:?-+:?[ ]*(?:\|[ ]*:?-+:?[ ]*)*\|?[ ]*$")]
     private static partial Regex DelimiterRow();
 
-    [GeneratedRegex(@"\r\n|\r|\n")]
-    private static partial Regex EditorLines();
-
     [GeneratedRegex(@"^ {0,3}> ?(.*)$")]
     private static partial Regex QuoteLine();
 
@@ -798,142 +1048,4 @@ internal static partial class Markdown
 
     [GeneratedRegex(@"^(\S+)\s+(?:""[^""]*""|'[^']*')$")]
     private static partial Regex TitledTarget();
-}
-
-/// <summary>A block of Markdown's words, selectable to copy: its strong, emphasis and code drawn as such, and its links
-/// in the link colour, the hand over them and a click opening one (when it selected nothing), through the window.</summary>
-public sealed class MarkdownText : SelectableTextBlock
-{
-    /// <summary>The pointer over a link, made once for every block: a move over one makes none.</summary>
-    private static Cursor? hand;
-
-    private readonly List<(int Start, int End, Uri Target)> links = [];
-    private readonly StringBuilder shown = new();
-    private readonly MarkdownPage page;
-
-    protected override Type StyleKeyOverride => typeof(SelectableTextBlock);
-
-    private MarkdownText(MarkdownPage page)
-    {
-        this.page = page;
-        TextWrapping = TextWrapping.Wrap;
-        Inlines ??= [];
-    }
-
-    /// <summary>The words as drawn.</summary>
-    public string Shown => shown.ToString();
-
-    /// <summary>Each link's words and address.</summary>
-    public IEnumerable<(string Words, Uri Target)> Links => links.Select(l => (Shown[l.Start..l.End], l.Target));
-
-    internal static MarkdownText Of(IReadOnlyList<Markdown.Inline> parts, MarkdownPage page, [IdentifierOf(typeof(StyleClasses))] string kind)
-    {
-        MarkdownText block = new(page) { Classes = { kind } };
-        block.Add(parts, bold: false, italic: false, link: null);
-        return block;
-    }
-
-    private void Add(IReadOnlyList<Markdown.Inline> parts, bool bold, bool italic, Uri? link)
-    {
-        foreach (Markdown.Inline part in parts)
-        {
-            switch (part)
-            {
-                case Markdown.Words words:
-                    Put(words.Text, bold, italic, link, code: false);
-                    break;
-                case Markdown.CodeSpan code:
-                    Put(code.Text, bold, italic, link, code: true);
-                    break;
-                case Markdown.Strong strong:
-                    Add(strong.Parts, bold: true, italic, link);
-                    break;
-                case Markdown.Emphasis emphasis:
-                    Add(emphasis.Parts, bold, italic: true, link);
-                    break;
-                case Markdown.Link linked when page.LinkOf(linked.Target) is { } target:
-                    int start = shown.Length;
-                    Add(linked.Parts, bold, italic, target);
-                    links.Add((start, shown.Length, target));
-                    break;
-                case Markdown.Link unlinked:
-                    // A link the page opens nothing of (the notes' to a file) is its words.
-                    Add(unlinked.Parts, bold, italic, link);
-                    break;
-                case Markdown.Image image when page.ImageFile is not null:
-                    // An image not drawn (a web one, one outside the folder) is the words it was given to stand for it.
-                    Put(image.Alt, bold, italic: true, link, code: false, muted: link is null);
-                    break;
-            }
-        }
-    }
-
-    private void Put(string text, bool bold, bool italic, Uri? link, bool code, bool muted = false)
-    {
-        // Set only where it differs, so the block's own weight (a heading's) holds for the rest.
-        Avalonia.Controls.Documents.Run run = new(text);
-        if (bold)
-        {
-            run.FontWeight = FontWeight.Bold;
-        }
-        if (italic)
-        {
-            run.FontStyle = FontStyle.Italic;
-        }
-        if (code)
-        {
-            run.InCodeFont();
-            run.Bind(TextElement.BackgroundProperty, this.GetResourceObservable(TokenKeys.Hover));
-        }
-        if (link is not null)
-        {
-            run.Bind(TextElement.ForegroundProperty, this.GetResourceObservable(TokenKeys.Link));
-        }
-        else if (muted)
-        {
-            run.Bind(TextElement.ForegroundProperty, this.GetResourceObservable(TokenKeys.TextMuted));
-        }
-        Inlines!.Add(run);
-        shown.Append(text);
-    }
-
-    /// <summary>The link drawn at a point of the block, or null: the one whose words are drawn there, on any of its lines.</summary>
-    public Uri? LinkAt(Point point)
-    {
-        // Not the hit's IsInside, which is false below a block's first line.
-        int at = TextLayout.HitTestPoint(point).TextPosition;
-        (int start, int end, Uri? target) = links.FirstOrDefault(l => at >= l.Start && at < l.End);
-        return target is not null && TextLayout.HitTestTextRange(start, end - start).Any(drawn => drawn.Contains(point)) ? target : null;
-    }
-
-    /// <summary>Where a link's first word is drawn in the block, for a click on it.</summary>
-    public Point PointOf(Uri target)
-    {
-        (int start, int end, _) = links.First(l => l.Target == target);
-        Rect first = TextLayout.HitTestTextRange(start, end - start).First();
-        return first.Center;
-    }
-
-    protected override void OnPointerMoved(PointerEventArgs e)
-    {
-        base.OnPointerMoved(e);
-        if (LinkAt(e.GetPosition(this)) is null)
-        {
-            ClearValue(CursorProperty);
-        }
-        else
-        {
-            Cursor = hand ??= new Cursor(StandardCursorType.Hand);
-        }
-    }
-
-    protected override void OnPointerReleased(PointerReleasedEventArgs e)
-    {
-        base.OnPointerReleased(e);
-        if (e.InitialPressMouseButton == MouseButton.Left && SelectionStart == SelectionEnd && LinkAt(e.GetPosition(this)) is { } target)
-        {
-            e.Handled = true;
-            page.Follow(target);
-        }
-    }
 }

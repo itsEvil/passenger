@@ -3,6 +3,7 @@ using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using System.Text.Json.Serialization.Metadata;
+using Passenger.Core;
 
 namespace Passenger.Host;
 
@@ -88,19 +89,16 @@ public static class HostMethods
     /// it with the global properties given reads (stamped) and makes, its references' too, or why a build of it reads more
     /// than its evaluations say.</summary>
     public const string Inputs = "inputs";
+
+    /// <summary><see cref="SolutionParams"/> to <see cref="SolutionBuild"/>: the configuration and platform a build of a
+    /// solution gives each project it builds, as MSBuild reads the solution.</summary>
+    public const string Solution = "solution";
 }
 
 public static class HostJson
 {
-    public static readonly JsonSerializerOptions Options = new(JsonSerializerDefaults.Web)
-    {
-        DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull,
-        // Named, as the serializer names it by default, so each message's metadata can be had before the first message.
-        TypeInfoResolver = new DefaultJsonTypeInfoResolver(),
-    };
-
     /// <summary>A request's line as the host reads it.</summary>
-    public static JsonTypeInfo<HostRequest> Request { get; } = (JsonTypeInfo<HostRequest>)Options.GetTypeInfo(typeof(HostRequest));
+    public static JsonTypeInfo<HostRequest> Request { get; } = PeerJson.Of<HostRequest>();
 }
 
 /// <summary>The SDK the host loaded: its folder (MSBuild's) and version.</summary>
@@ -114,7 +112,35 @@ public static class HostWords
 }
 
 /// <summary>Projects to evaluate, with the global properties they are evaluated with (the solution's).</summary>
-public sealed record EvaluateParams(IReadOnlyList<string> Projects, IReadOnlyDictionary<string, string> Properties);
+public sealed record EvaluateParams(IReadOnlyList<string> Projects, IReadOnlyDictionary<string, string> Properties)
+{
+    /// <summary>The global properties some projects take beyond <see cref="Properties"/>, by path: the configuration and
+    /// platform a build gives each.</summary>
+    public IReadOnlyDictionary<string, IReadOnlyDictionary<string, string>>? Each { get; init; }
+
+    /// <summary>The global properties one project is evaluated with.</summary>
+    public IReadOnlyDictionary<string, string> Of(string project) => HostProperties.Of(Properties, Each, project);
+}
+
+/// <summary>Global properties given to every project of a request, with those given to some beyond them.</summary>
+public static class HostProperties
+{
+    /// <summary>The properties one project takes: <paramref name="all"/>, and its own over them.</summary>
+    public static IReadOnlyDictionary<string, string> Of(IReadOnlyDictionary<string, string> all, IReadOnlyDictionary<string, IReadOnlyDictionary<string, string>>? each,
+        string project)
+    {
+        if (each is null || !each.TryGetValue(project, out IReadOnlyDictionary<string, string>? own) || own.Count == 0)
+        {
+            return all;
+        }
+        Dictionary<string, string> merged = new(all, StringComparer.OrdinalIgnoreCase);
+        foreach ((string name, string value) in own)
+        {
+            merged[name] = value;
+        }
+        return merged;
+    }
+}
 
 public sealed record EvaluateDone(int Evaluated, double Seconds);
 
@@ -249,12 +275,28 @@ public static class CarriedProperties
     /// names its own.</summary>
     public const string AspireHostingSDKVersion = "AspireHostingSDKVersion";
 
+    /// <summary>Whether .NET for Android builds an app of it, which it makes of a project whose OutputType was Exe, giving it
+    /// OutputType Library (an Android app has no Main of its own).</summary>
+    public const string AndroidApplication = "AndroidApplication";
+
+    /// <summary>The configurations the project declares, separated by ';' (the SDK's Debug;Release unless it names others,
+    /// Godot.NET.Sdk's Debug;ExportDebug;ExportRelease), which a folder with no solution chooses its builds' from.</summary>
+    public const string Configurations = "Configurations";
+
+    /// <summary>The platforms the project declares, separated by ';' (the SDK's AnyCPU unless it names others).</summary>
+    public const string Platforms = "Platforms";
+
+    /// <summary>The version of Azure Functions' host a Functions app runs on (v4), which every Functions SDK sets: a
+    /// runnable project with one is a .NET isolated worker, which Azure Functions Core Tools' func runs.</summary>
+    public const string AzureFunctionsVersion = "AzureFunctionsVersion";
+
     public static readonly IReadOnlyList<string> Names =
     [
         EnableSdkContainerSupport, ContainerRepository, ContainerImageName, ContainerBaseImage, DockerfileFile, DockerfileContext,
         DockerfileFastModeStage, ContainerDevelopmentMode, DockerDefaultTargetOS, UserSecretsId, IsPublishable, ProjectAssetsFile,
         NuGetPackageRoot, NuGetPackageFolders, TargetPath, NuGetLockFilePath, RootNamespace, PublishProfileRootFolder, ManagePackageVersionsCentrally,
         DirectoryPackagesPropsPath, GodotProjectDir, GodotProjectDirBase64, UsingGodotNETSdk, StaticWebAssetBasePath, PackageId, AspireHostingSDKVersion,
+        AndroidApplication, Configurations, Platforms, AzureFunctionsVersion,
     ];
 }
 
@@ -270,7 +312,15 @@ public sealed record FrameworkDependencies(string? Framework, IReadOnlyList<Pack
 
     /// <summary>The assembly the framework's build makes, wherever its output folder was moved; null without one.</summary>
     public string? TargetPath { get; init; }
+
+    /// <summary>The reference pack of each shared framework it references, as the SDK names it for this framework.</summary>
+    public IReadOnlyList<TargetingPack> TargetingPacks { get; init; } = [];
 }
+
+/// <summary>A shared framework's reference pack as the SDK's KnownFrameworkReference names it for a target framework: its
+/// name (<c>Microsoft.NETCore.App.Ref</c>, a workload's <c>Microsoft.Android.Ref.37</c>), and its version, null where a
+/// workload installs it (the SDK's <c>**FromWorkload**</c>).</summary>
+public sealed record TargetingPack(string Framework, string Name, string? Version);
 
 /// <summary>What a target framework of a project compiles its C# with: its DefineConstants, with the symbols the .NET SDK
 /// adds for the framework and its platform (NET11_0, NET8_0_OR_GREATER, WINDOWS), and its LangVersion ("12", "preview"),
@@ -280,15 +330,27 @@ public sealed record FrameworkSymbols(string Framework, IReadOnlyList<string> Sy
 /// <summary>A package reference, its version as restore takes it: its own, its VersionOverride, or the central one.</summary>
 public sealed record PackageDependency(string Name, string? Version, bool Implicit);
 
-/// <summary>A file of the project: its item type, full path, its Link (where it shows when it lives elsewhere) and the file
-/// it depends on, relative to its own folder, as MSBuild's DependentUpon is.</summary>
-public sealed record EvaluatedItem(string Type, string Path, string? Link = null, string? DependentUpon = null);
+/// <summary>A file of the project: its item type, full path, its Link (where it shows when it lives elsewhere), the file
+/// it depends on, relative to its own folder, as MSBuild's DependentUpon is, the shared project's items file
+/// (<see cref="SharedItemsExtension"/>) that names it, for a file a shared project brings in, and whether a NuGet
+/// package's own build file names it from a package folder (AndroidX's ProGuard rules): every project's copy of the
+/// package, where the SDK gives it a Link as it gives any file from elsewhere.</summary>
+public sealed record EvaluatedItem(string Type, string Path, string? Link = null, string? DependentUpon = null, string? Shared = null, bool Packaged = false)
+{
+    /// <summary>A shared project's items file (.projitems), which each project sharing its files imports.</summary>
+    public const string SharedItemsExtension = ".projitems";
+}
 
 /// <summary>The request to end, by its id.</summary>
 public sealed record CancelParams(int Request);
 
 /// <summary>Projects to build at design time, with the global properties (the solution's, Roslyn's server's own).</summary>
-public sealed record BuildParams(IReadOnlyList<string> Projects, IReadOnlyDictionary<string, string> Properties);
+public sealed record BuildParams(IReadOnlyList<string> Projects, IReadOnlyDictionary<string, string> Properties)
+{
+    /// <summary>The global properties some projects take beyond <see cref="Properties"/>, by path: the configuration and
+    /// platform a build gives each.</summary>
+    public IReadOnlyDictionary<string, IReadOnlyDictionary<string, string>>? Each { get; init; }
+}
 
 public sealed record BuildDone(int Built, double Seconds);
 
@@ -336,7 +398,7 @@ public sealed record BuiltProject(string Path, RawJson Infos, IReadOnlyList<Stam
             }
             else if (isInputs)
             {
-                inputs = JsonSerializer.Deserialize<List<Stamp>>(ref reader, HostJson.Options);
+                inputs = JsonSerializer.Deserialize<List<Stamp>>(ref reader, PeerJson.Options);
             }
             else if (isProblem)
             {
@@ -344,7 +406,7 @@ public sealed record BuiltProject(string Path, RawJson Infos, IReadOnlyList<Stam
             }
             else if (isDiagnostics)
             {
-                diagnostics = JsonSerializer.Deserialize<List<BuildDiagnostic>>(ref reader, HostJson.Options);
+                diagnostics = JsonSerializer.Deserialize<List<BuildDiagnostic>>(ref reader, PeerJson.Options);
             }
             else
             {
@@ -366,8 +428,9 @@ public sealed record HoldState(IReadOnlyList<string> Running, bool Held);
 
 /// <summary>A file's last write (UTC ticks) and length, 0 and -1 for one not there; for a folder, the hash of its names and
 /// how many (<see cref="Stamps.Folder"/>); for a program's C# file, the hash of its head's directives and how many
-/// (<see cref="Stamps.Head"/>).</summary>
-public sealed record Stamp(string Path, long Ticks, long Length, bool Folder = false, bool Head = false);
+/// (<see cref="Stamps.Head"/>); for a file that counts only by being there or not, 0 and 0, or 0 and -1
+/// (<see cref="Stamps.Presence"/>).</summary>
+public sealed record Stamp(string Path, long Ticks, long Length, bool Folder = false, bool Head = false, bool Presence = false);
 
 /// <summary>A project to evaluate for code help, with the global properties (the solution's) and the text of the open
 /// MSBuild files that differ from what is on disk, by path, which its evaluation reads instead.</summary>
@@ -427,6 +490,34 @@ public sealed record PropertiesParams(string Project, IReadOnlyDictionary<string
 
 /// <summary>Each property asked for that has a value, as evaluated, or why the project did not evaluate.</summary>
 public sealed record PropertiesAnswer(IReadOnlyDictionary<string, string> Values, string? Problem);
+
+/// <summary>A solution (.sln, .slnx) whose build is asked about, under the solution configuration and platform named, or
+/// what MSBuild takes given none.</summary>
+public sealed record SolutionParams(string Path, string? Configuration = null, string? Platform = null);
+
+/// <summary>Each project a build of the solution builds, with the configuration and platform it gives it (the solution
+/// configuration's mapping of it); or why MSBuild could not read the solution.</summary>
+public sealed record SolutionBuild(IReadOnlyList<SolutionBuilt> Projects, string? Problem)
+{
+    /// <summary>The solution configurations it declares, in its order, each a configuration and a platform ("Any CPU").</summary>
+    public IReadOnlyList<SolutionConfiguration> Declared { get; init; } = [];
+
+    /// <summary>The one a build given no configuration or platform takes; null where the solution did not read.</summary>
+    public SolutionConfiguration? Default { get; init; }
+
+    /// <summary>The one the answer is for: the one asked, else what the environment names, else the default.</summary>
+    public SolutionConfiguration? Taken { get; init; }
+
+    /// <summary>Every project it maps, built or not (left out of <see cref="Projects"/>), with what it maps it to.</summary>
+    public IReadOnlyList<SolutionBuilt> Mapped { get; init; } = [];
+}
+
+/// <summary>A solution configuration: its configuration and its platform, as the solution names them.</summary>
+public sealed record SolutionConfiguration(string Configuration, string Platform);
+
+/// <summary>A project's full path, and the Configuration and Platform a build of its solution gives it ("AnyCPU", never
+/// "Any CPU", as MSBuild gives it).</summary>
+public sealed record SolutionBuilt(string Project, string Configuration, string Platform);
 
 /// <summary>A file-based program's C# file, with the project the SDK makes of it (<c>dotnet run-api</c>): where that project
 /// would be (app.cs.csproj beside app.cs) and its XML; or why the SDK made none (a directive it does not read).</summary>

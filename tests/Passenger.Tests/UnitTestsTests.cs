@@ -62,12 +62,12 @@ public sealed class UnitTestsTests : UnitTestsFolders, IClassFixture<RestoredFol
         Assert.Null(window.Actions.Work.Of(AppActions.RunTests));
         Assert.True(window.DockHost.IsShown(ToolWindowIds.Tests), "After Run All the Unit Tests window was no longer in front, so its results had to be shown again");
         // vstest.console ran under the SDK's dotnet, which a VSTest package without the constructor for it fails here.
-        Assert.Equal("Tests passed: 3, failed: 1, skipped: 1 of 5", System.Text.RegularExpressions.Regex.Replace(window.BottomPanel.Tests.Status, @" in \d+\.\d s$", string.Empty));
+        Assert.Equal("Tests passed: 3, failed: 1, skipped: 1 of 5", System.Text.RegularExpressions.Regex.Replace(window.BottomPanel.Tests.Status, $" in {SaidWhile.Pattern}$", string.Empty));
         // The runner's log in the logs folder has what it found and how the run went.
         IdeErrors.Flush();
         string run = Ui.Shared(runnerLog)[Math.Min(logged, Ui.Shared(runnerLog).Length)..];
         Assert.Matches(@"Discovery complete: \d+ tests? found", run);
-        Assert.Matches(@"Run complete: \d+ results? in \d+\.\d\d s", run);
+        Assert.Matches($@"Run complete: \d+ results? in {SaidWhile.Pattern}", run);
         Assert.Equal(TestState.Failed, Method(window, "Two_and_two_make_five")!.State);
         Assert.Equal(TestState.Passed, Method(window, "Doubles")!.State);
         Assert.Equal(2, Method(window, "Doubles")!.Results.Count);
@@ -437,6 +437,105 @@ public sealed class UnitTestsTests : UnitTestsFolders, IClassFixture<RestoredFol
         Assert.StartsWith("Tests passed: 3, failed: 2 of 5", window.BottomPanel.Tests.Status, StringComparison.Ordinal);
         Assert.Equal(["5", "3", "2"], new[] { "All Tests", "Passed Tests", "Failed Tests" }.Select(f => Count(window, f)));
         Assert.True(window.Tests.Tree.Methods.Count == 2, $"The tree shows methods besides the two Sums: [{string.Join(", ", window.Tests.Tree.Methods.Select(m => m.FullName))}]");
+        window.Close();
+    }
+
+    /// <summary>A test project its solution maps to a platform (this machine's own: x64, or ARM64 on Arm), as a .slnx or a
+    /// .sln writes it, has its tests found where the solution's build put them, bin/&lt;platform&gt;/…, and runs them from
+    /// the caret.</summary>
+    [AvaloniaTheory]
+    [InlineData("slnx")]
+    [InlineData("sln")]
+    public void A_test_project_its_solution_maps_to_a_platform_is_found_where_the_solutions_build_put_it_and_runs_from_the_caret(string kind)
+    {
+        string platform = System.Runtime.InteropServices.RuntimeInformation.OSArchitecture == System.Runtime.InteropServices.Architecture.Arm64 ? "ARM64" : "x64";
+        string solution = NewFolder();
+        Write(solution, "Mapped.Tests/Mapped.Tests.csproj",
+            $"<Project Sdk=\"Microsoft.NET.Sdk\">\n  <PropertyGroup>\n    <TargetFramework>{TestProjects.Framework}</TargetFramework>\n  </PropertyGroup>\n  <ItemGroup>\n" +
+            $"    <PackageReference Include=\"Microsoft.NET.Test.Sdk\" Version=\"{TestPackages.TestSdk}\" />\n    <PackageReference Include=\"NUnit\" Version=\"{TestPackages.NUnit}\" />\n" +
+            $"    <PackageReference Include=\"NUnit3TestAdapter\" Version=\"{TestPackages.NUnitAdapter}\" />\n  </ItemGroup>\n</Project>\n");
+        string file = Write(solution, "Mapped.Tests/ExampleTests.cs",
+            "using NUnit.Framework;\n\nnamespace Mapped.Tests;\n\npublic class ExampleTests\n{\n    [Test]\n    public void Should_Do_Something()\n    {\n        Assert.That(2 + 2, Is.EqualTo(4));\n    }\n}\n");
+        string id = "{6F1C2B9E-2D4A-4C1B-9E1D-2B6A6E2C1A11}";
+        Write(solution, $"Mapped.{kind}", kind == "slnx"
+            ? $"<Solution>\n  <Configurations>\n    <Platform Name=\"{platform}\" />\n  </Configurations>\n  <Project Path=\"Mapped.Tests/Mapped.Tests.csproj\">\n" +
+              $"    <Platform Solution=\"*|{platform}\" Project=\"{platform}\" />\n  </Project>\n</Solution>\n"
+            : "Microsoft Visual Studio Solution File, Format Version 12.00\n# Visual Studio Version 17\n" +
+              $"Project(\"{{9A19103F-16F7-4668-BE54-9A1E7A4F7556}}\") = \"Mapped.Tests\", \"Mapped.Tests\\Mapped.Tests.csproj\", \"{id}\"\nEndProject\nGlobal\n" +
+              $"\tGlobalSection(SolutionConfigurationPlatforms) = preSolution\n\t\tDebug|{platform} = Debug|{platform}\n\t\tRelease|{platform} = Release|{platform}\n\tEndGlobalSection\n" +
+              $"\tGlobalSection(ProjectConfigurationPlatforms) = postSolution\n\t\t{id}.Debug|{platform}.ActiveCfg = Debug|{platform}\n\t\t{id}.Debug|{platform}.Build.0 = Debug|{platform}\n" +
+              $"\t\t{id}.Release|{platform}.ActiveCfg = Release|{platform}\n\t\t{id}.Release|{platform}.Build.0 = Release|{platform}\n\tEndGlobalSection\nEndGlobal\n");
+        Restore.Run(Path.Combine(solution, $"Mapped.{kind}"));
+        MainWindow window = Ui.OpenFolder(solution, languageServer: false);
+        window.OpenFile(file);
+        Ui.Settle();
+        Tree(window);
+        Ui.WaitFor(() => Method(window, "Should_Do_Something") is not null, "the test from its code");
+
+        Ui.PlaceAfter(window.EditorArea.CodeEditor, "public void Should_");
+        Ui.Run(window, AppActions.RunTests);
+        Ui.WaitFor(() => !window.Tests.IsBusy, () => $"the run of the test at the caret: {window.BottomPanel.Tests.Status}", TimeSpan.FromSeconds(180));
+        string built = Path.Combine(solution, "Mapped.Tests", "bin", platform, "Debug", TestProjects.Framework, "Mapped.Tests.dll");
+        Assert.True(File.Exists(built), $"The solution's build did not put the tests in {built}, so this test proves nothing of where they are looked for");
+        Assert.True(Method(window, "Should_Do_Something")?.State == TestState.Passed,
+            $"The test its solution builds for {platform} did not run from the caret: the Unit Tests window said '{window.BottomPanel.Tests.Status}'");
+        Assert.StartsWith("Tests passed: 1, failed: 0 of 1", window.BottomPanel.Tests.Status, StringComparison.Ordinal);
+        window.Close();
+    }
+
+    /// <summary>A library of shared test helpers its project marks as a test project, with no test SDK for VSTest to start a
+    /// test host from, found before a test project referencing it, hides none of that project's tests: its test runs from
+    /// the caret. The library's own test run from the caret, and Run All's tally, say which assembly's tests could not be
+    /// found and what VSTest said of it.</summary>
+    [AvaloniaFact]
+    public void An_assembly_vstest_cannot_look_through_hides_no_other_projects_tests_and_a_run_of_its_own_says_why()
+    {
+        string solution = NewFolder();
+        Write(solution, "Helpers.Testing/Helpers.Testing.csproj",
+            $"<Project Sdk=\"Microsoft.NET.Sdk\">\n  <PropertyGroup>\n    <TargetFramework>{TestProjects.Framework}</TargetFramework>\n    <IsTestProject>true</IsTestProject>\n  </PropertyGroup>\n" +
+            $"  <ItemGroup>\n    <PackageReference Include=\"NUnit\" Version=\"{TestPackages.NUnit}\" />\n  </ItemGroup>\n</Project>\n");
+        string helpers = Write(solution, "Helpers.Testing/Checks.cs",
+            "using NUnit.Framework;\n\nnamespace Helpers.Testing;\n\npublic static class Checks\n{\n    public static void Four(int value) => Assert.That(value, Is.EqualTo(4));\n}\n\n" +
+            "public class CheckTests\n{\n    [Test]\n    public void Checks_four() => Checks.Four(4);\n}\n");
+        Write(solution, "Real.Tests/Real.Tests.csproj",
+            $"<Project Sdk=\"Microsoft.NET.Sdk\">\n  <PropertyGroup>\n    <TargetFramework>{TestProjects.Framework}</TargetFramework>\n  </PropertyGroup>\n  <ItemGroup>\n" +
+            $"    <PackageReference Include=\"Microsoft.NET.Test.Sdk\" Version=\"{TestPackages.TestSdk}\" />\n    <PackageReference Include=\"NUnit\" Version=\"{TestPackages.NUnit}\" />\n" +
+            $"    <PackageReference Include=\"NUnit3TestAdapter\" Version=\"{TestPackages.NUnitAdapter}\" />\n" +
+            "    <ProjectReference Include=\"../Helpers.Testing/Helpers.Testing.csproj\" />\n  </ItemGroup>\n</Project>\n");
+        string file = Write(solution, "Real.Tests/ExampleTests.cs",
+            "using NUnit.Framework;\n\nnamespace Real.Tests;\n\npublic class ExampleTests\n{\n    [Test]\n    public void Should_Do_Something() => Helpers.Testing.Checks.Four(2 + 2);\n}\n");
+        Write(solution, "Shared.slnx", "<Solution>\n  <Project Path=\"Helpers.Testing/Helpers.Testing.csproj\" />\n  <Project Path=\"Real.Tests/Real.Tests.csproj\" />\n</Solution>\n");
+        Restore.Run(Path.Combine(solution, "Shared.slnx"));
+        MainWindow window = Ui.OpenFolder(solution, languageServer: false);
+        window.OpenFile(file);
+        Ui.Settle();
+        Tree(window);
+        Ui.WaitFor(() => Method(window, "Should_Do_Something") is not null && Method(window, "Checks_four") is not null, "both tests from their code");
+
+        Ui.PlaceAfter(window.EditorArea.CodeEditor, "public void Should_");
+        Ui.Run(window, AppActions.RunTests);
+        Ui.WaitFor(() => !window.Tests.IsBusy, () => $"the run of the test at the caret: {window.BottomPanel.Tests.Status}", TimeSpan.FromSeconds(180));
+        Assert.True(Method(window, "Should_Do_Something")?.State == TestState.Passed,
+            $"The test project's test did not run from the caret beside a library VSTest cannot look through: the Unit Tests window said '{window.BottomPanel.Tests.Status}'");
+
+        window.OpenFile(helpers);
+        Ui.Settle();
+        Ui.PlaceAfter(window.EditorArea.CodeEditor, "public void Checks_");
+        Ui.Run(window, AppActions.RunTests);
+        Ui.WaitFor(() => !window.Tests.IsBusy && window.BottomPanel.Tests.Status.StartsWith("No test of Checks_four", StringComparison.Ordinal),
+            () => $"the run of the library's test at the caret to find none: {window.BottomPanel.Tests.Status}", TimeSpan.FromSeconds(180));
+        string said = window.BottomPanel.Tests.Status;
+        Assert.True(said.StartsWith("No test of Checks_four was found: the tests in Helpers.Testing.dll (net10.0) could not be found: ", StringComparison.Ordinal)
+            && said.Contains("Microsoft.NET.Test.Sdk", StringComparison.Ordinal),
+            $"A run of a test in an assembly VSTest could not look through did not say which and why, so nothing tells the person to give it a test SDK: '{said}'");
+
+        Assert.True(window.Perform(AppActions.RunAllTests));
+        Ui.WaitFor(() => !window.Tests.IsBusy && window.BottomPanel.Tests.Status.StartsWith("Tests passed", StringComparison.Ordinal),
+            () => $"the run of every test: {window.BottomPanel.Tests.Status}", TimeSpan.FromSeconds(180));
+        said = window.BottomPanel.Tests.Status;
+        Assert.True(said.StartsWith("Tests passed: 1, failed: 0 of 1", StringComparison.Ordinal)
+            && said.Contains("; the tests in Helpers.Testing.dll (net10.0) could not be found: ", StringComparison.Ordinal),
+            $"Run All's tally did not say which assembly's tests could not be found, so its tests' absence goes unseen: '{said}'");
         window.Close();
     }
 
@@ -1007,7 +1106,7 @@ public sealed class UnitTestsTests : UnitTestsFolders, IClassFixture<RestoredFol
 
         Assert.True(window.Perform(AppActions.RunAllTests));
         Ui.WaitFor(() => !window.Tests.IsBusy && Method(window, "Named") is not null, "the run of every test", TimeSpan.FromSeconds(180));
-        Assert.Equal("Tests passed: 7, failed: 1 of 8", System.Text.RegularExpressions.Regex.Replace(window.BottomPanel.Tests.Status, @" in \d+\.\d s$", string.Empty));
+        Assert.Equal("Tests passed: 7, failed: 1 of 8", System.Text.RegularExpressions.Regex.Replace(window.BottomPanel.Tests.Status, $" in {SaidWhile.Pattern}$", string.Empty));
         Assert.Equal("8", Count(window, "All Tests"));
         Assert.Equal(["Fixtures.Tests", "  Fixtures.Tests", "    Parameterised", "      Positive", "    Typed", "      Named", "    Worded", "      Long"], Shown(window));
         TestNode positive = Method(window, "Positive")!;
@@ -1030,7 +1129,7 @@ public sealed class UnitTestsTests : UnitTestsFolders, IClassFixture<RestoredFol
         editor.GoTo(new TextPosition(17, 8));
         Ui.Run(window, AppActions.RunTests);
         Ui.WaitFor(() => !window.Tests.IsBusy && typed.Results.FirstOrDefault() is { } fresh && fresh != before, "the run of the generic fixture's test at the caret", TimeSpan.FromSeconds(120));
-        Assert.Equal("Tests passed: 2, failed: 0 of 2", System.Text.RegularExpressions.Regex.Replace(window.BottomPanel.Tests.Status, @" in \d+\.\d s$", string.Empty));
+        Assert.Equal("Tests passed: 2, failed: 0 of 2", System.Text.RegularExpressions.Regex.Replace(window.BottomPanel.Tests.Status, $" in {SaidWhile.Pattern}$", string.Empty));
 
         TestNode failing = positive.Children[0];
         TestNode passing = positive.Children[1];
@@ -1038,7 +1137,7 @@ public sealed class UnitTestsTests : UnitTestsFolders, IClassFixture<RestoredFol
         tree.SelectedItem = positive;
         Ui.ChooseFromMenu(tree, "Run");
         Ui.WaitFor(() => !window.Tests.IsBusy && failing.Results.FirstOrDefault() is { } fresh && fresh != failed, "the run of the fixture's method", TimeSpan.FromSeconds(120));
-        Assert.Equal("Tests passed: 1, failed: 1 of 2", System.Text.RegularExpressions.Regex.Replace(window.BottomPanel.Tests.Status, @" in \d+\.\d s$", string.Empty));
+        Assert.Equal("Tests passed: 1, failed: 1 of 2", System.Text.RegularExpressions.Regex.Replace(window.BottomPanel.Tests.Status, $" in {SaidWhile.Pattern}$", string.Empty));
 
         failed = failing.Results[0];
         TestOutcome passed = passing.Results[0];
@@ -1050,7 +1149,7 @@ public sealed class UnitTestsTests : UnitTestsFolders, IClassFixture<RestoredFol
         tree.SelectedItem = passing;
         Ui.ChooseFromMenu(tree, "Run");
         Ui.WaitFor(() => !window.Tests.IsBusy && passing.Results.FirstOrDefault() is { } fresh && fresh != passed, "the run of the instance found", TimeSpan.FromSeconds(120));
-        Assert.Equal("Tests passed: 1, failed: 0 of 1", System.Text.RegularExpressions.Regex.Replace(window.BottomPanel.Tests.Status, @" in \d+\.\d s$", string.Empty));
+        Assert.Equal("Tests passed: 1, failed: 0 of 1", System.Text.RegularExpressions.Regex.Replace(window.BottomPanel.Tests.Status, $" in {SaidWhile.Pattern}$", string.Empty));
         Assert.Same(failed, failing.Results[0]);
         Assert.Equal(TestState.Failed, failing.State);
         window.Close();

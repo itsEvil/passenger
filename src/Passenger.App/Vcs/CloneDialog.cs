@@ -2,7 +2,6 @@ using System.Globalization;
 using System.Text.RegularExpressions;
 using Avalonia;
 using Avalonia.Controls;
-using Avalonia.Layout;
 using Avalonia.Media;
 using Avalonia.Platform.Storage;
 using Avalonia.Threading;
@@ -30,6 +29,7 @@ public sealed partial class CloneDialog : IdeWindow
     /// <param name="folder">The folder offered to clone into.</param>
     public CloneDialog(string folder)
     {
+        FormRows.Scope(this);
         Title = "Clone Repository";
         Width = 560;
         SizeToContent = SizeToContent.Height;
@@ -40,12 +40,12 @@ public sealed partial class CloneDialog : IdeWindow
         parent = new TextBox { Classes = { StyleClasses.Search }, Text = folder };
         url.TextChanged += (_, _) => ShowDestination();
         parent.TextChanged += (_, _) => ShowDestination();
-        browse = new Button { Content = "Browse…", Margin = new Thickness(8, 0, 0, 0) };
+        browse = new Button { Content = "Browse…", Margin = new Thickness(Gaps.Normal, 0, 0, 0) };
         browse.Click += (_, _) => IdeErrors.Observe(BrowseAsync());
-        into = new TextBlock { Classes = { StyleClasses.Muted }, FontSize = 12, TextTrimming = TextTrimming.PathSegmentEllipsis, Margin = new Thickness(0, 6, 0, 0) };
+        into = new TextBlock { Classes = { StyleClasses.Muted }, FontSize = 12, TextTrimming = TextTrimming.PathSegmentEllipsis, Margin = new Thickness(0, Gaps.Tight, 0, 0) };
         bar = new ProgressBar { IsIndeterminate = true, Minimum = 0, Maximum = 100, Height = 4, MinHeight = 4 };
         progress = new TextBlock { Classes = { StyleClasses.Muted }, FontSize = 12, TextTrimming = TextTrimming.CharacterEllipsis };
-        working = new StackPanel { Spacing = 6, IsVisible = false, Children = { bar, progress } };
+        working = new StackPanel { Spacing = Gaps.Small, IsVisible = false, Children = { bar, progress } };
         problem = new TextBlock { TextWrapping = TextWrapping.Wrap, IsVisible = false };
         problem.Classes.Add(StyleClasses.Error);
 
@@ -53,19 +53,20 @@ public sealed partial class CloneDialog : IdeWindow
         clone.Click += (_, _) => IdeErrors.Observe(CloneAsync());
         Closing += (_, _) => cloning?.Cancel();
 
-        Grid fields = new() { ColumnDefinitions = new ColumnDefinitions("Auto,*"), RowDefinitions = new RowDefinitions("Auto,Auto,Auto") };
-        Add(fields, new TextBlock { Text = "URL:", VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(0, 0, 12, 0) }, 0, 0);
-        Add(fields, url, 0, 1);
-        Grid where = BrowseRow.Of(parent, browse);
-        where.Margin = new Thickness(0, 10, 0, 0);
-        Add(fields, new TextBlock { Text = "Directory:", VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(0, 10, 12, 0) }, 1, 0);
-        Add(fields, where, 1, 1);
-        Add(fields, into, 2, 1);
+        StackPanel fields = new()
+        {
+            Spacing = FormRows.Between,
+            Children =
+            {
+                FormRows.Of("URL:", url),
+                new StackPanel { Children = { FormRows.Of("Directory:", BrowseRow.Of(parent, browse)), FormRows.Of(null, into) } },
+            },
+        };
 
         Content = DialogFooter.Page(new StackPanel
         {
-            Margin = new Thickness(20),
-            Spacing = 16,
+            [DialogFooter.InsetProperty] = true,
+            Spacing = Gaps.Group,
             Children =
             {
                 new TextBlock { Text = "Clone Repository", FontWeight = FontWeight.SemiBold },
@@ -331,12 +332,5 @@ public sealed partial class CloneDialog : IdeWindow
         {
             Folder = path;
         }
-    }
-
-    private static void Add(Grid grid, Control control, int row, int column)
-    {
-        Grid.SetRow(control, row);
-        Grid.SetColumn(control, column);
-        grid.Children.Add(control);
     }
 }

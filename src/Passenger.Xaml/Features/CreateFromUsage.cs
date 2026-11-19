@@ -2,6 +2,8 @@ using System.Text;
 using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.CSharp;
 using Microsoft.CodeAnalysis.CSharp.Syntax;
+using Microsoft.CodeAnalysis.Text;
+using Passenger.Core;
 using Passenger.Languages.CSharp;
 using Passenger.Text;
 using Passenger.Xaml.Dialects;
@@ -82,7 +84,7 @@ public static class CreateFromUsage
             XmlTree tree = XmlTree.Parse(text);
             List<TextEdit> declared = [];
             string prefix = XamlRefactorings.Prefix(text, tree, uri, wanted, declared);
-            string x = XamlRefactorings.Prefix(text, tree, XamlDialect.XamlUri, "x", declared);
+            string x = XamlRefactorings.Prefix(text, tree, file.Dialect.LanguageUri, "x", declared);
             return XamlRefactorings.AddResource(text, $"<{(prefix.Length > 0 ? prefix + ":" : string.Empty)}{name} {x}:Key=\"{key}\" />", declared);
         })
         {
@@ -337,19 +339,19 @@ public static class CreateFromUsage
     private static string Indent(string code, string inside) =>
         string.Join('\n', code.Split('\n').Select((line, i) => i == 0 || line.Length == 0 ? line : inside + line));
 
-    /// <summary>A key as a class's name: its letters, digits and underscores, starting as an identifier may.</summary>
+    /// <summary>A key as a class's name: its characters a C# name may hold, starting as one may.</summary>
     private static string Identifier(string key)
     {
         StringBuilder name = new();
         foreach (char c in key)
         {
-            if (char.IsLetterOrDigit(c) || c == '_')
+            if (SyntaxFacts.IsIdentifierPartCharacter(c))
             {
                 name.Append(c);
             }
         }
         string made = name.ToString();
-        return made.Length > 0 && char.IsDigit(made[0]) ? "_" + made : made;
+        return made.Length > 0 && !SyntaxFacts.IsIdentifierStartCharacter(made[0]) ? "_" + made : made;
     }
 
     /// <summary>The namespace a new type in a folder goes in: that of the project's types already there, else the
@@ -375,15 +377,18 @@ public static class CreateFromUsage
         bool nullable = string.Equals(file.Project.Inputs.PropertyValue("Nullable"), "enable", StringComparison.OrdinalIgnoreCase);
         bool implicitUsings = string.Equals(file.Project.Inputs.PropertyValue("ImplicitUsings"), "enable", StringComparison.OrdinalIgnoreCase);
         string q = nullable ? "?" : string.Empty;
-        string ret = avalonia ? $"object{q}" : "object";
-        string value = avalonia ? $"object{q}" : "object";
+        // Avalonia's and MAUI's converters are annotated for nullable values; WPF's are not.
+        bool annotated = avalonia || file.Dialect is MauiDialect;
+        string ret = annotated ? $"object{q}" : "object";
+        string value = annotated ? $"object{q}" : "object";
         bool scoped = FileScoped(file);
         StringBuilder made = new();
         if (!implicitUsings)
         {
             made.Append("using System;\n");
         }
-        made.Append("using System.Globalization;\n").Append(avalonia ? "using Avalonia.Data.Converters;\n" : "using System.Windows.Data;\n").Append('\n');
+        string converters = avalonia ? "Avalonia.Data.Converters" : file.Dialect is MauiDialect ? "Microsoft.Maui.Controls" : "System.Windows.Data";
+        made.Append("using System.Globalization;\n").Append($"using {converters};\n").Append('\n');
         string indent = scoped ? string.Empty : Unit;
         made.Append(scoped ? $"namespace {space};\n\n" : $"namespace {space}\n{{\n");
         made.Append($"{indent}public class {(SyntaxFacts.GetKeywordKind(name) == SyntaxKind.None ? name : "@" + name)} : IValueConverter\n{indent}{{\n");
@@ -412,9 +417,8 @@ public static class CreateFromUsage
         {
             if (behind is not null && File.Exists(behind))
             {
-                string text = File.ReadAllText(behind);
-                return !System.Text.RegularExpressions.Regex.IsMatch(text, @"^\s*namespace\s+[\w.]+\s*(\{|$)", System.Text.RegularExpressions.RegexOptions.Multiline)
-                    || System.Text.RegularExpressions.Regex.IsMatch(text, @"^\s*namespace\s+[\w.]+\s*;", System.Text.RegularExpressions.RegexOptions.Multiline);
+                SyntaxList<MemberDeclarationSyntax> members = CodeBrackets.Parse(SourceText.From(File.ReadAllText(behind))).GetCompilationUnitRoot().Members;
+                return members.Any(m => m is FileScopedNamespaceDeclarationSyntax) || !members.Any(m => m is NamespaceDeclarationSyntax);
             }
         }
         catch (IOException)

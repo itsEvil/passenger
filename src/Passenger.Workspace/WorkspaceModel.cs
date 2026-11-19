@@ -29,6 +29,94 @@ public sealed record WorkspaceModel(string Folder, SolutionModel? Solution, IRea
     /// null for any other workspace.</summary>
     public UnreadSolution? Unread { get; init; }
 
+    /// <summary>The solution file it was read from and the filter it was read through, each stamped just before it was read:
+    /// one whose stamp no longer holds was written since.</summary>
+    public IReadOnlyList<Stamp> ReadFrom { get; init; } = [];
+
+    /// <summary>The build configuration and platform chosen for its builds, evaluations and runs; null for what MSBuild takes
+    /// when given none, which nothing is given for, where it maps each project as a build of it given nothing builds it.</summary>
+    public BuildChoice? Build { get; init; }
+
+    /// <summary>The global properties a project takes for <see cref="Build"/>, none for the configuration MSBuild takes.</summary>
+    public IReadOnlyDictionary<string, string> BuildPropertiesOf(string project) =>
+        Build is { } chosen ? chosen.PropertiesOf(project, PlatformsOf(project))
+            : new Dictionary<string, string>();
+
+    /// <summary>The global properties a build of a project alone is given for <see cref="Build"/>, as <see cref="BuildArgumentsFor"/>
+    /// gives them: its own (<see cref="BuildPropertiesOf"/>), and what the solution maps those it references to where the
+    /// build must be told (<see cref="BuildChoice.ToldOf"/>).</summary>
+    public IReadOnlyDictionary<string, string> BuiltWith(string project) => BuiltTogetherWith([project])(project);
+
+    /// <summary>The global properties each of projects built side by side in one build is given (<see cref="BuiltWith"/>'s),
+    /// each told of every project any of them must be told of: a project two of them reach is then given the same
+    /// properties by each, so the build builds it once.</summary>
+    public Func<string, IReadOnlyDictionary<string, string>> BuiltTogetherWith(IReadOnlyList<string> projects)
+    {
+        if (Build is not { } chosen)
+        {
+            return _ => new Dictionary<string, string>();
+        }
+        List<SolutionBuilt> told = [.. projects.SelectMany(project => chosen.ToldOf(project, PlatformsOf(project), ReferencesOf)).Distinct()];
+        return project =>
+        {
+            Dictionary<string, string> properties = new(BuildPropertiesOf(project), StringComparer.OrdinalIgnoreCase);
+            if (told.Count > 0)
+            {
+                properties[MSBuildNames.CurrentSolutionConfigurationContents] = BuildChoice.Contents(told);
+            }
+            return properties;
+        };
+    }
+
+    /// <summary>The platforms a project declares, as last evaluated; null for one not among <see cref="Projects"/>.</summary>
+    private string? PlatformsOf(string project) => Projects.FirstOrDefault(p => PathNames.Same(p.Path, project))?.Property(CarriedProperties.Platforms);
+
+    /// <summary>The configuration and platform a project builds as for <see cref="Build"/>: those it is given, else the .NET
+    /// SDK's Debug and AnyCPU, which a build given none takes; a solution's Any CPU as the project's AnyCPU.</summary>
+    public BuildConfiguration BuiltAs(string project)
+    {
+        IReadOnlyDictionary<string, string> given = BuildPropertiesOf(project);
+        string platform = given.GetValueOrDefault(MSBuildNames.Platform) is { Length: > 0 } named ? BuildConfigurations.OfProject(named) : BuildConfigurations.GivenNone.Platform;
+        return new BuildConfiguration(given.GetValueOrDefault(MSBuildNames.Configuration) is { Length: > 0 } configuration ? configuration : BuildConfigurations.GivenNone.Configuration,
+            platform);
+    }
+
+    /// <summary>The first of a project and those it references (as <paramref name="other"/> has them) that it and another
+    /// workspace build as a different configuration or platform (<see cref="BuiltAs"/>), with what each builds it as; null
+    /// where they build them all alike.</summary>
+    public (string Project, BuildConfiguration Here, BuildConfiguration There)? BuiltUnlike(WorkspaceModel other, string project)
+    {
+        IEnumerable<string> paths = other.Projects.FirstOrDefault(p => PathNames.Same(p.Path, project)) is { } model
+            ? model.WithReferenced(other.Projects).Select(p => p.Path) : [project];
+        foreach (string path in paths)
+        {
+            BuildConfiguration here = BuiltAs(path);
+            BuildConfiguration there = other.BuiltAs(path);
+            if (!here.Is(there))
+            {
+                return (path, here, there);
+            }
+        }
+        return null;
+    }
+
+    /// <summary>What a dotnet build of a target (the solution, a project, a program) is given for <see cref="Build"/>, a
+    /// project's with what the solution maps those it references to, as its projects reference each other; none for the
+    /// configuration MSBuild takes, or the folder itself. dotnet watch's (<paramref name="watched"/>) in its own words.</summary>
+    public IReadOnlyList<string> BuildArgumentsFor(string target, bool watched = false) =>
+        Build is not { } chosen || PathNames.Same(target, Folder) ? []
+        : chosen.ArgumentsFor(target, Solution is { } solution && PathNames.Same(solution.Path, target),
+            PlatformsOf(target), watched, ReferencesOf);
+
+    /// <summary>The projects a project references, as last evaluated; none for one not among <see cref="Projects"/>.</summary>
+    public IReadOnlyList<string> ReferencesOf(string project) => Projects.FirstOrDefault(p => PathNames.Same(p.Path, project))?.ProjectReferences ?? [];
+
+    /// <summary>What a dotnet publish of a project is given to build it as its build does: <see cref="BuildArgumentsFor"/>'s,
+    /// else the configuration its build takes given none (<paramref name="builtAs"/>, as its evaluation says), which a
+    /// publish given none would take Release in place of.</summary>
+    public IReadOnlyList<string> PublishArgumentsFor(string project, string? builtAs) =>
+        BuildArgumentsFor(project) is { Count: > 0 } chosen ? chosen : builtAs is { Length: > 0 } ? ["-c", builtAs] : [];
+
     /// <summary>What it was opened as, which Recent Solutions keeps and reopens: the solution filter, the solution, the
     /// project, else the folder.</summary>
     public string OpenedAs => Filter?.Path ?? Solution?.Path ?? ProjectFile ?? Folder;
@@ -45,15 +133,23 @@ public sealed record WorkspaceModel(string Folder, SolutionModel? Solution, IRea
     /// MSBuild's alone (.proj).</summary>
     private static readonly string[] ProjectExtensions = [".csproj", ".fsproj", ".vbproj", ".proj"];
 
+    /// <summary>The extensions of a file that opens as the workspace (<see cref="Opens"/>): a solution's, a solution
+    /// filter's and a C# project's.</summary>
+    public static IReadOnlyList<string> OpenedExtensions => Opened;
+
+    private static readonly string[] Opened = [.. SolutionExtensions, CSharpProject];
+
     /// <summary>Whether a file opens as the workspace rather than in an editor: a solution (.sln, .slnx), a solution
     /// filter (.slnf) or a C# project (.csproj).</summary>
-    public static bool Opens(string path) => IsSolution(path) || IsProject(path);
+    public static bool Opens(string path) => PathNames.HasExtension(path, Opened);
 
     /// <summary>Whether a file is a solution or a solution filter, either of which opens a solution.</summary>
     public static bool IsSolution(string path) => PathNames.HasExtension(path, SolutionExtensions);
 
     /// <summary>Whether a file is a C# project, the one kind of project that opens as the workspace.</summary>
-    public static bool IsProject(string path) => Path.GetExtension(path).Equals(".csproj", StringComparison.OrdinalIgnoreCase);
+    public static bool IsProject(string path) => Path.GetExtension(path).Equals(CSharpProject, StringComparison.OrdinalIgnoreCase);
+
+    private const string CSharpProject = ".csproj";
 
     /// <summary>Whether a file is a project file of any kind MSBuild evaluates as itself (<see cref="ProjectExtensions"/>),
     /// a C# project's among them.</summary>
@@ -107,16 +203,30 @@ public sealed record WorkspaceModel(string Folder, SolutionModel? Solution, IRea
             return new WorkspaceModel(folder, null, [ProjectModel.Unevaluated(named)]) { ProjectFile = named };
         }
         string? path = named is not null && IsSolution(named) && File.Exists(named) ? named : SolutionModel.Find(folder);
+        List<Stamp> stamped = path is null ? [] : [Stamps.File(path)];
         SolutionFilter? filter = path is not null && SolutionFilter.Is(path) ? SolutionFilter.Read(path) : null;
         if (path is not null && SolutionFilter.Is(path))
         {
             path = filter?.Solution;
+            if (path is not null)
+            {
+                stamped.Add(Stamps.File(path));
+            }
         }
-        // A Docker Compose project (.dcproj) is read as XML for its run configurations, never loaded as a project.
+        // A Docker Compose project is read as XML for its run configurations, a shared project for its files: neither loads.
         return path is not null && SolutionModel.Load(path, out unread) is { } solution
-            ? new WorkspaceModel(folder, solution, [.. solution.Projects.Where(p => !IsComposeProject(p.Path))]) { Filter = filter }
+            ? new WorkspaceModel(folder, solution, [.. solution.Projects.Where(p => !IsComposeProject(p.Path) && !Workspace.SharedProjects.Is(p.Path))])
+            {
+                Filter = filter,
+                ReadFrom = stamped,
+            }
             : null;
     }
+
+    /// <summary>The solution's shared projects (.shproj), each the home of the files its items file brings into the projects
+    /// importing it (<see cref="Workspace.SharedProjects"/>).</summary>
+    public IReadOnlyList<string> SharedProjects => Solution is null ? []
+        : [.. Solution.Projects.Where(p => p.Exists && Workspace.SharedProjects.Is(p.Path)).Select(p => p.Path)];
 
     /// <summary>The solution's Docker Compose projects (.dcproj), each a compose configuration of its own.</summary>
     public IReadOnlyList<string> ComposeProjects => Solution is null ? []
@@ -151,9 +261,14 @@ public sealed record WorkspaceModel(string Folder, SolutionModel? Solution, IRea
     /// <summary>What building the whole builds: the solution and each program beside it, or each project loaded in turn
     /// when some are unloaded or there is no solution; the folder when it has neither, for the .NET command line to say why.</summary>
     public IReadOnlyList<string> BuildTargets(IReadOnlyList<ProjectModel> loaded) =>
-        Solution is not null && loaded.Count == Projects.Count && ComposeProjects.Count == 0 ? [Solution.Path, .. Programs.Select(p => p.Path)]
+        BuiltSolution(loaded) is { } solution ? [solution, .. Programs.Select(p => p.Path)]
         : Solution is null && Projects.Count == 0 ? [Folder]
         : [.. loaded.Select(p => p.Path)];
+
+    /// <summary>The solution building the whole builds (<see cref="BuildTargets"/>), which gives each project the
+    /// configuration and platform it maps it to; null where the whole is built project by project.</summary>
+    public string? BuiltSolution(IReadOnlyList<ProjectModel> loaded) =>
+        Solution is not null && loaded.Count == Projects.Count && ComposeProjects.Count == 0 ? Solution.Path : null;
 
     /// <summary>Whether a language server loaded from one has the other's projects: the same solution listing the same
     /// projects, through the same filter of them if any, or the same projects without one. A server is told its solution
@@ -230,8 +345,8 @@ public sealed record WorkspaceModel(string Folder, SolutionModel? Solution, IRea
             found.AddRange(plain.Take(ProjectLimit - found.Count));
         }
         // A file a program includes, from any folder or by a wildcard, is that program's code, whatever its own head says.
-        List<(string Program, List<string> Patterns)> including = [.. found.Where(ProgramFiles.IsProgram).Select(p => (p, Included(p).ToList()))];
-        found.RemoveAll(q => ProgramFiles.IsProgram(q) && including.Any(i => !PathNames.Same(i.Program, q) && i.Patterns.Any(pattern => Globbed(pattern, q, PathNames.CaseIgnoredIn))));
+        List<(string Program, List<ItemPath> Patterns)> including = [.. found.Where(ProgramFiles.IsProgram).Select(p => (p, Included(p).ToList()))];
+        found.RemoveAll(q => ProgramFiles.IsProgram(q) && including.Any(i => !PathNames.Same(i.Program, q) && i.Patterns.Any(pattern => ItemPaths.Matches(pattern, q, PathNames.CaseIgnoredIn))));
         // A program another references (#:ref lib.cs) is one, its project the SDK's, whatever its head says.
         for (int i = 0; i < found.Count; i++)
         {
@@ -259,53 +374,26 @@ public sealed record WorkspaceModel(string Folder, SolutionModel? Solution, IRea
         }
     }
 
-    /// <summary>The C# files a program's <c>#:include</c> directives name, each a full path that may hold MSBuild's wildcards
-    /// (<c>lib/*.cs</c>, <c>**</c>) as the SDK hands it to MSBuild; none that names a property.</summary>
-    private static IEnumerable<string> Included(string program)
+    /// <summary>The C# files a program's <c>#:include</c> directives name, each from the program's folder as MSBuild reads
+    /// the SDK's Compile item of it, wildcards (<c>lib/*.cs</c>, <c>**</c>) and all; none that names a property.</summary>
+    private static IEnumerable<ItemPath> Included(string program)
     {
         foreach (string directive in ProgramFiles.Head(program))
         {
             if (ProgramFiles.Parse(directive) is ("include", { Length: > 0 } value) && !value.Contains('$', StringComparison.Ordinal)
-                && (ProgramFiles.IsProgram(value) || value.EndsWith('*')))
+                && (ProgramFiles.IsProgram(value) || value.EndsWith('*')) && ItemPaths.Read(value) is { } included)
             {
-                yield return Path.GetFullPath(value, Path.GetDirectoryName(program)!);
+                yield return included.FromFolder(Path.GetDirectoryName(program)!);
             }
         }
     }
-
-    /// <summary>Whether a file matches an include as MSBuild's globs match: <c>*</c> and <c>?</c> within a name, <c>**</c>
-    /// across folders, a name differing only in letter case where its folder ignores case (<paramref name="caseIgnoredIn"/>).</summary>
-    internal static bool Globbed(string pattern, string path, Func<string, bool> caseIgnoredIn) =>
-        Matches(Folded(pattern.Split(Separators)), 0, path, path.Split(Separators), 0, caseIgnoredIn);
-
-    private static readonly char[] Separators = ['/', '\\'];
-
-    /// <summary>A glob's parts with each run of <c>**</c> as the one it means, so a match goes as deep as its path and no
-    /// deeper, however long the glob.</summary>
-    private static string[] Folded(string[] parts) => [.. parts.Where((part, at) => at == 0 || part != "**" || parts[at - 1] != "**")];
-
-    private static bool Matches(string[] parts, int part, string path, string[] names, int name, Func<string, bool> caseIgnoredIn) =>
-        part == parts.Length ? name == names.Length
-        : parts[part] == "**" ? Matches(parts, part + 1, path, names, name, caseIgnoredIn) || (name < names.Length && Matches(parts, part, path, names, name + 1, caseIgnoredIn))
-        : name < names.Length && MatchesAt(parts[part], path, names, name, caseIgnoredIn) && Matches(parts, part + 1, path, names, name + 1, caseIgnoredIn);
-
-    /// <summary>Whether a path's name at an index matches one part of a glob, in the letter case its folder tells.</summary>
-    private static bool MatchesAt(string part, string path, string[] names, int name, Func<string, bool> caseIgnoredIn) =>
-        NameMatches(part, names[name], ignoreCase: false)
-        || NameMatches(part, names[name], ignoreCase: true) && caseIgnoredIn(path[..names.Take(name).Sum(n => n.Length + 1)]);
-
-    /// <summary>Whether a name matches one part of a glob; the empty part before a rooted path's first separator, which the
-    /// system's matcher matches with nothing, matches the empty name.</summary>
-    private static bool NameMatches(string part, string name, bool ignoreCase) => part.AsSpan().IndexOfAny('*', '?') < 0
-        ? name.Equals(part, ignoreCase ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal)
-        : System.IO.Enumeration.FileSystemName.MatchesSimpleExpression(part, name, ignoreCase);
 
     /// <summary>Whether a C# file's head makes it a file-based program, as <c>dotnet run</c> runs it: a <c>#!</c> line or a
     /// <c>#:</c> directive, unless it is a single-file Aspire AppHost, which Aspire runs. A folder's walk takes one only
     /// outside every project's folder, whose files are the project's; in a folder with no project, a file of no directive
     /// that begins with top-level statements is one too (<see cref="TakesPlainPrograms"/>).</summary>
     public static bool IsProgram(string path, IReadOnlyList<string> head) =>
-        ProgramFiles.IsProgram(path) && head.Count > 0 && !head.Any(IsAspireSdk);
+        ProgramFiles.IsProgram(path) && head.Count > 0 && !AspireHosts.IsHead(head);
 
     /// <summary>Whether its C# files of no directive that begin with top-level statements are programs, as <c>dotnet run</c>
     /// runs them: a folder opened with no solution or project in it, nor any found under it.</summary>
@@ -318,6 +406,15 @@ public sealed record WorkspaceModel(string Folder, SolutionModel? Solution, IRea
         List<string> head = ProgramFiles.Head(path);
         return IsProgram(path, head) || head.Count == 0 && ProgramFiles.IsProgram(path) && TakesPlainPrograms && ProgramFiles.BeginsWithStatement(path);
     }
+
+    /// <summary>Whether a C# file is one of its programs now, among the <paramref name="projects"/> loaded: in a folder the
+    /// walk for programs enters, there, compiled by no project nor another program, and a program by its text (<see
+    /// cref="IsProgramFile"/>) or one a program references (<c>#:ref</c>). Its head is read, so more than a few are a worker's.</summary>
+    public bool IsProgramNow(string path, IReadOnlyList<ProjectModel> projects) =>
+        FolderWalk.Enters(Folder, PathNames.Below(Path.GetDirectoryName(path)!, Folder), built: true)
+        && File.Exists(path)
+        && !projects.Any(p => p.IsProgram ? !PathNames.Same(p.Path, path) && p.Holds(path) : PathNames.Within(path, p.Folder))
+        && (IsProgramFile(path) || projects.Any(p => p.IsProgram && p.ProjectReferences.Contains(path, PathNames.Comparer)));
 
     /// <summary>Whether a C# file opened alone opens with its folder, a program of it: its head makes it one, or it has none
     /// and begins with top-level statements in a folder holding no project or solution.</summary>
@@ -341,7 +438,4 @@ public sealed record WorkspaceModel(string Folder, SolutionModel? Solution, IRea
             return false;
         }
     }
-
-    private static bool IsAspireSdk(string directive) =>
-        ProgramFiles.Parse(directive) is ("sdk", { } sdk) && sdk.Split('@')[0].Trim().Equals("Aspire.AppHost.Sdk", StringComparison.OrdinalIgnoreCase);
 }

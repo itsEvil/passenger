@@ -29,7 +29,7 @@ public sealed class ConflictsDialog : IdeWindow
     private static readonly string ColumnWidths = $"*,{StatusWidth},{StatusWidth}";
 
     /// <summary>Where a cell's words start in its column.</summary>
-    private const double CellInset = 8;
+    private const double CellInset = Gaps.Normal;
 
     private readonly VcsController vcs;
     private readonly Func<GitConflict, Task> merge;
@@ -54,7 +54,7 @@ public sealed class ConflictsDialog : IdeWindow
         MinHeight = 260;
         WindowStartupLocation = WindowStartupLocation.CenterOwner;
 
-        description = new TextBlock { [DockPanel.DockProperty] = Avalonia.Controls.Dock.Top, TextWrapping = TextWrapping.Wrap, Margin = new Thickness(0, 0, 0, 10) };
+        description = new TextBlock { [DockPanel.DockProperty] = Avalonia.Controls.Dock.Top, TextWrapping = TextWrapping.Wrap, Margin = new Thickness(0, 0, 0, Gaps.Wide) };
         ColumnTitles titles = ColumnTitles.Of(ColumnWidths, ["Name", string.Empty, string.Empty], ColumnTitles.OverList, CellInset);
         yoursColumn = titles.Titles[1];
         theirsColumn = titles.Titles[2];
@@ -66,15 +66,7 @@ public sealed class ConflictsDialog : IdeWindow
         };
         ReusedRows.Use(list, Row);
         list.SelectionChanged += (_, _) => UpdateButtons();
-        list.DoubleTapped += (_, _) => IdeErrors.Observe(MergeAsync());
-        list.AddHandler(KeyDownEvent, (_, e) =>
-        {
-            if (e.Key == Key.Enter && e.KeyModifiers == KeyModifiers.None)
-            {
-                IdeErrors.Observe(MergeAsync());
-                e.Handled = true;
-            }
-        }, RoutingStrategies.Tunnel);
+        ListKeys.Act(list, new ListActs { Open = () => IdeErrors.Observe(MergeAsync()) });
         Border table = new()
         {
             Classes = { StyleClasses.Framed },
@@ -88,13 +80,13 @@ public sealed class ConflictsDialog : IdeWindow
         StackPanel actions = new()
         {
             [DockPanel.DockProperty] = Avalonia.Controls.Dock.Right,
-            Spacing = 8,
-            Margin = new Thickness(12, 0, 0, 0),
+            Spacing = Gaps.Normal,
+            Margin = new Thickness(Gaps.Wide, 0, 0, 0),
             Children = { acceptYours, acceptTheirs, mergeButton },
         };
         Button close = new() { Content = "Close", IsCancel = true };
         close.Click += (_, _) => Close();
-        Content = DialogFooter.Page(new DockPanel { Margin = new Thickness(16), Children = { description, actions, table } }, DialogFooter.Bar(DialogFooter.Listed(close)));
+        Content = DialogFooter.Page(new DockPanel { [DialogFooter.InsetProperty] = true, Children = { description, actions, table } }, DialogFooter.Bar(DialogFooter.Listed(close)));
 
         EventHandler changed = (_, _) => Fill();
         EventHandler busy = (_, _) => UpdateButtons();
@@ -167,7 +159,7 @@ public sealed class ConflictsDialog : IdeWindow
         rows.Clear();
         foreach (GitConflict conflict in vcs.Conflicts.OrderBy(c => c.Path, StringComparer.Ordinal))
         {
-            string folder = vcs.Repository is { } repository ? Path.GetDirectoryName(repository.Relative(conflict.Path))?.Replace('\\', '/') ?? string.Empty : string.Empty;
+            string folder = vcs.Repository is { } repository ? ChangedFileRow.Folder(repository.Relative(conflict.Path)) : string.Empty;
             rows.Add(new ConflictRow(conflict, folder, sides.YoursHas(conflict) ? "Modified" : "Deleted", sides.TheirsHas(conflict) ? "Modified" : "Deleted"));
         }
         Chosen = [.. rows.Where(r => chosen.Contains(r.Conflict.Path))];
@@ -201,12 +193,13 @@ public sealed class ConflictsDialog : IdeWindow
     /// colour, its folder, and what yours and theirs did to it.</summary>
     private static Control Row()
     {
-        RowIcon icon = new() { Width = 14, Height = 14, Margin = new Thickness(0, 0, 6, 0) };
-        TextBlock name = new() { VerticalAlignment = VerticalAlignment.Center };
+        RowIcon icon = new() { Width = 14, Height = 14, Margin = new Thickness(0, 0, Gaps.Small, 0), [DockPanel.DockProperty] = Dock.Left };
+        TextBlock name = new() { VerticalAlignment = VerticalAlignment.Center, TextTrimming = TextTrimming.CharacterEllipsis, [DockPanel.DockProperty] = Dock.Left };
         name.Bind(TextBlock.ForegroundProperty, name.GetResourceObservable(TokenKeys.Vcs_File_Conflicted));
-        TextBlock folder = new() { VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(8, 0, 0, 0), FontSize = 12, TextTrimming = TextTrimming.CharacterEllipsis };
+        TextBlock folder = new() { VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(Gaps.Normal, 0, 0, 0), FontSize = 12, TextTrimming = TextTrimming.CharacterEllipsis };
         folder.Classes.Add(StyleClasses.Muted);
-        StackPanel file = new() { Orientation = Orientation.Horizontal, Margin = new Thickness(CellInset, 0, 0, 0), Children = { icon, name, folder } };
+        // The file narrows to its column, its folder ending in an ellipsis first, rather than running into what the sides did.
+        DockPanel file = new() { Margin = new Thickness(CellInset, 0, 0, 0), Children = { icon, name, folder } };
         TextBlock yours = Status(1);
         TextBlock theirs = Status(2);
         Grid line = new() { ColumnDefinitions = new ColumnDefinitions(ColumnWidths), Height = ListRow.Height, Children = { file, yours, theirs } };

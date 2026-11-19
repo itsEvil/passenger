@@ -1,4 +1,5 @@
 using Passenger.App.State;
+using Passenger.App.Workspace;
 using Passenger.Core;
 
 namespace Passenger.App.Settings;
@@ -13,73 +14,91 @@ namespace Passenger.App.Settings;
 public sealed class SettingsStore : IDisposable
 {
     private readonly StateDocument<AppSettings>? document;
-    private readonly FileSystemWatcher? watcher;
+
+    /// <summary>settings.json watched for other Passengers' changes; null for a window's own settings.</summary>
+    private readonly WatchedFile? watched;
     private AppSettings value;
+    private readonly List<SettingsPreview> previews = [];
+
+    /// <summary>The settings as last shown, which the process's share of the look and the windows have followed.</summary>
+    private AppSettings? effective;
     private bool inForce;
     private bool disposed;
 
-    private readonly Lock stamped = new();
-
-    /// <summary>settings.json's last write and length as this process last read it again or wrote it, under <see
-    /// cref="stamped"/>; none before the first time.</summary>
-    private (DateTime Written, long Length) read;
-
-    private SettingsStore(StateDocument<AppSettings>? document)
+    private SettingsStore(StateDocument<AppSettings>? document, AppSettings? opening = null)
     {
         this.document = document;
-        value = document?.Value ?? new AppSettings();
-        if (document is not null)
-        {
-            document.Wrote += Saw;
-        }
-        if (document is null || Path.GetDirectoryName(document.Path) is not { } folder)
+        value = document?.Value ?? opening ?? new AppSettings();
+        if (document is null)
         {
             return;
         }
-        try
+        watched = new WatchedFile(document.Path, "Settings", _ =>
         {
-            Directory.CreateDirectory(folder);
-            watcher = new FileSystemWatcher(folder, Path.GetFileName(document.Path))
-            {
-                NotifyFilter = NotifyFilters.LastWrite | NotifyFilters.FileName | NotifyFilters.Size | NotifyFilters.CreationTime,
-            };
-            // Written by a temporary file moved over it, so a rename onto the name counts as well as a write.
-            watcher.Changed += (_, _) => Look();
-            watcher.Created += (_, _) => Look();
-            watcher.Renamed += (_, e) =>
-            {
-                if (string.Equals(e.Name, watcher.Filter, StringComparison.OrdinalIgnoreCase))
-                {
-                    Look();
-                }
-            };
-            // Overflowed, or failed: a change it lost is in the file.
-            watcher.Error += (_, _) => Look();
-            watcher.EnableRaisingEvents = true;
-        }
-        catch (Exception error) when (error is IOException or UnauthorizedAccessException or ArgumentException or PlatformNotSupportedException)
-        {
-            // Unwatched, another Passenger's change is still kept, and read the next time this one changes something.
-            IdeErrors.Write($"Settings: {document.Path} is not watched for other Passengers' changes ({error.Message})");
-            watcher?.Dispose();
-            watcher = null;
-        }
+            UiThread.Post(ReadAgain);
+            return true;
+        });
+        document.Wrote += Saw;
     }
 
     /// <summary>Settings kept in a state folder's settings.json.</summary>
     internal static SettingsStore Kept(StateDocument<AppSettings> document) => new(document);
 
-    /// <summary>A window's own settings, kept nowhere: the defaults, changed only by that window.</summary>
-    public static SettingsStore Unkept() => new(null);
+    /// <summary>A window's own settings, kept nowhere: the defaults, or those it opens on, changed only by that window.</summary>
+    public static SettingsStore Unkept(AppSettings? opening = null) => new(null, opening);
+
+    /// <summary>The settings kept where PASSENGER_SETTINGS names (<see cref="StateStore.Named"/>), which a process nobody
+    /// sees opens on, read as a window keeping them reads them, on any thread: null with no folder named, or none kept there
+    /// (no file, or one that did not read).</summary>
+    internal static AppSettings? KeptWhereNamed() =>
+        StateStore.Named is { } folder ? new StateDocument<AppSettings>(Path.Combine(folder, StateStore.SettingsFile)).KeptNow() : null;
+
+    /// <summary>The logs' switches of the settings a process opens on, put in force before any window takes them, so what
+    /// it begins ahead of its window (a language server, an agent's first calls) is traced from its start.</summary>
+    internal static void LogsInForce(AppSettings opening) => LogsInForce(null, opening);
 
     /// <summary>The settings in force.</summary>
     public AppSettings Value => value;
 
+    /// <summary>The settings as shown: those in force with the looks open Settings dialogs changed put over them.</summary>
+    public AppSettings Effective => previews.Aggregate(value, (now, preview) => preview.Over(now));
+
+    /// <summary>The settings as shown changed, by a change in force or a Settings dialog's preview; raised once the
+    /// process's share of the look is in force.</summary>
+    public event EventHandler? PreviewChanged;
+
+    /// <summary>A Settings dialog's preview of the look, shown until it is disposed.</summary>
+    public SettingsPreview BeginPreview()
+    {
+        SettingsPreview preview = new(this);
+        previews.Add(preview);
+        return preview;
+    }
+
+    internal void EndPreview(SettingsPreview preview)
+    {
+        previews.Remove(preview);
+        RefreshPreview();
+    }
+
+    /// <summary>The settings as shown followed, where a preview changed them: an edit of behaviour redraws nothing.</summary>
+    internal void RefreshPreview()
+    {
+        AppSettings next = Effective;
+        if (next == effective)
+        {
+            return;
+        }
+        VisualsInForce(effective ?? value, next);
+        effective = next;
+        PreviewChanged?.Invoke(this, EventArgs.Empty);
+    }
+
     /// <summary>Whether the settings are kept in a file (the person's), rather than a window's own.</summary>
     public bool IsKept => document is not null;
 
-    /// <summary>The system's watcher of settings.json; null for a window's own settings, or a file that could not be watched.</summary>
-    public FileSystemWatcher? Watcher => watcher;
+    /// <summary>The watch on settings.json; null for a window's own settings.</summary>
+    public WatchedFile? Watched => watched;
 
     /// <summary>The settings changed, by a window of this process or by another Passenger; raised once the process's
     /// share (theme, keymap, logs) is in force.</summary>
@@ -115,7 +134,8 @@ public sealed class SettingsStore : IDisposable
             return;
         }
         inForce = true;
-        InForce(null, value);
+        InForce(null, Effective);
+        effective = Effective;
     }
 
     /// <summary>Writes a change still waiting, now.</summary>
@@ -127,9 +147,9 @@ public sealed class SettingsStore : IDisposable
     public void LookAgain()
     {
         UiThread.Check();
-        if (document is not null && !disposed)
+        if (!disposed)
         {
-            IdeErrors.Observe(BackgroundWork.Run(Look));
+            watched?.LookAgain();
         }
     }
 
@@ -140,36 +160,11 @@ public sealed class SettingsStore : IDisposable
         {
             document.Wrote -= Saw;
         }
-        watcher?.Dispose();
+        watched?.Dispose();
     }
 
-    /// <summary>On any thread: settings.json read again on the UI thread if it moved since this process last read or wrote
-    /// it, the window's own writes no change.</summary>
-    private void Look()
-    {
-        if (document is null)
-        {
-            return;
-        }
-        (DateTime Written, long Length) now = Stamp(document.Path);
-        lock (stamped)
-        {
-            if (now == read)
-            {
-                return;
-            }
-        }
-        UiThread.Post(ReadAgain);
-    }
-
-    /// <summary>settings.json as this process last read or wrote it, on any thread.</summary>
-    private void Saw((DateTime Written, long Length) stamp)
-    {
-        lock (stamped)
-        {
-            read = stamp;
-        }
-    }
+    /// <summary>settings.json as this process just wrote it, on the writing thread: no change for a look to read again.</summary>
+    private void Saw(FileStamp stamp) => watched?.Saw(stamp);
 
     /// <summary>settings.json as it is on disk now, when another Passenger changed it.</summary>
     private void ReadAgain()
@@ -179,7 +174,7 @@ public sealed class SettingsStore : IDisposable
             return;
         }
         // Taken before the read, so a write after it moves the stamp past this.
-        Saw(Stamp(document.Path));
+        watched?.Saw(FileStamp.Of(document.Path));
         if (!document.Reread())
         {
             return;
@@ -192,14 +187,17 @@ public sealed class SettingsStore : IDisposable
 
     private void Raise(AppSettings before, AppSettings after)
     {
-        InForce(before, after);
+        AppSettings next = Effective;
+        InForce(effective ?? before, next);
+        effective = next;
         Changed?.Invoke(this, new SettingsChange(before, after));
+        PreviewChanged?.Invoke(this, EventArgs.Empty);
     }
 
-    /// <summary>What belongs to the process, put in force once for every window: the theme, its dark or light and the
+    /// <summary>The process's share of the look, put in force once for every window: the theme, its dark or light and the
     /// code's colours only when their settings change, so one named on the command line stands until then; the code font and
-    /// the window's.</summary>
-    private static void InForce(AppSettings? before, AppSettings after)
+    /// the window's; the carets' width.</summary>
+    private static void VisualsInForce(AppSettings? before, AppSettings after)
     {
         if (Avalonia.Application.Current is { } app && (before is null || before.Theme != after.Theme))
         {
@@ -209,30 +207,63 @@ public sealed class SettingsStore : IDisposable
         {
             Themes.Apply(current, after.Look, after.ColourScheme);
         }
-        if (Avalonia.Application.Current is { } shown && (before is null || before.EditorFontFamily != after.EditorFontFamily))
+        FontsInForce(after);
+        if (Avalonia.Application.Current is { } careted && (before is null || before.CaretWidth != after.CaretWidth))
         {
-            Passenger.Editor.CodeFonts.Use(shown, Passenger.Editor.CodeFonts.Named(after.EditorFontFamily) ?? Passenger.Editor.CodeEditor.CodeFont);
+            Passenger.Editor.Carets.UseWidth(careted, after.CaretWidth);
         }
-        if (Avalonia.Application.Current is { } framed && (before is null || before.WindowFontFamily != after.WindowFontFamily))
+        if (Avalonia.Application.Current is { } scaled && (before is null || before.DisplayScale != after.DisplayScale))
         {
-            WindowFonts.Use(framed, WindowFonts.Named(after.WindowFontFamily) ?? WindowFonts.Carried);
+            InterfaceScale.Use(scaled, after.DisplayScale);
         }
+    }
+
+    /// <summary>The settings whose fonts are in force, which the theme's fonts give way to.</summary>
+    private static AppSettings? fontsOf;
+
+    /// <summary>The code's and the window's family in force, as their names: a family Settings names, else the theme's.</summary>
+    private static (string? Code, string? Window)? fontsInForce;
+
+    /// <summary>The code font and the window's: the family Settings names wherever the person named one, else the theme's,
+    /// else Passenger's own; put in force again as the theme's change.</summary>
+    private static void FontsInForce(AppSettings after)
+    {
+        if (fontsOf is null)
+        {
+            Themes.FontsChanged += (_, _) => FontsInForce(fontsOf!);
+        }
+        fontsOf = after;
+        (string? code, string? window) = (after.EditorFontFamily ?? Themes.Fonts.CodeFamily, after.WindowFontFamily ?? Themes.Fonts.WindowFamily);
+        if (Avalonia.Application.Current is { } shown && (fontsInForce is null || fontsInForce.Value.Code != code))
+        {
+            Passenger.Editor.CodeFonts.Use(shown, Passenger.Editor.CodeFonts.Named(code) ?? Passenger.Editor.CodeEditor.CodeFont);
+        }
+        if (Avalonia.Application.Current is { } framed && (fontsInForce is null || fontsInForce.Value.Window != window))
+        {
+            WindowFonts.Use(framed, WindowFonts.Named(window) ?? WindowFonts.Carried);
+        }
+        fontsInForce = Avalonia.Application.Current is null ? null : (code, window);
+    }
+
+    /// <summary>What belongs to the process, put in force once for every window: its share of the look, the keymap and the
+    /// logs' switches.</summary>
+    private static void InForce(AppSettings? before, AppSettings after)
+    {
+        VisualsInForce(before, after);
         if (before is null || before.Keymap != after.Keymap || !SameShortcuts(before.OwnShortcuts(), after.OwnShortcuts()))
         {
             AppActions.Choose(after.Keymap, after.OwnShortcuts());
         }
+        LogsInForce(before, after);
+    }
+
+    private static void LogsInForce(AppSettings? before, AppSettings after)
+    {
         if (before is null || before.TraceProtocols != after.TraceProtocols)
         {
             IdeLog.Traces = after.TraceProtocols;
         }
         IdeLog.Programs = after.LogEveryProgram;
-    }
-
-    /// <summary>A file's last write and length, or none while it is not there.</summary>
-    private static (DateTime Written, long Length) Stamp(string path)
-    {
-        FileInfo file = new(path);
-        return file.Exists ? (file.LastWriteTimeUtc, file.Length) : default;
     }
 
     private static bool SameShortcuts(Dictionary<string, string[]> one, Dictionary<string, string[]> other) =>

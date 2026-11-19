@@ -12,9 +12,11 @@
     <Project Path="src/Passenger.Helper/Passenger.Helper.csproj" />
     <Project Path="src/Passenger.Host/Passenger.Host.csproj" />
     <Project Path="src/Passenger.Inspector/Passenger.Inspector.csproj" />
+    <Project Path="src/Passenger.Inspector.Maui/Passenger.Inspector.Maui.csproj" />
     <Project Path="src/Passenger.Inspector.Wpf/Passenger.Inspector.Wpf.csproj" />
     <Project Path="src/Passenger.Languages/Passenger.Languages.csproj" />
     <Project Path="src/Passenger.Lsp/Passenger.Lsp.csproj" />
+    <Project Path="src/Passenger.MauiPreview/Passenger.MauiPreview.csproj" />
     <Project Path="src/Passenger.Packages/Passenger.Packages.csproj" />
     <Project Path="src/Passenger.Profiler/Passenger.Profiler.csproj" />
     <Project Path="src/Passenger.Roslyn.Extension/Passenger.Roslyn.Extension.csproj" />
@@ -40,6 +42,11 @@
   <Folder Name="/tests/AspireGraphs/">
     <Project Path="tests/AspireGraphs/ApiService/AspireGraphs.ApiService.csproj" />
     <Project Path="tests/AspireGraphs/AppHost/AspireGraphs.AppHost.csproj" />
+    <Project Path="tests/AspireGraphs/Functions/AspireGraphs.Functions.csproj" />
+    <Project Path="tests/AspireGraphs/FunctionsHost/AspireGraphs.FunctionsHost.csproj" />
+    <Project Path="tests/AspireGraphs/PackageApiService/AspireGraphs.PackageApiService.csproj" />
+    <Project Path="tests/AspireGraphs/PackageAppHost/AspireGraphs.PackageAppHost.csproj" />
+    <Project Path="tests/AspireGraphs/PackageServiceDefaults/AspireGraphs.PackageServiceDefaults.csproj" />
     <Project Path="tests/AspireGraphs/ServiceDefaults/AspireGraphs.ServiceDefaults.csproj" />
   </Folder>
   <Folder Name="/tests/BlazorGraphs/">
@@ -48,6 +55,11 @@
   </Folder>
   <Folder Name="/tests/AvaloniaGraphs/">
     <Project Path="tests/AvaloniaGraphs/Avalonia11/AvaloniaGraphs.Avalonia11.csproj" />
+    <Project Path="tests/AvaloniaGraphs/Avalonia12/AvaloniaGraphs.Avalonia12.csproj" />
+    <Project Path="tests/AvaloniaGraphs/Avalonia120/AvaloniaGraphs.Avalonia120.csproj" />
+  </Folder>
+  <Folder Name="/tests/MauiGraphs/">
+    <Project Path="tests/MauiGraphs/Controls/MauiGraphs.Controls.csproj" />
   </Folder>
   <Folder Name="/tests/GodotGraphs/">
     <Project Path="tests/GodotGraphs/GdUnit4/GodotGraphs.GdUnit4.csproj" />
@@ -56,6 +68,7 @@
   <Folder Name="/tests/UnitTestGraphs/">
     <Project Path="tests/UnitTestGraphs/MSTest/UnitTestGraphs.MSTest.csproj" />
     <Project Path="tests/UnitTestGraphs/NUnit/UnitTestGraphs.NUnit.csproj" />
+    <Project Path="tests/UnitTestGraphs/Reqnroll/UnitTestGraphs.Reqnroll.csproj" />
     <Project Path="tests/UnitTestGraphs/Xunit2/UnitTestGraphs.Xunit2.csproj" />
     <Project Path="tests/UnitTestGraphs/XunitV3/UnitTestGraphs.XunitV3.csproj" />
   </Folder>
@@ -72,6 +85,7 @@
     <Project Path="tests/Debuggees/LinkedLibrary/LinkedLibrary.csproj" />
     <Project Path="tests/Debuggees/LoopingConsoleApp/LoopingConsoleApp.csproj" />
     <Project Path="tests/Debuggees/LoopingConsoleAppOptimized/LoopingConsoleAppOptimized.csproj" />
+    <Project Path="tests/Debuggees/MinimalApiApp/MinimalApiApp.csproj" />
     <Project Path="tests/Debuggees/PassengerCases/PassengerCases.csproj" />
     <Project Path="tests/Debuggees/PassengerCasesProxies/PassengerCasesProxies.csproj" />
     <Project Path="tests/Debuggees/ReadsInputConsoleApp/ReadsInputConsoleApp.csproj" />

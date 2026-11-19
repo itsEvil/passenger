@@ -90,6 +90,172 @@ public sealed class ProblemsTests : IClassFixture<ProblemsTests.Project>
             $"The Solution tab's rows {when} are not those it lists afresh:\n{string.Join('\n', kept)}\n\nAfresh:\n{string.Join('\n', afresh)}");
     }
 
+    /// <summary>The status bar says solution-wide analysis is under way while its first round is, a turning ring in place
+    /// of its icon: a tick there would say the solution has no errors before any file nobody opened was analysed. Once the
+    /// round answers, it says what the round found (here Bad.cs's error).</summary>
+    [AvaloniaFact]
+    public void The_status_bar_says_solution_wide_analysis_is_under_way_until_its_first_round_answers()
+    {
+        MainWindow window = project.Open("Helper.cs");
+        Passenger.Lsp.LanguageServer server = window.CSharpService!.Session!.Server;
+        Avalonia.Controls.Button analysis = Avalonia.Controls.ControlExtensions.FindControl<Avalonia.Controls.Button>(window, "AnalysisButton")!;
+        WorkingRing? ring = Avalonia.Controls.ControlExtensions.FindControl<WorkingRing>(window, "AnalysisWorking");
+        TaskCompletionSource asked = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        List<(long At, string What)> marks = [];
+        long since = Mark(marks, "solution-wide analysis turned on");
+        (bool Analysing, string? Said, bool Ringed)? held = null;
+        try
+        {
+            // The first pull held unsent, as by a server still analysing a large solution, the bar read as it is held: the server's refresh may let go of it before a later look.
+            Task holding = server.HoldNext(Passenger.Roslyn.Extension.ExtensionMethods.WorkspaceDiagnostic, _ =>
+            {
+                Mark(marks, "a pull held unsent, the status bar looked at");
+                held = Avalonia.Threading.Dispatcher.UIThread.CheckAccess()
+                    ? (window.CSharpService.IsAnalysing, Avalonia.Controls.ToolTip.GetTip(analysis) as string, ring?.IsVisible == true)
+                    : (false, "nothing: the pull was asked off the window's thread", false);
+                return true;
+            }, asked.Task);
+            window.Perform(AppActions.ToggleSolutionAnalysis);
+            // Pumped, not settled: the round is background work until it answers.
+            Ui.PumpUntil(() => holding.IsCompleted, "the first pull of the solution's diagnostics to be asked, and held");
+            Assert.True(held?.Analysing == true,
+                $"Solution-wide analysis's first round was over as its first pull was held unsent:\n{StepsSince(window.CSharpService, since, marks)}");
+            Assert.True(held?.Said?.StartsWith("Solution-wide analysis is under way", StringComparison.Ordinal) == true && held?.Ringed == true,
+                $"While solution-wide analysis had yet to answer its first round, the status bar said \"{held?.Said}\" with {(held?.Ringed == true ? "a turning ring" : "no ring")}");
+        }
+        finally
+        {
+            asked.TrySetResult();
+        }
+        Ui.WaitFor(() => window.CSharpService is { IsAnalysing: false }, () => $"the first round to answer once its pull was let go:\n{StepsSince(window.CSharpService, since, marks)}");
+        string? after = Avalonia.Controls.ToolTip.GetTip(analysis) as string;
+        Assert.True(after?.StartsWith("Solution-wide analysis: ", StringComparison.Ordinal) == true && ring?.IsVisible == false,
+            $"Once the first round answered, finding Bad.cs's error, the status bar said \"{after}\" with {(ring?.IsVisible == true ? "a ring still turning" : "no ring")}");
+        window.Close();
+    }
+
+    /// <summary>Solution-wide analysis's first round is over once the server has analysed every source, not once it answers,
+    /// which it may leave until the next change: a round's pull asked again as the solution moved, after the pull before it
+    /// had taken that change, is held open with nothing coming to end it. With the first pull's answer held, the round ends
+    /// and the Solution tab lists the closed file's error.</summary>
+    [AvaloniaFact]
+    public void The_first_round_ends_once_the_server_has_analysed_every_source_though_its_answer_waits()
+    {
+        MainWindow window = project.Open("Helper.cs");
+        ProblemsModel problems = window.BottomPanel.Problems;
+        Passenger.App.CSharp.CSharpService service = window.CSharpService!;
+        Passenger.Lsp.LanguageServer server = service.Session!.Server;
+        TaskCompletionSource answered = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        try
+        {
+            Task holding = server.HoldNextAnswer(Passenger.Roslyn.Extension.ExtensionMethods.WorkspaceDiagnostic,
+                p => p is Passenger.Lsp.WorkspaceDiagnosticParams { Identifier: "WorkspaceDocumentsAndProject" }, answered.Task);
+            window.Perform(AppActions.ToggleSolutionAnalysis);
+            // Pumped, not settled: a held answer is work in flight.
+            bool Ended() => !service.IsAnalysing && problems.SolutionProblems?.Any(p => p.Code == "CS0029") == true;
+            Assert.True(Ui.Pumped(Ended, TimeSpan.FromSeconds(90)),
+                $"Solution-wide analysis's first round {(service.IsAnalysing ? "was still under way" : "ended")} with its first pull "
+                + $"{(holding.IsCompleted ? "answered and its answer held" : "let go or unanswered")}, the closed file's error "
+                + $"{(problems.SolutionProblems?.Any(p => p.Code == "CS0029") == true ? "listed" : "not listed")}{Ui.ServerLogTail()}");
+        }
+        finally
+        {
+            answered.TrySetResult();
+        }
+        window.Close();
+    }
+
+    /// <summary>A file nobody has open changed on disk while one of solution-wide analysis's pulls is under way has the pull
+    /// let go and asked again of the solution the change made, rather than waited for: the server would finish it on the
+    /// solution before the change, then analyse it whole again, as it did every session's first round. With the pull asked
+    /// after a key held unsent, as by a server analysing a large solution for minutes, the Solution tab lists the file's new
+    /// error once the server says its solution moved.</summary>
+    [AvaloniaFact]
+    public void A_file_changed_on_disk_while_a_pull_is_under_way_has_it_asked_again_of_the_solution_the_change_made()
+    {
+        MainWindow window = project.Open("Helper.cs");
+        ProblemsModel problems = window.BottomPanel.Problems;
+        List<(long At, string What)> marks = [];
+        long since = Mark(marks, "solution-wide analysis turned on");
+        window.Perform(AppActions.ToggleSolutionAnalysis);
+        Ui.WaitFor(() => problems.SolutionProblems?.Any(p => p.Code == "CS0029") == true, "the closed file's error");
+        Passenger.App.CSharp.CSharpService service = window.CSharpService!;
+        Passenger.Lsp.LanguageServer server = service.Session!.Server;
+        Passenger.Editor.CodeEditor editor = window.EditorArea.CodeEditor;
+        const string Analysed = "WorkspaceDocumentsAndProject";
+        TaskCompletionSource released = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        Task? holding = null;
+        // Placed at the key's change, so only a pull asked after it is held: the one under way may be one no key lets go, which the server answers.
+        void HoldTheNextPull(object? sender, DocumentChangedEventArgs e)
+        {
+            editor.Document.Changed -= HoldTheNextPull;
+            Mark(marks, "the key's change, the next pull to be held unsent");
+            holding = server.HoldNext(Passenger.Roslyn.Extension.ExtensionMethods.WorkspaceDiagnostic,
+                p => p is Passenger.Lsp.WorkspaceDiagnosticParams { Identifier: Analysed }, released.Task);
+        }
+        try
+        {
+            editor.Document.Changed += HoldTheNextPull;
+            Rename(window, "Twice", "Twice2");
+            Ui.WaitFor(() => holding?.IsCompleted == true,
+                () => $"the analysis to ask again once the key's own pull answered, and that pull held:\n{StepsSince(service, since, marks)}");
+            int asked = service.PullsAsked(Analysed);
+
+            Mark(marks, "Bad.cs rewritten");
+            project.Rewrite("Bad.cs", "class Bad\n{\n    public int Count = Missing;\n}\n");
+            bool Listed() => problems.SolutionProblems?.Any(p => p.Code == "CS0103" && p.Path?.EndsWith("Bad.cs", StringComparison.Ordinal) == true) == true;
+            // Pumped, not settled: the held pull stands for the server's work in flight until it is let go.
+            Assert.True(Ui.Pumped(Listed, TimeSpan.FromSeconds(90)),
+                $"Bad.cs's new error was not listed while the pull asked after the key, before Bad.cs changed, was held unsent: "
+                + $"the analysis asked {service.PullsAsked(Analysed) - asked} more pulls of every file's problems (listed: "
+                + $"{string.Join("; ", problems.SolutionProblems?.Select(p => $"{Path.GetFileName(p.Path)} {p.Code}") ?? [])}):\n"
+                + $"{StepsSince(service, since, marks)}{Ui.ServerLogTail()}");
+            Assert.DoesNotContain(problems.SolutionProblems!, p => p.Code == "CS0029" && p.Path?.EndsWith("Bad.cs", StringComparison.Ordinal) == true);
+        }
+        finally
+        {
+            editor.Document.Changed -= HoldTheNextPull;
+            released.TrySetResult();
+        }
+        window.Close();
+    }
+
+    /// <summary>A file's pull of what its project's whole analysis reports in it, which solution-wide analysis adds, is named
+    /// by its source while it waits on the server, so a long wait (a large project's) says which pull it is.</summary>
+    [AvaloniaFact]
+    public void A_files_project_wide_pull_waiting_on_the_server_is_named_by_its_source()
+    {
+        MainWindow window = project.Open("Helper.cs");
+        Passenger.Lsp.LanguageServer server = window.CSharpService!.Session!.Server;
+        window.Perform(AppActions.ToggleSolutionAnalysis);
+        Ui.WaitFor(() => server.DiagnosticSources.Contains(Passenger.Lsp.LspDocument.ProjectWideSource),
+            "the server to give files a project-wide source of diagnostics, as it does analysing the whole solution");
+        TaskCompletionSource asked = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        string? conversation = null;
+        try
+        {
+            // Read as the pull is held, where it surely waits: a later pull (the server's refresh) may let go of it before the test looks.
+            Task holding = server.HoldNext(Passenger.Lsp.LspMethods.DocumentDiagnostic, p =>
+            {
+                if (p is not Passenger.Lsp.DocumentDiagnosticParams { Identifier: Passenger.Lsp.LspDocument.ProjectWideSource })
+                {
+                    return false;
+                }
+                conversation = server.Conversation();
+                return true;
+            }, asked.Task);
+            window.KeyTextInput(" ");
+            Ui.PumpUntil(() => holding.IsCompleted, "the file's project-wide pull to be asked, and held");
+            Assert.True(conversation!.Contains($"{Passenger.Lsp.LspMethods.DocumentDiagnostic} ({Passenger.Lsp.LspDocument.ProjectWideSource})", StringComparison.Ordinal),
+                $"The file's project-wide pull waiting on the server was not named by its source: {conversation}");
+        }
+        finally
+        {
+            asked.TrySetResult();
+        }
+        window.Close();
+    }
+
     /// <summary>Solution-wide analysis turned on as the folder opens, while its language server starts and before the
     /// window has a session of it, reaches the server once it has: the Solution tab lists the error of a file nobody
     /// opened, which a server left analysing the open files alone never reports.</summary>
@@ -130,7 +296,7 @@ public sealed class ProblemsTests : IClassFixture<ProblemsTests.Project>
 
         window.Perform(AppActions.ToggleSolutionAnalysis);
         Assert.False(window.Settings.SolutionWideAnalysis);
-        (_, Passenger.Lsp.WorkspaceDocumentDiagnosticReport narrowed) = Reported(server, [source], [new Passenger.Lsp.PreviousResultId(analysed.Uri, analysed.ResultId)],
+        (_, Passenger.Lsp.WorkspaceDocumentDiagnosticReport narrowed) = Reported(server, [source], [new Passenger.Lsp.PreviousResultId(analysed.Uri, analysed.ResultId, analysed.ProjectContext)],
             r => r.Uri == analysed.Uri,
             () => $"the server to say Bad.cs's problems are gone once solution-wide analysis was turned off: it says nothing new of a file it goes on analysing{Ui.ServerLogTail()}");
         Assert.True(narrowed is { Kind: "full", ResultId: null, Items: null or [] },
@@ -140,7 +306,8 @@ public sealed class ProblemsTests : IClassFixture<ProblemsTests.Project>
     }
 
     /// <summary>The first report a pull of each source streams that <paramref name="wanted"/> takes, with its source, the
-    /// pulls let go once it has come, since Roslyn holds a workspace pull open until the next change.</summary>
+    /// pulls let go once it has come, since Roslyn holds a workspace pull open until the next change. Asked as solution-wide
+    /// analysis asks, of Passenger's extension.</summary>
     private static (string? Source, Passenger.Lsp.WorkspaceDocumentDiagnosticReport Report) Reported(Passenger.Lsp.LanguageServer server,
         IEnumerable<string?> sources, IReadOnlyList<Passenger.Lsp.PreviousResultId> previous, Func<Passenger.Lsp.WorkspaceDocumentDiagnosticReport, bool> wanted,
         Func<string> what)
@@ -153,7 +320,7 @@ public sealed class ProblemsTests : IClassFixture<ProblemsTests.Project>
             {
                 came.Enqueue((source, report));
             }
-        }, letGo.Token))];
+        }, letGo.Token, new Dictionary<string, string>()))];
         try
         {
             Ui.WaitFor(() => !came.IsEmpty, what, TimeSpan.FromSeconds(30));
@@ -182,7 +349,7 @@ public sealed class ProblemsTests : IClassFixture<ProblemsTests.Project>
 
         // The pulls held open answer the edit, and the next pull of every source is refused.
         Passenger.Lsp.LanguageServer server = window.CSharpService!.Session!.Server;
-        Task refused = server.RefuseNext(Passenger.Lsp.LspMethods.WorkspaceDiagnostic, server.WorkspaceDiagnosticSources.Count);
+        Task refused = server.RefuseNext(Passenger.Roslyn.Extension.ExtensionMethods.WorkspaceDiagnostic, server.WorkspaceDiagnosticSources.Count);
         Rename(window, "Twice", "Thrice");
         bool CallerBroken() => problems.SolutionProblems?.Any(p => p.Path?.EndsWith("Caller.cs", StringComparison.Ordinal) == true) == true;
         Ui.WaitFor(CallerBroken, "the broken caller's error", TimeSpan.FromMinutes(1));
@@ -198,7 +365,8 @@ public sealed class ProblemsTests : IClassFixture<ProblemsTests.Project>
     /// <summary>Keys typed in a burst have solution-wide analysis ask the server again once typing pauses, not for every key:
     /// its pulls held open for a change are let go as the first key comes and asked again once the open file's own pull has
     /// answered, and the Solution tab then lists what the keys broke in a file nobody has open. The keys come one straight
-    /// after another, each with the work it posted run, so no pause comes between them however slow the machine.</summary>
+    /// after another, each with the work it posted run, so no pause comes between them however slow the machine; what is
+    /// asked counts from the first key's change, as the work come due before it runs as the key is sent.</summary>
     [AvaloniaFact]
     public void Keys_typed_in_a_burst_have_solution_wide_analysis_ask_the_server_again_once_typing_pauses()
     {
@@ -210,31 +378,71 @@ public sealed class ProblemsTests : IClassFixture<ProblemsTests.Project>
         editor.Selections = SelectionSet.Single(editor.Document.Snapshot.ToString().IndexOf("Twice", StringComparison.Ordinal) + "Twice".Length);
         editor.Focus();
         bool CallerBroken() => problems.SolutionProblems?.Any(p => p.Path?.EndsWith("Caller.cs", StringComparison.Ordinal) == true) == true;
+        Passenger.App.CSharp.CSharpService service = window.CSharpService!;
+        List<(long At, string What)> marks = [];
+        long since = Mark(marks, "the warm-up's space typed");
         // A key and its undoing first, which the server answers as it does a session's first change.
         string written = editor.Document.Snapshot.ToString();
         Ui.Type(window, "SPACE", " ");
         Ui.Press(window, "BACK_SPACE");
+        Mark(marks, "the warm-up's space taken back");
         Assert.True(editor.Document.Snapshot.ToString() == written, "A space typed after Twice and taken back left the file changed");
-        Passenger.App.CSharp.CSharpService service = window.CSharpService!;
         IReadOnlyList<string?> sources = service.Session!.Server.WorkspaceDiagnosticSources;
         int[] Asked() => [.. sources.Select(service.PullsAsked)];
         int[] before = Asked();
 
         const int Keys = 10;
-        int[] during = new int[sources.Count];
+        int[]? atFirstKey = null;
+        void FirstKey(object? sender, DocumentChangedEventArgs e)
+        {
+            if (atFirstKey is null)
+            {
+                atFirstKey = Asked();
+                Mark(marks, "key 1's change");
+            }
+        }
+        editor.Document.Changed += FirstKey;
         for (int typed = 0; typed < Keys; typed++)
         {
-            int[] asked = Asked();
+            Mark(marks, $"key {typed + 1} sent");
             window.KeyTextInput("x");
-            during = [.. Asked().Select((now, i) => during[i] + now - asked[i])];
+            Mark(marks, $"key {typed + 1}'s work run");
         }
+        editor.Document.Changed -= FirstKey;
+        int[] typing = Asked();
+        int[] first = atFirstKey ?? before;
+        int[] during = [.. typing.Select((now, i) => now - first[i])];
         Ui.WaitFor(CallerBroken, "the error the keys made in the caller nobody has open", TimeSpan.FromMinutes(1));
         Ui.Settle();
         int[] after = Asked();
-        string Said() => string.Join(", ", sources.Select((source, i) => $"{source ?? "every source"} {during[i]} then {after[i] - before[i] - during[i]}"));
+        string Said() => string.Join(", ", sources.Select((source, i) => $"{source ?? "every source"} {first[i] - before[i]}, {during[i]} then {after[i] - typing[i]}"));
         Assert.True(during.All(n => n == 0),
-            $"Solution-wide analysis asked the server again while {Keys} keys were typed in a burst, where it asks only once typing pauses (during the keys, then after: {Said()})");
+            $"Solution-wide analysis asked the server again while {Keys} keys were typed in a burst, where it asks only once typing pauses (before the first key's change, during the keys, then after: {Said()}):\n{StepsSince(service, since, marks)}");
         window.Close();
+    }
+
+    /// <summary>A step of the test's own, at the time it is marked, said among the analysis's (<see cref="StepsSince"/>).</summary>
+    private static long Mark(List<(long At, string What)> marks, string what)
+    {
+        long at = System.Diagnostics.Stopwatch.GetTimestamp();
+        lock (marks)
+        {
+            marks.Add((at, what));
+        }
+        return at;
+    }
+
+    /// <summary>Solution-wide analysis's steps since <paramref name="since"/> with the test's own marks among them, each at its
+    /// time from then: which pull went when against the keys, the open file's pulls and the server's refreshes.</summary>
+    private static string StepsSince(Passenger.App.CSharp.CSharpService service, long since, List<(long At, string What)> marks)
+    {
+        List<(long At, string What)> all = [.. service.AnalysisSteps().Where(s => s.At >= since).Select(s => (s.At, s.ToString()))];
+        lock (marks)
+        {
+            all.AddRange(marks);
+        }
+        return string.Join('\n', all.OrderBy(s => s.At).Select(s =>
+            $"{System.Diagnostics.Stopwatch.GetElapsedTime(since, s.At).TotalMilliseconds,9:0.0} ms  {s.What}"));
     }
 
     /// <summary>A file's markers are put in order once, as its diagnostics are taken, however its server's sources gave them
@@ -511,68 +719,6 @@ public sealed class ProblemsTests : IClassFixture<ProblemsTests.Project>
         return (window, typed, listed);
     }
 
-    /// <summary>Solution-wide analysis places each file's warnings without a copy of the file's text, and decodes each
-    /// warning at a small cost: over a thousand files nobody has open with no break only Roslyn counts, a pull of their
-    /// warnings allocates (on every thread, the least of three) under 8 KB a file more when each is 17 KB long than when it
-    /// is a few lines, where a copy of its text costs three times its size, and twenty warnings a file under 4 KB for each
-    /// warning more than two.</summary>
-    [AvaloniaFact]
-    public void A_pull_of_thousands_of_warnings_decodes_each_at_a_small_cost_and_never_copies_a_files_text()
-    {
-        (long dense, int denseListed) = PullBytes(files: 100, warnings: 20, lines: 2);
-        (long few, int fewListed) = PullBytes(files: 100, warnings: 2, lines: 2);
-        (long shortFiles, int listed) = PullBytes(files: 1000, warnings: 2, lines: 2);
-        (long longFiles, _) = PullBytes(files: 1000, warnings: 2, lines: 210);
-        long perText = (longFiles - shortFiles) / 1000;
-        long perWarning = (dense - few) / (denseListed - fewListed);
-        TestContext.Current.TestOutputHelper?.WriteLine(
-            $"A pull of {listed} problems allocated {longFiles / 1024:N0} KB over 1,000 files of 17 KB, {shortFiles / 1024:N0} KB over 1,000 of a few lines: {perText:N0} bytes a file more; "
-            + $"{dense / 1024:N0} KB for {denseListed} problems in 100 files, {few / 1024:N0} KB for {fewListed}: {perWarning:N0} bytes a warning more");
-        Assert.True(perText < 8 * 1024,
-            $"A pull of solution-wide analysis allocated {longFiles / 1024:N0} KB over 1,000 files of 17 KB, {shortFiles / 1024:N0} KB over 1,000 of a few lines: {perText:N0} bytes for each file's 17 KB, as if its text were read to place its warnings");
-        Assert.True(perWarning < 4 * 1024,
-            $"A pull of solution-wide analysis allocated {dense / 1024:N0} KB for {denseListed} warnings, {few / 1024:N0} KB for {fewListed} in the same files: {perWarning:N0} bytes for each warning more");
-    }
-
-    /// <summary>What turning solution-wide analysis on allocates on every thread until Problems counts every warning, the
-    /// least of three, over <paramref name="files"/> files of a comment of <paramref name="lines"/> lines and
-    /// <paramref name="warnings"/> unused variables each; and how many problems it listed.</summary>
-    private (long Bytes, int Listed) PullBytes(int files, int warnings, int lines)
-    {
-        string comment = string.Concat(Enumerable.Repeat("// A line of a long comment the compiler passes over, as long as a line of code.\n", lines));
-        List<(string, string)> written = [];
-        for (int i = 0; i < files; i++)
-        {
-            System.Text.StringBuilder text = new(comment);
-            text.Append(System.Globalization.CultureInfo.InvariantCulture, $"static class Long{i}\n{{\n    static void All()\n    {{\n");
-            for (int j = 0; j < warnings; j++)
-            {
-                text.Append(System.Globalization.CultureInfo.InvariantCulture, $"        int unused{j};\n");
-            }
-            written.Add(($"Long{i}.cs", text.Append("    }\n}\n").ToString()));
-        }
-        project.Write(written);
-        MainWindow window = project.Open("Program.cs");
-        ProblemsModel problems = window.BottomPanel.Problems;
-        // Each file's warnings and Bad.cs's error.
-        int listed = (files * warnings) + 1;
-        long least = long.MaxValue;
-        for (int time = 0; time < 3; time++)
-        {
-            Ui.Settle();
-            long before = GC.GetTotalAllocatedBytes(precise: true);
-            window.Perform(AppActions.ToggleSolutionAnalysis);
-            // Counted rather than quiet: a source's first pull may stay open, and the whole list sorts again at each look.
-            Ui.PumpUntil(() => problems.SolutionCount == listed, $"the solution's {listed} problems", TimeSpan.FromMinutes(3));
-            least = Math.Min(least, GC.GetTotalAllocatedBytes(precise: true) - before);
-            Assert.Equal(new TextPosition(lines + 4, 12), problems.SolutionProblems!.First(p => p.Path!.EndsWith("Long0.cs", StringComparison.Ordinal)).Position);
-            window.Perform(AppActions.ToggleSolutionAnalysis);
-            Assert.Null(problems.SolutionProblems);
-        }
-        window.Close();
-        return (least, listed);
-    }
-
     /// <summary>A key's problems never wait for what the whole project's analysis reports in the open file, which with
     /// solution-wide analysis on and 4,000 warnings in files nobody has open answers a change seconds after the file's own:
     /// with that held unanswered, the error a key makes is listed in the File and Solution tabs and marked in the editor.</summary>
@@ -677,7 +823,7 @@ public sealed class ProblemsTests : IClassFixture<ProblemsTests.Project>
         window.EditorArea.CodeEditor.Selections = SelectionSet.Single(new Selection(at, at + "before".Length));
         window.KeyTextInput("typed");
         Ui.WaitFor(() => Saying("typed", closed: false) == 1, "the open file's edit's warning");
-        TaskCompletionSource<bool> fromDisk = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        TaskCompletionSource<bool?> fromDisk = new(TaskCreationOptions.RunContinuationsAsynchronously);
         window.AskConflict = _ => fromDisk.Task;
 
         Passenger.Lsp.LanguageServer server = window.CSharpService.Session.Server;
@@ -854,8 +1000,7 @@ public sealed class ProblemsTests : IClassFixture<ProblemsTests.Project>
     /// <summary>What the server's log says of its files watched and told, and the IDE's of the folders watched for it, last.</summary>
     private static string WatchLog(Passenger.Lsp.LanguageServer server)
     {
-        string? log = Directory.EnumerateFiles(server.LogFolder, $"server-*-{server.ProcessId}.log").FirstOrDefault();
-        IEnumerable<string> lines = (log is null ? [] : Ui.Shared(log).Split('\n').Where(l => l.Contains("watched for the server", StringComparison.Ordinal) || l.Contains("Told the server", StringComparison.Ordinal)))
+        IEnumerable<string> lines = Ui.Shared(server.LogPath).Split('\n').Where(l => l.Contains("watched for the server", StringComparison.Ordinal) || l.Contains("Told the server", StringComparison.Ordinal))
             .Concat(Ui.Shared(Passenger.App.IdeLog.PathOf(Passenger.App.IdeLog.Ide)).Split('\n').Where(l => l.Contains($"(process {server.ProcessId})", StringComparison.Ordinal) && l.Contains("watch", StringComparison.Ordinal)));
         return string.Join(" | ", lines.TakeLast(12));
     }
@@ -929,5 +1074,81 @@ public sealed class ProblemsTests : IClassFixture<ProblemsTests.Project>
             // The server's first load makes bin, which a reset would take for a file the test added: made now, the folder stays as reset.
             Directory.CreateDirectory(PathOf("bin"));
         }
+    }
+}
+
+/// <summary>What a pull of solution-wide analysis costs the IDE to read, counted across the process, so the class runs
+/// alone: on the class's own copy of <see cref="ProblemsTests"/>' project.</summary>
+[Collection(Alone.Name)]
+public sealed class SolutionAnalysisBytesTests : IClassFixture<ProblemsTests.Project>
+{
+    private readonly ProblemsTests.Project project;
+
+    public SolutionAnalysisBytesTests(ProblemsTests.Project project)
+    {
+        this.project = project;
+        project.Reset();
+    }
+
+    /// <summary>Solution-wide analysis places each file's warnings without a copy of the file's text, and decodes each
+    /// warning at a small cost: over a thousand files nobody has open with no break only Roslyn counts, a pull of their
+    /// warnings allocates (on every thread, the least of three) under 8 KB a file more when each is 17 KB long than when it
+    /// is a few lines, where a copy of its text costs three times its size, and twenty warnings a file under 4 KB for each
+    /// warning more than two.</summary>
+    [AvaloniaFact]
+    public void A_pull_of_thousands_of_warnings_decodes_each_at_a_small_cost_and_never_copies_a_files_text()
+    {
+        (long dense, int denseListed) = PullBytes(files: 100, warnings: 20, lines: 2);
+        (long few, int fewListed) = PullBytes(files: 100, warnings: 2, lines: 2);
+        (long shortFiles, int listed) = PullBytes(files: 1000, warnings: 2, lines: 2);
+        (long longFiles, _) = PullBytes(files: 1000, warnings: 2, lines: 210);
+        long perText = (longFiles - shortFiles) / 1000;
+        long perWarning = (dense - few) / (denseListed - fewListed);
+        TestContext.Current.TestOutputHelper?.WriteLine(
+            $"A pull of {listed} problems allocated {longFiles / 1024:N0} KB over 1,000 files of 17 KB, {shortFiles / 1024:N0} KB over 1,000 of a few lines: {perText:N0} bytes a file more; "
+            + $"{dense / 1024:N0} KB for {denseListed} problems in 100 files, {few / 1024:N0} KB for {fewListed}: {perWarning:N0} bytes a warning more");
+        Assert.True(perText < 8 * 1024,
+            $"A pull of solution-wide analysis allocated {longFiles / 1024:N0} KB over 1,000 files of 17 KB, {shortFiles / 1024:N0} KB over 1,000 of a few lines: {perText:N0} bytes for each file's 17 KB, as if its text were read to place its warnings");
+        Assert.True(perWarning < 4 * 1024,
+            $"A pull of solution-wide analysis allocated {dense / 1024:N0} KB for {denseListed} warnings, {few / 1024:N0} KB for {fewListed} in the same files: {perWarning:N0} bytes for each warning more");
+    }
+
+    /// <summary>What turning solution-wide analysis on allocates on every thread until Problems counts every warning, the
+    /// least of three, over <paramref name="files"/> files of a comment of <paramref name="lines"/> lines and
+    /// <paramref name="warnings"/> unused variables each; and how many problems it listed.</summary>
+    private (long Bytes, int Listed) PullBytes(int files, int warnings, int lines)
+    {
+        string comment = string.Concat(Enumerable.Repeat("// A line of a long comment the compiler passes over, as long as a line of code.\n", lines));
+        List<(string, string)> written = [];
+        for (int i = 0; i < files; i++)
+        {
+            System.Text.StringBuilder text = new(comment);
+            text.Append(System.Globalization.CultureInfo.InvariantCulture, $"static class Long{i}\n{{\n    static void All()\n    {{\n");
+            for (int j = 0; j < warnings; j++)
+            {
+                text.Append(System.Globalization.CultureInfo.InvariantCulture, $"        int unused{j};\n");
+            }
+            written.Add(($"Long{i}.cs", text.Append("    }\n}\n").ToString()));
+        }
+        project.Write(written);
+        MainWindow window = project.Open("Program.cs");
+        ProblemsModel problems = window.BottomPanel.Problems;
+        // Each file's warnings and Bad.cs's error.
+        int listed = (files * warnings) + 1;
+        long least = long.MaxValue;
+        for (int time = 0; time < 3; time++)
+        {
+            Ui.Settle();
+            long before = GC.GetTotalAllocatedBytes(precise: true);
+            window.Perform(AppActions.ToggleSolutionAnalysis);
+            // Counted rather than quiet: a source's first pull may stay open, and the whole list sorts again at each look.
+            Ui.PumpUntil(() => problems.SolutionCount == listed, $"the solution's {listed} problems", TimeSpan.FromMinutes(3));
+            least = Math.Min(least, GC.GetTotalAllocatedBytes(precise: true) - before);
+            Assert.Equal(new TextPosition(lines + 4, 12), problems.SolutionProblems!.First(p => p.Path!.EndsWith("Long0.cs", StringComparison.Ordinal)).Position);
+            window.Perform(AppActions.ToggleSolutionAnalysis);
+            Assert.Null(problems.SolutionProblems);
+        }
+        window.Close();
+        return (least, listed);
     }
 }

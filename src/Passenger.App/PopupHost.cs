@@ -165,7 +165,7 @@ public sealed class PopupHost
     }
 
     /// <summary>The least room between a popup's frame and the edge of the window it is over.</summary>
-    private const double Gap = 8;
+    private const double Gap = Gaps.Normal;
 
     /// <summary>A layer's popup fitted again to the window it is over, resized.</summary>
     private static void Refit(Panel layer, ContentControl host)
@@ -224,7 +224,7 @@ public sealed class PopupHost
     private bool ShowsEditors(TopLevel? window) => window is not null && (window == TopLevel.GetTopLevel(overlay) || editors.Windows.Any(w => w.Window == window));
 
     /// <summary>Gives the keys back to what had them in a window, still shown there: a list's row to that row, or the row
-    /// of the item it showed, the list may have made again meanwhile (<see cref="ListKeys.Hold(RowWithKeys)"/>); false
+    /// of the item it showed, the list may have made again meanwhile (<see cref="ListKeys.Hold(RowWithKeys, NavigationMethod)"/>); false
     /// where nothing of it is left.</summary>
     private static bool GiveBack(TopLevel window, Control? had, RowWithKeys? row)
     {

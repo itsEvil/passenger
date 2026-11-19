@@ -43,6 +43,7 @@ public sealed class Server(Replies replies, HostReady ready)
                 HostMethods.Properties => Properties.Run(Read<PropertiesParams>(request)),
                 HostMethods.Inputs => BuildReads.Run(Read<InputsParams>(request), cancel.Token),
                 HostMethods.Program => VirtualProjects.Take(Read<ProgramParams>(request)),
+                HostMethods.Solution => Solutions.Run(Read<SolutionParams>(request)),
                 _ => throw new InvalidOperationException($"the host has no method {request.Method}"),
             };
             replies.Result(request.Id, result);
@@ -82,7 +83,7 @@ public sealed class Server(Replies replies, HostReady ready)
     }
 
     private static T Read<T>(HostRequest request) =>
-        request.Params.Deserialize<T>(HostJson.Options) ?? throw new InvalidOperationException($"{request.Method} was sent no parameters");
+        request.Params.Deserialize<T>(PeerJson.Options) ?? throw new InvalidOperationException($"{request.Method} was sent no parameters");
 
     private EvaluateDone Evaluate(int id, EvaluateParams asked, CancellationToken cancel)
     {

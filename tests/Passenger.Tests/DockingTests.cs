@@ -490,7 +490,7 @@ public sealed class DockingTests
         window.KeepLayout();
         DockHost dock = window.DockHost;
         string[] built = [ToolWindowIds.Structure, ToolWindowIds.Find, ToolWindowIds.Hierarchy, ToolWindowIds.Bookmarks, ToolWindowIds.LocalHistory, ToolWindowIds.Endpoints, ToolWindowIds.NuGet, ToolWindowIds.Containers, ToolWindowIds.Terminal, ToolWindowIds.Git, ToolWindowIds.Commit,
-            ToolWindowIds.Problems, ToolWindowIds.Debug, ToolWindowIds.LiveTree, ToolWindowIds.Profiler, ToolWindowIds.Aspire, ToolWindowIds.Requests, ToolWindowIds.Migrations];
+            ToolWindowIds.Problems, ToolWindowIds.Debug, ToolWindowIds.LiveTree, ToolWindowIds.Profiler, ToolWindowIds.Aspire, ToolWindowIds.Requests, ToolWindowIds.Migrations, ToolWindowIds.StepLibrary];
         foreach (string id in built)
         {
             Assert.False(dock[id].IsBuilt, $"The {dock[id].Title} window's view was made as the window started, though it is hidden");
@@ -694,6 +694,235 @@ public sealed class DockingTests
         }
     }
 
+    [AvaloniaTheory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void A_right_click_on_a_stripe_lists_the_windows_of_the_icons_place_or_of_the_place_nearest_its_empty_space(bool right)
+    {
+        MainWindow window = Open();
+        try
+        {
+            DockHost dock = window.DockHost;
+            ToolAnchor upper = right ? ToolAnchor.RightTop : ToolAnchor.LeftTop;
+            ToolAnchor lower = right ? ToolAnchor.RightBottom : ToolAnchor.LeftBottom;
+            ToolAnchor bottom = right ? ToolAnchor.BottomRight : ToolAnchor.BottomLeft;
+            dock.Move(dock[ToolWindowIds.Explorer], upper);
+            dock.Move(dock[ToolWindowIds.Structure], lower);
+            dock.Move(dock[ToolWindowIds.Run], bottom);
+            Ui.Settle();
+            Control stripe = StripeBar(window, right);
+            foreach (ToolAnchor place in (ToolAnchor[])[upper, lower, bottom])
+            {
+                ToolWindow first = dock.Windows.Where(w => w.Anchor == place).OrderBy(w => w.Order).First();
+                Ui.RightClick(Button(window, first.Id));
+                Assert.Equal(Titles(dock, place), Listed(dock.StripeMenu));
+                dock.StripeMenu!.Close();
+            }
+            // Halfway between two places' nearest icons is the boundary between their lists.
+            double upperEnd = PlaceButtons(window, dock, upper).Max(b => Ui.Centre(b, stripe).Y);
+            double lowerStart = PlaceButtons(window, dock, lower).Min(b => Ui.Centre(b, stripe).Y);
+            double lowerEnd = PlaceButtons(window, dock, lower).Max(b => Ui.Centre(b, stripe).Y);
+            double bottomStart = PlaceButtons(window, dock, bottom).Min(b => Ui.Centre(b, stripe).Y);
+            foreach ((double y, ToolAnchor place) in new[]
+            {
+                (((upperEnd + lowerStart) / 2) - 2, upper),
+                (((upperEnd + lowerStart) / 2) + 2, lower),
+                (((lowerEnd + bottomStart) / 2) - 2, lower),
+                (((lowerEnd + bottomStart) / 2) + 2, bottom),
+            })
+            {
+                Ui.RightClick(stripe, new Point(4, y));
+                Assert.True(Titles(dock, place).SequenceEqual(Listed(dock.StripeMenu)),
+                    $"A right click on the stripe's empty space at {y:0} listed [{string.Join(", ", Listed(dock.StripeMenu))}], not {ToolWindow.Name(place)}'s windows");
+                dock.StripeMenu!.Close();
+            }
+        }
+        finally
+        {
+            window.Close();
+        }
+    }
+
+    [AvaloniaFact]
+    public void A_window_unchecked_on_its_stripes_checklist_leaves_the_stripe_open_or_not_and_comes_back_checked_or_from_View()
+    {
+        MainWindow window = Open();
+        try
+        {
+            DockHost dock = window.DockHost;
+            dock.Show(ToolWindowIds.Structure);
+            Ui.Settle();
+            ToolWindow structure = dock[ToolWindowIds.Structure];
+            Ui.RightClick(Button(window, ToolWindowIds.Structure));
+            Assert.True(Checked(dock.StripeMenu, structure.Title), "Structure, on its stripe, is not checked on its place's checklist");
+            Ui.Choose(dock.StripeMenu, structure.Title);
+            Assert.True(!dock.IsShown(ToolWindowIds.Structure) && StripeButton(window, ToolWindowIds.Structure) is null,
+                "Structure, open and unchecked on its stripe's checklist, stayed open or kept its stripe icon");
+            Assert.Equal(structure.Anchor, dock[ToolWindowIds.Structure].Anchor);
+
+            ToolWindow neighbour = dock.Windows.First(w => w.Anchor == structure.Anchor && w != structure);
+            Ui.RightClick(Button(window, neighbour.Id));
+            Assert.False(Checked(dock.StripeMenu, structure.Title), "Structure, off its stripe, is still checked on its place's checklist");
+            Ui.Choose(dock.StripeMenu, structure.Title);
+            Assert.True(StripeButton(window, ToolWindowIds.Structure) is not null && !dock.IsShown(ToolWindowIds.Structure),
+                "Structure, checked again, did not come back to its stripe hidden");
+
+            Ui.RightClick(Button(window, ToolWindowIds.Structure));
+            Ui.Choose(dock.StripeMenu, structure.Title);
+            Assert.Null(StripeButton(window, ToolWindowIds.Structure));
+            NativeMenu tools = Ui.Submenu(Ui.Submenu(window.MenuBar, "View"), MainMenu.ToolWindows);
+            tools.Items.OfType<NativeMenuItem>().Single(i => i.Header == structure.Title).Command!.Execute(null);
+            Ui.Settle();
+            Assert.True(dock.IsShown(ToolWindowIds.Structure) && StripeButton(window, ToolWindowIds.Structure) is not null,
+                "View > Tool Windows > Structure did not open it on its stripe again");
+        }
+        finally
+        {
+            window.Close();
+        }
+    }
+
+    [AvaloniaFact]
+    public void A_place_with_every_window_off_the_stripe_is_on_its_stripes_checklist_through_a_restart_until_Restore_Default_Layout()
+    {
+        string state = TestFolders.Create("stripe-checklist-");
+        try
+        {
+            MainWindow window = Open(state);
+            window.KeepLayout();
+            DockHost dock = window.DockHost;
+            ToolAnchor emptied = dock[ToolWindowIds.Structure].Anchor;
+            foreach (ToolWindow each in dock.Windows.Where(w => w.Anchor == emptied).ToList())
+            {
+                Ui.RightClick(Button(window, each.Id));
+                Ui.Choose(dock.StripeMenu, each.Title);
+            }
+            Assert.DoesNotContain(window.DockHost.GetVisualDescendants().OfType<ToggleButton>(), b => b.Tag is string id && dock[id].Anchor == emptied);
+            window.Close();
+            Ui.Settle();
+
+            MainWindow next = Open(state);
+            try
+            {
+                next.KeepLayout();
+                Ui.Settle();
+                dock = next.DockHost;
+                Assert.DoesNotContain(dock.GetVisualDescendants().OfType<ToggleButton>(), b => b.Tag is string id && dock[id].Anchor == emptied);
+                Ui.RightClick(Button(next, ToolWindowIds.Explorer));
+                MenuItem place = dock.StripeMenu!.Items.OfType<MenuItem>().SingleOrDefault(i => Equals(i.Header, ToolWindow.Name(emptied)))
+                    ?? throw new Xunit.Sdk.XunitException($"The left stripe's checklist does not offer {ToolWindow.Name(emptied)}, whose windows are all off it: [{string.Join(", ", Listed(dock.StripeMenu))}]");
+                Assert.Equal(Titles(dock, emptied), place.Items.OfType<MenuItem>().Select(i => (string)i.Header!));
+                Assert.All(place.Items.OfType<MenuItem>(), i => Assert.False(i.IsChecked));
+                Ui.Choose(dock.StripeMenu, ToolWindow.Name(emptied), "Structure");
+                Assert.NotNull(StripeButton(next, ToolWindowIds.Structure));
+
+                dock.RestoreDefault();
+                Ui.Settle();
+                Assert.All(dock.Windows, w => Assert.False(w.IsClosed, $"{w.Title} stayed off its stripe after Restore Default Layout"));
+            }
+            finally
+            {
+                next.Close();
+            }
+        }
+        finally
+        {
+            TestFolders.Delete(state);
+        }
+    }
+
+    /// <summary>A stripe whose every icon the person unchecked on its checklists stays shown, holding none, where it folded
+    /// away with them and its checklist could no longer be opened: a right click on it lists its places' windows, and one
+    /// checked there comes back to it.</summary>
+    [AvaloniaFact]
+    public void A_stripe_whose_every_icon_was_unchecked_stays_and_its_checklist_puts_one_back()
+    {
+        MainWindow window = Open();
+        try
+        {
+            DockHost dock = window.DockHost;
+            Control stripe = StripeBar(window, right: true);
+            for (int taken = 0; taken < dock.Windows.Count && Icons(stripe).FirstOrDefault() is { } icon; taken++)
+            {
+                Ui.RightClick(icon);
+                Ui.Choose(dock.StripeMenu, dock[(string)icon.Tag!].Title);
+            }
+            Assert.Empty(Icons(stripe));
+            Assert.True(dock.ColumnDefinitions[6].ActualWidth == 40 && stripe.IsEffectivelyVisible,
+                $"The right stripe, every icon unchecked, takes {dock.ColumnDefinitions[6].ActualWidth:0.#} units: its checklist is out of reach");
+
+            Ui.RightClick(stripe, new Point(stripe.Bounds.Width / 2, 60));
+            string title = Listed(dock.StripeMenu).FirstOrDefault()
+                ?? throw new Xunit.Sdk.XunitException("A right click on the emptied stripe lists no window to put back");
+            Ui.Choose(dock.StripeMenu, title);
+            ToolWindow back = dock.Windows.Single(w => w.Title == title);
+            Assert.True(StripeButton(window, back.Id) is { IsEffectivelyVisible: true } && !back.IsClosed,
+                $"{title}, checked on the emptied stripe's checklist, has no icon on it");
+        }
+        finally
+        {
+            window.Close();
+        }
+
+        static IEnumerable<ToggleButton> Icons(Control stripe) =>
+            stripe.GetVisualDescendants().OfType<ToggleButton>().Where(b => b.Tag is string && b.IsEffectivelyVisible);
+    }
+
+    [AvaloniaFact]
+    public void A_stripe_button_dropped_between_two_of_its_places_lands_between_them_past_a_window_off_the_stripe_and_its_own_place()
+    {
+        MainWindow window = Open();
+        try
+        {
+            // Run, the place's first, goes down past its own place.
+            DropBetween(window, ToolWindowIds.Run, ToolWindowIds.Tests, ToolWindowIds.Build);
+            // Debug, off the stripe, stands before Aspire in the place's order; Problems comes from below.
+            window.DockHost.SetOnStripe(ToolWindowIds.Debug, false);
+            Ui.Settle();
+            DropBetween(window, ToolWindowIds.Problems, ToolWindowIds.Aspire, ToolWindowIds.Tests);
+        }
+        finally
+        {
+            window.Close();
+        }
+    }
+
+    /// <summary>Drags a window's stripe button to halfway between two others' and checks it now stands between them.</summary>
+    private static void DropBetween(MainWindow window, string id, string above, string below)
+    {
+        Point to = (Ui.Centre(Button(window, above), window) + Ui.Centre(Button(window, below), window)) / 2;
+        Ui.Drag(window, Ui.Centre(Button(window, id), window), to);
+        DockHost dock = window.DockHost;
+        string[] shown = [.. PlaceButtons(window, dock, dock[above].Anchor).OrderBy(b => Ui.Centre(b, window).Y).Select(b => (string)b.Tag!)];
+        int at = Array.IndexOf(shown, id);
+        Assert.True(at > 0 && at < shown.Length - 1 && shown[at - 1] == above && shown[at + 1] == below,
+            $"{id} dropped between {above} and {below} stands in [{string.Join(", ", shown)}]");
+    }
+
+    /// <summary>The titles of a place's windows in their order, as its checklist lists them.</summary>
+    private static IEnumerable<string> Titles(DockHost dock, ToolAnchor place) =>
+        dock.Windows.Where(w => w.Anchor == place).OrderBy(w => w.Order).Select(w => w.Title);
+
+    /// <summary>What a stripe's checklist lists, its windows' titles.</summary>
+    private static List<string> Listed(ContextMenu? menu) =>
+        [.. (menu ?? throw new Xunit.Sdk.XunitException("The right click opened no checklist")).Items.OfType<MenuItem>().TakeWhile(i => i.ToggleType == MenuItemToggleType.CheckBox).Select(i => (string)i.Header!)];
+
+    private static bool Checked(ContextMenu? menu, string title) =>
+        (menu ?? throw new Xunit.Sdk.XunitException("The right click opened no checklist")).Items.OfType<MenuItem>().Single(i => Equals(i.Header, title)).IsChecked;
+
+    /// <summary>A place's stripe icons, shown.</summary>
+    private static IEnumerable<ToggleButton> PlaceButtons(MainWindow window, DockHost dock, ToolAnchor place) =>
+        window.DockHost.GetVisualDescendants().OfType<ToggleButton>().Where(b => b.Tag is string id && dock[id].Anchor == place && b.IsEffectivelyVisible);
+
+    /// <summary>A window's stripe icon; null where it has none.</summary>
+    private static ToggleButton? StripeButton(MainWindow window, string id) =>
+        window.DockHost.GetVisualDescendants().OfType<ToggleButton>().FirstOrDefault(b => Equals(b.Tag, id));
+
+    /// <summary>The left or right stripe itself, whose empty space a right click lands on.</summary>
+    private static Control StripeBar(MainWindow window, bool right) =>
+        window.DockHost.GetVisualDescendants().OfType<Border>().Where(b => b.Classes.Contains(StyleClasses.StripeBar))
+            .OrderBy(b => Ui.Centre(b, window).X).ToList()[right ? 1 : 0];
+
     /// <summary>A tool window's header button running one of the window's actions, shown in the pane its window is in.</summary>
     private static Button HeaderButton(MainWindow window, string id, string action) =>
         window.DockHost[id].Content.GetVisualAncestors().OfType<DockPanel>().First(p => p.Classes.Contains(StyleClasses.ToolPane))
@@ -704,7 +933,8 @@ public sealed class DockingTests
     {
         MainWindow window = new() { Width = 1200, Height = 800, StateFolder = state ?? Passenger.App.State.StateStore.DefaultRoot };
         window.Show();
-        Ui.Settle();
+        // The dock's own ways, with every window in it, whatever a folder would bring.
+        Ui.ServeEveryWindow(window);
         return window;
     }
 

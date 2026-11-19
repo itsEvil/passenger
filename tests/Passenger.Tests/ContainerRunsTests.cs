@@ -99,6 +99,35 @@ public sealed class ContainerRunsTests(RestoredFolders folders) : IClassFixture<
         window.Close();
     }
 
+    /// <summary>Release chosen, a Compose solution's .NET services run from Passenger's Release build, mounted in their
+    /// containers, nothing built as Debug.</summary>
+    [AvaloniaFact]
+    public void A_compose_run_under_release_runs_its_dotnet_services_from_passengers_release_build()
+    {
+        Assert.SkipWhen(Docker.WhyNot is not null, Docker.WhyNot ?? string.Empty);
+        (string folder, string project) = Restored("release");
+        MainWindow window = Open(folder);
+        const string Name = "Compose: compose.yaml";
+        try
+        {
+            Ui.WaitFor(() => BuildConfigurationTests.Offered(window) == "Debug, Release",
+                () => $"Debug and Release offered, where the widget offers {BuildConfigurationTests.Offered(window)}");
+            BuildConfigurationTests.Choose(window, "Release");
+            Assert.True(window.SelectConfiguration(Name));
+            Launched(window, "the Compose application to come up under Release");
+            string mounted = Docker.Run("inspect", "-f", "{{range .Mounts}}{{.Source}} -> {{.Destination}};{{end}}", Container(project, "web")).Replace('\\', '/');
+            Assert.True(mounted.Contains($"/Web/bin/Release/{TestProjects.Framework} -> {ContainerPlans.AppFolder};", StringComparison.Ordinal),
+                $"web did not run from Passenger's Release build, its container mounting {mounted}");
+            Assert.Equal("web 1", Page(Published(project, "web")));
+            Assert.False(Directory.Exists(Path.Combine(folder, "Web", "bin", "Debug")), "The run under Release built web as Debug");
+        }
+        finally
+        {
+            Docker.Stopped(window, project, "Stop to take every container down");
+            window.Close();
+        }
+    }
+
     /// <summary>A Rerun whose restart of web fails (the engine refuses Compose's restart once, through a docker over the real
     /// one) says so and leaves web on its old build, and the next Rerun restarts web, whose build has changed since it last
     /// started, rather than finding nothing changed.</summary>
@@ -230,6 +259,65 @@ public sealed class ContainerRunsTests(RestoredFolders folders) : IClassFixture<
         }
     }
 
+    /// <summary>A compose configuration builds only what it brings up: one naming its backing service alone starts it with no
+    /// dotnet build, and one naming web builds Web, which it runs beside the cache it depends on, and not Api, which nothing
+    /// it starts needs.</summary>
+    [AvaloniaFact]
+    public void A_compose_configuration_builds_only_the_services_it_starts_and_what_they_depend_on()
+    {
+        Assert.SkipWhen(Docker.WhyNot is not null, Docker.WhyNot ?? string.Empty);
+        (string folder, string project) = Restored("only");
+        List<string> builds = [];
+        EventHandler<ChildStart> started = (_, child) =>
+        {
+            if (child.Command.Contains(" build ", StringComparison.Ordinal))
+            {
+                lock (builds)
+                {
+                    builds.Add(child.Command);
+                }
+            }
+        };
+        ChildProcesses.Started += started;
+        MainWindow window = Open(folder);
+        RunConfiguration compose = window.Configurations.First(c => c.Kind == RunKind.Compose);
+        RunConfiguration cache = compose.Copied() with { Name = "Cache alone", Services = ["cache"], Generated = false };
+        RunConfiguration web = compose.Copied() with { Name = "Web and its cache", Services = ["web"], Generated = false };
+        window.SetConfigurations([cache, web], cache.Name);
+        try
+        {
+            Launched(window, "the cache alone to come up");
+            Assert.StartsWith("Running Cache alone: 0 .NET services from Passenger's build, 1 other service", window.Status, StringComparison.Ordinal);
+            Assert.True(Builds().Length == 0, $"Cache alone, which starts no .NET service, started dotnet builds first:\n{string.Join('\n', Builds())}");
+            Assert.Equal(["cache"], States(project).Keys);
+            Docker.Stopped(window, project, "Stop to take the cache down");
+            Ui.WaitFor(() => !window.IsRunning, "the log to stop being followed");
+
+            Assert.True(window.SelectConfiguration(web.Name));
+            Launched(window, "web to come up beside its cache");
+            Assert.StartsWith("Running Web and its cache: 1 .NET service from Passenger's build, 1 other service", window.Status, StringComparison.Ordinal);
+            Assert.Equal("web 1", Served(window, project, "web"));
+            Assert.Equal(["cache", "web"], States(project).Keys.Order(StringComparer.Ordinal));
+            Assert.True(Builds().Length == 1, $"Web and its cache was to build once, but started {Builds().Length} dotnet builds:\n{string.Join('\n', Builds())}");
+            Assert.True(File.Exists(Path.Combine(folder, "Web", "bin", "Debug", TestProjects.Framework, "Web.dll")), "web ran without Web built");
+            Assert.False(Directory.Exists(Path.Combine(folder, "Api", "bin")), "Web and its cache built Api, which nothing it starts runs");
+        }
+        finally
+        {
+            ChildProcesses.Started -= started;
+            Docker.Stopped(window, project, "Stop to take every container down");
+            window.Close();
+        }
+
+        string[] Builds()
+        {
+            lock (builds)
+            {
+                return [.. builds];
+            }
+        }
+    }
+
     /// <summary>A compose run builds its .NET services side by side in one dotnet build: with an error in each, it starts
     /// nothing, says the build failed in both, and Problems lists each one's error under its own project; mended, it comes
     /// up from one more build, and Rerun with nothing changed builds nothing, the Build window saying both are up to date.</summary>
@@ -330,7 +418,7 @@ public sealed class ContainerRunsTests(RestoredFolders folders) : IClassFixture<
             static bool Logged(string l) => l.Contains("at Shop.Program.Main()", StringComparison.Ordinal) && l.Contains("| ", StringComparison.Ordinal);
             Ui.WaitFor(() => Run(window).Split('\n').Any(Logged), "the container's frame in the Run window", TimeSpan.FromMinutes(1));
             string line = Run(window).Split('\n').First(Logged);
-            FileLink link = Assert.IsType<FileLink>(Assert.Single(window.BottomPanel.Run.Links.In(line)).Target);
+            FileLink link = Assert.IsType<FileLink>(Assert.Single(Ui.LinksIn(window.BottomPanel.Run.Links, line)).Target);
             Assert.Equal(PathNames.Canonical(Path.Combine(folder, "src", "Shop", "Program.cs")), link.Path);
             Assert.Equal(0, link.Position.Line);
             Assert.Equal($"{project}-shop:passenger", Docker.Short(Docker.Run("inspect", "-f", "{{.Config.Image}}", Container(project, "shop"))));
@@ -579,10 +667,7 @@ public sealed class ContainerRunsTests(RestoredFolders folders) : IClassFixture<
         {
             Launched(window, "the ticker to come up");
             Ui.WaitFor(() => Run(window).Contains("tick 2\n", StringComparison.Ordinal), "the ticker's lines in the Run window", TimeSpan.FromMinutes(1));
-            using (System.Diagnostics.Process log = System.Diagnostics.Process.GetProcessById(window.Runner.ProcessId ?? throw new InvalidOperationException("The run follows no log")))
-            {
-                log.Kill(entireProcessTree: true);
-            }
+            OwnProcess.Of(window.Runner.ProcessId ?? throw new InvalidOperationException("The run follows no log")).Kill();
             Ui.WaitFor(() => Run(window).Contains("services still run: following their log again", StringComparison.Ordinal) || !window.IsRunning,
                 "the run's log to be followed again", TimeSpan.FromMinutes(1));
             Assert.True(window.IsRunning, $"The run took its log's end for its own: {window.Status}\n{Run(window)}");
@@ -604,67 +689,6 @@ public sealed class ContainerRunsTests(RestoredFolders folders) : IClassFixture<
         {
             ChildProcesses.Started -= heard;
             Docker.Stopped(window, project, "Stop to take the ticker down");
-            window.Close();
-        }
-    }
-
-    /// <summary>A Compose run's output costs the same small amount for each line however many come: 10,000 lines of its image's
-    /// build through the Run console, its secrets masked as they come, and 10,000 of its service's log after it, allocate no
-    /// more for each line off the window's thread, where they are read and masked, than <see cref="AspireStandInTests.PumpBytes"/>
-    /// over what 1,000 do.</summary>
-    [AvaloniaFact]
-    public void A_compose_runs_build_and_log_cost_a_small_constant_for_each_line_however_many_come()
-    {
-        Assert.SkipWhen(Docker.WhyNot is not null, Docker.WhyNot ?? string.Empty);
-        string folder = TestFolders.Create("ctr-lines-");
-        string project = ProjectNamed("lines");
-        // 20 steps 0.2 s apart however many lines, so runs last alike; a build clips what it ran past 200 KiB a second.
-        TestFolders.Write(folder, "lines.sh", """
-            [ "$1" = build ] && { echo 'connecting with DB_PASSWORD=hunter2-not-shown'; echo 'sent Authorization: Bearer abc.def-not-shown'; }
-            n=$(cat /lines)
-            step=$((n / 20))
-            [ "$step" -gt 0 ] || step=1
-            i=0
-            while [ "$i" -lt "$n" ]; do
-                awk -v from="$i" -v n="$n" -v step="$step" 'BEGIN { for (j = from + 1; j <= from + step && j <= n; j++) printf "info: request %06d served in 4 ms by worker %d\n", j, j % 8 }'
-                i=$((i + step))
-                sleep 0.2
-            done
-            echo "wrote $n lines"
-
-            """);
-        TestFolders.Write(folder, "Dockerfile", $"FROM {Docker.Image}\nCOPY lines lines.sh /\nRUN sh /lines.sh build\n");
-        TestFolders.Write(folder, "compose.yaml", $"name: {project}\nservices:\n  lines:\n    build: {{ context: ., no_cache: true }}\n    pull_policy: build\n"
-            + "    init: true\n    command: [\"sh\", \"-c\", \"sh /lines.sh; sleep 600\"]\n");
-        TestFolders.Write(folder, "lines", "1");
-        MainWindow window = Open(folder);
-        Assert.True(window.SelectConfiguration("Compose: compose.yaml"));
-        try
-        {
-            (long, long) Ran(int count)
-            {
-                File.WriteAllText(Path.Combine(folder, "lines"), count.ToString(CultureInfo.InvariantCulture));
-                Task<string?> running = Task.FromResult<string?>(null);
-                (long, long) allocated = AspireStandInTests.Streamed(window.BottomPanel.Run, [$"wrote {count} lines\n", $"wrote {count} lines\n"], () => running = window.RunAsync());
-                string? refused = Ui.Await(running, "the service to come up", TimeSpan.FromMinutes(5));
-                Assert.True(refused is null, $"{refused}\n{Run(window)}");
-                // The console keeps the last megabyte of what came, which after 10,000 lines of each is past the build's first lines.
-                string shown = Run(window);
-                Assert.True((count > 1_000 || (shown.Contains("DB_PASSWORD=" + ContainerSecrets.Masked, StringComparison.Ordinal)
-                    && shown.Contains("Authorization: " + ContainerSecrets.Masked, StringComparison.Ordinal))) && !shown.Contains("not-shown", StringComparison.Ordinal),
-                    $"The build's secrets were not masked as they came:\n{string.Join('\n', shown.Split('\n').Where(line => line.Contains("DB_PASSWORD", StringComparison.Ordinal) || line.Contains("Authorization", StringComparison.Ordinal)))}");
-                Docker.Stopped(window, project, "Stop to take the service down");
-                Ui.WaitFor(() => !window.IsRunning, "the log to stop being followed");
-                return allocated;
-            }
-            AspireStandInTests.LineCost each = AspireStandInTests.PerLine(Ran, 2);
-            TestContext.Current.TestOutputHelper?.WriteLine($"For each line more: {each}");
-            Assert.True(each.Pumps < AspireStandInTests.PumpBytes,
-                $"A Compose run's build and log allocated {each.Pumps:N0} bytes off the window's thread for each line of 10,000 more than of 1,000, as if each read or line were copied again to be masked");
-        }
-        finally
-        {
-            Docker.Stopped(window, project, "Stop to take the service down");
             window.Close();
         }
     }
@@ -778,10 +802,10 @@ public sealed class ContainerRunsTests(RestoredFolders folders) : IClassFixture<
     }
 
     /// <summary>A run whose service serves HTTPS with no trusted development certificate asks first, in a window that
-    /// lets no agent in (--no-mcp): Run over HTTP serves it over HTTP; a failed export is said in the status bar;
-    /// Create and Trust has dev-certs trust it and export it as PEM with no password, the person's alone to read, again
-    /// once dev-certs names another certificate (an earlier Passenger's open folder and .pfx put right); Run and
-    /// Profile stopped as dev-certs checks say so and leave nothing. dev-certs is a stand-in.</summary>
+    /// lets no agent in (--no-mcp): Run over HTTP serves it over HTTP, its page opened over HTTP; a failed export is said
+    /// in the status bar; Create and Trust has dev-certs trust it and export it as PEM with no password, the person's alone
+    /// to read, again once dev-certs names another certificate (an earlier Passenger's open folder and .pfx put right); Run
+    /// and Profile stopped as dev-certs checks say so and leave nothing. dev-certs is a stand-in.</summary>
     [AvaloniaFact]
     public void A_run_that_serves_HTTPS_with_no_trusted_certificate_asks_to_create_and_trust_it_or_run_over_HTTP_and_says_an_export_that_fails()
     {
@@ -850,6 +874,10 @@ public sealed class ContainerRunsTests(RestoredFolders folders) : IClassFixture<
             Assert.Contains("\"ASPNETCORE_HTTP_PORTS=8081\"", Env(), StringComparison.Ordinal);
             Assert.DoesNotContain("/https", Mounts(), StringComparison.Ordinal);
             Assert.Equal("web 1", Page(Published(project, "web", 8081)));
+            // Its HTTPS port serves HTTP this run, so the page opens over HTTP, once web answers there.
+            Ui.WaitFor(() => window.Browsed.Any(), "the browser to open at web's port", TimeSpan.FromMinutes(1));
+            int served = Published(project, "web", 8081);
+            Assert.True(window.Browsed is [{ Scheme: "http" } page] && page.Port == served, $"The browser opened [{string.Join(", ", window.Browsed)}], where web serves HTTP on {served}");
             Stopped(window, project);
 
             File.WriteAllText(Path.Combine(standIn, "check"), "0");
@@ -1062,7 +1090,7 @@ public sealed class ContainerRunsTests(RestoredFolders folders) : IClassFixture<
             Assert.Contains($"{project}-cache-1", listed, StringComparison.Ordinal);
             Assert.DoesNotContain(own, listed, StringComparison.Ordinal);
             Press(asked.CancelButton);
-            Assert.Equal($"Cache was not run: {project}-cache-1 of {project}, which Passenger did not make, were left as they are", Ui.Await(running, "Run to end once Cancel was answered", TimeSpan.FromMinutes(1)));
+            Assert.Equal($"Cache was not run: {project}-cache-1 of {project}, which Passenger did not make for this folder, were left as they are", Ui.Await(running, "Run to end once Cancel was answered", TimeSpan.FromMinutes(1)));
             Assert.Equal(theirs, Container(project, "cache"));
             Assert.Equal("running", Docker.State(theirs));
 
@@ -1122,6 +1150,181 @@ public sealed class ContainerRunsTests(RestoredFolders folders) : IClassFixture<
             window.Perform(AppActions.Stop);
             window.Close();
         }
+    }
+
+    /// <summary>A Docker Compose project (.dcproj) naming its Compose project (DockerComposeProjectName) runs its services under
+    /// that name, over the one its compose file gives: Compose lists the project by it, its containers carry it and none the
+    /// file's name, and Stop takes them down.</summary>
+    [AvaloniaFact]
+    public void A_Docker_Compose_projects_DockerComposeProjectName_names_the_Compose_project_its_run_brings_up_and_Stop_takes_down()
+    {
+        Assert.SkipWhen(Docker.WhyNot is not null, Docker.WhyNot ?? string.Empty);
+        (string folder, string files) = Restored("dcfile");
+        string project = ProjectNamed("dcproj");
+        TestFolders.Write(folder, "docker-compose.dcproj", $"""
+            <Project ToolsVersion="15.0" Sdk="Microsoft.Docker.Sdk">
+              <PropertyGroup Label="Globals">
+                <DockerComposeProjectName>{project}</DockerComposeProjectName>
+                <DockerComposeBaseFilePath>compose</DockerComposeBaseFilePath>
+                <DockerServiceName>web</DockerServiceName>
+              </PropertyGroup>
+            </Project>
+
+            """);
+        TestFolders.Write(folder, "Shop.slnx", "<Solution>\n  <Project Path=\"Web/Web.csproj\" />\n  <Project Path=\"Api/Api.csproj\" />\n  <Project Path=\"docker-compose.dcproj\" />\n</Solution>\n");
+        MainWindow window = Open(folder);
+        Assert.True(window.SelectConfiguration("docker-compose"), $"No configuration of the .dcproj: [{string.Join(", ", window.Configurations.Select(c => c.Name))}]");
+        try
+        {
+            Launched(window, "the Docker Compose project to come up");
+            Assert.Equal(["api", "cache", "web"], States(project).Keys.Order(StringComparer.Ordinal));
+            Assert.All(States(project).Values, state => Assert.Equal("running", state));
+            Assert.Contains($"\"Name\":\"{project}\"", Docker.Run("compose", "ls", "--all", "--format", "json"), StringComparison.Ordinal);
+            Assert.True(States(files).Count == 0, $"The compose file's own project {files} was brought up beside the .dcproj's {project}");
+            Assert.Equal("web 1", Served(window, project, "web"));
+        }
+        finally
+        {
+            Docker.Stopped(window, project, "Stop to take the Docker Compose project's containers down");
+        }
+        Ui.WaitFor(() => !window.IsRunning, "the log to stop being followed");
+        window.Close();
+    }
+
+    /// <summary>Detach lets go of a Docker Compose project's run on a real engine: its containers run on, the run no longer
+    /// followed nor Stop's; the close of a window nobody sees asks nothing and takes them down, as it takes all the folder
+    /// started.</summary>
+    [AvaloniaFact]
+    public void Detach_leaves_a_Docker_Compose_projects_containers_running_until_the_window_closes()
+    {
+        Assert.SkipWhen(Docker.WhyNot is not null, Docker.WhyNot ?? string.Empty);
+        (string folder, string project) = Restored("dcdetach");
+        TestFolders.Write(folder, "docker-compose.dcproj", """
+            <Project ToolsVersion="15.0" Sdk="Microsoft.Docker.Sdk">
+              <PropertyGroup>
+                <DockerComposeBaseFilePath>compose</DockerComposeBaseFilePath>
+              </PropertyGroup>
+            </Project>
+
+            """);
+        TestFolders.Write(folder, "Shop.slnx", "<Solution>\n  <Project Path=\"Web/Web.csproj\" />\n  <Project Path=\"Api/Api.csproj\" />\n  <Project Path=\"docker-compose.dcproj\" />\n</Solution>\n");
+        MainWindow window = Open(folder);
+        Assert.True(window.SelectConfiguration("docker-compose"), $"No configuration of the .dcproj: [{string.Join(", ", window.Configurations.Select(c => c.Name))}]");
+        try
+        {
+            Launched(window, "the Docker Compose project to come up");
+            Assert.True(window.Perform(AppActions.Detach), "Detach did not run");
+            Ui.WaitFor(() => !window.IsRunning, "the run to be let go of");
+            Assert.StartsWith("Detached from docker-compose", window.Status, StringComparison.Ordinal);
+            Assert.Equal("Nothing is running", window.Actions.WhyNot(AppActions.Stop, window.Actions.Context()));
+            Assert.Equal(["api", "cache", "web"], States(project).Keys.Order(StringComparer.Ordinal));
+            Assert.All(States(project).Values, state => Assert.Equal("running", state));
+            Assert.Equal("web 1", Served(window, project, "web"));
+        }
+        catch
+        {
+            Docker.Stopped(window, project, "Stop to take every container down");
+            throw;
+        }
+        // A window nobody sees asks nothing: its close takes them down.
+        window.Close();
+        Docker.TakenDown(project, "the window's close to take down the containers of the run let go of");
+    }
+
+    /// <summary>Two windows on folders of one name (a/x and b/x) run one Compose project, each its own service. Detach in one
+    /// and close it: the question asks of that window's container alone, and Leave Running leaves only it as the person's,
+    /// never the other window's, which stays its run's, so the end of its Passenger would still take it down.</summary>
+    [AvaloniaFact]
+    public void Leave_Running_leaves_the_person_only_the_closing_windows_containers_of_a_Compose_project_another_folder_runs_too()
+    {
+        Assert.SkipWhen(Docker.WhyNot is not null, Docker.WhyNot ?? string.Empty);
+        string project = ProjectNamed("letgo");
+        (string first, string second) = SameNamed(project, "left", "right");
+        MainWindow leaving = Open(first, seen: true);
+        MainWindow staying = Open(second);
+        try
+        {
+            foreach (MainWindow window in (MainWindow[])[leaving, staying])
+            {
+                Assert.True(window.SelectConfiguration("Compose: compose.yaml"), $"No Compose configuration: [{string.Join(", ", window.Configurations.Select(c => c.Name))}]");
+                Launched(window, "the folder's Compose run to come up");
+            }
+            string left = Docker.Run("inspect", "-f", "{{.Id}}", $"{project}-left-1")[..12];
+            string right = Docker.Run("inspect", "-f", "{{.Id}}", $"{project}-right-1")[..12];
+            Assert.True(leaving.Perform(AppActions.Detach), "Detach did not run");
+            Ui.WaitFor(() => !leaving.IsRunning, "the run to be let go of");
+            leaving.Close();
+            Ui.ClickButton(ContainersTests.AskedOfLetGo(leaving), "Leave Running");
+            Ui.WaitFor(() => !leaving.IsVisible, "the window to close once Leave Running was chosen");
+            IReadOnlyList<string> persons = ContainerLabels.LeftIn(TestRun.Settings);
+            Assert.Contains(left, persons);
+            Assert.False(persons.Contains(right), $"Leave Running in {first}'s window left {project}-right-1, the run of {second}'s window, to the person: "
+                + "the end of this Passenger and the next one's clean-up would pass it over");
+            Assert.Equal("running", Docker.State($"{project}-left-1"));
+            Docker.Stopped(staying, project, "the other window's Stop to take its own container down", $"{ComposeLabels.Service}=right");
+        }
+        finally
+        {
+            Closed(project, leaving, staying);
+        }
+    }
+
+    /// <summary>A run of a Compose project another window runs too, from a folder of the same name, asks before taking that
+    /// window's container of a service both start, as it asks of the person's own; Cancel leaves it to the run that made it.</summary>
+    [AvaloniaFact]
+    public void A_run_asks_before_replacing_another_windows_container_of_a_Compose_project_of_the_same_name()
+    {
+        Assert.SkipWhen(Docker.WhyNot is not null, Docker.WhyNot ?? string.Empty);
+        string project = ProjectNamed("taken");
+        (string first, string second) = SameNamed(project, "cache", "cache");
+        MainWindow running = Open(first);
+        MainWindow taking = Open(second);
+        try
+        {
+            Assert.True(running.SelectConfiguration("Compose: compose.yaml"), $"No Compose configuration: [{string.Join(", ", running.Configurations.Select(c => c.Name))}]");
+            Launched(running, "the first folder's Compose run to come up");
+            string theirs = Container(project, "cache");
+            Assert.True(taking.SelectConfiguration("Compose: compose.yaml"));
+            Task<string?> started = taking.RunAsync();
+            Ui.PumpUntil(() => taking.ReplaceQuestion is not null || started.IsCompleted, "the run to ask about the other window's container", TimeSpan.FromMinutes(2));
+            Assert.True(taking.ReplaceQuestion is not null,
+                $"The run took {project}-cache-1 from the other window's run asking nothing: {(started.IsCompleted ? started.Result : null)}");
+            Press(DialogButtonsTests.Check(taking.ReplaceQuestion!).CancelButton);
+            Assert.Equal($"Compose: compose.yaml was not run: {project}-cache-1 of {project}, which Passenger did not make for this folder, were left as they are",
+                Ui.Await(started, "Run to end once Cancel was answered", TimeSpan.FromMinutes(1)));
+            Assert.Equal(theirs, Container(project, "cache"));
+            Assert.Equal("running", Docker.State(theirs));
+        }
+        finally
+        {
+            Closed(project, running, taking);
+        }
+    }
+
+    /// <summary>Two folders of the project's name (a/x and b/x), each a compose.yaml of one sleeping busybox service and no
+    /// name of its own, so each run's Compose project is its folder's name, the same for both.</summary>
+    private static (string First, string Second) SameNamed(string project, string firstService, string secondService)
+    {
+        string root = TestFolders.Create($"ctr-{project}-");
+        string first = PathNames.Canonical(Directory.CreateDirectory(Path.Combine(root, "a", project)).FullName);
+        string second = PathNames.Canonical(Directory.CreateDirectory(Path.Combine(root, "b", project)).FullName);
+        TestFolders.Write(first, "compose.yaml", Sleeping(firstService));
+        TestFolders.Write(second, "compose.yaml", Sleeping(secondService));
+        return (first, second);
+
+        static string Sleeping(string service) =>
+            $"services:\n  {service}:\n    image: {Docker.Image}\n    command: [\"sleep\", \"600\"]\n    network_mode: none\n";
+    }
+
+    /// <summary>Closes the windows and removes what is left of the project: asked, never run, since the windows' own take-down
+    /// may be removing it still.</summary>
+    private static void Closed(string project, params MainWindow[] windows)
+    {
+        foreach (MainWindow window in windows)
+        {
+            window.Close();
+        }
+        Docker.Ask(["rm", "-f", .. Docker.Run("ps", "-aq", "--filter", $"label={ComposeLabels.Project}={project}").Split('\n', StringSplitOptions.RemoveEmptyEntries)]);
     }
 
     private static void Press(Avalonia.Controls.Button button)
@@ -1202,7 +1405,7 @@ public sealed class ContainerRunsTests(RestoredFolders folders) : IClassFixture<
     }
 
     /// <summary>A test's Compose project's name: the test run's and the test's own, so whatever it leaves is told apart.</summary>
-    private static string ProjectNamed(string name) => $"ptest{Environment.ProcessId.ToString(CultureInfo.InvariantCulture)}{name}";
+    internal static string ProjectNamed(string name) => $"ptest{Environment.ProcessId.ToString(CultureInfo.InvariantCulture)}{name}";
 
     private static void WriteShop(string folder, string project)
     {
@@ -1252,13 +1455,15 @@ public sealed class ContainerRunsTests(RestoredFolders folders) : IClassFixture<
         """;
 
     /// <summary>A window on a Compose solution; with no C# language server unless a test asks it something (Hot Reload),
-    /// since a container run, its debugging and its profiling ask it nothing.</summary>
-    internal static MainWindow Open(string folder, DotnetWords? devCertificates = null, bool agentsAllowed = true, bool languageServer = false, ContainerEngine? engine = null)
+    /// since a container run, its debugging and its profiling ask it nothing; <paramref name="seen"/> as a person's window,
+    /// which asks the person as it closes.</summary>
+    internal static MainWindow Open(string folder, DotnetWords? devCertificates = null, bool agentsAllowed = true, bool languageServer = false, ContainerEngine? engine = null,
+        bool seen = false)
     {
         MainWindow window = new()
         {
             Width = 1200, Height = 800, DevCertificates = devCertificates, AgentsAllowed = agentsAllowed, StartsLanguageServer = languageServer,
-            Engine = engine ?? ContainerEngine.Shared,
+            Engine = engine ?? ContainerEngine.Shared, Unseen = !seen && PassengerApp.ShowsNoWindow,
         };
         window.Show();
         window.OpenFolder(folder);
@@ -1363,5 +1568,72 @@ public sealed class ContainerRunsTests(RestoredFolders folders) : IClassFixture<
     {
         window.BottomPanel.Run.Flush();
         return window.BottomPanel.Run.Document.Snapshot.ToString();
+    }
+}
+
+/// <summary>What a Compose run's output costs on its way into the Run console, counted off the window's thread: the class
+/// runs alone, as whatever a class beside the window tests allocates meanwhile would count as the console's.</summary>
+[Collection(Alone.Name)]
+public sealed class ContainerRunsBytesTests
+{
+    /// <summary>A Compose run's output costs the same small amount for each line however many come: 10,000 lines of its image's
+    /// build through the Run console, its secrets masked as they come, and 10,000 of its service's log after it, allocate no
+    /// more for each line off the window's thread, where they are read and masked, than <see cref="AspireConsoleBytesTests.PumpBytes"/>
+    /// over what 1,000 do.</summary>
+    [AvaloniaFact]
+    public void A_compose_runs_build_and_log_cost_a_small_constant_for_each_line_however_many_come()
+    {
+        Assert.SkipWhen(Docker.WhyNot is not null, Docker.WhyNot ?? string.Empty);
+        string folder = TestFolders.Create("ctr-lines-");
+        string project = ContainerRunsTests.ProjectNamed("lines");
+        // 20 steps 0.2 s apart however many lines, so runs last alike; a build clips what it ran past 200 KiB a second.
+        TestFolders.Write(folder, "lines.sh", """
+            [ "$1" = build ] && { echo 'connecting with DB_PASSWORD=hunter2-not-shown'; echo 'sent Authorization: Bearer abc.def-not-shown'; }
+            n=$(cat /lines)
+            step=$((n / 20))
+            [ "$step" -gt 0 ] || step=1
+            i=0
+            while [ "$i" -lt "$n" ]; do
+                awk -v from="$i" -v n="$n" -v step="$step" 'BEGIN { for (j = from + 1; j <= from + step && j <= n; j++) printf "info: request %06d served in 4 ms by worker %d\n", j, j % 8 }'
+                i=$((i + step))
+                sleep 0.2
+            done
+            echo "wrote $n lines"
+
+            """);
+        TestFolders.Write(folder, "Dockerfile", $"FROM {Docker.Image}\nCOPY lines lines.sh /\nRUN sh /lines.sh build\n");
+        TestFolders.Write(folder, "compose.yaml", $"name: {project}\nservices:\n  lines:\n    build: {{ context: ., no_cache: true }}\n    pull_policy: build\n"
+            + "    init: true\n    command: [\"sh\", \"-c\", \"sh /lines.sh; sleep 600\"]\n");
+        TestFolders.Write(folder, "lines", "1");
+        MainWindow window = ContainerRunsTests.Open(folder);
+        Assert.True(window.SelectConfiguration("Compose: compose.yaml"));
+        try
+        {
+            (long, long) Ran(int count)
+            {
+                File.WriteAllText(Path.Combine(folder, "lines"), count.ToString(CultureInfo.InvariantCulture));
+                Task<string?> running = Task.FromResult<string?>(null);
+                (long, long) allocated = AspireConsoleBytesTests.Streamed(window.BottomPanel.Run, [$"wrote {count} lines\n", $"wrote {count} lines\n"], () => running = window.RunAsync());
+                string? refused = Ui.Await(running, "the service to come up", TimeSpan.FromMinutes(5));
+                Assert.True(refused is null, $"{refused}\n{ContainerRunsTests.Run(window)}");
+                // The console keeps the last megabyte of what came, which after 10,000 lines of each is past the build's first lines.
+                string shown = ContainerRunsTests.Run(window);
+                Assert.True((count > 1_000 || (shown.Contains("DB_PASSWORD=" + ContainerSecrets.Masked, StringComparison.Ordinal)
+                    && shown.Contains("Authorization: " + ContainerSecrets.Masked, StringComparison.Ordinal))) && !shown.Contains("not-shown", StringComparison.Ordinal),
+                    $"The build's secrets were not masked as they came:\n{string.Join('\n', shown.Split('\n').Where(line => line.Contains("DB_PASSWORD", StringComparison.Ordinal) || line.Contains("Authorization", StringComparison.Ordinal)))}");
+                Docker.Stopped(window, project, "Stop to take the service down");
+                Ui.WaitFor(() => !window.IsRunning, "the log to stop being followed");
+                return allocated;
+            }
+            AspireConsoleBytesTests.LineCost each = AspireConsoleBytesTests.PerLine(Ran, 2);
+            TestContext.Current.TestOutputHelper?.WriteLine($"For each line more: {each}");
+            Assert.True(each.Pumps < AspireConsoleBytesTests.PumpBytes,
+                $"A Compose run's build and log allocated {each.Pumps:N0} bytes off the window's thread for each line of 10,000 more than of 1,000, as if each read or line were copied again to be masked");
+        }
+        finally
+        {
+            Docker.Stopped(window, project, "Stop to take the service down");
+            window.Close();
+        }
     }
 }

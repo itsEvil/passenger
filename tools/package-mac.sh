@@ -1,6 +1,6 @@
 #!/bin/sh
-# Passenger's macOS disk image: `just package-mac [osx-arm64] [--dry-run]` makes
-# artifacts/package/Passenger-macos-arm64.dmg (Apple Silicon only: no Intel Mac build ships), a name each release keeps.
+# Passenger's macOS disk image: `just package-mac [osx-arm64|osx-x64] [--dry-run]` makes
+# artifacts/package/Passenger-macos-arm64.dmg (Apple Silicon) or Passenger-macos-x64.dmg (Intel), names each release keeps.
 # The Release publish (self-contained, ReadyToRun, the debugger and Roslyn's server beside it) becomes Passenger.app,
 # signed under the hardened runtime with the entitlements below: by PASSENGER_SIGN_IDENTITY (a Developer ID
 # Application identity), else ad hoc, which Apple Silicon needs to run it at all and which a person opens once through
@@ -14,9 +14,9 @@ rid=osx-arm64
 dry_run=
 for arg in "$@"; do
     case $arg in
-        osx-arm64) rid=$arg ;;
+        osx-arm64 | osx-x64) rid=$arg ;;
         --dry-run) dry_run=1 ;;
-        *) fail "'$arg' is neither osx-arm64 nor --dry-run (no Intel Mac build ships)" ;;
+        *) fail "'$arg' is neither osx-arm64, osx-x64 nor --dry-run" ;;
     esac
 done
 arch=${rid#osx-}
@@ -52,67 +52,125 @@ if [ "$(git -C "$root" rev-parse --is-shallow-repository)" = true ]; then
 fi
 build=$(git -C "$root" rev-list --count HEAD)
 
-# The image is mounted under the work folder while it is made and checked, and never left mounted, a failure included.
-mounted=
+# The whole disk of each attachment of the image file $1, as hdiutil lists them.
+disks_of() {
+    hdiutil info -plist | python3 -I -c '
+import os, plistlib, sys
+for image in plistlib.loads(sys.stdin.buffer.read()).get("images", []):
+    path = image.get("image-path", "")
+    entries = [entity["dev-entry"] for entity in image.get("system-entities", []) if "dev-entry" in entity]
+    if entries and os.path.exists(path) and os.path.samefile(path, sys.argv[1]):
+        print(min(entries))
+' "$1"
+}
+# Whether the image file $1 takes the shared lock a convert asks for: a read-write attachment's helper holds it whole.
+unlocked() {
+    python3 -I -c '
+import os, sys
+try:
+    os.close(os.open(sys.argv[1], os.O_RDONLY | os.O_SHLOCK | os.O_NONBLOCK))
+except BlockingIOError:
+    sys.exit(1)
+except FileNotFoundError:
+    pass
+' "$1"
+}
+# What has the disk $1's device nodes or the image file $2 open, as root sees it where sudo asks no password.
+holders() {
+    nodes=
+    for node in "$1" "$1"s* "/dev/r${1#/dev/}" "/dev/r${1#/dev/}"s*; do
+        if [ -e "$node" ]; then
+            nodes="$nodes $node"
+        fi
+    done
+    as=
+    if sudo -n true 2>/dev/null; then
+        as="sudo -n"
+    fi
+    $as lsof $nodes "$2" 2>/dev/null || true
+}
+# The image is attached under the work folder while it is made and checked, and never left attached, a failure included.
+attached=
 attach() {
+    attached=$1
     mkdir -p "$mount"
     hdiutil attach "$@" -nobrowse -noautoopen -mountpoint "$mount" -quiet
-    mounted=1
 }
+# Detached is hdiutil listing the image no more and its file unlocked: a volume unmounted whose disk a process held open
+# stays attached, its helper locking the file (every convert then "Resource temporarily unavailable", #1473), and its
+# mount point answers each later detach "No such file or directory". So its disk is detached, for up to two minutes,
+# forced from the fourth try (Spotlight or XProtect holding the volume); what held it is said, and failing, fails.
 detach() {
-    # Spotlight or XProtect can hold a volume just made a moment: the last tries force it, the very last without -quiet.
-    for try in 1 2 3 4 5; do
+    said="$work/detach-said.txt"
+    : > "$said"
+    try=0
+    while disks=$(disks_of "$attached"); [ -n "$disks" ] || ! unlocked "$attached"; do
+        try=$((try + 1))
+        if [ "$try" -gt 1 ]; then
+            if [ "$try" -gt 15 ]; then
+                grep -v 'hdiutil: WARNING' "$said" >&2 || true
+                fail "$attached could not be detached in two minutes"
+            fi
+            sleep $((try - 1))
+        fi
         force=
         if [ "$try" -gt 3 ]; then
             force=-force
         fi
-        if hdiutil detach "$mount" $force -quiet; then
-            mounted=
-            return
-        fi
-        sleep "$try"
+        for disk in $disks; do
+            if ! hdiutil detach "$disk" $force >> "$said" 2>&1; then
+                echo "package-mac: what had $disk or $(basename "$attached") open after try $try:" >> "$said"
+                holders "$disk" "$attached" >> "$said"
+            fi
+        done
     done
-    # A try that failed may still have detached it (hdiutil then answers "No such file or directory"): not mounted is done.
-    if mount | grep -qF " on $mount "; then
-        if ! hdiutil detach "$mount" -force; then
-            lsof +D "$mount" >&2 || true
-            fail "the image mounted at $mount could not be detached"
-        fi
+    if [ "$try" -gt 1 ]; then
+        echo "package-mac: $(basename "$attached") was detached on try $try, the tries before saying:" >&2
+        grep -v 'hdiutil: WARNING' "$said" >&2 || true
     fi
-    mounted=
+    attached=
 }
-# hdiutil create and convert now and then fail ("Resource busy", the system's scanners on what was just written), and
-# -quiet closes stderr: tried three times, a moment apart, the last one saying why. OUT is removed first.
+# hdiutil create and convert now and then fail ("Resource busy", the system's scanners on what was just written): tried
+# three times, a moment apart, each try's words kept (-quiet closes stderr), the last failure saying what images the
+# machine has attached and which process holds each. MADE is removed first.
 retry_hdiutil() {
-    out=$1
+    made=$1
     shift
-    for try in 1 2; do
-        rm -f "$out"
-        if hdiutil "$@" -quiet; then
+    said="$work/hdiutil-said.txt"
+    for try in 1 2 3; do
+        rm -f "$made"
+        if hdiutil "$@" >"$said" 2>&1; then
             return
         fi
-        echo "package-mac: hdiutil $1 failed (try $try), trying again" >&2
-        sleep $((try * 5))
+        echo "package-mac: hdiutil $1 failed (try $try): $(tail -n 5 "$said")" >&2
+        if [ "$try" -lt 3 ]; then
+            sleep $((try * 5))
+        fi
     done
-    rm -f "$out"
-    hdiutil "$@" || fail "hdiutil $1 failed three times"
+    hdiutil info >&2 || true
+    fail "hdiutil $1 failed three times"
 }
-# The state of the copied app's runs (below), removed with it however the script ends.
+# The state of the copied app's runs (below).
 settings=
-trap '[ -z "$mounted" ] || hdiutil detach "$mount" -force -quiet; [ -z "$settings" ] || rm -rf "$settings"' EXIT
+# However the script ends, the image is detached and that state removed.
+leave() {
+    if [ -n "$attached" ]; then
+        for disk in $(disks_of "$attached"); do
+            hdiutil detach "$disk" -force -quiet || true
+        done
+    fi
+    if [ -n "$settings" ]; then
+        rm -rf "$settings"
+    fi
+}
+trap leave EXIT
 trap 'exit 1' HUP INT TERM
 if [ -d "$mount" ]; then
     hdiutil detach "$mount" -force -quiet 2>/dev/null || true
 fi
 # A mount of the image being replaced reads the new file as its own and calls its app damaged, so it is ejected first.
 if [ -f "$image" ]; then
-    for disk in $(hdiutil info -plist | python3 -I -c '
-import os, plistlib, sys
-for image in plistlib.loads(sys.stdin.buffer.read()).get("images", []):
-    path = image.get("image-path", "")
-    if os.path.exists(path) and os.path.samefile(path, sys.argv[1]):
-        print(min(entity["dev-entry"] for entity in image.get("system-entities", []) if "dev-entry" in entity))
-' "$image"); do
+    for disk in $(disks_of "$image"); do
         hdiutil detach "$disk" -quiet || fail "$image is mounted ($disk) and could not be ejected: eject it, then package again"
         echo "package-mac: ejected $disk, a mount of the image being replaced" >&2
     done
@@ -125,6 +183,19 @@ mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
 cp -R "$publish/." "$app/Contents/MacOS/"
 # The web servers go in Resources, since codesign takes a dotted folder under Contents/MacOS for a nested bundle.
 mv "$app/Contents/MacOS/web" "$app/Contents/Resources/web"
+# The debug relays too, files Passenger copies to where an app loads them: Gatekeeper refuses a notarized app carrying
+# another platform's Mach-O (an iOS simulator's relay) among its code.
+relays="$app/Contents/Resources/debugger/relay"
+if [ -d "$app/Contents/MacOS/debugger/relay" ]; then
+    mkdir -p "$(dirname "$relays")"
+    mv "$app/Contents/MacOS/debugger/relay" "$relays"
+fi
+# Nothing dotted may stay among the code, or codesign refuses the app's seal as a bundle it cannot read.
+dotted_code() {
+    dotted=$(find "$1/Contents/MacOS" -mindepth 1 -type d -name '*.*' | head -n 1)
+    [ -z "$dotted" ] || fail "the app's code carries a dotted folder, which codesign takes for a bundle: ${dotted#"$1/"}"
+}
+dotted_code "$app"
 cp "$root/src/Passenger.App/Assets/Passenger.icns" "$app/Contents/Resources/Passenger.icns"
 # The document types Open With and the Dock offer Passenger: solutions, C# projects and folders, never as default.
 cat > "$app/Contents/Info.plist" <<EOF
@@ -227,6 +298,14 @@ find "$app/Contents/MacOS" -type f ! -path "$app/Contents/MacOS/Passenger" | whi
         *) sign "$file" ;;
     esac
 done
+# The notary takes a relay's Mach-O only as the Developer ID signed it, though the bundle seals it as a resource.
+if [ -d "$relays" ]; then
+    find "$relays" -type f | while IFS= read -r file; do
+        case $(file -b "$file") in
+            Mach-O*) sign "$file" ;;
+        esac
+    done
+fi
 sign --entitlements "$entitlements" "$app"
 codesign --verify --deep --strict "$app"
 # Stapled, the app opens with no Gatekeeper warning offline too, once copied out of the image.
@@ -288,6 +367,7 @@ xattr -px com.apple.FinderInfo "$mount" | grep -q '^00 00 00 00 00 00 00 00 04' 
 python3 -I "$root/tools/dmg-layout.py" check "$mount" "$volume_name"
 [ "$(ls -A "$mount/.fseventsd")" = no_log ] || fail "the image carries the event log of its read-write mount"
 codesign --verify --deep --strict "$shipped"
+dotted_code "$shipped"
 if codesign -d --entitlements - --xml "$shipped" 2>/dev/null | grep -q get-task-allow; then
     fail "the app's entitlements carry get-task-allow"
 fi
@@ -297,14 +377,28 @@ said=$(plutil -extract CFBundleShortVersionString raw -o - "$plist")
 said=$(plutil -extract CFBundleVersion raw -o - "$plist")
 [ "$said" = "$build" ] || fail "the app's Info.plist says build $said, not $build"
 for part in roslyn/Microsoft.CodeAnalysis.LanguageServer.dll roslyn-extension/Passenger.Roslyn.Extension.dll debugger/Passenger.DebugAdapter.dll \
-    debugger/libdbgshim.dylib passenger-helper passenger-helper.dll passenger-helper.deps.json passenger-helper.runtimeconfig.json \
-    LICENSE.txt THIRD-PARTY-NOTICES.txt; do
+    debugger/libdbgshim.dylib inspector/Passenger.Inspector.dll inspector/Avalonia.Headless.dll passenger-helper passenger-helper.dll \
+    passenger-helper.deps.json passenger-helper.runtimeconfig.json LICENSE.txt THIRD-PARTY-NOTICES.txt; do
     [ -f "$shipped/Contents/MacOS/$part" ] || fail "the app has no $part"
 done
-for part in web/passenger/prettier.cjs web/passenger/docker-hub.cjs web/schemas/compose-spec.json; do
+for part in web/passenger/prettier.cjs web/passenger/docker-hub.cjs web/passenger/yaml-schemas.mjs web/schemas/compose-spec.json; do
     [ -f "$shipped/Contents/Resources/$part" ] || fail "the app has no $part in its Resources"
 done
+# Every headless platform the inspector carries for an older Avalonia is the app's too.
+for part in $(cd "$publish/inspector" && find avalonia -type f); do
+    [ -f "$shipped/Contents/MacOS/inspector/$part" ] || fail "the app has no inspector/$part"
+done
+# Every relay the build carried is a resource of the app, none left among its code.
+[ ! -e "$shipped/Contents/MacOS/debugger/relay" ] || fail "the app carries its debug relays among its code"
+if [ -d "$publish/debugger/relay" ]; then
+    for part in $(cd "$publish/debugger/relay" && find . -type f); do
+        [ -f "$shipped/Contents/Resources/debugger/relay/$part" ] || fail "the app has no debug relay ${part#./} in its Resources"
+    done
+fi
 find "$shipped/Contents/MacOS" -type f -exec file -F '|' {} + | grep '| *Mach-O' | cut -d'|' -f1 > "$work/mach-o"
+if [ -d "$shipped/Contents/Resources/debugger/relay" ]; then
+    find "$shipped/Contents/Resources/debugger/relay" -type f -exec file -F '|' {} + | grep '| *Mach-O' | cut -d'|' -f1 >> "$work/mach-o"
+fi
 [ -s "$work/mach-o" ] || fail "the app has no Mach-O file"
 while IFS= read -r file; do
     lipo "$file" -verify_arch "$machine" || fail "${file#"$shipped/"} is built for $(lipo -archs "$file"), not $machine"
@@ -322,6 +416,18 @@ mkdir -p "$check/Sample"
 ditto "$shipped" "$check/Passenger.app"
 detach
 codesign --verify --deep --strict "$check/Passenger.app" || fail "the app copied out of the image does not verify before it runs"
+# Under Rosetta the Intel app evaluates projects only with an Intel SDK: DOTNET_ROOT_X64's, as .NET's own host reads it.
+evaluates=1
+if [ "$machine" = x86_64 ] && [ "$(sysctl -n hw.optional.arm64 2>/dev/null || true)" = 1 ]; then
+    if [ -n "${DOTNET_ROOT_X64:-}" ]; then
+        DOTNET_ROOT=$DOTNET_ROOT_X64
+        PATH="$DOTNET_ROOT_X64:$PATH"
+        export DOTNET_ROOT PATH
+    else
+        evaluates=
+        echo "package-mac: no DOTNET_ROOT_X64 names an Intel .NET SDK, so the check under Rosetta evaluates no project" >&2
+    fi
+fi
 # The framework of the SDK the repository's global.json picks, which carries its own reference assemblies: nothing downloaded.
 framework=net$(cd "$check/Sample" && dotnet --version | cut -d. -f1).0
 cat > "$check/Sample/Sample.csproj" <<EOF
@@ -343,6 +449,9 @@ for run in 1 2; do
     if [ "${loaded:-0}" -ne "$run" ]; then
         tail -n 20 "$settings/logs/passenger.log" >&2 || true
         fail "the C# language server of the app copied out of the image did not load the sample in run $run"
+    fi
+    if [ -n "$evaluates" ] && grep -E 'The project host could not (evaluate|build) the projects' "$settings/logs/passenger.log" >&2; then
+        fail "the project host of the app copied out of the image could not read the sample in run $run"
     fi
 done
 ls "$settings"/cache/roslyn/*/cache/* > /dev/null 2>&1 \

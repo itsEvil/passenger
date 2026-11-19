@@ -30,6 +30,8 @@ internal static class Program
         {
             return signed;
         }
+        // Before anything of the IDE starts, so a start that fails before its log is set up still leaves why.
+        CrashFile.Watch();
         // First, as Velopack asks; an update never installs as a second Passenger starts, which would end the first.
         if (Installation.Installed)
         {
@@ -40,16 +42,24 @@ internal static class Program
         {
             options = LaunchOptions.Parse(args);
             _ = Updates.ReleaseFeed.Default;
+            _ = Web.JsonSchemas.Place;
+            _ = Web.DockerHubTags.Named;
+            _ = OpenVsx.Registry;
+            _ = Mobile.AndroidLicences.Repository;
+            _ = DotnetReleases.Feed;
+            _ = Xaml.SourceLink.Server;
             _ = Discord.DiscordIpc.Default;
-            Web.JsonSchemas.CheckVariable();
-            Web.DockerHubTags.CheckVariable();
+            _ = ThemeSource.Repository.Reached;
             _ = Containers.BuildKitChecks.ByDefault;
+            _ = SystemMotion.Named;
             _ = Debugging.BrowserRun.Proxy;
             Mcp.McpProxy.CheckVariable();
             _ = Mcp.McpHost.StartsLanguageServer;
             _ = MainWindow.WatchSaysLater;
             _ = CSharp.CSharpService.SlowLoad;
             _ = Mcp.AgentCall.Every;
+            _ = Mcp.PassengerTools.ServerLimit;
+            _ = Run.Devices.DeviceLaunches.EndHold;
             _ = Dap.AdapterEnvironment.EvaluationTimeout;
             _ = Text.TextSearch.Apart;
             _ = Languages.TextMate.TextMateHighlighter.LineTime;
@@ -62,6 +72,10 @@ internal static class Program
         }
 
         Options = options;
+        if (options.Mcp != McpMode.Attach)
+        {
+            LeaveStartingFolder();
+        }
         // Before anything starts, so nothing started reads it; a relay keeps its own, which the updated app it becomes reads.
         Stream? input = options.Mcp == McpMode.Attach ? null : StandardInput.Take();
         // Before the shell's environment or a look for leftovers: Main's thread waits here for a running Passenger's answer.
@@ -69,6 +83,11 @@ internal static class Program
         {
             input?.Dispose();
             return 0;
+        }
+        // A screenshot's state is a folder of its own, made so (Apart), unless PASSENGER_SETTINGS names one.
+        if (options.Screenshot is null || State.StateStore.Named is not null)
+        {
+            State.StateStore.Own();
         }
         Core.ShellEnvironment.Load();
         if (options.Mcp != McpMode.Attach && options.Screenshot is null)
@@ -98,11 +117,29 @@ internal static class Program
             return Apart(() => Screenshot.Run(options, screenshot));
         }
         int code = BuildAvaloniaApp()
+            .Checked()
             .AfterSetup(builder => ApplyTheme(builder.Instance!, options))
             .StartWithClassicDesktopLifetime(args);
         // What the windows ended (debuggers, Roslyn's servers) has a moment; then an update made ready installs, last of all.
         PassengerApp.End();
         return code;
+    }
+
+    /// <summary>Works in the person's home folder from here on, the command line's paths read whole: a program started by
+    /// its bare name (Avalonia's xdg-open) is looked for in the working folder before the PATH, and the folder Passenger
+    /// was started in may be a repository it opens. A relay (--mcp-attach) keeps its own, its agent's folder.</summary>
+    private static void LeaveStartingFolder()
+    {
+        string home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile, Environment.SpecialFolderOption.DoNotVerify);
+        try
+        {
+            Environment.CurrentDirectory = home;
+        }
+        catch (Exception refused) when (refused is IOException or UnauthorizedAccessException or ArgumentException)
+        {
+            // A home that is gone or unnamed: the root of the system's disk, which only the system writes.
+            Environment.CurrentDirectory = Path.GetPathRoot(Environment.SystemDirectory) is { Length: > 0 } root ? root : "/";
+        }
     }
 
     /// <summary>A screenshot keeps nothing of the person's: unless PASSENGER_SETTINGS names a folder, its state and logs
@@ -164,20 +201,36 @@ internal static class Program
     public static void ApplyTheme(Application app, LaunchOptions options)
     {
         ApplyTheme(app, options.Theme);
-        Themes.Apply(app, options.Look, options.Scheme);
+        if (options.Look is not null || options.Scheme is not null)
+        {
+            Themes.Apply(app, options.Look is { } look ? look.Theme : Themes.Look, options.Scheme is { } scheme ? scheme.Theme : Themes.Scheme);
+        }
     }
 
     public static void ApplyTheme(Application app, ThemeChoice? theme)
     {
         if (theme is { } choice)
         {
-            app.RequestedThemeVariant = choice switch
+            Themes.UseVariant(app, choice switch
             {
                 ThemeChoice.Dark => ThemeVariant.Dark,
                 ThemeChoice.Light => ThemeVariant.Light,
                 _ => ThemeVariant.Default,
-            };
+            });
         }
+    }
+
+    /// <summary>Avalonia on the headless platform (<see cref="HeadlessPlatform"/>), the command line's theme over the one in
+    /// force, for a Passenger nobody sees (<c>--mcp</c>, <c>--headless</c>, a screenshot), the process first taken as
+    /// headless (<see cref="PassengerApp.RunsHeadless"/>) where it was not already.</summary>
+    internal static void SetUpHeadless(LaunchOptions launch)
+    {
+        PassengerApp.RunsHeadless();
+        AppBuilder.Configure<App>()
+            .UseHeadlessPlatform()
+            .Checked()
+            .AfterSetup(builder => ApplyTheme(builder.Instance!, launch))
+            .SetupWithoutStarting();
     }
 
     /// <summary>The XAML previewer calls this by name, so it stays public and parameterless. Avalonia's log goes to the

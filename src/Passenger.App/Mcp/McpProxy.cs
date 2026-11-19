@@ -94,13 +94,17 @@ public sealed partial class McpProxy
     }
 
     /// <summary>Fails a start whose <see cref="StartVariable"/> or <see cref="StartedForVariable"/> is not one this build
-    /// knows, as a malformed flag does; the second is read into <see cref="StartedForAgent"/> and taken out.</summary>
+    /// knows, as a malformed flag does; the second is read into <see cref="StartedForAgent"/>, and <see cref="SessionVariable"/>
+    /// into the session followed, each taken out: what the environment gives now, so read with neither given, the process
+    /// was started for no agent and follows no relay's session.</summary>
     public static void CheckVariable()
     {
         if (Environment.GetEnvironmentVariable(StartVariable) is { Length: > 0 } how && how != "headless")
         {
             throw new FormatException($"{StartVariable} takes headless (the test run's), not '{how}'");
         }
+        StartedForAgent = false;
+        followed = null;
         if (Environment.GetEnvironmentVariable(StartedForVariable) is { Length: > 0 } started)
         {
             if (started != "agent")
@@ -744,7 +748,7 @@ public sealed partial class McpProxy
         }
         catch (OperationCanceledException) when (joiningCancel.IsCancellationRequested && !cancel.IsCancellationRequested)
         {
-            throw new NotJoined($"Joining the Passenger window on {here} timed out after {StartLimit.TotalSeconds:0} s; a later call tries again.");
+            throw new NotJoined($"Joining the Passenger window on {here} timed out after {Durations.Said(StartLimit)}; a later call tries again.");
         }
         finally
         {
@@ -862,12 +866,12 @@ public sealed partial class McpProxy
         }
         if (await AppSocket.AskAsync(here, cancel) is null)
         {
-            call.Waits($"Starting Passenger on {here} and waiting for its window (at most {StartLimit.TotalSeconds:0} s)");
+            call.Waits($"Starting Passenger on {here} and waiting for its window (at most {Durations.Said(StartLimit)})");
             await LaunchAsync(cancel);
         }
         else
         {
-            call.Waits($"Waiting for the running Passenger to open {here} (at most {StartLimit.TotalSeconds:0} s)");
+            call.Waits($"Waiting for the running Passenger to open {here} (at most {Durations.Said(StartLimit)})");
         }
         while (true)
         {
@@ -903,7 +907,7 @@ public sealed partial class McpProxy
             IdeErrors.Observe(ChildProcesses.ErrorStream(headless).CopyToAsync(Stream.Null, CancellationToken.None));
             return;
         }
-        if (OperatingSystem.IsMacOS() && Bundle(self) is { } app)
+        if (OperatingSystem.IsMacOS() && MacBundles.Of(self) is { } app)
         {
             // The variable reaches only a Passenger LaunchServices starts; one running already opens the folder as it is.
             ChildResult opened = await ChildProcesses.RunAsync(ChildProcesses.Command("/usr/bin/open", ["--env", $"{StartedForVariable}=agent", "-a", app, here]),
@@ -924,15 +928,6 @@ public sealed partial class McpProxy
         {
             throw new NotJoined($"Passenger did not start: {error.Message}");
         }
-    }
-
-    /// <summary>The app bundle an executable is inside (<c>X.app/Contents/MacOS/Passenger</c>), or null.</summary>
-    private static string? Bundle(string executable)
-    {
-        string? macOS = Path.GetDirectoryName(executable);
-        string? contents = macOS is null ? null : Path.GetDirectoryName(macOS);
-        string? app = contents is null ? null : Path.GetDirectoryName(contents);
-        return app is not null && app.EndsWith(".app", StringComparison.OrdinalIgnoreCase) && Path.GetFileName(macOS) == "MacOS" ? app : null;
     }
 
     /// <summary>The agent went: the window it joined sees it go.</summary>

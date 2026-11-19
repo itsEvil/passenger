@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using Passenger.App.Editors;
 using Passenger.App.Web;
 using Passenger.App.Workspace;
@@ -342,7 +343,7 @@ internal sealed partial class CodeActions(AssistContext context, PopupPlacement 
         {
             return (RefactorOutcome.Refused($"{what} was not applied: {stale}"), false);
         }
-        RefactorOutcome made = chosen.Edit is { } edit ? await ApplyEditAsync(edit, asked, what) : new RefactorOutcome(string.Empty, null, [], []);
+        RefactorOutcome made = chosen.Edit is { } edit ? await ApplyEditAsync(edit, asked, what, what) : new RefactorOutcome(string.Empty, null, [], []);
         if (made.Problem is not null)
         {
             return (made, false);
@@ -442,7 +443,7 @@ internal sealed partial class CodeActions(AssistContext context, PopupPlacement 
         TextSnapshot text = Editor.Document.Snapshot;
         int caret = Editor.Selections.Primary.Caret;
         TextRange word = RenamedAt(document, text, caret);
-        if (word.Length == 0 || !(TextNavigation.IsWordChar(text[word.Start]) || (context.WebCurrent is { } named && WebAssist.IsWebWordChar(named, text[word.Start]))))
+        if (word.Length == 0 || !(WordCharacters.IsWord(text[word.Start]) || (context.WebCurrent is { } named && WebAssist.IsWebWordChar(named, text[word.Start]))))
         {
             return;
         }
@@ -451,31 +452,38 @@ internal sealed partial class CodeActions(AssistContext context, PopupPlacement 
         IdeErrors.Observe(OfferFileRenames(box, document, word.Start));
     }
 
-    /// <summary>The rename box over a name of a file, C#'s, a web language's or a GDScript's: the name is renamed as the box
-    /// closes with one, held on it through what is typed meanwhile, with a type's files where the box offers them and they
-    /// are chosen.</summary>
+    /// <summary>The rename box over a name of a file, C#'s, a web language's or a GDScript's, renamed through its server or
+    /// Passenger's reading of the scripts (<see cref="AskRename(OpenDocument, int, RenameBox, Func{Anchor, string, Patience, Task{RefactorOutcome}})"/>),
+    /// with a type's files where the box offers them and they are chosen.</summary>
     private RenameBox ShowRenameBox(OpenDocument document, TextSnapshot text, TextRange word)
     {
         RenameBox box = new(text.GetText(word));
-        ChangeTracker opened = new(Editor.Document);
-        popups.ShowModal(box, word.Start, async name =>
+        AskRename(document, word.Start, box, (held, name, patience) => RenameSymbolAsync(document, held, name, box.RenamesFiles, patience));
+        return box;
+    }
+
+    /// <summary>Rename's box opened on a name at an offset of a file: once a new name is given, <paramref name="rename"/> renames
+    /// it from a place held on the name through what is written meanwhile, while the box is open and as the rename is worked
+    /// out, made again as <see cref="AssistContext.PatientlyAsync(string, Func{Patience, Task{RefactorOutcome}})"/> makes a
+    /// change, and what it came to said; the name given unchanged renames nothing. A server's failure is said by the box's
+    /// answer (<see cref="PopupPlacement.Carried"/>).</summary>
+    internal void AskRename(OpenDocument document, int at, RenameBox box, Func<Anchor, string, Patience, Task<RefactorOutcome>> rename)
+    {
+        string old = box.Text;
+        ChangeTracker opened = new(document.Text);
+        popups.ShowModal(box, at, async name =>
         {
-            // Let go as the box closed, just before: what was typed while it was open is still mapped.
-            int at = opened.MapOffset(word.Start);
-            if (name is null)
+            // Let go as the box closed, just before: what was written while it was open is still mapped.
+            int now = opened.MapOffset(at);
+            if (name is null || name == old)
             {
                 return;
             }
-            // Held on the name through what is typed while the rename is out, however often it is worked out.
-            Anchor held = HeldAt(document, at);
+            // Held on the name through what is written while the rename is out, however often it is worked out.
+            Anchor held = HeldAt(document, now);
             try
             {
-                RefactorOutcome made = await context.PatientlyAsync(AppActions.Rename, patience => RenameSymbolAsync(document, held, name, box.RenamesFiles, patience));
-                Told("Rename", made);
-            }
-            catch (LanguageServerFailed failed)
-            {
-                context.Failed("Rename", failed);
+                Told("Rename", await context.PatientlyAsync(AppActions.Rename, patience => rename(held, name, patience)));
             }
             finally
             {
@@ -483,8 +491,11 @@ internal sealed partial class CodeActions(AssistContext context, PopupPlacement 
             }
         });
         popups.WhenClosed(opened.Dispose);
-        return box;
     }
+
+    /// <summary>Rename's box opened on the name <paramref name="old"/> at an offset of a file (<see cref="AskRename(OpenDocument, int, RenameBox, Func{Anchor, string, Patience, Task{RefactorOutcome}})"/>).</summary>
+    internal void AskRename(OpenDocument document, int at, string old, Func<Anchor, string, Patience, Task<RefactorOutcome>> rename) =>
+        AskRename(document, at, new RenameBox(old), rename);
 
     /// <summary>Whether a name can be written as a C# identifier: as it is, or after an @ (a keyword's name).</summary>
     private static bool IsCSharpName(string name) => Microsoft.CodeAnalysis.CSharp.SyntaxFacts.IsValidIdentifier(name.StartsWith('@') ? name[1..] : name);
@@ -496,8 +507,35 @@ internal sealed partial class CodeActions(AssistContext context, PopupPlacement 
 
     /// <summary>The name a rename at an offset of a file renames: a web language's through its own characters (CSS's
     /// --accent, JavaScript's $el).</summary>
-    private TextRange RenamedAt(OpenDocument document, TextSnapshot text, int offset) =>
+    internal TextRange RenamedAt(OpenDocument document, TextSnapshot text, int offset) =>
         context.WebOf(document) is { } web ? WebAssist.WebWordAt(web, text, offset) : TextNavigation.WordAt(text, offset);
+
+    /// <summary>The character just before a renamed name that the server's edit of it in <paramref name="path"/> replaces
+    /// too (a '.', '#', '$' or '@'), where <paramref name="name"/> does not begin with it; else null.</summary>
+    internal static char? SigilOf(System.Text.Json.JsonElement edit, string path, TextSnapshot text, TextRange word, string name)
+    {
+        if (word.Start == 0 || word.Length == 0)
+        {
+            return null;
+        }
+        char before = text[word.Start - 1];
+        if (AssistContext.IsIdentifierChar(before) || char.IsWhiteSpace(before) || name.StartsWith(before))
+        {
+            return null;
+        }
+        foreach (FileEdits file in Shapes.WorkspaceEdit(edit).Where(f => f.Operation is null && PathNames.Same(DocumentUris.ToPath(f.Uri), path)))
+        {
+            foreach (LspTextEdit change in file.Edits)
+            {
+                if (text.GetOffset(ServerPlaces.PositionOf(text, change.Range.Start)) == word.Start - 1
+                    && text.GetOffset(ServerPlaces.PositionOf(text, change.Range.End)) == word.End)
+                {
+                    return before;
+                }
+            }
+        }
+        return null;
+    }
 
     /// <summary>A name renamed through the language server at an offset of a file, a type's files named after it renamed
     /// with it when <paramref name="renameFiles"/> and the markup its class is made with following it
@@ -518,6 +556,45 @@ internal sealed partial class CodeActions(AssistContext context, PopupPlacement 
         }
     }
 
+    /// <summary>What the folder's C# declares at <paramref name="declared"/> (Roslyn's line and column), read as
+    /// <paramref name="written"/>, its own name or the property or a command the MVVM Toolkit makes of it, renamed from its
+    /// declaration (<see cref="RenameSymbolAsync(OpenDocument, int, string, bool, Patience?)"/>) so it is read as
+    /// <paramref name="name"/>: a field or method by the name that makes it, refused where none would. Its file is read for
+    /// the rename where it is not open.</summary>
+    internal async Task<RefactorOutcome> RenameDeclaredAsync(Passenger.Xaml.Metadata.SourcePlace declared, string written, string name, bool renameFiles, Patience? patience)
+    {
+        OpenDocument code;
+        IDisposable hold;
+        try
+        {
+            (code, hold) = context.Editors.Lend(declared.Path);
+        }
+        catch (Exception unread) when (unread is IOException or UnauthorizedAccessException)
+        {
+            return RefactorOutcome.Refused($"Rename was not applied: {Path.GetFileName(declared.Path)} could not be read: {unread.Message}");
+        }
+        try
+        {
+            if (context.CSharp?.For(code)?.Lsp is not { } lsp)
+            {
+                return RefactorOutcome.Refused($"Rename was not applied: the C# language server has yet to read {Path.GetFileName(declared.Path)}");
+            }
+            int offset = lsp.OffsetOf(new LspPosition(declared.Line, declared.Column));
+            TextSnapshot text = code.Text.Snapshot;
+            string own = text.GetText(TextNavigation.WordAt(text, offset));
+            if (Passenger.Xaml.Features.CodeSymbol.NameFor(own, written, name) is not { } renamed)
+            {
+                return RefactorOutcome.Refused($"Rename was not applied: a source generator makes {written} of {own}, and no name of {own}'s is known to make '{name}'");
+            }
+            return renamed == own ? new RefactorOutcome($"{name} is its name already", null, [], [])
+                : await RenameSymbolAsync(code, offset, renamed, renameFiles, patience);
+        }
+        finally
+        {
+            hold.Dispose();
+        }
+    }
+
     /// <summary>Writes in the IDE's log a rename the server answered with nothing, none of its files known to be behind: where
     /// it says the name is declared, and each file of its solution written in the last minute, how long before the
     /// request, whether it holds the file as the disk has it, and when it was told the file changed.</summary>
@@ -533,9 +610,9 @@ internal sealed partial class CodeActions(AssistContext context, PopupPlacement 
             WrittenLately lately = await session.WrittenSinceAsync(asked.Since - TimeSpan.FromMinutes(1));
             IReadOnlyList<Roslyn.Extension.TextHeld> held = await session.HeldTextsAsync([.. lately.Written.Select(w => w.Path)]);
             // Each file read off the window's thread, as files of any size may have been written.
-            files = await BackgroundWork.Run(() => string.Join("; ", held.Select(t => $"{Path.GetFileName(t.Path)} {(asked.Since - File.GetLastWriteTimeUtc(t.Path)).TotalSeconds:0.00} s before, "
+            files = await BackgroundWork.Run(() => string.Join("; ", held.Select(t => $"{Path.GetFileName(t.Path)} {Durations.Said(asked.Since - File.GetLastWriteTimeUtc(t.Path))} before, "
                 + (t.Hash is { } hash && HeldTexts.OnDisk(t.Path, hash) == true ? "held as on disk" : "held otherwise")
-                + (session.Server.WatchedFiles.ToldAt(t.Path) is { } told ? $", told {(asked.Since - told).TotalSeconds:0.00} s before" : ", never told"))));
+                + (session.Server.WatchedFiles.ToldAt(t.Path) is { } told ? $", told {Durations.Said(Stopwatch.GetElapsedTime(told, asked.Sent))} before" : ", never told"))));
         }
         catch (LanguageServerFailed failed)
         {
@@ -566,7 +643,7 @@ internal sealed partial class CodeActions(AssistContext context, PopupPlacement 
         if (document.Language == Languages.Language.CSharp && await context.Languages.Xaml.NamedElementOfAsync(document, definitions, at.Offset) is { Path: { } elementFile } element)
         {
             return element.Name == name ? new RefactorOutcome($"{name} is its name already", null, [], [])
-                : await context.Languages.Xaml.XamlRenameAsync(elementFile, element.Name, name, patience) ?? RefactorOutcome.Refused($"{Path.GetFileName(elementFile)} is not XAML Passenger reads");
+                : await context.Languages.Xaml.XamlRenameAsync(elementFile, element.Name, name, patience) ?? RefactorOutcome.Refused(XamlAssist.Unread(elementFile));
         }
         // A component's file at its start is the class Razor makes of it, which the server takes in the C# made of the file.
         TypeRename.Component? component = context.WebOf(document) is null
@@ -598,8 +675,19 @@ internal sealed partial class CodeActions(AssistContext context, PopupPlacement 
             ? await godotServer.RenameAsync(new UriSpan(DocumentUris.FromPath(declaring), declared, declared), own)
             : component is null ? await context.Now(document).RenameAsync(at.Offset, name)
             : context.CSharp?.Session is { } session ? await session.RenameAsync(component.Name, name) : null;
+        // A server renaming the name with a sigil the name shown leaves out (.card, #main, $accent, @accent) is asked again with it.
+        if (renamed is { } bare && context.WebOf(document) is not null && SigilOf(bare, document.Path, text, RenamedAt(document, text, at.Offset), name) is char sigil)
+        {
+            renamed = await context.Now(document).RenameAsync(at.Offset, sigil + name);
+        }
         if (renamed is not { } edit)
         {
+            // A property the MVVM Toolkit makes, which the server renames nowhere, is renamed through the field or method it is made of.
+            if (component is null && godot is null && document.Language == Languages.Language.CSharp
+                && await context.Now(document).SymbolAtAsync(at.Offset) is { MadeOf: { Path: { } maker, At: { } made } } toolkitMade)
+            {
+                return await RenameDeclaredAsync(new Passenger.Xaml.Metadata.SourcePlace(PathNames.Canonical(maker), made.Line, made.Character), toolkitMade.Name, name, renameFiles, patience);
+            }
             // A server behind a file it reads from disk (the class's XAML making a field, however long ago written) may not know the name yet.
             if (await StaleAsync(document, NoEdit, asked, patience, await MarkupOfClassAtAsync(document, at.Offset)) is { } unread)
             {
@@ -608,7 +696,6 @@ internal sealed partial class CodeActions(AssistContext context, PopupPlacement 
             await NoteNothingToRenameAsync(old, definitions, asked);
             return new RefactorOutcome("This can't be renamed", null, [], []);
         }
-        TypeRename.Markup markup = type is null ? new([], null) : await TypeRename.MarkupAsync(context.Xaml?.Invoke(), type, name, renameFiles);
         NamedSymbol? symbol = component is null && document.Language == Languages.Language.CSharp ? godot?.Symbol ?? await context.Now(document).SymbolAtAsync(at.Offset) : null;
         // Its uses in XAML, found where it is declared still: a binding's path, x:DataType, x:Static, a handler, a tag.
         (IReadOnlyList<(string Path, IReadOnlyList<LspTextEdit> Edits)> inXaml, string? unfollowed) = symbol is not null
@@ -644,12 +731,6 @@ internal sealed partial class CodeActions(AssistContext context, PopupPlacement 
         {
             return RefactorOutcome.Refused($"Rename was not applied: {stale}");
         }
-        Func<string, TextSnapshot?> answered = WorkspaceEdits.Answered(context.Editors, asked);
-        if (markup.ClassFile is { } xaml && type?.FullName is { } fullName && TypeRename.ClassEdit(xaml, answered(xaml), fullName, name) is { } named
-            && !inXaml.Any(f => PathNames.Same(f.Path, named.Path) && f.Edits.Any(e => e.Range == named.Edit.Range)))
-        {
-            edit = TypeRename.With(edit, named.Path, named.Edit);
-        }
         if (inXaml.Count > 0)
         {
             edit = TypeRename.With(edit, inXaml);
@@ -663,19 +744,12 @@ internal sealed partial class CodeActions(AssistContext context, PopupPlacement 
             edit = TypeRename.With(edit, [.. toolkit.Uses.GroupBy(u => u.Path, PathNames.Comparer).Select(file => (file.Key, (IReadOnlyList<LspTextEdit>)[.. file.Select(u =>
                 new LspTextEdit(new LspRange(new LspPosition(u.At.Line, u.At.Character), new LspPosition(u.End.Line, u.End.Character)), u.Name))]))]);
         }
+        TakenAlong along = type is null ? new(edit, []) : await TakenAlongAsync(type, name, renameFiles, edit, asked);
+        edit = along.Edit;
+        List<(string From, string To)> moves = [.. along.Moves];
         IReadOnlyList<RefactoredFile> edited = await WorkspaceEdits.FilesAsync(context.Editors, edit, asked);
-        List<(string From, string To)> moves = [.. (renameFiles ? type?.Files ?? [] : []).Select(f => (From: f, To: TypeRename.Renamed(f, name))).Concat(markup.Moves)
-            .Where(m => m.From != m.To && File.Exists(m.From) && !edited.Any(f => f.Change == "moved" && PathNames.Same(f.Path, m.From))).Distinct()];
-        // A Godot script's file moved: the scenes that load it follow, and its .uid goes beside it.
-        (IReadOnlyList<PlacedEdits> loading, IReadOnlyList<(string From, string To)> beside) = await context.Languages.CSharp.GodotMovedAsync(moves);
-        if (loading.Count > 0)
-        {
-            edit = TypeRename.With(edit, loading);
-            edited = [.. edited, .. loading.Where(l => !edited.Any(f => PathNames.Same(f.Path, l.Path))).Select(l => new RefactoredFile(l.Path, "changed", [.. l.Edits.Select(e => e.Range.Start.Line + 1)]))];
-        }
-        moves.AddRange(beside);
         // A scene's places were read from the project's index, which a save the folder's watcher has yet to tell of leaves behind.
-        if (await context.Languages.CSharp.GodotOutOfDateAsync([.. inScenes, .. scripted, .. loading], asked, patience) is { } overtaken)
+        if (await context.Languages.CSharp.GodotOutOfDateAsync([.. inScenes, .. scripted], asked, patience) is { } overtaken)
         {
             return RefactorOutcome.Refused($"Rename was not applied: {overtaken}");
         }
@@ -683,9 +757,12 @@ internal sealed partial class CodeActions(AssistContext context, PopupPlacement 
         string command = $"Rename {old} to {name}";
         using CommandHistory.Recording recording = context.Editors.Commands.Record(command);
         TypeRename.Applied applied;
+        List<string> left = [];
+        string? ungodot;
         try
         {
             applied = TypeRename.Apply(context.Editors, edit, moves, asked, dropped, recording);
+            ungodot = await GodotFollowAsync(edit, applied, recording, left);
             // Written whether or not every file moved: the code is renamed either way.
             await WorkspaceEdits.LandedAsync(recording, context.Say);
         }
@@ -701,8 +778,40 @@ internal sealed partial class CodeActions(AssistContext context, PopupPlacement 
         {
             said += $"{(dropped.Count > 0 ? "; and" : ", but")} {unmoved}";
         }
-        return new RefactorOutcome(said, null, [.. changed, .. applied.Moved.Select(m => new RefactoredFile(m.From, "moved", [], m.To))], dropped);
+        if (ungodot is not null || left.Count > 0)
+        {
+            said += $"; {ungodot ?? string.Join("; ", left)}";
+        }
+        return new RefactorOutcome(said, null, [.. changed, .. applied.Moved.Select(m => new RefactoredFile(m.From, RefactoredChange.Moved, [], m.To))], dropped) { Unmoved = applied.Unmoved };
     }
+
+    /// <summary>What a type's rename to <paramref name="name"/> takes along, Rename's and a code action's alike: the
+    /// <c>x:Class</c> naming it, where the edit does not change it already; its files named after it when
+    /// <paramref name="renameFiles"/>, and the markup its class is made with (<see cref="TypeRename.MarkupAsync"/>), each but
+    /// those the edit moves itself. The edit with them, and the moves.</summary>
+    private async Task<TakenAlong> TakenAlongAsync(TypeRename.Named type, string name, bool renameFiles, System.Text.Json.JsonElement edit, Asked? asked)
+    {
+        TypeRename.Markup markup = await TypeRename.MarkupAsync(context.Xaml?.Invoke(), type, name, renameFiles);
+        if (markup.ClassFile is { } xaml && type.FullName is { } fullName && TypeRename.ClassEdit(xaml, WorkspaceEdits.Answered(context.Editors, asked)(xaml), fullName, name) is { } named
+            && !WorkspaceEdits.Changes(edit, named.Path, named.Edit.Range))
+        {
+            edit = TypeRename.With(edit, named.Path, named.Edit);
+        }
+        IReadOnlyList<string> moved = WorkspaceEdits.Moved(edit);
+        List<(string From, string To)> moves = [.. (renameFiles ? type.Files : []).Select(f => (From: f, To: TypeRename.Renamed(f, name))).Concat(markup.Moves)
+            .Where(m => m.From != m.To && File.Exists(m.From) && !moved.Any(p => PathNames.Same(p, m.From))).Distinct()];
+        return new TakenAlong(edit, moves);
+    }
+
+    /// <summary>A type's rename's edit with what it takes along (<see cref="TakenAlongAsync"/>), and the files it moves.</summary>
+    private sealed record TakenAlong(System.Text.Json.JsonElement Edit, IReadOnlyList<(string From, string To)> Moves);
+
+    /// <summary>A Godot project's files following the files a change moved within its command, those its edit renamed and
+    /// those a type's rename took along (<see cref="CSharpAssist.GodotFollowAsync"/>): null once they follow, else why one
+    /// could not.</summary>
+    private Task<string?> GodotFollowAsync(System.Text.Json.JsonElement edit, TypeRename.Applied applied, CommandHistory.Recording recording, List<string> left) =>
+        context.Languages.CSharp.GodotFollowAsync([.. WorkspaceEdits.Renames(edit).Where(r => Path.Exists(r.To) && (!Path.Exists(r.From) || PathNames.Same(r.From, r.To)))
+            .Concat(applied.Moved).Select(m => (m.From, PathNames.Canonical(m.To)))], recording, left);
 
     /// <summary>A GDScript's member renamed from where its script declares it, as Rename there renames it: the script lent
     /// with no tab where none shows it, renamed by Passenger's reading, else once Godot's server reads it, within
@@ -716,12 +825,12 @@ internal sealed partial class CodeActions(AssistContext context, PopupPlacement 
             {
                 return scripted;
             }
-            DateTime until = DateTime.UtcNow + Waits.Of(ScriptServed);
+            Deadline until = Deadline.In(Waits.Of(ScriptServed));
             if (context.WebOf(document) is { Lsp: null })
             {
                 context.Say($"Rename waits for Godot's server to read {document.Name}");
             }
-            while (context.WebOf(document) is { Lsp: null } && context.Web?.Invoke()?.CannotStart(document) == false && DateTime.UtcNow < until)
+            while (context.WebOf(document) is { Lsp: null } && context.Web?.Invoke()?.CannotStart(document) == false && !until.Passed)
             {
                 // Looked at every 50 ms: a web server's document comes as the server starts, raising nothing.
                 await Task.Delay(50);
@@ -785,22 +894,142 @@ internal sealed partial class CodeActions(AssistContext context, PopupPlacement 
         }
     }
 
+    /// <summary>Vim's =: each stretch of the file's lines laid out as Reformat Code lays out a selection, the last first so
+    /// the lines above stay where they were, then each caret on its line's first non-blank; what it came to said.</summary>
+    internal async Task ReformatLinesAsync(OpenDocument document, IReadOnlyList<(int First, int Last)> lines)
+    {
+        using (BackgroundWork.Scope())
+        {
+            try
+            {
+                Reformatted? done = null;
+                for (int i = lines.Count - 1; i >= 0; i--)
+                {
+                    TextSnapshot text = document.Text.Snapshot;
+                    if (lines[i].Last >= text.LineCount)
+                    {
+                        continue;
+                    }
+                    TextRange range = TextRange.FromBounds(text.GetLineStart(lines[i].First), text.GetLine(lines[i].Last).End);
+                    done = await ReformatAsync(document, range, () => context.Ask("Reformat Code"));
+                    if (done is not { Applied: true })
+                    {
+                        break;
+                    }
+                }
+                if (context.Editors.Active == document)
+                {
+                    TextSnapshot after = document.Text.Snapshot;
+                    bool breakEnds = Vim.KeepsFinalLineBreak(document.Text.Saved);
+                    Editor.Selections = Editor.Selections.With(s => Selection.At(Vim.Settled(after, TextNavigation.IndentEnd(after, after.GetLine(after.GetLineFromOffset(s.Caret))), breakEnds)));
+                }
+                if (done is not null)
+                {
+                    context.Say(done.Said);
+                }
+            }
+            catch (LanguageServerFailed failed)
+            {
+                context.Failed("Reformat Code", failed);
+            }
+        }
+    }
+
     /// <summary>What Reformat Code came to: whether it was applied, whether it changed the text (not when the file was
     /// formatted already), and what to say of it, or why it was not applied.</summary>
-    internal sealed record Reformatted(bool Applied, bool Changed, string Said);
+    internal sealed record Reformatted(bool Applied, bool Changed, string Said)
+    {
+        /// <summary>Why a reformat refused was not applied, as <see cref="Refused"/> was told; null where it says so otherwise.</summary>
+        public string? Why { get; init; }
+
+        /// <summary>A reformat not applied, saying why.</summary>
+        public static Reformatted Refused(string what, string why) => new(false, false, $"{what} was not applied: {why}") { Why = why };
+
+        /// <summary>A reformat of a file shown read-only, refused whatever its formatter would make of it; null for a file
+        /// that takes one.</summary>
+        public static Reformatted? ReadOnly(OpenDocument document, string what) =>
+            document.IsReadOnly ? Refused(what, Refusals.ReadOnly(document.Name)) : null;
+
+        /// <summary>A reformat's edits, in the offsets of the text as <paramref name="asked"/> began, carried onto the open
+        /// file as it is now and applied as one undoable edit; refused where the file is read-only or the code one changes
+        /// was edited meanwhile, and no change where there are none or the file has closed.</summary>
+        public static Reformatted Apply(EditorArea editors, OpenDocument document, ChangeTracker asked, IReadOnlyList<TextEdit> edits, string what)
+        {
+            if (ReadOnly(document, what) is { } refused)
+            {
+                return refused;
+            }
+            if (edits.Count == 0 || !editors.Documents.Contains(document))
+            {
+                return new(true, false, "Already formatted");
+            }
+            if (asked.Map(edits) is not { } mapped)
+            {
+                return Refused(what, "the code it changes was edited meanwhile");
+            }
+            WorkspaceEdits.ApplyTo(editors, document, mapped);
+            return new(true, true, "Reformatted");
+        }
+    }
 
     /// <summary>Reformat Code on a file, the window's and an agent's alike, as one undoable edit, only <paramref name="within"/>
     /// when given: XAML by Passenger's own layout, a web language by its project's Prettier where it formats it on Reformat
-    /// Code, else the language <paramref name="server"/> gives, asked for only then. Null with no server to ask, or once
-    /// the file has closed.</summary>
-    internal async Task<Reformatted?> ReformatAsync(OpenDocument document, TextRange? within, Func<LspDocument?> server)
+    /// Code, else the language <paramref name="server"/> gives, asked for only then; a read-only file refused before any is
+    /// asked. Null with no server to ask, or once the file has closed.</summary>
+    internal async Task<Reformatted?> ReformatAsync(OpenDocument document, TextRange? within, Func<LspDocument?> server, CancellationToken cancel = default)
     {
+        if (Reformatted.ReadOnly(document, "Reformat Code") is { } refused)
+        {
+            return refused;
+        }
         within = within is { } range ? WholeLines(document.Text.Snapshot, range) : null;
         if (await context.Languages.FormatAsync(document, within) is { } done)
         {
             return done;
         }
-        return server() is { } lsp ? await ServerFormatAsync(lsp, document, "Reformat Code", within) : null;
+        return server() is { } lsp ? await ServerFormatAsync(lsp, document, "Reformat Code", within, cancel) : null;
+    }
+
+    /// <summary>How long a save waits for a language server's layout before it goes on without it.</summary>
+    private static readonly TimeSpan SaveLimit = TimeSpan.FromSeconds(3);
+
+    /// <summary>Reformat on save: a changed file laid out whole as Reformat Code lays it out, as one undoable edit, its
+    /// language server given <see cref="SaveLimit"/> to answer. Null once done, or where nothing lays the file out; else
+    /// why it was left as it was, in the status bar's words, the save going on regardless.</summary>
+    internal async Task<string?> ReformatOnSaveAsync(OpenDocument document)
+    {
+        const string what = "Reformat on save";
+        string? unready = null;
+        LspDocument? ServerOf()
+        {
+            IServerDocument? served = context.ServerOf(document);
+            if (served is { Lsp: null })
+            {
+                unready = context.WebOf(document) is not null && context.Web?.Invoke() is { } web ? web.Unready(what, document)
+                    : context.CSharp?.Unready(what);
+            }
+            return served?.Lsp;
+        }
+        using CancellationTokenSource limit = new();
+        limit.CancelAfter(Waits.Of(SaveLimit));
+        try
+        {
+            return await ReformatAsync(document, null, ServerOf, limit.Token) switch
+            {
+                null => unready,
+                { Applied: true } => null,
+                { Why: { } why } => $"{what} was not applied to {document.Name}: {why}",
+                { } refused => refused.Said,
+            };
+        }
+        catch (OperationCanceledException) when (limit.IsCancellationRequested)
+        {
+            return $"{what} was not applied to {document.Name}: its language server did not answer within {Durations.Said(Waits.Of(SaveLimit))}";
+        }
+        catch (LanguageServerFailed failed)
+        {
+            return $"{what} failed: {failed.Reason}";
+        }
     }
 
     /// <summary>A selection ending at a line's start, as one of whole lines does, kept to the lines before it: the line it
@@ -816,13 +1045,13 @@ internal sealed partial class CodeActions(AssistContext context, PopupPlacement 
     /// <summary>The language server's formatting of a file, or of <paramref name="within"/> where the server formats a
     /// range (else the whole file, said), carried through what was typed as it worked, applied; null once the file has
     /// closed.</summary>
-    private async Task<Reformatted?> ServerFormatAsync(LspDocument lsp, OpenDocument document, string what, TextRange? within = null)
+    private async Task<Reformatted?> ServerFormatAsync(LspDocument lsp, OpenDocument document, string what, TextRange? within = null, CancellationToken cancel = default)
     {
         using ChangeTracker asked = new(document.Text);
         bool whole = within is null || !lsp.FormatsRanges;
         IReadOnlyList<LspTextEdit> answer = within is { } range && !whole
-            ? await lsp.FormatAsync(range, document.Indentation.Options, document.Conventions)
-            : await lsp.FormatAsync(document.Indentation.Options, document.Conventions);
+            ? await lsp.FormatAsync(range, document.Indentation.Options, document.Conventions, cancel)
+            : await lsp.FormatAsync(document.Indentation.Options, document.Conventions, cancel);
         if (!context.Editors.Documents.Contains(document))
         {
             return null;
@@ -833,17 +1062,9 @@ internal sealed partial class CodeActions(AssistContext context, PopupPlacement 
             // Only the selection's own lines are laid out: the line after it keeps its indentation.
             laid.RemoveAll(e => e.Start >= kept.End);
         }
-        if (asked.Map(laid) is not { } edits)
-        {
-            return new Reformatted(false, false, $"{what} was not applied: the code it changes was edited meanwhile");
-        }
-        if (edits.Count > 0)
-        {
-            WorkspaceEdits.ApplyTo(context.Editors, document, edits);
-        }
         // The server's edits that come to nothing in the file's line breaks and indentation are no reformat.
-        string said = edits.Count == 0 ? "Already formatted" : "Reformatted";
-        return new Reformatted(true, edits.Count > 0, within is not null && whole ? $"{said} the whole file: its language server formats no selection" : said);
+        Reformatted done = Reformatted.Apply(context.Editors, document, asked, laid, what);
+        return done.Applied && within is not null && whole ? done with { Said = $"{done.Said} the whole file: its language server formats no selection" } : done;
     }
 
     /// <summary>The selection a file's reformatting keeps to: the editor's, when it shows the file and something is selected.</summary>
@@ -932,7 +1153,7 @@ internal sealed partial class CodeActions(AssistContext context, PopupPlacement 
     /// left alone and named in the status bar. Whether every file took it, once those not open have landed.</summary>
     internal async Task<bool> ApplyWorkspaceAsync(System.Text.Json.JsonElement edit, Asked? asked, string what)
     {
-        RefactorOutcome made = await ApplyEditAsync(edit, asked, what);
+        RefactorOutcome made = await ApplyEditAsync(edit, asked, what, what);
         if (made.Problem is not null)
         {
             context.Say(made.Problem);
@@ -945,23 +1166,41 @@ internal sealed partial class CodeActions(AssistContext context, PopupPlacement 
         return made.Left.Count == 0;
     }
 
-    /// <summary><see cref="ApplyWorkspaceAsync"/>'s change made, once the files it wrote have landed: the files it changed
-    /// and those it left, with that it is done when the status bar said it was waiting for one, or why not.</summary>
-    private async Task<RefactorOutcome> ApplyEditAsync(System.Text.Json.JsonElement edit, Asked? asked, string what)
+    /// <summary>A server's edit made as one command of Undo under <paramref name="title"/>, the window's and an agent's alike,
+    /// what it makes, moves or deletes followed as a refactoring's are (<see cref="AssistContext.ChangeFilesAsync"/>), once
+    /// its files have landed: the files it changed and moved and those it left, with that it is done when the status bar said
+    /// it was waiting for one, or that a file could not follow its type, or why not, each said as <paramref name="what"/>. A
+    /// type it renames takes along what Rename's does (<see cref="TakenAlongAsync"/>), whatever action made it.</summary>
+    internal async Task<RefactorOutcome> ApplyEditAsync(System.Text.Json.JsonElement edit, Asked? asked, string title, string what)
     {
+        List<(string From, string To)> moves = [];
+        foreach ((TypeRename.Named type, string name) in await TypeRename.RenamedByAsync(context.Editors, edit, asked))
+        {
+            TakenAlong along = await TakenAlongAsync(type, name, RenameSettings.RenameFiles, edit, asked);
+            edit = along.Edit;
+            moves.AddRange(along.Moves.Where(m => !moves.Any(n => PathNames.Same(n.From, m.From))));
+        }
         List<string> dropped = [];
         IReadOnlyList<RefactoredFile> files = await WorkspaceEdits.FilesAsync(context.Editors, edit, asked);
         bool waited;
-        using CommandHistory.Recording recording = context.Editors.Commands.Record(what);
+        TypeRename.Applied applied = new(0, [], null);
+        List<string> left = [];
+        string? unfollowed;
+        using CommandHistory.Recording recording = context.Editors.Commands.Record(title);
         try
         {
-            WorkspaceEdits.ApplyAsCommand(context.Editors, edit, recording, asked, dropped);
+            await context.ChangeFilesAsync([.. WorkspaceEdits.Paths(edit), .. moves.SelectMany(m => new[] { m.From, m.To })], recording,
+                () => applied = TypeRename.Apply(context.Editors, edit, moves, asked, dropped, recording));
+            unfollowed = await GodotFollowAsync(edit, applied, recording, left);
             waited = await WorkspaceEdits.LandedAsync(recording, context.Say);
         }
         catch (WorkspaceEditFailed failed)
         {
             return RefactorOutcome.Refused($"{what} was not applied: {failed.Message}");
         }
-        return new RefactorOutcome(waited ? $"{what} done" : string.Empty, null, files, dropped);
+        string said = applied.Unmoved is { } unmoved ? $"{what} was made, but {unmoved}"
+            : (unfollowed ?? (left.Count > 0 ? string.Join("; ", left) : null)) is { } godot ? $"{what} was made, but {godot}"
+            : waited ? $"{what} done" : string.Empty;
+        return new RefactorOutcome(said, null, [.. files, .. applied.Moved.Select(m => new RefactoredFile(m.From, RefactoredChange.Moved, [], m.To))], dropped) { Unmoved = applied.Unmoved };
     }
 }

@@ -17,10 +17,12 @@ public partial class MainWindow
     {
         Dock.Add(new Docking.ToolWindow(ToolWindowIds.Terminal, "Terminal", IconKeys.Terminal, MakeTerminal, Docking.ToolAnchor.BottomLeft)
         {
+            Serves = ToolWindowServes.EveryFolder,
             Action = AppActions.ShowTerminal,
             Tools = () => terminal?.HeaderTools,
             Menus = [new MenuPlace("Tools", 0, 2)],
             Activate = ToggleTerminal,
+            TakesKeysAsShown = true,
         });
         actions!.Add(new IdeAction(AppActions.NewTerminalSession, "New Terminal Session", "Terminal", _ => IdeErrors.Observe(NewTerminalSessionAsync())) { FromTerminal = true });
     }
@@ -36,7 +38,7 @@ public partial class MainWindow
     /// <summary>The Terminal window's view, as it is first shown or asked for, with the settings in force then.</summary>
     private ToolWindows.TerminalPanel MakeTerminal()
     {
-        ToolWindows.TerminalPanel panel = terminal = new ToolWindows.TerminalPanel(() => Folder ?? Environment.GetFolderPath(Environment.SpecialFolder.UserProfile));
+        ToolWindows.TerminalPanel panel = terminal = new ToolWindows.TerminalPanel(() => FolderHeld ?? Environment.GetFolderPath(Environment.SpecialFolder.UserProfile));
         panel.ActionRequested += (_, action) => Request(action);
         panel.Emptied += (_, _) =>
         {
@@ -49,13 +51,14 @@ public partial class MainWindow
         // Going to the terminal is leaving the code, as going to another program is: what is not saved is (Autosave).
         panel.View.GotFocus += (_, _) => SaveOnLeaving();
         AddTerminalLinks(panel);
+        FollowTerminalLook(panel, settingsStore.Effective, null);
         FollowTerminalSettings(panel, settings, null);
         return panel;
     }
 
-    /// <summary>The terminal's font and shell as Settings give them: the code font in force unless it has a font of its own,
-    /// and a shell no longer set given back to the system's.</summary>
-    private static void FollowTerminalSettings(ToolWindows.TerminalPanel panel, Passenger.App.Settings.AppSettings next, Passenger.App.Settings.AppSettings? before)
+    /// <summary>The terminal's look as the settings shown give it, a Settings dialog's preview too: the code font in force
+    /// unless it has a font of its own.</summary>
+    private static void FollowTerminalLook(ToolWindows.TerminalPanel panel, Passenger.App.Settings.AppSettings next, Passenger.App.Settings.AppSettings? before)
     {
         panel.View.FontSize = next.TerminalFontSize;
         if (before is null || before.TerminalFontFamily != next.TerminalFontFamily)
@@ -69,9 +72,14 @@ public partial class MainWindow
                 panel.View.ClearValue(Terminal.TerminalView.FontFamilyProperty);
             }
         }
-        panel.View.CopyOnSelection = next.TerminalCopyOnSelection;
         panel.View.CursorBlinking = next.TerminalCursorBlinking;
         panel.View.CursorStyle = next.TerminalCursorStyle;
+    }
+
+    /// <summary>The terminal's ways as the settings in force give them: a shell no longer set given back to the system's.</summary>
+    private static void FollowTerminalSettings(ToolWindows.TerminalPanel panel, Passenger.App.Settings.AppSettings next, Passenger.App.Settings.AppSettings? before)
+    {
+        panel.View.CopyOnSelection = next.TerminalCopyOnSelection;
         if (next.TerminalShell is { } shell && Run.CommandLine.Split(shell) is { Count: > 0 } parts)
         {
             panel.Shell = (parts[0], [.. parts.Skip(1)]);
@@ -104,7 +112,7 @@ public partial class MainWindow
             }
             return;
         }
-        ShowToolWindow(ToolWindowIds.Terminal);
+        Dock.Bring(ToolWindowIds.Terminal);
         TerminalPanel.FocusView();
     }
 

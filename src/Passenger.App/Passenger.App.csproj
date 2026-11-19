@@ -15,10 +15,15 @@
   <ItemGroup>
     <!-- Every window's icon (AppIcon), at each size Windows draws one. -->
     <AvaloniaResource Include="Assets/Passenger.ico" />
-    <!-- The mark About, the Welcome page and What's New show, drawn from Assets/passenger.svg. -->
+    <!-- The mark About, the Welcome page, the first start and What's New show, drawn from Assets/passenger.svg. -->
     <AvaloniaResource Include="Assets/passenger.png" />
     <!-- The window's typeface (Theme/WindowFonts.cs): Inter 4.1's hinted faces as rsms/inter's release gives them. -->
     <AvaloniaResource Include="Fonts/*.ttf" />
+    <!-- The themes Passenger carries beside its own, a source in theme format 1 (Theme/BuiltInThemes.cs, docs/themes.md). -->
+    <AvaloniaResource Include="Theme/BuiltIn/**/*.json;Theme/BuiltIn/**/*.png;Theme/BuiltIn/**/*.jpg;Theme/BuiltIn/**/*.jpeg;Theme/BuiltIn/**/*.webp" />
+    <!-- The first start's pictures of Passenger in each theme it carries, dark and light (Welcome/FirstStartView.cs), taken
+         by just first-start-shots. -->
+    <AvaloniaResource Include="Assets/FirstStart/*.webp" />
     <!-- MSBuild's own schemas (dotnet/msbuild, MIT), which the .NET SDK does not carry: the elements, properties, items,
          metadata and tasks the code help in project files offers and describes (MSBuild/MSBuildSchema.cs). -->
     <EmbeddedResource Include="MSBuild/Schemas/*.xsd" LogicalName="MSBuild/%(Filename)%(Extension)" />
@@ -36,6 +41,8 @@
     <!-- Passenger's preload for the Dockerfile server, which keeps it from Docker Hub while Settings says so
          (Web/DockerHubTags.cs). -->
     <None Include="Web/docker-hub.cjs" Link="web/passenger/docker-hub.cjs" CopyToOutputDirectory="PreserveNewest" />
+    <!-- Passenger's preload for the YAML server, which has it ask Passenger for each schema's file (Web/JsonSchemas.cs). -->
+    <None Include="Web/yaml-schemas.mjs" Link="web/passenger/yaml-schemas.mjs" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 
   <ItemGroup>
@@ -49,6 +56,12 @@
     <PackageReference Include="Avalonia.HarfBuzz" />
     <PackageReference Include="Avalonia.Headless" />
     <PackageReference Include="Avalonia.Skia" />
+    <!-- Avalonia.Skia's Skia and HarfBuzz, taken at the versions Directory.Packages.props gives, each with its Linux
+         native library, which would otherwise stay at the older version Avalonia.Skia names. -->
+    <PackageReference Include="SkiaSharp" />
+    <PackageReference Include="SkiaSharp.NativeAssets.Linux" />
+    <PackageReference Include="HarfBuzzSharp" />
+    <PackageReference Include="HarfBuzzSharp.NativeAssets.Linux" />
     <!-- Aspire's resource service client (Aspire/), its C# generated from Aspire/Protocol/dashboard_service.proto and
          checked in beside it (just aspire-protocol), so no build runs protoc. -->
     <PackageReference Include="Google.Protobuf" />
@@ -101,6 +114,14 @@
                       GlobalPropertiesToRemove="RuntimeIdentifier;SelfContained;PublishReadyToRun" />
     <!-- What Passenger and the inspector say to each other, one definition for both ends. -->
     <Compile Include="../Passenger.Inspector/Protocol.cs" Link="LiveTree/InspectorProtocol.cs" />
+    <!-- The system's hotkeys on the headless platform, which Passenger's own windows drawn on no screen take as an unseen
+         app does. -->
+    <Compile Include="../Passenger.Inspector/SystemHotkeys.cs" Link="HeadlessHotkeys.cs" />
+    <!-- Built first and carried under inspector/maui/, never linked: a .NET MAUI app Passenger runs on a device loads it
+         (LiveTree/LiveApp.cs). It is built once for every platform, as MAUI's cross-platform assemblies it is compiled
+         against are the same on each. -->
+    <ProjectReference Include="../Passenger.Inspector.Maui/Passenger.Inspector.Maui.csproj" ReferenceOutputAssembly="false" Private="false"
+                      GlobalPropertiesToRemove="RuntimeIdentifier;SelfContained;PublishReadyToRun" />
     <!-- Built first on every system and carried under inspector/wpf/ by a Windows build alone, never linked: a WPF app Passenger
          runs or debugs loads it (LiveTree/LiveApp.cs). It targets net8.0-windows, which this project's own framework is not, so
          it is built for its own framework rather than this one's. -->
@@ -128,6 +149,11 @@
                       SkipGetTargetFrameworkProperties="true" GlobalPropertiesToRemove="RuntimeIdentifier;SelfContained;PublishReadyToRun;TargetFramework" />
     <!-- The previewer's messages, one definition for both ends. -->
     <Compile Include="../Passenger.WpfPreview/Protocol.cs" Link="Xaml/WpfPreviewProtocol.cs" />
+    <!-- Built first and carried under mauipreview/, never linked: MAUI's previewer runs in its own process on Passenger's
+         runtime (Xaml/MauiPreviewHost.cs), built for the publish's system or this machine's. -->
+    <ProjectReference Include="../Passenger.MauiPreview/Passenger.MauiPreview.csproj" ReferenceOutputAssembly="false" Private="false"
+                      GlobalPropertiesToRemove="SelfContained;PublishReadyToRun" />
+    <Compile Include="../Passenger.MauiPreview/Protocol.cs" Link="Xaml/MauiPreviewProtocol.cs" />
   </ItemGroup>
 
   <!-- TraceEvent's props give a build its Windows natives under x86/, amd64/ and arm64/: msdia140 (the DIA SDK, for
@@ -154,7 +180,7 @@
     <None Include="../../docs/release-notes/*.md" Link="release-notes/%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" Visible="false" />
   </ItemGroup>
 
-  <Target Name="NoticeInputs" DependsOnTargets="ResolvePackageAssets;ResolveRuntimePackAssets;IncludeDebugAdapter;IncludeProjectHost">
+  <Target Name="NoticeInputs" DependsOnTargets="ResolvePackageAssets;ResolveRuntimePackAssets;IncludeDebugAdapter;IncludeProjectHost;IncludeMauiPreview">
     <MSBuild Projects="../../tools/Passenger.Notices/Passenger.Notices.csproj" Targets="GetTargetPath"
              RemoveProperties="RuntimeIdentifier;SelfContained;PublishReadyToRun" BuildInParallel="$(BuildInParallel)">
       <Output TaskParameter="TargetOutputs" ItemName="NoticesTool" />
@@ -178,6 +204,7 @@
       <NoticePackage Include="@(RuntimePackAsset->'%(NuGetPackageId)/%(NuGetPackageVersion)')" Condition="'$(SelfContained)' == 'true'" />
       <NoticeDebuggerDeps Include="$(DebugAdapterFolder)*.deps.json" />
       <NoticeHostDeps Include="$(ProjectHostFolder)*.deps.json" />
+      <NoticeMauiPreviewDeps Include="$(MauiPreviewFolder)*.deps.json" />
       <NoticesServerPackage Include="@(NoticesServer->WithMetadataValue('Kind', 'package'))" />
       <NoticeServerDeps Include="%(NoticesServerPackage.Folder)**/*.deps.json" />
       <NoticeWebStamp Include="@(NoticesWeb->'%(Stamp)')" />
@@ -195,6 +222,7 @@
       <NoticeLine Include="@(NoticePackageOnce->'package=%(Identity)')" />
       <NoticeLine Include="@(NoticeDebuggerDeps->'debugger=%(FullPath)')" />
       <NoticeLine Include="@(NoticeHostDeps->'host=%(FullPath)')" />
+      <NoticeLine Include="@(NoticeMauiPreviewDeps->'mauipreview=%(FullPath)')" />
       <NoticeLine Include="@(NoticesServerPackage->'server=%(Identity)')" />
       <NoticeLine Include="@(NoticesServerPackage->'serverFolder=%(Folder)')" />
       <NoticeLine Include="@(NoticesServer->WithMetadataValue('Kind', 'leftOut')->'serverLeftOut=%(Identity)')" />
@@ -206,7 +234,7 @@
   </Target>
 
   <Target Name="WriteNotices" DependsOnTargets="NoticeInputs"
-          Inputs="$(NoticesArguments);@(NoticesTool);@(NoticeText);@(NoticeDebuggerDeps);@(NoticeHostDeps);@(NoticeServerDeps);@(NoticeWebStamp)" Outputs="$(NoticesFile)">
+          Inputs="$(NoticesArguments);@(NoticesTool);@(NoticeText);@(NoticeDebuggerDeps);@(NoticeHostDeps);@(NoticeMauiPreviewDeps);@(NoticeServerDeps);@(NoticeWebStamp)" Outputs="$(NoticesFile)">
     <Exec Command="&quot;$(NoticesHost)&quot; &quot;@(NoticesTool)&quot; &quot;$(NoticesArguments)&quot;" />
   </Target>
 
@@ -217,7 +245,8 @@
   </Target>
 
   <!-- The inspector becomes this project's output under inspector/: its own assembly, XAML Hot Reload's compiler and the
-       headless platform, since the app it loads into brings the Avalonia it uses. -->
+       headless platform (an older Avalonia's in its folder there), since the app it loads into brings the Avalonia it
+       uses. -->
   <Target Name="IncludeInspector" BeforeTargets="AssignTargetPaths">
     <MSBuild Projects="../Passenger.Inspector/Passenger.Inspector.csproj" Targets="GetTargetPath"
              RemoveProperties="RuntimeIdentifier;SelfContained;PublishReadyToRun" BuildInParallel="$(BuildInParallel)">
@@ -229,7 +258,21 @@
     </MSBuild>
     <ItemGroup>
       <InspectorFile Include="@(InspectorAssembly->'%(RootDir)%(Directory)%(Filename).dll');@(InspectorAssembly->'%(RootDir)%(Directory)%(Filename).pdb')" />
-      <None Include="@(InspectorFile)" Link="inspector/%(InspectorFile.Filename)%(InspectorFile.Extension)"
+      <None Include="@(InspectorFile)" Link="inspector/%(InspectorFile.Folder)%(InspectorFile.Filename)%(InspectorFile.Extension)"
+            CopyToOutputDirectory="PreserveNewest" Visible="false" />
+    </ItemGroup>
+  </Target>
+
+  <!-- The MAUI inspector becomes this project's output under inspector/maui/: its own assembly alone, since the app it
+       loads into brings the MAUI it uses. -->
+  <Target Name="IncludeMauiInspector" BeforeTargets="AssignTargetPaths">
+    <MSBuild Projects="../Passenger.Inspector.Maui/Passenger.Inspector.Maui.csproj" Targets="GetTargetPath"
+             RemoveProperties="RuntimeIdentifier;SelfContained;PublishReadyToRun" BuildInParallel="$(BuildInParallel)">
+      <Output TaskParameter="TargetOutputs" ItemName="MauiInspectorAssembly" />
+    </MSBuild>
+    <ItemGroup>
+      <MauiInspectorFile Include="@(MauiInspectorAssembly->'%(RootDir)%(Directory)%(Filename).dll');@(MauiInspectorAssembly->'%(RootDir)%(Directory)%(Filename).pdb')" />
+      <None Include="@(MauiInspectorFile)" Link="inspector/maui/%(MauiInspectorFile.Filename)%(MauiInspectorFile.Extension)"
             CopyToOutputDirectory="PreserveNewest" Visible="false" />
     </ItemGroup>
   </Target>
@@ -295,6 +338,23 @@
     </ItemGroup>
   </Target>
 
+  <!-- MAUI's previewer becomes this project's output under mauipreview/: all its build writes for the system, Avalonia's
+       backend for MAUI, MAUI's controls and Skia's and HarfBuzz's natives with it, as it shares no assembly with the app. -->
+  <Target Name="IncludeMauiPreview" BeforeTargets="AssignTargetPaths">
+    <MSBuild Projects="../Passenger.MauiPreview/Passenger.MauiPreview.csproj" Targets="GetTargetPath"
+             RemoveProperties="SelfContained;PublishReadyToRun" BuildInParallel="$(BuildInParallel)">
+      <Output TaskParameter="TargetOutputs" ItemName="MauiPreviewAssembly" />
+    </MSBuild>
+    <PropertyGroup>
+      <MauiPreviewFolder>@(MauiPreviewAssembly->'%(RootDir)%(Directory)')</MauiPreviewFolder>
+    </PropertyGroup>
+    <ItemGroup>
+      <MauiPreviewFile Include="$(MauiPreviewFolder)**/*" Exclude="$(MauiPreviewFolder)*.runtimeconfig.dev.json" />
+      <None Include="@(MauiPreviewFile)" Link="mauipreview/%(MauiPreviewFile.RecursiveDir)%(MauiPreviewFile.Filename)%(MauiPreviewFile.Extension)"
+            CopyToOutputDirectory="PreserveNewest" Visible="false" />
+    </ItemGroup>
+  </Target>
+
   <!-- The project host's output becomes this project's output items under host/: the host and MSBuildLocator, the one
        package it carries. -->
   <Target Name="IncludeProjectHost" BeforeTargets="AssignTargetPaths">
@@ -338,6 +398,20 @@
     <ItemGroup>
       <DebugAdapterFile Include="$(DebugAdapterFolder)**/*" />
       <None Include="@(DebugAdapterFile)" Link="debugger/%(DebugAdapterFile.RecursiveDir)%(DebugAdapterFile.Filename)%(DebugAdapterFile.Extension)"
+            CopyToOutputDirectory="PreserveNewest" Visible="false" />
+      <!-- The debug relay a Debug app on an Android device loads, for each of its processors, as tools/debug-relay.sh
+           built it (CI builds it on macOS for every system's package): carried whatever system this build runs on.
+           An iOS simulator's app (on Apple silicon) and a Mac Catalyst app load their own, of the Mac's processor,
+           copied from where a Mac's Passenger carries it (its bundle's Resources: CarriedFiles); an iOS device's waits
+           until one proves it. -->
+      <DebugRelayFile Include="$([MSBuild]::EnsureTrailingSlash('$(ArtifactsPath)'))debug-relay/**/libpassenger-debug.so" />
+      <DebugRelayFile Include="$([MSBuild]::EnsureTrailingSlash('$(ArtifactsPath)'))debug-relay/iossimulator-arm64*/libpassenger-debug.dylib;$([MSBuild]::EnsureTrailingSlash('$(ArtifactsPath)'))debug-relay/maccatalyst-arm64*/libpassenger-debug.dylib"
+                      Condition="'$(RuntimeIdentifier)' == 'osx-arm64' Or ('$(RuntimeIdentifier)' == '' And $([MSBuild]::IsOSPlatform('OSX'))
+                                 And '$([System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture)' == 'Arm64')" />
+      <DebugRelayFile Include="$([MSBuild]::EnsureTrailingSlash('$(ArtifactsPath)'))debug-relay/maccatalyst-x64*/libpassenger-debug.dylib"
+                      Condition="'$(RuntimeIdentifier)' == 'osx-x64' Or ('$(RuntimeIdentifier)' == '' And $([MSBuild]::IsOSPlatform('OSX'))
+                                 And '$([System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture)' == 'X64')" />
+      <None Include="@(DebugRelayFile)" Link="debugger/relay/%(DebugRelayFile.RecursiveDir)%(DebugRelayFile.Filename)%(DebugRelayFile.Extension)"
             CopyToOutputDirectory="PreserveNewest" Visible="false" />
     </ItemGroup>
   </Target>

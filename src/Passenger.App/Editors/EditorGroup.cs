@@ -5,10 +5,12 @@ using Avalonia.Controls;
 using Avalonia.Controls.Primitives;
 using Avalonia.Controls.Shapes;
 using Avalonia.Controls.Templates;
+using Avalonia.Data;
 using Avalonia.Input;
 using Avalonia.Interactivity;
 using Avalonia.Layout;
 using Avalonia.Media;
+using Avalonia.Styling;
 using Avalonia.VisualTree;
 using Passenger.App.Tables;
 using Passenger.App.Workspace;
@@ -59,12 +61,21 @@ public sealed class EditorGroup : DockPanel
 
     /// <summary>At the strip's end, shown while tabs are out of its sight: the list of them.</summary>
     private readonly Button hiddenTabs;
-    private readonly Grid body;
-    private HairlineDivider? divider;
-    private Control? side;
+
+    /// <summary>The editor's place under the theme's picture and a pane of its file's own beside it, or under it in a narrow
+    /// group: the group's own child, before which the bars over the body go. The picture is the editor's alone, so a preview
+    /// beside it shows its file on the preview's own ground.</summary>
+    private readonly ToolWindows.PaneSplit body;
+
+    /// <summary>The editor and what shows over it in its stead: a diff, an asset, a table, a Godot project's page.</summary>
+    private readonly Panel editorPlace;
     private readonly Banner banner = new();
     private readonly Button bannerLink;
+
+    /// <summary>The banner's way to the merge window, while the file shown is in conflict.</summary>
+    private readonly Button mergeLink;
     private EditorTab? active;
+    private EditorTabsPlace tabsPlace;
 
     /// <summary>The table over the editor for a CSV or workbook, made as the group first shows one.</summary>
     private TableViewer? tables;
@@ -112,25 +123,33 @@ public sealed class EditorGroup : DockPanel
         {
             Classes = { StyleClasses.TabStrip },
             [DockProperty] = Dock.Top,
-            Child = new DockPanel
+            Child = new Panel
             {
                 Children =
                 {
-                    hiddenTabs,
-                    PreviewToggle,
-                    stripView,
+                    new DockPanel { Children = { hiddenTabs, PreviewToggle, stripView } },
+                    new ThemeBackdrop(BackgroundPlaces.Frame),
                 },
             },
         };
         bannerLink = banner.Link(null, () => active?.Document.NoticeAction?.Run());
         bannerLink.Name = "BannerLink";
         bannerLink.IsVisible = false;
+        mergeLink = banner.Link(Merge, () =>
+        {
+            if (active?.Document is { InConflict: true } conflicted)
+            {
+                area.MergeAsked(conflicted);
+            }
+        });
+        mergeLink.Name = "MergeLink";
+        mergeLink.IsVisible = false;
         Children.Add(tabBar);
         Children.Add(banner);
         Children.Add(Find);
-        // The editor beside a pane of its file's own (a XAML file's preview), divided by a hairline that resizes them.
-        body = new Grid { ColumnDefinitions = new ColumnDefinitions("*,0,0") };
-        body.Children.Add(Editor);
+        editorPlace = new Panel { Children = { Editor } };
+        // The picture over the editor's place, whatever it holds, in a panel of their own; never over the pane beside it.
+        body = new ToolWindows.PaneSplit(new Panel { Children = { editorPlace, new ThemeBackdrop(BackgroundPlaces.Editor) } }, null, "*,1,*");
         Children.Add(body);
         // The group the person works in is the area's active one; while a table lies over the editor, the table takes its focus.
         Editor.GotFocus += (_, _) =>
@@ -180,43 +199,19 @@ public sealed class EditorGroup : DockPanel
     /// <summary>The columns of the editor's gutter, fed from the file it shows.</summary>
     public EditorGutter Gutter { get; }
 
-    /// <summary>A pane beside the editor for the file it shows (a XAML file's preview), half the group's width at first and
-    /// resized by the hairline between them; null for none.</summary>
+    /// <summary>A pane for the file the editor shows (a XAML file's preview, a Markdown file's), half the group at first
+    /// and resized by the hairline between them: beside the editor, or under it where the group is narrow and tall as
+    /// a tool window's two panes stand (<see cref="ToolWindows.PaneSplit"/>), so each keeps a width to read; null for none.
+    /// Another file's pane takes the place the last one was given.</summary>
     public Control? Side
     {
-        get => side;
-        set
-        {
-            if (value == side)
-            {
-                return;
-            }
-            if (side is not null)
-            {
-                body.Children.Remove(side);
-            }
-            if (value is null)
-            {
-                body.Children.Remove(divider!);
-                divider = null;
-                body.ColumnDefinitions = new ColumnDefinitions("*,0,0");
-            }
-            else if (divider is null)
-            {
-                // A divider only while there is a pane to divide from, so the splits' own are the only ones otherwise.
-                divider = new HairlineDivider(GridResizeDirection.Columns) { [Grid.ColumnProperty] = 1 };
-                body.Children.Add(divider);
-                body.ColumnDefinitions = new ColumnDefinitions("*,1,*");
-            }
-            side = value;
-            if (value is not null)
-            {
-                // Another file's pane takes the place the last one was given.
-                Grid.SetColumn(value, 2);
-                body.Children.Add(value);
-            }
-        }
+        get => body.Second;
+        set => body.Second = value;
     }
+
+    /// <summary>Whether the pane of the file's own stands under the editor rather than beside it.</summary>
+    public bool SideUnder => body.IsStacked;
+
     public FindBar Find { get; }
 
     /// <summary>The tab strip's toggle of the preview beside the editor, shown while the group shows a Markdown file or a
@@ -327,9 +322,77 @@ public sealed class EditorGroup : DockPanel
     {
         get
         {
-            double from = stripView.Offset.X;
-            double to = from + stripView.Viewport.Width;
-            return [.. tabs.Where(tab => strip.ContainerFromItem(tab) is not Control shown || shown.Bounds.X < from - 0.5 || shown.Bounds.Right > to + 0.5)];
+            bool down = tabsPlace != EditorTabsPlace.Top;
+            double from = down ? stripView.Offset.Y : stripView.Offset.X;
+            double to = from + (down ? stripView.Viewport.Height : stripView.Viewport.Width);
+            return [.. tabs.Where(tab => strip.ContainerFromItem(tab) is not Control shown
+                || (down ? shown.Bounds.Y : shown.Bounds.X) < from - 0.5 || (down ? shown.Bounds.Bottom : shown.Bounds.Right) > to + 0.5)];
+        }
+    }
+
+    /// <summary>Where its tabs stand: a row across its top that scrolls, or a column down its left or right side, each tab
+    /// as wide as the column.</summary>
+    public EditorTabsPlace TabsPlace
+    {
+        get => tabsPlace;
+        set
+        {
+            if (value == tabsPlace)
+            {
+                return;
+            }
+            tabsPlace = value;
+            bool down = value != EditorTabsPlace.Top;
+            tabBar[DockProperty] = value switch { EditorTabsPlace.Left => Dock.Left, EditorTabsPlace.Right => Dock.Right, _ => Dock.Top };
+            tabBar.Classes.Set(StyleClasses.SideTabs, down);
+            strip.ItemsPanel = new FuncTemplate<Panel?>(() => new StackPanel { Orientation = down ? Orientation.Vertical : Orientation.Horizontal });
+            stripView.HorizontalScrollBarVisibility = down ? ScrollBarVisibility.Disabled : ScrollBarVisibility.Hidden;
+            stripView.VerticalScrollBarVisibility = down ? ScrollBarVisibility.Auto : ScrollBarVisibility.Disabled;
+            hiddenTabs[DockProperty] = down ? Dock.Bottom : Dock.Right;
+            PreviewToggle[DockProperty] = down ? Dock.Top : Dock.Right;
+            tabBar.Styles.Clear();
+            if (down)
+            {
+                tabBar.Styles.Add(SideShadows(value));
+            }
+            // Every tab made again for the new direction.
+            ReusedRows.Use(strip, Tab);
+            RevealActive();
+        }
+    }
+
+    /// <summary>The most of a group's width its tabs down a side take, so a narrow group (a small window's, a split's) keeps
+    /// the rest for the code, the tabs' names ending sooner in their ellipsis.</summary>
+    private const double SideTabsShare = 1.0 / 3;
+
+    protected override Size MeasureOverride(Size availableSize)
+    {
+        // Set before the column is measured, so it is laid out once at its width.
+        double most = tabsPlace == EditorTabsPlace.Top ? double.PositiveInfinity : availableSize.Width * SideTabsShare;
+        if (!tabBar.MaxWidth.Equals(most))
+        {
+            tabBar.MaxWidth = most;
+        }
+        return base.MeasureOverride(availableSize);
+    }
+
+    /// <summary>The theme's open tab down a side: a line its shadow draws inside the tab along its top drawn along the
+    /// side toward the editor instead, so the tab still reads as joined to it; a shadow cast outside it stays as it is.</summary>
+    private Styles SideShadows(EditorTabsPlace place)
+    {
+        Style active = new(x => x.OfType<Border>().Class(StyleClasses.Tab).Class(StyleClasses.Active));
+        active.Setters.Add(new Setter(Border.BoxShadowProperty, tabBar.GetResourceObservable(TokenKeys.TabShadow, shadow => shadow is BoxShadows shadows ? Turned(shadows) : shadow).ToBinding()));
+        // A split the person is not working in draws its open tab plainly, as across the top.
+        Style elsewhere = new(x => x.OfType<Border>().Class(StyleClasses.Tab).Class(StyleClasses.Active).Class(StyleClasses.Elsewhere));
+        elsewhere.Setters.Add(new Setter(Border.BoxShadowProperty, new BoxShadows(default)));
+        return [active, elsewhere];
+
+        BoxShadows Turned(BoxShadows shadows)
+        {
+            BoxShadow[] each = [.. Enumerable.Range(0, shadows.Count).Select(i => shadows[i] is { IsInset: true } inset
+                ? inset with { OffsetX = place == EditorTabsPlace.Left ? -inset.OffsetY : inset.OffsetY, OffsetY = place == EditorTabsPlace.Left ? inset.OffsetX : -inset.OffsetX }
+                : shadows[i])];
+            return each.Length == 0 ? shadows : new BoxShadows(each[0], each[1..]);
         }
     }
 
@@ -374,13 +437,23 @@ public sealed class EditorGroup : DockPanel
         }
         tab.IsPinned = pinned;
         tabs.Move(tabs.IndexOf(tab), tabs.Count(t => t.IsPinned && t != tab));
+        // A pinned diff is one the person keeps, so it no longer follows the Commit window's choice.
+        if (pinned)
+        {
+            document.Diff?.Keep();
+        }
     }
 
     /// <summary>A hidden tab's kept carets follow what changes its text meanwhile (a reload, a rename), as the shown one's do;
     /// release notes shown are drawn again from their new text (a build that carries others).</summary>
     private void OnTabTextChanged(object? sender, DocumentChangedEventArgs e)
     {
-        if (tabs.FirstOrDefault(t => t.Document.Text == sender) is not { } tab)
+        EditorTab? tab = null;
+        for (int i = 0; i < tabs.Count && tab is null; i++)
+        {
+            tab = tabs[i].Document.Text == sender ? tabs[i] : null;
+        }
+        if (tab is null)
         {
             return;
         }
@@ -388,7 +461,7 @@ public sealed class EditorGroup : DockPanel
         {
             ClearPreview();
             preview = PreviewOf(tab.Document);
-            body.Children.Add(preview);
+            editorPlace.Children.Add(preview);
         }
         else if (tab != active && views.TryGetValue(tab.Document, out (SelectionSet Selections, Vector Scroll) view))
         {
@@ -399,7 +472,7 @@ public sealed class EditorGroup : DockPanel
     /// <summary>What shows in the editor's place for a tab that is no text to edit: a diff, an asset's preview, or release
     /// notes rendered.</summary>
     private Control PreviewOf(OpenDocument document) =>
-        document.Diff is { } diff ? diff.Make() : document.Asset is { } asset ? new AssetPreviewControl(asset) : new ReleaseNotesView(document, area.Browse);
+        document.Tool is { } tool ? tool.Make() : document.Diff is { } diff ? diff.Make() : document.Asset is { } asset ? new AssetPreviewControl(asset) : new ReleaseNotesView(document, area.Browse);
 
     /// <summary>The diff this group shows while it shows a diff's tab, else null.</summary>
     public Vcs.DiffView? Diff => preview as Vcs.DiffView;
@@ -413,26 +486,29 @@ public sealed class EditorGroup : DockPanel
         }
     }, Avalonia.Threading.DispatcherPriority.Loaded);
 
+    /// <summary>The width Vim's gq wraps a file at where textwidth is not set: its .editorconfig's max_line_length, 0 for none.</summary>
+    private static int LineLengthOf(OpenDocument document) => EditorConfig.Number(document.Conventions["max_line_length"]) ?? 0;
+
+    /// <summary>The editor refusing changes while the file shown is read-only, Vim mode saying why in Refusals' words.</summary>
+    private void FollowReadOnly(OpenDocument document)
+    {
+        Editor.IsReadOnly = document.IsReadOnly;
+        Editor.ReadOnlyWhy = document.IsReadOnly ? Refusals.ReadOnly(document.Name) : null;
+    }
+
     /// <summary>Whether the editor shows the file, rather than a view of its own in the editor's place.</summary>
-    private static bool InEditor(OpenDocument document) => document.Asset is null && !document.IsReleaseNotes && document.Diff is null;
+    private static bool InEditor(OpenDocument document) => document.Asset is null && !document.IsReleaseNotes && document.Diff is null && document.Tool is null;
 
     /// <summary>Gives the keys to what shows the file: a diff's file's side, its preview or rendered notes, which its keys
-    /// move through, else the editor.</summary>
-    public void FocusShown()
+    /// move through, else the editor; given them as by Tab (<paramref name="method"/>), it draws the ring round it. False
+    /// where it could not take them.</summary>
+    public bool FocusShown(NavigationMethod method = NavigationMethod.Unspecified) => preview switch
     {
-        if (preview is Vcs.DiffView diff)
-        {
-            diff.Right.Focus();
-        }
-        else if (preview is not null)
-        {
-            preview.Focus();
-        }
-        else
-        {
-            Editor.Focus();
-        }
-    }
+        Vcs.DiffView diff => diff.Right.Focus(method),
+        ToolTabView tool => tool.Window.TakeKeys(method),
+        not null => preview.Focus(method),
+        _ => Editor.Focus(method),
+    };
 
     /// <summary>Shows a file's text, its asset preview or rendered release notes, or a diff, keeping the carets and scroll of the
     /// text it replaces. A preview detaches the hidden text editor so editing commands cannot change the previous file; a view
@@ -478,17 +554,19 @@ public sealed class EditorGroup : DockPanel
             tables?.Hide();
             godotPage?.Hide();
             preview = PreviewOf(document);
-            body.Children.Add(preview);
+            editorPlace.Children.Add(preview);
             ShowBanner(document);
             tabBar.IsVisible = true;
             FollowSidePreview();
             return;
         }
         (SelectionSet selections, Vector scroll) = views.TryGetValue(document, out (SelectionSet Selections, Vector Scroll) view) ? view : (document.Selections, document.Scroll);
+        ThemeLanguages.Follow(Editor, document.Language.Id);
         Editor.LineCommentPrefix = document.Language.LineComment;
         Editor.BlockComment = document.Language.BlockComment;
         Editor.Markup = document.Language.Markup;
         Editor.Indent = document.Indentation.Options;
+        Editor.LineLength = LineLengthOf(document);
         Editor.ReindentsPaste = document.Language.ReindentsPaste;
         Editor.ShowWhitespaces = document.ShowWhitespaces;
         // Its decorations are the file's, which every editor showing it reads.
@@ -497,7 +575,7 @@ public sealed class EditorGroup : DockPanel
         AutomationProperties.SetName(Editor, document.Title);
         Gutter.Show(document);
         Editor.ContextLabel = ContextShown(document);
-        Editor.IsReadOnly = document.IsReadOnly;
+        FollowReadOnly(document);
         ShowBanner(document);
         Editor.IsVisible = true;
         tabBar.IsVisible = true;
@@ -527,8 +605,8 @@ public sealed class EditorGroup : DockPanel
         {
             tables = new TableViewer();
             Children.Insert(Children.IndexOf(body), tables.Bar);
-            // Over the editor in its own column, so a XAML-like pane beside it is never covered.
-            body.Children.Add(tables.Body);
+            // Over the editor in its place, so a XAML-like pane beside it is never covered.
+            editorPlace.Children.Add(tables.Body);
             tables.Switched += (_, _) =>
             {
                 AttachFind();
@@ -559,7 +637,7 @@ public sealed class EditorGroup : DockPanel
         {
             godotPage = new Godot.GodotPageViewer();
             Children.Insert(Children.IndexOf(body), godotPage.Bar);
-            body.Children.Add(godotPage.Body);
+            editorPlace.Children.Add(godotPage.Body);
             godotPage.Switched += (_, _) =>
             {
                 if (godotPage.ShowsPage)
@@ -579,15 +657,23 @@ public sealed class EditorGroup : DockPanel
     /// <summary>The Godot project page this group shows, null while it shows a project.godot's text or another file.</summary>
     public Godot.GodotPageViewer? GodotPage => godotPage is { ShowsPage: true } ? godotPage : null;
 
-    /// <summary>The banner over the file: where a read-only file comes from, what its notice says, and what its next save
-    /// does to how it is stored.</summary>
+    /// <summary>What the banner over a file Git has in conflict says, before its way to the merge window.</summary>
+    public const string Conflicted = "This file has merge conflicts";
+
+    private const string Merge = "Merge…";
+
+    /// <summary>The banner over the file: where a read-only file comes from, that Git has it in conflict, what its notice
+    /// says, and what its next save does to how it is stored.</summary>
     private void ShowBanner(OpenDocument document)
     {
-        // A diff's own bar says what it is.
-        string[] said = [.. new[] { document.IsReadOnly && document.Diff is null ? document.Origin : null, document.Notice, document.EncodingWarning }.OfType<string>()];
+        // A diff's own bar says what it is, and a tool window is no file.
+        bool file = document is { Diff: null, Tool: null };
+        bool conflicted = file && document.InConflict;
+        string[] said = [.. new[] { document.IsReadOnly && file ? document.Origin : null, conflicted ? Conflicted : null, document.Notice, document.EncodingWarning }.OfType<string>()];
         banner.Say(said.Length > 0 ? string.Join("  ·  ", said) : null);
         bannerLink.IsVisible = document.Notice is not null && document.NoticeAction is not null;
         bannerLink.Content = document.NoticeAction?.Text;
+        mergeLink.IsVisible = conflicted;
     }
 
     /// <summary>What the banner over the file shown says, null while it shows none.</summary>
@@ -598,6 +684,9 @@ public sealed class EditorGroup : DockPanel
 
     /// <summary>The banner's link, for a click on it.</summary>
     public Control BannerLinkControl => bannerLink;
+
+    /// <summary>The banner's Merge… over a file in conflict, shown while it is.</summary>
+    public Button MergeLink => mergeLink;
 
     /// <summary>Takes a file's tab away. Where it was the tab shown, the group shows the one it showed before (the latest
     /// first), its neighbour where it showed no other, or nothing when it was the last.</summary>
@@ -665,10 +754,11 @@ public sealed class EditorGroup : DockPanel
     public int IndexAt(Point at)
     {
         int index = 0;
+        bool down = tabsPlace != EditorTabsPlace.Top;
         foreach (Control tab in tabBar.GetVisualDescendants().OfType<Border>().Where(b => b.Classes.Contains(StyleClasses.Tab)))
         {
-            Point centre = tab.TranslatePoint(new Point(tab.Bounds.Width / 2, 0), tabBar) ?? default;
-            if (at.X > centre.X)
+            Point centre = tab.TranslatePoint(new Point(tab.Bounds.Width / 2, tab.Bounds.Height / 2), tabBar) ?? default;
+            if (down ? at.Y > centre.Y : at.X > centre.X)
             {
                 index++;
             }
@@ -722,7 +812,7 @@ public sealed class EditorGroup : DockPanel
                 if (document.Asset is { } asset)
                 {
                     preview = new AssetPreviewControl(asset);
-                    body.Children.Add(preview);
+                    editorPlace.Children.Add(preview);
                     if (focused)
                     {
                         preview.Focus();
@@ -733,7 +823,7 @@ public sealed class EditorGroup : DockPanel
                 bool keys = preview?.IsKeyboardFocusWithin == true;
                 ClearPreview();
                 preview = PreviewOf(document);
-                body.Children.Add(preview);
+                editorPlace.Children.Add(preview);
                 if (keys)
                 {
                     FocusShown();
@@ -742,7 +832,7 @@ public sealed class EditorGroup : DockPanel
             case nameof(OpenDocument.Highlighter):
                 Editor.Highlighter = document.Highlighter;
                 break;
-            case nameof(OpenDocument.Notice) or nameof(OpenDocument.NoticeAction) or nameof(OpenDocument.EncodingWarning):
+            case nameof(OpenDocument.Notice) or nameof(OpenDocument.NoticeAction) or nameof(OpenDocument.EncodingWarning) or nameof(OpenDocument.InConflict):
                 ShowBanner(document);
                 break;
             case nameof(OpenDocument.ProjectContexts):
@@ -750,12 +840,12 @@ public sealed class EditorGroup : DockPanel
                 Editor.ContextLabel = ContextShown(document);
                 break;
             case nameof(OpenDocument.IsReadOnly):
-                Editor.IsReadOnly = document.IsReadOnly;
+                FollowReadOnly(document);
                 ShowBanner(document);
                 break;
             case nameof(OpenDocument.Path):
                 ShowTable(document);
-                Editor.IsReadOnly = document.IsReadOnly;
+                FollowReadOnly(document);
                 ShowBanner(document);
                 AttachFind();
                 Editor.LineCommentPrefix = document.Language.LineComment;
@@ -766,6 +856,7 @@ public sealed class EditorGroup : DockPanel
                 break;
             case nameof(OpenDocument.Indentation):
                 Editor.Indent = document.Indentation.Options;
+                Editor.LineLength = LineLengthOf(document);
                 break;
             case nameof(OpenDocument.SoftWrap):
                 Editor.SoftWrap = document.SoftWrap;
@@ -781,7 +872,7 @@ public sealed class EditorGroup : DockPanel
     {
         if (preview is not null)
         {
-            body.Children.Remove(preview);
+            editorPlace.Children.Remove(preview);
             (preview as IDisposable)?.Dispose();
             preview = null;
         }
@@ -801,17 +892,26 @@ public sealed class EditorGroup : DockPanel
         RowIcon pinGlyph = new() { Width = 10, Height = 10, DataKey = IconKeys.Pin };
         Button pin = new() { Classes = { StyleClasses.TabPin }, Content = pinGlyph };
         ToolButtons.Tip(pin, "Unpin Tab");
-        Border border = new()
-        {
-            Classes = { StyleClasses.Tab },
-            Child = new StackPanel
+        Panel ends = new() { Width = 16, Height = 16, Children = { modified, close } };
+        bool down = tabsPlace != EditorTabsPlace.Top;
+        Border border = new() { Classes = { StyleClasses.Tab } };
+        // Down a side, the name takes the column's width left over, its close at the column's edge.
+        ChosenMark.Hold(border, down
+            ? new DockPanel
+            {
+                VerticalAlignment = VerticalAlignment.Center,
+                Children =
+                {
+                    Docked(icon, Dock.Left, 0), Docked(ends, Dock.Right, 6), Docked(pin, Dock.Right, 6), Docked(name, Dock.Left, 6),
+                },
+            }
+            : new StackPanel
             {
                 Orientation = Orientation.Horizontal,
-                Spacing = 6,
+                Spacing = Gaps.Small,
                 VerticalAlignment = VerticalAlignment.Center,
-                Children = { icon, name, pin, new Panel { Width = 16, Height = 16, Children = { modified, close } } },
-            },
-        };
+                Children = { icon, name, pin, ends },
+            });
         OpenDocument? Shown() => (border.DataContext as EditorTab)?.Document;
         close.Click += (_, e) =>
         {
@@ -835,8 +935,10 @@ public sealed class EditorGroup : DockPanel
             name.Text = document.Title;
             icon.Data = document.Icon;
             icon.Foreground = document.IconBrush;
-            ToolTip.SetTip(border, document.Path);
-            modified.IsVisible = document.IsModified;
+            ToolTip.SetTip(border, document.Tool is not null ? document.Title
+                : document.Follows ? $"{document.Path}\n\nFollows the file chosen in the Commit window; pin the tab or edit in it to keep it" : document.Path);
+            border.Classes.Set(StyleClasses.Follows, document.Follows);
+            border.Classes.Set(StyleClasses.Modified, document.IsModified);
             border.Classes.Set(StyleClasses.Active, tab.IsActive);
             border.Classes.Set(StyleClasses.Elsewhere, !IsCurrent);
             pin.IsVisible = tab.IsPinned;
@@ -850,9 +952,9 @@ public sealed class EditorGroup : DockPanel
             }
             if (e.PropertyName == nameof(OpenDocument.IsModified))
             {
-                modified.IsVisible = tab.Document.IsModified;
+                border.Classes.Set(StyleClasses.Modified, tab.Document.IsModified);
             }
-            else if (e.PropertyName == nameof(OpenDocument.Path))
+            else if (e.PropertyName is nameof(OpenDocument.Path) or nameof(OpenDocument.Diff) or nameof(OpenDocument.Follows))
             {
                 Paint(tab);
             }
@@ -928,7 +1030,21 @@ public sealed class EditorGroup : DockPanel
         };
         border.PointerMoved += (_, e) => area.TabDragOf(this)?.Continue(e);
         border.PointerReleased += (_, e) => area.TabDragOf(this)?.End(e);
-        return border.Showing<EditorTab>(Paint);
+        if (!down)
+        {
+            return border.Showing<EditorTab>(Paint);
+        }
+        // Each tab of a column as high as the strip is across the top, its margins inside it as there.
+        Panel slot = new() { Children = { border } };
+        slot.Bind(HeightProperty, slot.GetResourceObservable(TokenKeys.TabStripHeight));
+        return slot.Showing<EditorTab>(Paint);
+
+        static Control Docked(Control part, Dock side, double apart)
+        {
+            part[DockProperty] = side;
+            part.Margin = new Thickness(apart, 0, 0, 0);
+            return part;
+        }
     }
 
     /// <summary>What the editor's context switcher shows for a file in several of the server's projects: the target

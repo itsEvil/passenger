@@ -6,35 +6,35 @@ using Passenger.Core;
 
 namespace Passenger.App.Updates;
 
-/// <summary>macOS's update, from the disk image a person downloads (Passenger-macos-arm64.dmg or -x64), into the state
-/// folder's <c>updates/</c>: its SHA-256 checked against the release's SHA256SUMS, its Passenger.app copied out and
-/// checked again (bundle, version, signature, and the running app's team once there is one). As the process ends the
-/// two apps trade places in one step where the volume allows (renamex_np's swap), and Restart to Update starts the new
-/// one through LaunchServices: nothing of the update runs after Passenger has gone.</summary>
+/// <summary>macOS's update, from the disk image a person downloads (Passenger-macos-arm64.dmg or -x64), opened on the
+/// startup disk (<see cref="ImageFolder"/>): its SHA-256 checked against the release's SHA256SUMS, its Passenger.app
+/// copied out into the state folder's <c>updates/</c> and checked again (bundle, version, signature, and the running
+/// app's team once there is one). As the process ends the two apps trade places in one step where the volume allows
+/// (renamex_np's swap), and Restart to Update starts the new one through LaunchServices: nothing of the update runs
+/// after Passenger has gone.</summary>
 [SupportedOSPlatform("macos")]
-public sealed partial class DiskImageUpdater : Updater
+public sealed partial class DiskImageUpdater : InPlaceUpdater
 {
     /// <summary>The app at the image's top, as tools/package-mac.sh makes it.</summary>
     private const string AppName = "Passenger.app";
 
     /// <summary>The app made ready, named so LaunchServices never takes it for an app to open until it is in place.</summary>
-    private const string Staged = "Passenger.update";
+    private const string ReadyApp = "Passenger.update";
 
     private const string Sums = ReleaseSums.Name;
 
     private static readonly TimeSpan ToolLimit = TimeSpan.FromMinutes(10);
-
-    private readonly Func<string, Task> start;
 
     /// <param name="bundle">The installed Passenger.app.</param>
     /// <param name="staging">Where downloads are made ready: the state folder's <c>updates/</c>.</param>
     /// <param name="start">How the installed app is started again by Restart to Update: LaunchServices' open by
     /// default.</param>
     public DiskImageUpdater(string bundle, string staging, Func<string, Task>? start = null)
+        : base(start ?? Open)
     {
         Bundle = bundle;
         Staging = staging;
-        this.start = start ?? Open;
+        ImageFolder = PathNames.Canonical(UserTemporary.Of(staging, "updates"));
     }
 
     /// <summary>The installed Passenger.app this copy runs from.</summary>
@@ -43,17 +43,42 @@ public sealed partial class DiskImageUpdater : Updater
     /// <summary>The folder downloads are made ready in.</summary>
     public string Staging { get; }
 
+    /// <summary>The folder each release's disk image is downloaded to and opened in, by version: the state's own in the
+    /// user's temporary folder on the startup disk (<see cref="UserTemporary.Of"/>) unless a test names one, never under
+    /// <see cref="Staging"/>, which a home folder on an external drive takes with it, where macOS's disk image tools may
+    /// refuse what the startup disk lets them do ("hdiutil: attach failed - Permission denied").</summary>
+    public string ImageFolder { get; init; }
+
     public override string Installed => Bundle;
+
+    /// <summary>The waits before each try again to open an image that would not open: a minute in all.</summary>
+    public IReadOnlyList<TimeSpan> OpenAgainAfter { get; init; } =
+        [TimeSpan.FromSeconds(1), TimeSpan.FromSeconds(2), TimeSpan.FromSeconds(4), TimeSpan.FromSeconds(8), TimeSpan.FromSeconds(15), TimeSpan.FromSeconds(30)];
+
+    /// <summary>Runs as each try to open the image begins, given the image and the try's number from 1: nothing but in a
+    /// test, which holds the image there as another program may.</summary>
+    public Func<string, int, Task>? Opening { get; init; }
+
+    /// <summary>The waits before each try again to let the image go while something holds its disk: two minutes in all,
+    /// forced from the fourth try.</summary>
+    public IReadOnlyList<TimeSpan> LetGoAgainAfter { get; init; } =
+        [TimeSpan.FromSeconds(1), TimeSpan.FromSeconds(2), TimeSpan.FromSeconds(4), TimeSpan.FromSeconds(8), TimeSpan.FromSeconds(15), TimeSpan.FromSeconds(30), TimeSpan.FromSeconds(60)];
+
+    /// <summary>Runs as each try to let the image go begins, given its attachments and the try's number from 1: nothing but
+    /// in a test, which holds a disk there as another program may.</summary>
+    public Func<IReadOnlyList<AttachedImages.Attachment>, int, Task>? LettingGo { get; init; }
+
+    /// <summary>What opens the image and lets it go: this Mac's own (<see cref="ThisMacs"/>) but in a test.</summary>
+    public DiskImageTool Images { get; init; } = ThisMacs;
+
+    /// <summary>diskutil image where macOS has it (from 26; a later macOS calls hdiutil's attach and detach deprecated), hdiutil before.</summary>
+    public static DiskImageTool ThisMacs => OperatingSystem.IsMacOSVersionAtLeast(26) ? DiskImageTool.Diskutil : DiskImageTool.Hdiutil;
 
     /// <summary>The running copy's updater: the app bundle its executable is in, when this user can replace it.</summary>
     internal static DiskImageUpdater? OfThisBundle(string staging, out string why)
     {
         string? executable = Environment.ProcessPath;
-        string? macOS = Path.GetDirectoryName(executable);
-        string? contents = Path.GetDirectoryName(macOS);
-        string? bundle = Path.GetDirectoryName(contents);
-        if (bundle is null || Path.GetFileName(macOS) != "MacOS" || Path.GetFileName(contents) != "Contents"
-            || !bundle.EndsWith(".app", StringComparison.OrdinalIgnoreCase))
+        if (MacBundles.Of(executable) is not { } bundle)
         {
             why = $"{executable} is not in an app bundle, as a build from source is not";
             return null;
@@ -80,7 +105,7 @@ public sealed partial class DiskImageUpdater : Updater
             return Announced(release, "disk image for this processor");
         }
         string folder = Path.Combine(Staging, release.Version);
-        string app = Path.Combine(folder, Staged);
+        string app = Path.Combine(folder, ReadyApp);
         // Not held: removing old copies is the disk's work, which nothing drawn waits for.
         await BackgroundWork.Unheld(() => CleanAsync(keep: release.Version), cancel).ConfigureAwait(false);
         string identifier = await PlistAsync(Bundle, "CFBundleIdentifier", cancel).ConfigureAwait(false)
@@ -101,119 +126,81 @@ public sealed partial class DiskImageUpdater : Updater
             }
         }
         Directory.CreateDirectory(folder);
-        (string saved, string expected) = await DownloadCheckedAsync(package, folder, progress, cancel).ConfigureAwait(false);
-        await CopyOutAsync(saved, folder, app, cancel).ConfigureAwait(false);
+        string opened = Path.Combine(Directory.CreateDirectory(ImageFolder, OwnerOnly).FullName, release.Version);
+        Directory.CreateDirectory(opened);
+        (string saved, string expected) = await DownloadCheckedAsync(package, opened, progress, cancel).ConfigureAwait(false);
+        await CopyOutAsync(saved, opened, app, cancel).ConfigureAwait(false);
         File.Delete(saved);
+        RemoveEmpty(opened);
+        RemoveEmpty(ImageFolder);
         await CheckAsync(app, identifier, release.Version, team, cancel).ConfigureAwait(false);
         return new UpdateOutcome.Ready($"Passenger {release.Version} downloaded to {app}: {package.Download.Name}'s SHA-256 is {Sums}' {expected}, and the app's signature holds{Signed(team)}");
     }
 
-    public override void Install(bool restart)
-    {
-        try
-        {
-            InstallReady(restart);
-        }
-        finally
-        {
-            LetRelaysGo();
-        }
-    }
-
-    private void InstallReady(bool restart)
-    {
-        if (Ready is not { } version)
-        {
-            return;
-        }
-        string app = Path.Combine(Staging, version, Staged);
-        if (!Directory.Exists(app))
-        {
-            IdeErrors.Write($"Updates: Passenger {version} was not installed: {app} is gone");
-            return;
-        }
-        IReadOnlyList<OtherCopy> others = Others();
-        if (WaitsFor(others, version, Bundle) is not null)
-        {
-            return;
-        }
-        FollowRelays(others, version);
-        (string? why, string? old) = Replace(app, version);
-        // The app is in place, or the old one still is: either way the relays start again from it.
-        LetRelaysGo();
-        if (why is not null)
-        {
-            IdeErrors.Write($"Updates: Passenger {version} was not installed: {app} could not take the place of {Bundle}: {why}");
-            Restart(restart, start);
-            IdeErrors.Flush();
-            return;
-        }
-        // LaunchServices notices a bundle that changed by its date.
-        Directory.SetLastWriteTimeUtc(Bundle, DateTime.UtcNow);
-        IdeErrors.Write($"Updates: Passenger {version} installed in {Bundle}{(restart ? ", and started" : string.Empty)}");
-        Restart(restart, start);
-        Remove(old);
-        Ready = null;
-        // As the process ends, after its last window: nothing is left to await it.
-        Synchronously.Run(() => CleanAsync(keep: null));
-        IdeErrors.Flush();
-    }
+    protected override string Staged(string version) => Path.Combine(Staging, version, ReadyApp);
 
     /// <summary>The new app takes the installed one's place: the two trade places in one step where the volume can swap
-    /// folders (APFS), the app copied beside the installed one first when the state folder is on another volume, and on a
-    /// volume that cannot swap (HFS+) in two renames, the old app put back should the second fail. Gives why not, or where
-    /// the old app now is.</summary>
-    private (string? Why, string? Old) Replace(string app, string version)
+    /// folders (APFS), the app copied beside the installed one first (<see cref="Beside"/>) when the state folder is on
+    /// another volume, and on a volume that cannot swap (HFS+) in two renames (<see cref="InPlaceUpdater.InTwoRenames"/>).
+    /// The old app is left where the new one was, for <see cref="Tidy"/>.</summary>
+    protected override string? Replace(string staged, string version)
     {
-        int failed = Swap(app, Bundle);
+        int failed = Swap(staged, Bundle);
         if (failed == 0)
         {
-            return (null, app);
+            return null;
         }
         if (failed is not (CrossDevice or NotSupported))
         {
-            return (Marshal.GetPInvokeErrorMessage(failed), null);
+            return Marshal.GetPInvokeErrorMessage(failed);
         }
-        string beside = Path.Combine(Path.GetDirectoryName(Bundle)!, $".{Path.GetFileName(Bundle)}.{version}");
+        string beside = Beside(version);
         Remove(beside);
-        ChildResult copied = Run("ditto", [app, beside]);
+        ChildResult copied = Run("ditto", [staged, beside]);
         if (!copied.Succeeded)
         {
             Remove(beside);
-            return ($"it could not be copied beside it: {copied.Said}", null);
+            return $"the new app could not be copied into {Path.GetDirectoryName(Bundle)}: {copied.Said}";
         }
         failed = Swap(beside, Bundle);
         if (failed == 0)
         {
-            return (null, beside);
+            return null;
         }
         if (failed != NotSupported)
         {
             Remove(beside);
-            return (Marshal.GetPInvokeErrorMessage(failed), null);
+            return Marshal.GetPInvokeErrorMessage(failed);
         }
-        string old = beside + ".old";
-        try
-        {
-            Directory.Move(Bundle, old);
-        }
-        catch (Exception error) when (error is IOException or UnauthorizedAccessException)
+        (string? why, bool leftAside) = InTwoRenames(beside, beside + Old, version);
+        // The new app's copy goes unless the installed app could not be put back, when it is one of the two left.
+        if (why is not null && !leftAside)
         {
             Remove(beside);
-            return (error.Message, null);
         }
-        try
-        {
-            Directory.Move(beside, Bundle);
-            return (null, old);
-        }
-        catch (Exception error) when (error is IOException or UnauthorizedAccessException)
-        {
-            Directory.Move(old, Bundle);
-            Remove(beside);
-            return (error.Message, null);
-        }
+        return why;
     }
+
+    /// <summary>LaunchServices notices a bundle that changed by its date.</summary>
+    protected override void Placed() => Directory.SetLastWriteTimeUtc(Bundle, DateTime.UtcNow);
+
+    /// <summary>The old app, wherever <see cref="Replace"/> left it, and every download made ready.</summary>
+    protected override void Tidy(string version)
+    {
+        Remove(Beside(version));
+        Remove(Beside(version) + Old);
+        // As the process ends, after its last window: nothing is left to await it.
+        Synchronously.Run(() => CleanAsync(keep: null));
+    }
+
+    /// <summary>Where the new app is copied beside the installed one, on its volume, hidden.</summary>
+    private string Beside(string version) => Path.Combine(Path.GetDirectoryName(Bundle)!, $".{Path.GetFileName(Bundle)}.{version}");
+
+    /// <summary>The installed app's name while the new one takes its place in two renames.</summary>
+    private const string Old = ".old";
+
+    /// <summary>The image folder's mode: the user's alone.</summary>
+    private const UnixFileMode OwnerOnly = UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute;
 
     public override async Task DiscardAsync()
     {
@@ -221,19 +208,14 @@ public sealed partial class DiskImageUpdater : Updater
         await CleanAsync(keep: null).ConfigureAwait(false);
     }
 
-    protected override IReadOnlyList<int> RunningHere() => RunningAs(Path.Combine(Bundle, "Contents", "MacOS", "Passenger"));
+    protected override IReadOnlyList<int> RunningHere() => RunningAs(Path.Combine(MacBundles.Programs(Bundle), "Passenger"));
 
-    /// <summary>The app at the image's top, copied out of it mounted read-only (hdiutil checks the image's own checksums
-    /// as it mounts it), and the image let go of, a failure included.</summary>
-    private static async Task CopyOutAsync(string image, string folder, string app, CancellationToken cancel)
+    /// <summary>The app at the image's top, copied out of it mounted read-only, and the image let go of, a failure included.</summary>
+    private async Task CopyOutAsync(string image, string folder, string app, CancellationToken cancel)
     {
         string mount = Path.Combine(folder, "mount");
         Directory.CreateDirectory(mount);
-        ChildResult attached = await RunAsync("hdiutil", ["attach", image, "-readonly", "-nobrowse", "-noautoopen", "-mountpoint", mount], cancel).ConfigureAwait(false);
-        if (!attached.Succeeded)
-        {
-            throw new UpdateRefusedException($"{Path.GetFileName(image)} does not open as a disk image", attached.Said);
-        }
+        await AttachAsync(image, mount, cancel).ConfigureAwait(false);
         try
         {
             string inside = Path.Combine(mount, AppName);
@@ -249,9 +231,72 @@ public sealed partial class DiskImageUpdater : Updater
         }
         finally
         {
-            await DetachAsync(mount).ConfigureAwait(false);
+            await LetGoAsync(folder, LetGoAgainAfter, forcedFrom: 4).ConfigureAwait(false);
         }
     }
+
+    /// <summary>The image mounted read-only at <paramref name="mount"/>, tried again while it will not open: its SHA-256 is
+    /// the release's, so what refuses it is this Mac (a program holding the file just written, which hdiutil calls
+    /// "Resource temporarily unavailable"), and that lets go. Refused once the tries are spent (<see cref="Refusal"/>).</summary>
+    private async Task AttachAsync(string image, string mount, CancellationToken cancel)
+    {
+        string name = Path.GetFileName(image);
+        for (int attempt = 1; ; attempt++)
+        {
+            if (Opening is { } opening)
+            {
+                await opening(image, attempt).ConfigureAwait(false);
+            }
+            ChildResult attached = await RunAsync(ImageTool(["image", "attach", "--readOnly", "--mountOptions", "nobrowse", "--mountPoint", mount, image],
+                ["attach", image, "-readonly", "-nobrowse", "-noautoopen", "-mountpoint", mount]), cancel).ConfigureAwait(false);
+            if (attached.Succeeded)
+            {
+                if (attempt > 1)
+                {
+                    IdeErrors.Write($"Updates: {name} opened as a disk image at try {attempt}");
+                }
+                return;
+            }
+            string said = FailureOf(attached);
+            if (attempt > OpenAgainAfter.Count)
+            {
+                throw new UpdateRefusedException(Refusal(image, said), $"{attached.Said}; {await HeldAsync(image, cancel).ConfigureAwait(false)}");
+            }
+            TimeSpan pause = Waits.Of(OpenAgainAfter[attempt - 1]);
+            IdeErrors.Write($"Updates: {name} did not open as a disk image at try {attempt} ({said}); trying again in {Durations.Said(pause)}");
+            await Task.Delay(pause, cancel).ConfigureAwait(false);
+        }
+    }
+
+    /// <summary>Why the image did not open, as the update says it: where macOS refused access to it, the folder it was
+    /// refused in and that the release's page has it to install by hand, the tool's words beside; else the tool's
+    /// words.</summary>
+    private static string Refusal(string image, string said) => AttachedImages.RefusesAccess(said)
+        ? $"{Path.GetFileName(image)} does not open as a disk image: macOS refused access to it in {Path.GetDirectoryName(image)} ({said}); the release's page has it to install by hand"
+        : $"{Path.GetFileName(image)} does not open as a disk image: {said}";
+
+    /// <summary>What has the image open, and where it is attached already, for a refusal to say.</summary>
+    private static async Task<string> HeldAsync(string image, CancellationToken cancel)
+    {
+        string held = AttachedImages.Held(await AttachedImages.HoldersAsync([image], cancel).ConfigureAwait(false));
+        (IReadOnlyList<AttachedImages.Attachment>? listed, string why) = await AttachedImages.ListAsync(cancel).ConfigureAwait(false);
+        if (listed is null)
+        {
+            return $"{held}; {why}";
+        }
+        string canonical = PathNames.Canonical(image);
+        string[] attached = [.. listed.Where(a => PathNames.Same(PathNames.Canonical(a.Image), canonical))
+            .Select(a => a.Mounts.Count == 0 ? $"{a.Disk}, mounted nowhere" : $"{a.Disk} at {string.Join(", ", a.Mounts)}")];
+        return attached.Length == 0 ? held : $"{held}; attached already as {string.Join("; ", attached)}";
+    }
+
+    /// <summary>What the tool said of an attach that failed, its last line but a warning, named as hdiutil names itself
+    /// ("hdiutil: attach failed - Resource busy", "diskutil: The disk image is corrupted"); else how it ended.</summary>
+    private string FailureOf(ChildResult attached) =>
+        attached.Error.Split('\n', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries)
+            .LastOrDefault(line => !line.StartsWith("hdiutil: WARNING", StringComparison.Ordinal)) is not { } said ? attached.Ended
+            : Images == DiskImageTool.Diskutil ? $"diskutil: {(said.StartsWith(DiskutilError, StringComparison.Ordinal) ? said[DiskutilError.Length..] : said)}"
+            : said;
 
     /// <summary>The app made ready is the release's: the installed app's bundle, the release's version, its signature
     /// whole, and the installed app's team's when that has one.</summary>
@@ -288,41 +333,110 @@ public sealed partial class DiskImageUpdater : Updater
         return read.Succeeded ? read.Output.Trim() : null;
     }
 
-    /// <summary>Every download made ready but <paramref name="keep"/>'s, an image still mounted let go of first.</summary>
+    /// <summary>Every download made ready but <paramref name="keep"/>'s, and every image downloaded, an image still mounted
+    /// let go of first.</summary>
     private async Task CleanAsync(string? keep)
     {
-        if (!Directory.Exists(Staging))
+        await CleanAsync(ImageFolder, keep: null).ConfigureAwait(false);
+        RemoveEmpty(ImageFolder);
+        // Staging may hold images too, mounted where an older Passenger opened them.
+        await CleanAsync(Staging, keep).ConfigureAwait(false);
+    }
+
+    /// <summary>Every folder in <paramref name="root"/> but <paramref name="keep"/>, an image still mounted let go of first.</summary>
+    private async Task CleanAsync(string root, string? keep)
+    {
+        if (!Directory.Exists(root))
         {
             return;
         }
-        foreach (string folder in Directory.EnumerateDirectories(Staging))
+        foreach (string folder in Directory.EnumerateDirectories(root))
         {
             if (Path.GetFileName(folder) == keep)
             {
                 continue;
             }
-            if (Directory.Exists(Path.Combine(folder, "mount")))
+            string mount = Path.Combine(folder, "mount");
+            if (Directory.Exists(mount) && !await LetGoAsync(folder, [], forcedFrom: 1).ConfigureAwait(false))
             {
-                await DetachAsync(Path.Combine(folder, "mount")).ConfigureAwait(false);
+                // Still attached: all but its mount point goes, which the next clean tries again.
+                foreach (string entry in Directory.EnumerateFileSystemEntries(folder).Where(entry => entry != mount))
+                {
+                    RemoveEntry(entry);
+                }
+                continue;
             }
             Remove(folder);
         }
     }
 
-    private static async Task DetachAsync(string mount)
+    /// <summary>A folder of the update's own once nothing is left in it, kept where something is.</summary>
+    private static void RemoveEmpty(string folder)
     {
-        if (!(await ToolAsync("hdiutil", ["detach", mount, "-quiet"]).ConfigureAwait(false)).Succeeded)
+        try
         {
-            await ToolAsync("hdiutil", ["detach", mount, "-force", "-quiet"]).ConfigureAwait(false);
+            if (Directory.Exists(folder) && !Directory.EnumerateFileSystemEntries(folder).Any())
+            {
+                Directory.Delete(folder);
+            }
+        }
+        catch (Exception error) when (error is IOException or UnauthorizedAccessException)
+        {
+            IdeErrors.Write($"Updates: {folder} could not be removed: {error.Message}");
+        }
+    }
+
+    /// <summary>A folder or file of a download's, a failure logged.</summary>
+    private static void RemoveEntry(string entry)
+    {
+        if (Directory.Exists(entry))
+        {
+            Remove(entry);
+            return;
         }
         try
         {
-            Directory.Delete(mount);
+            File.Delete(entry);
         }
-        catch (IOException)
+        catch (Exception error) when (error is IOException or UnauthorizedAccessException)
         {
-            // Still mounted, or holding something: the next clean tries again.
+            IdeErrors.Write($"Updates: {entry} could not be removed: {error.Message}");
         }
+    }
+
+    /// <summary>Every image in a download's folder let go of by its disks (<see cref="AttachedImages.DetachAsync"/>), again
+    /// after each of <paramref name="pauses"/> while one is listed, forced from the try <paramref name="forcedFrom"/>: a
+    /// disk a process holds open stays attached once its volume is unmounted. Whether none is listed any more; its mount
+    /// point is removed then, and kept where one still is, what held it in the log.</summary>
+    private async Task<bool> LetGoAsync(string folder, IReadOnlyList<TimeSpan> pauses, int forcedFrom)
+    {
+        string under = PathNames.Canonical(folder);
+        AttachedImages.LetGo letGo = await AttachedImages.DetachAsync(attachment => PathNames.IsUnder(PathNames.Canonical(attachment.Image), under),
+            (disk, attempt) => attempt >= forcedFrom ? ImageTool(["eject", "force", disk], ["detach", disk, "-force"]) : ImageTool(["eject", disk], ["detach", disk]),
+            [.. pauses.Select(Waits.Of)], LettingGo, CancellationToken.None).ConfigureAwait(false);
+        string said = string.Join(" ", letGo.Said.Select(words => $"[{words}]"));
+        if (!letGo.Detached)
+        {
+            IdeErrors.Write($"Updates: the disk image in {folder} is still attached after {Plural.Of(letGo.Tries, "try", "tries")} to let it go: {said}");
+            return false;
+        }
+        if (letGo.Tries > 1)
+        {
+            IdeErrors.Write($"Updates: the disk image in {folder} was let go of at try {letGo.Tries}, the tries before saying: {said}");
+        }
+        string mount = Path.Combine(folder, "mount");
+        try
+        {
+            if (Directory.Exists(mount))
+            {
+                Directory.Delete(mount);
+            }
+        }
+        catch (Exception error) when (error is IOException or UnauthorizedAccessException)
+        {
+            IdeErrors.Write($"Updates: {mount} could not be removed: {error.Message}");
+        }
+        return true;
     }
 
     /// <summary>LaunchServices starts the app as a new instance (this one is still ending), with the state folder, release
@@ -345,10 +459,18 @@ public sealed partial class DiskImageUpdater : Updater
         }
     }
 
-    private static Task<ChildResult> RunAsync(string tool, IEnumerable<string> arguments, CancellationToken cancel) =>
-        ChildProcesses.RunAsync(Tool(tool, arguments), limit: ToolLimit, cancel: cancel);
+    private static Task<ChildResult> RunAsync(string tool, IEnumerable<string> arguments, CancellationToken cancel) => RunAsync(Tool(tool, arguments), cancel);
+
+    private static Task<ChildResult> RunAsync(ProcessStartInfo start, CancellationToken cancel) => ChildProcesses.RunAsync(start, limit: ToolLimit, cancel: cancel);
 
     private static ProcessStartInfo Tool(string tool, IEnumerable<string> arguments) => ChildProcesses.Command(Path.Combine("/usr/bin", tool), arguments);
+
+    /// <summary>The image's tool run with these arguments: diskutil's or hdiutil's.</summary>
+    private ProcessStartInfo ImageTool(IEnumerable<string> diskutil, IEnumerable<string> hdiutil) =>
+        Images == DiskImageTool.Diskutil ? ChildProcesses.Command("/usr/sbin/diskutil", diskutil) : Tool("hdiutil", hdiutil);
+
+    /// <summary>How diskutil begins a line saying why it failed.</summary>
+    private const string DiskutilError = "Error: ";
 
     /// <summary>A tool waited for where nothing awaits: the install, as the process ends.</summary>
     private static ChildResult Run(string tool, IEnumerable<string> arguments) => Synchronously.Run(() => ToolAsync(tool, arguments));
@@ -374,4 +496,11 @@ public sealed partial class DiskImageUpdater : Updater
 
     [GeneratedRegex(@"^TeamIdentifier=(.+)$", RegexOptions.Multiline)]
     private static partial Regex Team();
+}
+
+/// <summary>macOS's tool for disk images: diskutil image (from macOS 26), or hdiutil.</summary>
+public enum DiskImageTool
+{
+    Hdiutil,
+    Diskutil,
 }

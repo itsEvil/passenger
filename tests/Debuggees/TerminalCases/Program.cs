@@ -63,6 +63,53 @@ switch (args)
             Write("\e[?1l");
         }
         break;
+    case ["keyboard", .. string[] asked]:
+        // The keys as read, as cat -v shows them, on one line once q comes; with flags, first pushed as the kitty
+        // keyboard protocol asks and the flags the terminal says are in force told, then popped at the end.
+        using (Terminal.Raw())
+        {
+            if (asked is [string flags])
+            {
+                Write($"\e[>{flags}u\e[?u");
+                string answer = ReadTo('u');
+                Write($"flags {answer[3..^1]}\r\n");
+            }
+            Write("keyboard?\r\n");
+            StringBuilder read = new();
+            for (int b = input.ReadByte(); b is >= 0 and not 'q'; b = input.ReadByte())
+            {
+                read.Append(b < 32 ? $"^{(char)(b + 64)}" : ((char)b).ToString());
+            }
+            Write($"{read}\r\n");
+            if (asked.Length > 0)
+            {
+                Write("\e[<u");
+            }
+        }
+        break;
+    case ["typed", .. string[] asked]:
+        // What is typed until q, as its bytes were read: the text decoded from UTF-8 and ended by a bar, then each of its
+        // code points; with flags, first pushed as the kitty keyboard protocol asks, then popped at the end.
+        using (Terminal.Raw())
+        {
+            if (asked is [string flags])
+            {
+                Write($"\e[>{flags}u");
+            }
+            Write("typed?\r\n");
+            List<byte> bytes = [];
+            for (int b = input.ReadByte(); b is >= 0 and not 'q'; b = input.ReadByte())
+            {
+                bytes.Add((byte)b);
+            }
+            string typed = Encoding.UTF8.GetString([.. bytes]);
+            Write($"{typed}|\r\n{string.Join(' ', typed.EnumerateRunes().Select(r => $"U+{r.Value:X4}"))}\r\n");
+            if (asked.Length > 0)
+            {
+                Write("\e[<u");
+            }
+        }
+        break;
     case ["mouse", .. string[] modes]:
         // The mouse reports as read, in SGR's form (1006) after the modes asked for (1002, 1003), each on a line of its
         // own as cat -v shows it, until Ctrl+C; the modes put back after.
@@ -187,6 +234,36 @@ switch (args)
             }
         }
         Write("done\n");
+        break;
+    case ["links"]:
+        // Words linked as Spectre.Console's link markup links them (OSC 8 ended by ST), one ended by BEL with an id, and
+        // one to an address of no scheme a click opens, each beside plain words.
+        Write("see \e]8;;https://example.com/spectre\e\\the docs\e]8;;\e\\ or \e]8;id=7;https://example.com/other\athis\e]8;;\a"
+            + " not \e]8;;mailto:someone@example.com\e\\mail\e]8;;\e\\ end\r\n");
+        break;
+    case ["file-links", string there, string missing]:
+        // Words linked to another host's file, to a share's path by four slashes and by escaped backslashes, then to a
+        // file here and to one that is not.
+        Write("far \e]8;;file://otherhost/share/x\e\\host\e]8;;\e\\ unc \e]8;;file:////otherhost/share/y\e\\shape\e]8;;\e\\"
+            + " esc \e]8;;file:///%5C%5Cotherhost%5Cshare%5Cz\e\\path\e]8;;\e\\"
+            + $" here \e]8;;{new Uri(there).AbsoluteUri}\e\\notes\e]8;;\e\\ gone \e]8;;{new Uri(missing).AbsoluteUri}\e\\lost\e]8;;\e\\\r\n");
+        break;
+    case ["found-paths"]:
+        // Paths naming another machine as a stack frame, a deterministic build's frame, a compiler's message, a Godot
+        // error's place and file addresses write them (a share's by either slash, a device's, an automount root's), then a
+        // frame in a file of the folder's.
+        Write("   at Shop.Main() in \\\\otherhost\\share\\Program.cs:line 5\r\n"
+            + "   at Shop.Main() in /_///otherhost/share/Program.cs:line 6\r\n"
+            + "//otherhost/share/Program.cs(3,1): error CS1002: ; expected\r\n"
+            + "/net/otherhost/share/Program.cs(4,1): error CS1002: ; expected\r\n"
+            + "/net/otherhost/share/Program.cs:12 and \\\\?\\C:\\share\\Device.cs:4\r\n"
+            + "   at: void Main._Process(double) (res:////otherhost/share/Main.cs:19)\r\n"
+            + "see file://otherhost/share/x.cs or file:////otherhost/share/y.cs\r\n"
+            + "   at Shop.Main() in src/Program.cs:line 2\r\n");
+        break;
+    case ["blocks"]:
+        // A bar of full blocks, as Spectre.Console's charts draw, then upper halves and a right half.
+        Write("██████ ▀▀▐\r\n");
         break;
     case ["variables", .. string[] names]:
         // Each of these variables the program has, as env lists it, then a line saying they are listed.

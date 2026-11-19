@@ -29,6 +29,11 @@ public interface IPackageFeed
     /// <summary>What a version of a package depends on, as its own metadata says, by target framework; null when the feed
     /// has no such version, or cannot say.</summary>
     Task<PackageDependencies?> DependenciesAsync(string id, string version, CancellationToken cancel) => Task.FromResult<PackageDependencies?>(null);
+
+    /// <summary>The versions among those asked that the feed says their owner deprecated, each keyed as asked; none where
+    /// the feed cannot say.</summary>
+    Task<IReadOnlyDictionary<string, Deprecation>> DeprecationsAsync(string id, IReadOnlyCollection<string> versions, CancellationToken cancel) =>
+        Task.FromResult(FeedDeprecations.None.Deprecated);
 }
 
 /// <summary>A package version's dependencies as its nuspec groups them: by target framework (null for the group that
@@ -67,6 +72,9 @@ public sealed record DependencyGroup(string? Framework, IReadOnlyList<(string Id
 /// <summary>What a search of several feeds found: the packages, each once with the feeds that have it; the feeds that
 /// did not answer, and why; and how many packages the package source mapping left out.</summary>
 public sealed record FeedSearch(IReadOnlyList<PackageSummary> Packages, IReadOnlyList<(string Feed, string Problem)> Failed, int Unmapped);
+
+/// <summary>A package's versions and the feeds that could not answer, so a partial answer stays distinguishable.</summary>
+public sealed record FeedVersions(IReadOnlyList<string> Versions, IReadOnlyList<(string Feed, string Problem)> Failed);
 
 /// <summary>The feeds the NuGet window searches at once: All Feeds, or the one chosen. Each is asked in parallel; a
 /// package found in several is listed once, at its newest version; one the package source mapping keeps from a feed is
@@ -138,23 +146,31 @@ public sealed class FeedSet(string name, IReadOnlyList<IPackageFeed> feeds, Func
 
     public async Task<IReadOnlyList<string>> VersionsAsync(string id, bool prerelease, CancellationToken cancel)
     {
-        IPackageFeed[] asked = [.. feeds.Where(f => allows(f.Name, id))];
-        (IReadOnlyList<string>? Found, Exception? Failed)[] answers = await Task.WhenAll(asked.Select(async feed =>
+        FeedVersions answer = await VersionsEachAsync(id, prerelease, cancel);
+        if (answer.Failed.Count > 0 && answer.Failed.Count == feeds.Count(f => allows(f.Name, id)))
+        {
+            throw new HttpRequestException(string.Join("; ", answer.Failed.Select(f => $"{f.Feed}: {f.Problem}")));
+        }
+        return answer.Versions;
+    }
+
+    /// <summary>A package's versions from the allowed feeds, preserving failures beside successful answers.</summary>
+    public async Task<FeedVersions> VersionsEachAsync(string id, bool prerelease, CancellationToken cancel)
+    {
+        (IReadOnlyList<string> Found, string? Problem)[] answers = await Task.WhenAll(feeds.Where(f => allows(f.Name, id)).Select(async feed =>
         {
             try
             {
-                return (await feed.VersionsAsync(id, prerelease, cancel), (Exception?)null);
+                return (await feed.VersionsAsync(id, prerelease, cancel), (string?)null);
             }
-            catch (Exception failed) when (!cancel.IsCancellationRequested && asked.Length > 1 && IsFeedFailure(failed))
+            catch (Exception failed) when (!cancel.IsCancellationRequested && IsFeedFailure(failed))
             {
-                return ((IReadOnlyList<string>?)null, failed);
+                return ((IReadOnlyList<string>)[], failed.Message);
             }
         }));
-        if (answers.Length > 0 && answers.All(a => a.Failed is not null))
-        {
-            throw answers[0].Failed!;
-        }
-        return [.. answers.SelectMany(a => a.Found ?? []).Distinct(StringComparer.OrdinalIgnoreCase).OrderByDescending(v => v, VersionOrder.Instance)];
+        IPackageFeed[] asked = [.. feeds.Where(f => allows(f.Name, id))];
+        return new FeedVersions([.. answers.SelectMany(a => a.Found).Distinct(StringComparer.OrdinalIgnoreCase).OrderByDescending(v => v, VersionOrder.Instance)],
+            [.. answers.Select((a, i) => (Feed: asked[i].Name, a.Problem)).Where(a => a.Problem is not null).Select(a => (a.Feed, a.Problem!))]);
     }
 
     /// <summary>A version's dependencies from the first feed the package source mapping allows that has it.</summary>
@@ -176,6 +192,33 @@ public sealed class FeedSet(string name, IReadOnlyList<IPackageFeed> feeds, Func
         }
         return null;
     }
+
+    /// <summary>The deprecated versions among those asked, from the feeds the package source mapping allows, asked at once
+    /// (a version any of them deprecates is deprecated, the first one's words kept), with the feeds that did not answer.</summary>
+    public async Task<FeedDeprecations> DeprecationsEachAsync(string id, IReadOnlyCollection<string> versions, CancellationToken cancel)
+    {
+        IPackageFeed[] asked = [.. feeds.Where(f => allows(f.Name, id))];
+        (IReadOnlyDictionary<string, Deprecation> Found, string? Problem)[] answers = await Task.WhenAll(asked.Select(async feed =>
+        {
+            try
+            {
+                return (await feed.DeprecationsAsync(id, versions, cancel), (string?)null);
+            }
+            catch (Exception failed) when (!cancel.IsCancellationRequested && IsFeedFailure(failed))
+            {
+                return (FeedDeprecations.None.Deprecated, failed.Message);
+            }
+        }));
+        Dictionary<string, Deprecation> merged = new(StringComparer.OrdinalIgnoreCase);
+        foreach ((string version, Deprecation deprecation) in answers.SelectMany(a => a.Found))
+        {
+            merged.TryAdd(version, deprecation);
+        }
+        return new FeedDeprecations(merged, [.. answers.Select((a, i) => (Feed: asked[i].Name, a.Problem)).Where(a => a.Problem is not null).Select(a => (a.Feed, a.Problem!))]);
+    }
+
+    public async Task<IReadOnlyDictionary<string, Deprecation>> DeprecationsAsync(string id, IReadOnlyCollection<string> versions, CancellationToken cancel) =>
+        (await DeprecationsEachAsync(id, versions, cancel)).Deprecated;
 
     /// <summary>What a feed throws when it cannot answer: it is down, refuses, says what is no feed, or is no folder.</summary>
     public static bool IsFeedFailure(Exception failed) =>
@@ -219,6 +262,9 @@ public sealed class FeedClient
     /// <summary>Where the window asks a credential provider for what the feed's nuget.config does not give.</summary>
     public CredentialProviders Providers { get; init; } = CredentialProviders.Default;
 
+    /// <summary>Why the credentials NuGet gives the feed by its name are not sent to it (<see cref="FeedSource.Withheld"/>).</summary>
+    public string? Withheld { get; init; }
+
     /// <summary>A GET of one of the feed's URLs, answered (whatever its status) once credentials have been tried.</summary>
     public async Task<HttpResponseMessage> GetAsync(Uri url, CancellationToken cancel)
     {
@@ -248,7 +294,7 @@ public sealed class FeedClient
                 throw new HttpRequestException($"{Name} refused the credentials its nuget.config gives (401 Unauthorized)", null, HttpStatusCode.Unauthorized);
             }
             retry = await Providers.GetAsync(Index, isRetry: sent is not null, cancel)
-                ?? throw new HttpRequestException($"{Name} needs credentials (401 Unauthorized): none in its nuget.config, and no credential provider gave any", null, HttpStatusCode.Unauthorized);
+                ?? throw new HttpRequestException($"{Name} needs credentials (401 Unauthorized): {Withheld ?? "none in its nuget.config"}, and no credential provider gave any", null, HttpStatusCode.Unauthorized);
             Volatile.Write(ref credentials, retry);
         }
         response = await SendAsync(url, retry, cancel);
@@ -392,6 +438,47 @@ public sealed class V3Feed(FeedClient client) : IPackageFeed
             }
             return new PackageDependencies(groups);
         }
+    }
+
+    /// <summary>The deprecated versions among those asked, from the package's registration: its index, and of the pages it
+    /// gives by reference only those that may hold a version asked; none from a feed without registrations, or without the
+    /// package.</summary>
+    public async Task<IReadOnlyDictionary<string, Deprecation>> DeprecationsAsync(string id, IReadOnlyCollection<string> versions, CancellationToken cancel)
+    {
+        if (versions.Count == 0 || (await ServicesAsync(cancel)).Registrations is not { } registrations
+            || await client.GetJsonAsync<JsonDocument>(new Uri(registrations, $"{id.ToLowerInvariant()}/index.json"), Json, cancel) is not { } index)
+        {
+            return FeedDeprecations.None.Deprecated;
+        }
+        List<(string Version, Deprecation Deprecation)> read = [];
+        List<Uri> referenced = [];
+        using (index)
+        {
+            foreach (JsonElement page in JsonMembers.Items(index.RootElement, "items"))
+            {
+                if (JsonMembers.Value(page, "items") is not null)
+                {
+                    read.AddRange(Deprecation.OnPage(page, versions));
+                }
+                else if (Deprecation.MayHold(page, versions) && JsonMembers.Text(page, "@id") is { } at)
+                {
+                    referenced.Add(new Uri(registrations, at));
+                }
+            }
+        }
+        // A page it lists that is not there leaves its versions unknown, never not deprecated.
+        IReadOnlyList<(string, Deprecation)>[] pages = await Task.WhenAll(referenced.Select(async at =>
+        {
+            using JsonDocument page = await client.GetJsonAsync<JsonDocument>(at, Json, cancel)
+                ?? throw new HttpRequestException($"{Name} lists a registration page at {at} that is not there (404 Not Found)", null, HttpStatusCode.NotFound);
+            return (IReadOnlyList<(string, Deprecation)>)[.. Deprecation.OnPage(page.RootElement, versions)];
+        }));
+        Dictionary<string, Deprecation> found = new(StringComparer.OrdinalIgnoreCase);
+        foreach ((string version, Deprecation deprecation) in read.Concat(pages.SelectMany(p => p)))
+        {
+            found.TryAdd(version, deprecation);
+        }
+        return found;
     }
 
     /// <summary>The advisories the feed's VulnerabilityInfo resource gives, by package; none from a feed without the
@@ -633,7 +720,7 @@ public static class PackageFeeds
             string path = Uri.TryCreate(source.Source, UriKind.Absolute, out Uri? uri) && uri.IsFile ? uri.LocalPath : source.Source;
             return new FolderFeed(path, source.Name);
         }
-        FeedClient client = new(source.Name, new Uri(source.Source), http, source.Credentials, source.AllowInsecure, source.SkipCertificateCheck);
+        FeedClient client = new(source.Name, new Uri(source.Source), http, source.Credentials, source.AllowInsecure, source.SkipCertificateCheck) { Withheld = source.Withheld };
         bool v3 = source.ProtocolVersion == 3 || new Uri(source.Source).AbsolutePath.EndsWith(".json", StringComparison.OrdinalIgnoreCase);
         return v3 ? new V3Feed(client) : new V2Feed(client);
     }

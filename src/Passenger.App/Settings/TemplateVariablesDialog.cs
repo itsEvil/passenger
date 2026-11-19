@@ -48,17 +48,17 @@ public sealed class TemplateVariablesDialog : IdeWindow
         DockPanel.SetDock(parameterName, Dock.Left);
         StackPanel chosen = new()
         {
-            Spacing = 10,
-            Margin = new Thickness(16, 0, 0, 0),
+            Spacing = Gaps.Wide,
+            Margin = new Thickness(Gaps.Group, 0, 0, 0),
             Children = { macro, parameterRow, EditableBox, ChangeMacroButton },
         };
-        StackPanel moves = new() { Orientation = Orientation.Horizontal, Spacing = 2, Children = { up, down } };
+        StackPanel moves = new() { Orientation = Orientation.Horizontal, Spacing = Gaps.Hair, Children = { up, down } };
         DockPanel left = new() { Width = 180 };
         DockPanel.SetDock(moves, Dock.Bottom);
         left.Children.Add(moves);
         Border framed = new() { Classes = { StyleClasses.Framed }, Child = names };
         left.Children.Add(framed);
-        DockPanel body = new() { Margin = new Thickness(16, 14, 16, 8) };
+        DockPanel body = new() { [DialogFooter.InsetProperty] = true };
         DockPanel.SetDock(left, Dock.Left);
         body.Children.Add(left);
         body.Children.Add(chosen);
@@ -168,10 +168,10 @@ public sealed class ChooseMacroDialog : IdeWindow
         WindowStartupLocation = WindowStartupLocation.CenterOwner;
         list.ItemsSource = (string[])[NoMacro, .. LiveTemplates.Macros.Select(m => m.Description)];
         list.SelectedIndex = LiveTemplates.Macros.ToList().FindIndex(m => m.Name == current) + 1;
-        list.DoubleTapped += (_, _) => Close(true);
+        ListKeys.Act(list, new ListActs { Open = () => Close(true) });
         OkButton = DialogFooter.Default();
         OkButton.Click += (_, _) => Close(true);
-        Content = DialogFooter.Page(new Border { Classes = { StyleClasses.Framed }, Margin = new Thickness(12), Child = list }, DialogFooter.OkCancel(OkButton, () => Close(false)));
+        Content = DialogFooter.Page(new Border { Classes = { StyleClasses.Framed }, [DialogFooter.InsetProperty] = true, Child = list }, DialogFooter.OkCancel(OkButton, () => Close(false)));
     }
 
     public Button OkButton { get; }

@@ -6,17 +6,19 @@ using Avalonia.Input.Platform;
 using Avalonia.Media;
 using Avalonia.Media.Fonts.Tables.Cmap;
 using Avalonia.Threading;
+using Passenger.Core;
 using Passenger.Editor;
 
 namespace Passenger.Terminal;
 
 /// <summary>Draws a <see cref="TerminalSession"/>'s screen in the editor's font and sends it the keys: xterm's
-/// encodings for every key (the arrows' application forms when a program asks), the clipboard on Cmd+C and Cmd+V
-/// (Ctrl+Shift+C and V, or Ctrl+C with a selection, elsewhere), a drag to select and a double-click for a word, the
-/// wheel through the scrollback (or to the program, when it asked for the mouse). The size follows the control's, in
-/// whole cells. Web addresses and stack frames are drawn as links, opened by a click (one that drags selects instead);
-/// file paths are drawn as text, underlined faintly under the pointer and as links while Cmd (Ctrl elsewhere) is held.
-/// Cmd+click (Ctrl+click) opens either.</summary>
+/// encodings for every key (the arrows' application forms when a program asks), or the kitty keyboard protocol's once a
+/// program asks for it (<see cref="TerminalKeys"/>), what an input method composes once it commits it (drawn at the
+/// cursor until then), the clipboard on Cmd+C and Cmd+V (Ctrl+Shift+C and V, or Ctrl+C with a selection, elsewhere), a
+/// drag to select and a double-click for a word, the wheel through the scrollback (or to the program, when it asked for
+/// the mouse). The size follows the control's, in whole cells. Web addresses and stack frames are drawn as links, opened
+/// by a click (one that drags selects instead); file paths are drawn as text, underlined faintly under the pointer and as
+/// links while Cmd (Ctrl elsewhere) is held. Cmd+click (Ctrl+click) opens either.</summary>
 public sealed partial class TerminalView : Control
 {
     public static readonly StyledProperty<double> FontSizeProperty =
@@ -29,6 +31,10 @@ public sealed partial class TerminalView : Control
 
     public static readonly StyledProperty<CursorShape> CursorStyleProperty =
         AvaloniaProperty.Register<TerminalView, CursorShape>(nameof(CursorStyle), CursorShape.Block);
+
+    public static readonly StyledProperty<CaretBlink> CursorBlinkProperty = CodeEditor.CaretBlinkProperty.AddOwner<TerminalView>();
+
+    public static readonly StyledProperty<double> CursorWidthProperty = CodeEditor.CaretWidthProperty.AddOwner<TerminalView>();
 
     private const double Pad = 6;
 
@@ -68,7 +74,8 @@ public sealed partial class TerminalView : Control
     public TerminalView()
     {
         // Blinking is continuous visual work, so it must not hold screenshots or background-work waits.
-        blink = new DispatcherTimer(TimeSpan.FromMilliseconds(530), DispatcherPriority.Background, (_, _) =>
+        blink = new DispatcherTimer(DispatcherPriority.Background) { Interval = CaretBlink.Default.Shown };
+        blink.Tick += (_, _) =>
         {
             if (!ShouldBlink)
             {
@@ -76,9 +83,10 @@ public sealed partial class TerminalView : Control
                 return;
             }
             cursorOn = !cursorOn;
+            Blinks++;
+            blink.Interval = CursorBlink.While(cursorOn);
             InvalidateVisual();
-        });
-        blink.Stop();
+        };
         Focusable = true;
         ClipToBounds = true;
         Cursor = new Cursor(StandardCursorType.Ibeam);
@@ -105,6 +113,9 @@ public sealed partial class TerminalView : Control
         };
         ContextMenu = Menu();
         CodeFonts.Follow(this, FontFamilyProperty);
+        Carets.FollowBlink(this, CursorBlinkProperty);
+        Carets.FollowWidth(this, CursorWidthProperty);
+        AddHandler(TextInputMethodClientRequestedEvent, (_, e) => e.Client = InputMethod);
     }
 
     /// <summary>The terminal's menu: Copy, Paste and Clear Buffer, with their keys.</summary>
@@ -128,6 +139,10 @@ public sealed partial class TerminalView : Control
     /// a terminal with none.</summary>
     public Func<ReadOnlySpan<char>, IReadOnlyList<(int Start, int Length, object Target, bool Hidden)>>? Links { get; set; }
 
+    /// <summary>What a link a program made (OSC 8) opens, by its address, which only the host reads; null for an address
+    /// it opens nothing for, which stays text. Null for a terminal whose programs' links are all text.</summary>
+    public Func<string, object?>? LinkTo { get; set; }
+
     /// <summary>The link under the pointer; null when there is none.</summary>
     public TerminalLink? HoveredLink { get; private set; }
 
@@ -148,6 +163,8 @@ public sealed partial class TerminalView : Control
         ClearSelection();
         heldTop = null;
         RestartBlink();
+        FollowInputMethod();
+        FollowAccessibleText();
     }
 
     public double FontSize
@@ -176,6 +193,23 @@ public sealed partial class TerminalView : Control
         set => SetValue(CursorStyleProperty, value);
     }
 
+    /// <summary>How the cursor blinks while it blinks at all: the one in force for every caret (<see cref="Carets"/>) unless given.</summary>
+    public CaretBlink CursorBlink
+    {
+        get => GetValue(CursorBlinkProperty);
+        set => SetValue(CursorBlinkProperty, value);
+    }
+
+    /// <summary>How many times the cursor has blinked, shown or hidden.</summary>
+    public long Blinks { get; private set; }
+
+    /// <summary>A line or underline cursor's breadth: the caret width in force (<see cref="Carets"/>) unless given.</summary>
+    public double CursorWidth
+    {
+        get => GetValue(CursorWidthProperty);
+        set => SetValue(CursorWidthProperty, value);
+    }
+
     /// <summary>The shell drawn and typed to.</summary>
     public TerminalSession? Session
     {
@@ -186,6 +220,9 @@ public sealed partial class TerminalView : Control
             {
                 session.Output -= OnOutput;
             }
+            // A composition begun for one program is never finished into another's.
+            inputMethod?.Discard();
+            ForgetComposed();
             session = value;
             reportedPress = false;
             if (session is not null)
@@ -195,6 +232,8 @@ public sealed partial class TerminalView : Control
             }
             heldTop = null;
             RestartBlink();
+            FollowInputMethod();
+            FollowAccessibleText();
         }
     }
 
@@ -252,6 +291,7 @@ public sealed partial class TerminalView : Control
         anchor = (fromLine, fromColumn);
         active = (toLine, toColumn);
         InvalidateVisual();
+        FollowAccessibleText();
     }
 
     public void ClearSelection()
@@ -259,6 +299,7 @@ public sealed partial class TerminalView : Control
         anchor = null;
         active = null;
         InvalidateVisual();
+        FollowAccessibleText();
     }
 
     /// <summary>Scrolls the view through the scrollback: up a positive number of lines, down a negative one.</summary>
@@ -272,6 +313,7 @@ public sealed partial class TerminalView : Control
         long to = Math.Clamp(TopLine - lines, screen.FirstLine, screen.ScreenTop);
         heldTop = to < screen.ScreenTop ? to : null;
         RestartBlink();
+        FollowInputMethod();
     }
 
     protected override void OnPropertyChanged(AvaloniaPropertyChangedEventArgs change)
@@ -283,9 +325,14 @@ public sealed partial class TerminalView : Control
             FitSize();
             InvalidateVisual();
         }
-        else if (change.Property == CursorBlinkingProperty || change.Property == CursorStyleProperty || change.Property == IsVisibleProperty)
+        else if (change.Property == CursorBlinkingProperty || change.Property == CursorStyleProperty || change.Property == IsVisibleProperty
+            || change.Property == CursorBlinkProperty)
         {
             RestartBlink();
+        }
+        else if (change.Property == CursorWidthProperty)
+        {
+            InvalidateVisual();
         }
     }
 
@@ -304,10 +351,14 @@ public sealed partial class TerminalView : Control
     protected override void OnLostFocus(FocusChangedEventArgs e)
     {
         base.OnLostFocus(e);
+        inputMethod?.Discard();
+        ForgetComposed();
         RestartBlink();
     }
 
-    private bool ShouldBlink => attached && IsEffectivelyVisible && IsFocused
+    /// <summary>Whether the cursor blinks now: a program's ask or the setting's, and never where the system's blink in force
+    /// keeps carets shown.</summary>
+    private bool ShouldBlink => attached && IsEffectivelyVisible && IsFocused && CursorBlink.Blinks
         && session is { IsRunning: true, Screen.CursorVisible: true }
         && TopLine == session.Screen.ScreenTop && (session.Screen.RequestedCursorBlinking ?? CursorBlinking);
 
@@ -317,6 +368,7 @@ public sealed partial class TerminalView : Control
         blink.Stop();
         if (ShouldBlink)
         {
+            blink.Interval = CursorBlink.Shown;
             blink.Start();
         }
         InvalidateVisual();
@@ -366,6 +418,8 @@ public sealed partial class TerminalView : Control
         }
         session.Resize(columns, rows);
         InvalidateVisual();
+        FollowInputMethod();
+        FollowAccessibleText();
     }
 
     /// <summary>New output shows at the bottom, but for a person reading back through the scrollback, whose top line
@@ -382,11 +436,15 @@ public sealed partial class TerminalView : Control
             HoverLink(held);
         }
         RestartBlink();
+        FollowInputMethod();
+        FollowAccessibleText();
     }
 
-    /// <summary>Whether a cell is drawn in a run with its neighbours: one code point a column wide that the terminal's
-    /// font has. A wide character, a letter with its marks or one another font draws is drawn alone, fitted to its cells.</summary>
-    private bool InRun(Cell cell) => cell.Width == 1 && !cell.IsJoined && (cell.Rune < 0x7f || glyphs?.ContainsGlyph(cell.Rune) == true);
+    /// <summary>Whether a line's cell is drawn in a run with its neighbours: one code point a column wide that the
+    /// terminal's font has, linked or not. A wide character, a letter with its marks or one another font draws is drawn
+    /// alone, fitted to its cells.</summary>
+    private bool InRun(TerminalLine line, int column) => line.Cells[column] is { Width: 1 } cell && line.IsOneCodePoint(column)
+        && (cell.Rune < 0x7f || glyphs?.ContainsGlyph(cell.Rune) == true);
 
     /// <summary>The link holding the cell under a point, if any.</summary>
     private TerminalLink? LinkAt(Point at)
@@ -433,8 +491,8 @@ public sealed partial class TerminalView : Control
         InvalidateVisual();
     }
 
-    /// <summary>A cell's colour: the theme's for the sixteen named ones, xterm's 6x6x6 cube and grey ramp for the rest
-    /// of the 256, or the 24-bit colour given.</summary>
+    /// <summary>A cell's colour, as <see cref="TerminalColours"/> names it: the theme's for the sixteen named ones, else
+    /// the colour itself.</summary>
     private IBrush Colour(int colour, IBrush fallback)
     {
         if (colour == CellStyle.Default)
@@ -445,26 +503,8 @@ public sealed partial class TerminalView : Control
         {
             return known;
         }
-        IBrush brush;
-        if ((colour & CellStyle.Rgb) != 0)
-        {
-            brush = new SolidColorBrush(Color.FromRgb((byte)(colour >> 16), (byte)(colour >> 8), (byte)colour));
-        }
-        else if (colour < 16)
-        {
-            brush = Find($"Passenger.Terminal.Ansi{colour}") ?? fallback;
-        }
-        else if (colour < 232)
-        {
-            int index = colour - 16;
-            static byte Level(int step) => (byte)(step == 0 ? 0 : 55 + (step * 40));
-            brush = new SolidColorBrush(Color.FromRgb(Level(index / 36), Level(index / 6 % 6), Level(index % 6)));
-        }
-        else
-        {
-            byte grey = (byte)(8 + ((colour - 232) * 10));
-            brush = new SolidColorBrush(Color.FromRgb(grey, grey, grey));
-        }
+        IBrush brush = TerminalColours.Token(colour) is { } token ? Find(token) ?? fallback
+            : new SolidColorBrush(Color.FromUInt32(0xFF000000 | (uint)TerminalColours.Rgb(colour)!.Value));
         palette[colour] = brush;
         return brush;
     }
@@ -538,6 +578,7 @@ public sealed partial class TerminalView : Control
         selecting = true;
         e.Pointer.Capture(this);
         InvalidateVisual();
+        FollowAccessibleText();
         e.Handled = true;
     }
 
@@ -549,6 +590,7 @@ public sealed partial class TerminalView : Control
         {
             active = CellAt(e.GetPosition(this));
             InvalidateVisual();
+            FollowAccessibleText();
         }
         else if (session is not null)
         {
@@ -692,16 +734,20 @@ public sealed partial class TerminalView : Control
         {
             return;
         }
+        inputMethod?.Committed();
+        ForgetComposed();
         Typed();
         session.Write(e.Text);
         e.Handled = true;
+        FollowInputMethod();
     }
 
     protected override void OnKeyDown(KeyEventArgs e)
     {
         base.OnKeyDown(e);
-        if (session is null)
+        if (session is null || e.Key == Key.ImeProcessed)
         {
+            // A key the input method takes is its own: a composition's letter, a candidate's number, the Enter committing it.
             return;
         }
         if (e.Key is Key.LWin or Key.RWin or Key.LeftCtrl or Key.RightCtrl)
@@ -747,7 +793,8 @@ public sealed partial class TerminalView : Control
             // Its character comes as text input, which handling the key here would keep from coming.
             return;
         }
-        if (Encode(e.Key, mods, session.Screen.ApplicationCursorKeys) is { } sequence)
+        if (TerminalKeys.Of(e.Key, mods, e.PhysicalKey, e.KeySymbol, session.Screen.ApplicationCursorKeys, session.Screen.KeyboardFlags, altSendsEscape: !mac,
+            beginNamed: OperatingSystem.IsWindows()) is { } sequence)
         {
             Typed();
             session.Write(sequence);
@@ -770,78 +817,6 @@ public sealed partial class TerminalView : Control
     private static bool IsAltGrTyping(KeyEventArgs e) => OperatingSystem.IsWindows()
         && (e.KeyModifiers & ~KeyModifiers.Shift) == (KeyModifiers.Control | KeyModifiers.Alt)
         && e.KeySymbol is { Length: > 0 } symbol && !char.IsControl(symbol[0]) && !char.IsWhiteSpace(symbol[0]);
-
-    /// <summary>xterm's bytes for a key that is not plain text: Enter, the arrows and the keypad's keys, the
-    /// function keys, and Ctrl (or Alt, as a leading ESC) with a letter. Null for keys whose text input carries them.</summary>
-    private static string? Encode(Key key, KeyModifiers mods, bool applicationCursor)
-    {
-        bool ctrl = mods.HasFlag(KeyModifiers.Control);
-        bool alt = mods.HasFlag(KeyModifiers.Alt) && !OperatingSystem.IsMacOS();
-        string? plain = key switch
-        {
-            Key.Enter => "\r",
-            Key.Back => ctrl ? "\x08" : "\x7f",
-            Key.Tab => mods.HasFlag(KeyModifiers.Shift) ? "\x1b[Z" : "\t",
-            Key.Escape => "\x1b",
-            Key.Up => Cursor('A'),
-            Key.Down => Cursor('B'),
-            Key.Right => Cursor('C'),
-            Key.Left => Cursor('D'),
-            Key.Home => Cursor('H'),
-            Key.End => Cursor('F'),
-            Key.Insert => Tilde(2),
-            Key.Delete => Tilde(3),
-            Key.PageUp => Tilde(5),
-            Key.PageDown => Tilde(6),
-            Key.F1 => Function('P'),
-            Key.F2 => Function('Q'),
-            Key.F3 => Function('R'),
-            Key.F4 => Function('S'),
-            Key.F5 => Tilde(15),
-            Key.F6 => Tilde(17),
-            Key.F7 => Tilde(18),
-            Key.F8 => Tilde(19),
-            Key.F9 => Tilde(20),
-            Key.F10 => Tilde(21),
-            Key.F11 => Tilde(23),
-            Key.F12 => Tilde(24),
-            _ => null,
-        };
-        if (plain is not null)
-        {
-            return alt && key is Key.Enter or Key.Back ? "\x1b" + plain : plain;
-        }
-        if (ctrl && Control(key) is { } control)
-        {
-            return alt ? "\x1b" + control : control;
-        }
-        if (alt && key is >= Key.A and <= Key.Z)
-        {
-            char letter = (char)('a' + (key - Key.A));
-            return "\x1b" + (mods.HasFlag(KeyModifiers.Shift) ? char.ToUpperInvariant(letter) : letter);
-        }
-        return null;
-
-        int Modifier() => 1 + (mods.HasFlag(KeyModifiers.Shift) ? 1 : 0) + (mods.HasFlag(KeyModifiers.Alt) ? 2 : 0) + (ctrl ? 4 : 0);
-        string Cursor(char final) => Modifier() > 1 ? $"\x1b[1;{Modifier()}{final}" : applicationCursor ? $"\x1bO{final}" : $"\x1b[{final}";
-        string Tilde(int code) => Modifier() > 1 ? $"\x1b[{code};{Modifier()}~" : $"\x1b[{code}~";
-        string Function(char final) => Modifier() > 1 ? $"\x1b[1;{Modifier()}{final}" : $"\x1bO{final}";
-    }
-
-    /// <summary>The control character Ctrl makes of a key: Ctrl+A is 1 through Ctrl+Z 26, and the few punctuation keys
-    /// terminals give the rest of C0 to.</summary>
-    private static string? Control(Key key) => key switch
-    {
-        >= Key.A and <= Key.Z => ((char)(key - Key.A + 1)).ToString(),
-        Key.Space or Key.D2 => "\0",
-        Key.OemOpenBrackets or Key.D3 => "\x1b",
-        Key.OemPipe or Key.D4 => "\x1c",
-        Key.OemCloseBrackets or Key.D5 => "\x1d",
-        Key.D6 => "\x1e",
-        Key.OemMinus or Key.D7 or Key.OemQuestion => "\x1f",
-        Key.D8 => "\x7f",
-        _ => null,
-    };
 
     /// <summary>Copies the selection to the clipboard.</summary>
     public async Task CopyAsync()

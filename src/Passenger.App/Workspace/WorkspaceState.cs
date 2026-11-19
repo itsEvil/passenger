@@ -6,9 +6,10 @@ using Passenger.Editor;
 namespace Passenger.App.Workspace;
 
 /// <summary>What a folder's window had open, kept in the folder's place in the store: the editors' splits, tabs (pinned
-/// or not) and carets, the editor windows, the recent files, the projects unloaded, the target frameworks chosen and the
-/// files' folds and whether Godot's script editor was offered, so opening the folder again brings them back. Only the window a
-/// person uses keeps it, as with the layout.</summary>
+/// or not) and carets, the editor windows, the recent files, the projects unloaded, the target frameworks chosen, the
+/// Migrations window's environments, the files' folds, the Explorer's view, where Attach to Process's programs run and
+/// whether Godot's script editor was offered, so opening the folder again brings them back. Only the window a person uses
+/// keeps it, as with the layout.</summary>
 public sealed record WorkspaceState : IStateDocument<WorkspaceState>
 {
     public EditorLayout? Editors { get; init; }
@@ -25,6 +26,17 @@ public sealed record WorkspaceState : IStateDocument<WorkspaceState>
     /// <summary>The target framework chosen for each multi-targeted project, by its path (<see cref="TargetFrameworkChoices"/>).</summary>
     public Dictionary<string, string> TargetFrameworks { get; init; } = [];
 
+    /// <summary>The environment the Migrations window runs dotnet ef in for each startup project chosen in it, by its path
+    /// (<see cref="Migrations.EfEnvironmentChoices"/>).</summary>
+    public Dictionary<string, string> MigrationEnvironments { get; init; } = [];
+
+    /// <summary>Where each project of devices, emulators or simulators runs, by its path (<see cref="Run.Devices.DeviceChoices"/>).</summary>
+    public Dictionary<string, Run.Devices.KeptTarget> RunTargets { get; init; } = [];
+
+    /// <summary>The build configuration and platform chosen, with what the solution mapped each project to under them
+    /// (<see cref="BuildConfigurationChoices"/>); null for the one MSBuild takes given none.</summary>
+    public KeptBuildChoice? Build { get; init; }
+
     /// <summary>The folds of the files opened lately, each as it closed, the latest first.</summary>
     public List<KeptFolds> Folds { get; init; } = [];
 
@@ -35,6 +47,13 @@ public sealed record WorkspaceState : IStateDocument<WorkspaceState>
     /// since offers to write again, once.</summary>
     public string? GodotTemplatesStyle { get; init; }
 
+    /// <summary>The Explorer's view the person last switched to, which it opens in: the Solution view unless they chose the
+    /// Files view.</summary>
+    public Explorer.ExplorerViewKind ExplorerView { get; init; }
+
+    /// <summary>Where the programs Attach to Process lists run, as the person last chose; null for anywhere.</summary>
+    public Debugging.AttachScope? AttachScope { get; init; }
+
     public static IReadOnlyList<Action<JsonObject>> Upgrades { get; } = [StateStore.Unversioned];
 
     /// <summary>A tab or a path without its file is left out, and a window without editors; the editors bring the rest (a
@@ -42,6 +61,8 @@ public sealed record WorkspaceState : IStateDocument<WorkspaceState>
     /// open them. A file's folds are left out without its path, and a fold that is not a start and an end in order.</summary>
     public WorkspaceState Clamped() => this with
     {
+        ExplorerView = Enum.IsDefined(ExplorerView) ? ExplorerView : Explorer.ExplorerViewKind.Solution,
+        AttachScope = AttachScope is { } scope && Enum.IsDefined(scope.Where) && (scope.Where == Debugging.AttachWhere.Container) == scope.Container is { Length: > 0 } ? scope : null,
         Folds = [.. (Folds ?? []).Where(f => f is { Path.Length: > 0 }).Take(FoldMemory.Kept).Select(f => f with
         {
             Folded = [.. (f.Folded ?? []).Where(r => r is [>= 0 and var start, var end] && end > start)],
@@ -55,6 +76,14 @@ public sealed record WorkspaceState : IStateDocument<WorkspaceState>
         RecentFiles = [.. (RecentFiles ?? []).Where(f => !string.IsNullOrEmpty(f))],
         UnloadedProjects = [.. (UnloadedProjects ?? []).Where(p => !string.IsNullOrEmpty(p))],
         TargetFrameworks = (TargetFrameworks ?? []).Where(p => p.Key is { Length: > 0 } && p.Value is { Length: > 0 })
+            .ToDictionary(p => p.Key, p => p.Value, StringComparer.Ordinal),
+        MigrationEnvironments = (MigrationEnvironments ?? []).Where(p => p.Key is { Length: > 0 } && p.Value is { } environment && Migrations.EfEnvironmentChoices.WhyNot(environment) is null)
+            .ToDictionary(p => p.Key, p => p.Value, StringComparer.Ordinal),
+        Build = Build is { Configuration.Length: > 0, Platform.Length: > 0 } build
+            ? build with { Mapped = [.. (build.Mapped ?? []).Where(m => m is { Project.Length: > 0, Configuration.Length: > 0, Platform.Length: > 0 })] }
+            : null,
+        RunTargets = (RunTargets ?? []).Where(p => p.Key is { Length: > 0 } && p.Value is { Key.Length: > 0, Name.Length: > 0 } t
+                && Enum.IsDefined(t.Platform) && Enum.IsDefined(t.Kind))
             .ToDictionary(p => p.Key, p => p.Value, StringComparer.Ordinal),
     };
 

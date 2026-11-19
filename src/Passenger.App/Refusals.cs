@@ -1,4 +1,6 @@
 using System.Globalization;
+using Passenger.App.Mobile;
+using Passenger.App.Settings;
 using Passenger.Core;
 using Passenger.Text;
 using Passenger.Workspace;
@@ -9,11 +11,60 @@ namespace Passenger.App;
 /// action, a tool or a status line says it: the status bar, a greyed menu item's tip and an agent's ide_action alike.</summary>
 public static class Refusals
 {
+    /// <summary>No tool window is open, for an action on the one open last.</summary>
+    public const string NoToolWindowOpen = "No tool window is open";
+
+    /// <summary>Closed tool windows keep their stripe icons or tabs, so Close is Hide.</summary>
+    public static readonly string ClosedKeepIcons =
+        $"Closed tool windows keep their icons or tabs: Hide closes them ({SettingsDialog.PlaceOfPage(SettingsDialog.Appearance)} | Closed tool windows)";
+
     /// <summary>No file is shown in the editor.</summary>
     public const string NoFile = "No file is open";
 
+    /// <summary>No tab is open and no tool window serves the folder, for the Switcher.</summary>
+    public const string NothingToSwitchTo = "No tab or tool window is open to switch to";
+
     /// <summary>The file shown is no Godot scene, nor a script a scene runs, of a Godot project the folder builds a game of.</summary>
     public const string NoGodotScene = "No scene of a Godot game is open: open a .tscn, or a script one of its nodes runs";
+
+    /// <summary>The folder open is not trusted, so Passenger runs none of its code (<see cref="WorkspaceTrust"/>): no build,
+    /// run, debug, test, profile, restore, Hot Reload, C# language server or previewer of its.</summary>
+    public const string Untrusted = WorkspaceTrust.Untrusted;
+
+    /// <summary>The folder open is not trusted, so an agent's package search asks none of the feeds its nuget.config names,
+    /// which may be any server.</summary>
+    public const string UntrustedFeeds = $"The folder is not trusted: an agent's {Mcp.McpTools.NugetSearch} asks none of the feeds its nuget.config names until the person trusts it";
+
+    /// <summary>What trusting a folder lets Passenger run, as the trust question and the banner say it.</summary>
+    public const string TrustLets = "Trusted, Passenger runs its code as it works: design-time builds and restore as it opens, the analyzers and "
+        + "source generators its projects name, builds, runs, tests and debugging, its own TypeScript, ESLint and Prettier, and the programs its "
+        + "Git configuration names.";
+
+    /// <summary>What the banner over an untrusted folder says.</summary>
+    public const string UntrustedSaid = "This folder is not trusted: none of its code runs until you trust it";
+
+    /// <summary>What the banner over an untrusted folder below the top of a Git repository says: its Trust Folder trusts the
+    /// repository (<see cref="WorkspaceTrust.FolderToTrust"/>).</summary>
+    public static string UntrustedInRepository(string repository) =>
+        $"This folder is not trusted: none of its code runs until you trust the Git repository it is in, {Path.GetFileName(repository)}";
+
+    /// <summary>What the banner over a folder no longer trusted says while what the person started there runs on.</summary>
+    public static string UntrustedRunsOn(IReadOnlyList<string> running) =>
+        $"This folder is no longer trusted: {Plural.Listed(running)} {Plural.Agreeing(running.Count, "runs", "run")} on until {Plural.Agreeing(running.Count, "it ends", "they end")} or this window closes";
+
+    /// <summary>A project template that restores what it makes, with no option to skip that, refused in a folder not trusted.</summary>
+    public static string RestoresUntrusted(string template) =>
+        $"{template} restores the project it makes and cannot be told not to, which would run this folder's MSBuild files: trust the folder first";
+
+    /// <summary>An agent asked to trust a folder, which only the person does: through an action, or by its input into
+    /// Passenger's windows.</summary>
+    public const string TrustIsThePersons = "Only the person trusts a folder, with Trust Folder over the editors";
+
+    /// <summary>An agent's input reaching the question whether to trust a folder, which only the person answers.</summary>
+    public const string TrustAnsweredByThePerson = "Only the person answers whether to trust a folder: no agent's input reaches the question";
+
+    /// <summary>The folder open is trusted already.</summary>
+    public const string TrustedAlready = "The folder is trusted already";
 
     /// <summary>The window has no folder open (a solution, a project or a folder of files).</summary>
     public const string NoFolder = "No folder is open";
@@ -21,11 +72,44 @@ public static class Refusals
     /// <summary>The folder open has no solution (a project opened alone, or a folder of files).</summary>
     public const string NoSolution = "No solution is open";
 
+    /// <summary>No solution is open, and a launch profile of several projects lives in a file beside one.</summary>
+    public const string NoSolutionForProfiles = $"{NoSolution}: a launch profile of several projects is kept beside one, where Visual Studio reads it too";
+
+    /// <summary>The folder open has neither a solution nor a project, so the Explorer has only its files to show.</summary>
+    public const string NoSolutionView = "The open folder has no solution or project: the Explorer shows its files alone";
+
     /// <summary>The folder open is in no Git working tree.</summary>
     public const string NoRepository = "The folder is not in a Git repository";
 
     /// <summary>The folder open is in a Git working tree already, which Create Git Repository would make.</summary>
     public const string InRepository = "The folder is in a Git repository already";
+
+    /// <summary>Git has files in conflict, which no commit takes as they are.</summary>
+    public const string CommitWithConflicts = "Resolve conflicts in order to commit";
+
+    /// <summary>The Commit window has no file chosen, and no merge to finish or commit to amend.</summary>
+    public const string NoFilesChosenToCommit = "No files are chosen to commit";
+
+    /// <summary>The Commit window's message is empty or blank.</summary>
+    public const string EmptyCommitMessage = "The commit message is empty";
+
+    /// <summary>The Git log's branches panel has HEAD, a group or no row chosen, where a branch or tag is acted on.</summary>
+    public const string NoRefChosen = "No branch or tag is chosen";
+
+    /// <summary>The branches panel has no branch chosen, which alone is marked as a favourite.</summary>
+    public const string NoBranchChosen = "No branch is chosen";
+
+    /// <summary>The branches panel has no local branch chosen, which alone Update brings up to date.</summary>
+    public const string NoLocalBranchChosen = "No local branch is chosen";
+
+    /// <summary>A local branch to update that tracks no remote's branch to bring it up to.</summary>
+    public static string Untracked(string branch) => $"{branch} tracks no remote's branch to update from";
+
+    /// <summary>A remote's branch, which a fetch brings up to date where Update brings a local branch.</summary>
+    public static string FetchedNotUpdated(string branch) => $"{branch} is a remote's branch, which Git › Fetch brings up to date";
+
+    /// <summary>The branch checked out, which git deletes only once another is.</summary>
+    public static string CheckedOut(string branch) => $"{branch} is checked out";
 
     /// <summary>The folder has no C# language server: it has neither a solution nor a project, or its window starts none.</summary>
     public const string NoCSharp = "No C# language server runs for this folder";
@@ -80,8 +164,14 @@ public static class Refusals
     /// <summary>A C# file come under a project that the language server has not loaded into it (<see
     /// cref="CSharp.CSharpService.UnplacedAsync"/>), whose answers about the solution would leave it out.</summary>
     public static string NotTakenIn(string file, string project) =>
-        $"{file} is not loaded into {project} yet: the C# language server has not taken it in after {CSharp.Patience.Limit.TotalSeconds:0} s, "
+        $"{file} is not loaded into {project} yet: the C# language server has not taken it in after {Durations.Said(CSharp.Patience.Limit)}, "
         + "and would answer without it; try again once it has";
+
+    /// <summary>A project the C# language server was asked to load again (its file or an import changed) that it has not
+    /// loaded since (<see cref="CSharp.CSharpService.UnplacedAsync"/>), whose answers would be of the project as it was.</summary>
+    public static string NotLoadedAgain(string project) =>
+        $"{project} is not loaded again yet: the C# language server has not loaded it as changed after {Durations.Said(CSharp.Patience.Limit)}, "
+        + "and would answer from it as it was; try again once it has";
 
     /// <summary>What an answer given before the C# language server took C# files come under its projects into them went
     /// without (<see cref="CSharp.CSharpService.UntakenAsync"/>), the files named as shown.</summary>
@@ -97,12 +187,73 @@ public static class Refusals
         { Asked: { } asked } => $"The .NET SDK {asked} that {(missing.GlobalJson is { } file ? PathNames.Shown(PathNames.Canonical(file), folder) : "global.json")} "
             + "asks for is not installed: install it, or have global.json name one that is",
         { NoHost: true } => NoDotnet,
-        { NoneInstalled: true } => $"Only the .NET runtime is installed: {NeedsTheSdk}",
+        { ForOtherProcessor: true } => OnlyNativeSdk,
+        { NoneInstalled: true } => $"{RuntimeAlone(null)}: {NeedsTheSdk}",
         _ => $"No .NET SDK was found for this folder: {ChildResult.FirstLineOf(missing.Said)}",
     };
 
+    /// <summary>A C# code tool asked while the folder's projects have no .NET SDK to load with, as <paramref name="lacking"/>
+    /// says it: the language server holds none of their code to answer from.</summary>
+    public static string ProjectsUnloadable(string lacking) =>
+        $"The folder's projects are not loaded, so the C# language server has none of their code to search or read: {lacking}";
+
+    /// <summary>A C# code tool asked about a file of a project the language server met an error loading and holds no code
+    /// of, with what it met.</summary>
+    public static string ProjectNotLoaded(string project, string error) =>
+        $"{project} did not load into the C# language server, which holds none of its code to answer from: {error.TrimEnd('.')}. Mend that and it loads again; "
+        + "diagnostics with no path lists what each project met loading";
+
+    /// <summary>A C# code tool's answer, empty, while projects the language server met an error loading may hold what it
+    /// looked for.</summary>
+    public static string NoneWhileUnloaded(string none, IReadOnlyList<(string Project, string Error)> failed) =>
+        $"{none}, but the C# language server met errors loading {Plural.Listed([.. failed.Select(f => f.Project)])}, whose code it may not hold: "
+        + $"{string.Join("; ", failed.Select(f => $"{f.Project}: {f.Error}"))}";
+
+    /// <summary>A C# code tool asked while the language server is still loading the folder's projects after the wait.</summary>
+    public static string StillLoading(TimeSpan waited, string state) =>
+        $"The C# language server is still loading the folder's projects after {Durations.Said(waited)} ({(state.Length > 0 ? state : "starting")}), "
+        + "so it has nothing of them to answer from yet: ask again once workspace says languageServer is ready";
+
+    /// <summary>A C# code tool asked while what a restore brought, or a load again, is still to reach the language server
+    /// after the wait: <paramref name="coming"/> says what, as the agent was told it waited for.</summary>
+    public static string StillComing(TimeSpan waited, string coming) =>
+        $"Passenger waited {Durations.Said(waited)} for {coming}, which has not come, so the answer would be of the code before it: ask again in a moment";
+
+    /// <summary>An x64 Passenger the system translates found only a .NET SDK of the system's own processor, whose MSBuild it
+    /// cannot load (<see cref="MissingSdk.ForOtherProcessor"/>).</summary>
+    public static string OnlyNativeSdk => $"This {TranslatedBuild}, loads projects only with {X64Sdk}, and {ThisComputer}'s is {SystemsProcessor}'s: "
+        + $"{SystemsOwnPassenger}, or install the x64 .NET SDK beside it";
+
+    /// <summary>An x64 Passenger the system translates with no .NET SDK at all: no .NET, or a runtime alone, in
+    /// <paramref name="runtime"/>.</summary>
+    public static string TranslatedWithoutSdk(string? runtime) =>
+        $"{(runtime is null ? NoneOfDotnet : RuntimeAlone(runtime))}, and this {TranslatedBuild}, loads projects "
+        + $"only with {X64Sdk}: {SystemsOwnPassenger} and installs the .NET SDK for it, or install the x64 .NET SDK yourself";
+
+    /// <summary>Install .NET SDK in an x64 Passenger the system translates: the SDK it installs, the system's own processor's,
+    /// is one this Passenger cannot load.</summary>
+    public static string InstallsOnlyNative => $"Install .NET SDK installs only {ThisComputer}'s own .NET SDK, {SystemsProcessor}'s, which this {TranslatedBuild}, cannot load: "
+        + $"{SystemsOwnPassenger}, or install the x64 .NET SDK yourself";
+
+    /// <summary>An x64 build of Passenger, as the system translating it runs it.</summary>
+    private static string TranslatedBuild => OperatingSystem.IsMacOS() ? "Intel build of Passenger, run by Rosetta" : "x64 build of Passenger, run by emulation";
+
+    private static string X64Sdk => OperatingSystem.IsMacOS() ? "an Intel (x64) .NET SDK" : "an x64 .NET SDK";
+
+    private static string ThisComputer => OperatingSystem.IsMacOS() ? "this Mac" : "this computer";
+
+    private static string SystemsProcessor => OperatingSystem.IsMacOS() ? "Apple Silicon" : "Arm64";
+
+    /// <summary>The way on for an x64 Passenger the system translates: the build for the system's own processor.</summary>
+    private static string SystemsOwnPassenger => $"download Passenger for {SystemsProcessor}, which suits {ThisComputer}";
+
     /// <summary>No dotnet at all, runtime or SDK, was found.</summary>
-    public const string NoDotnet = $"No .NET is installed: files open and edit, and Git and the terminal work, but {NeedsTheSdk}";
+    public const string NoDotnet = $"{NoneOfDotnet}: files open and edit, and Git and the terminal work, but {NeedsTheSdk}";
+
+    private const string NoneOfDotnet = "No .NET is installed";
+
+    /// <summary>A dotnet with runtimes alone, in <paramref name="root"/> where it is known.</summary>
+    private static string RuntimeAlone(string? root) => $"Only the .NET runtime is installed{(root is { } at ? $", in {PathNames.Shown(at, null)}" : string.Empty)}";
 
     private const string NeedsTheSdk = "projects need the .NET SDK to load, build, run and test";
 
@@ -111,7 +262,8 @@ public static class Refusals
     public static string? Dotnet(DotnetWant want, string? folder) => want.Lack switch
     {
         DotnetLack.NoDotnet => NoDotnet,
-        DotnetLack.RuntimeOnly => $"Only the .NET runtime is installed{(want.Root is { } root ? $", in {PathNames.Shown(root, null)}" : string.Empty)}: {NeedsTheSdk}",
+        DotnetLack.RuntimeOnly => $"{RuntimeAlone(want.Root)}: {NeedsTheSdk}",
+        DotnetLack.OtherProcessor => want.SystemsOwn is null ? TranslatedWithoutSdk(want.Root) : OnlyNativeSdk,
         DotnetLack.GlobalJsonSdk or DotnetLack.NoSdk => NoSdk(want.Missing!, folder),
         DotnetLack.OlderThanProject when want.ChosenBy is { } asked => $"{want.Newer!.Value.Project} targets .NET {want.Newer.Value.Framework}, which the .NET SDK {want.Sdk} "
             + $"does not build: {PathNames.Shown(asked.Path, folder)} chose it, asking for {asked.Version}{(asked.RollForward is { } roll ? $" with rollForward {roll}" : string.Empty)}; "
@@ -129,6 +281,11 @@ public static class Refusals
     public const string AgentInstalls = "An agent's own Passenger, which nobody is at, never installs software: ask the person, who does it with the banner over "
         + "Passenger's window, or Tools, Install .NET SDK…";
 
+    /// <summary>An agent's input into Passenger's window asking to install the .NET SDK, or answering the person's question
+    /// whether to: only the person installs it there, an agent asking them through ide_action.</summary>
+    public const string InstallIsThePersons = "Only the person installs the .NET SDK by Passenger's window, never an agent's input: "
+        + "an agent's ide_action of Install .NET SDK… asks the person at their window";
+
     /// <summary>An agent's Add .NET to the Shell's PATH: the person's shell is theirs to change.</summary>
     public const string AgentChangesPath = "An agent never changes the person's shell PATH: ask the person, who does it with the banner over Passenger's window, "
         + "or Tools, Add .NET to the Shell's PATH…";
@@ -138,9 +295,11 @@ public static class Refusals
     public static string LooseWithoutSdk(string file) =>
         $"{file} is a C# file of no project, which knows no framework types until a .NET SDK is installed: Roslyn reads a loose file's framework only from a project the SDK's MSBuild builds";
 
-    /// <summary>Install .NET SDK with nothing lacking: the newest SDK found, and where.</summary>
+    /// <summary>Install .NET SDK with nothing it installs mending the want: the newest SDK found, and where; or, for a
+    /// Passenger the system translates, which loads none of the system's own SDKs, that it installs none it loads.</summary>
     public static string NothingToInstall(DotnetMachine? machine, DotnetWant want) =>
-        machine?.NewestSdk is { } sdk && machine.Found is { } found
+        want.Lack == DotnetLack.OtherProcessor || want is { Translated: true, Install: not null } ? InstallsOnlyNative
+        : machine?.NewestSdk is { } sdk && machine.Found is { } found
             ? $"The .NET SDK {want.Sdk ?? sdk} is installed, in {PathNames.Shown(found.Root, null)}: nothing is missing"
             : "Passenger is still looking for .NET";
 
@@ -156,8 +315,26 @@ public static class Refusals
     /// closed.</summary>
     public static string NoFolderTo(string verb) => $"Nothing to {verb}: no folder is open";
 
+    /// <summary>Why no build configuration can be chosen: the folder's solution or projects have not been read yet.</summary>
+    public const string NoBuildConfigurations = "The folder's build configurations are not read yet: its solution or projects are still being read";
+
     /// <summary>An action on a Godot project asked for in a folder that holds none.</summary>
     public const string NoGodotProject = "The open folder holds no Godot project (project.godot)";
+
+    /// <summary>The Aspire window, in a folder holding no AppHost: no project Aspire's SDK makes one, no single-file AppHost.</summary>
+    public const string NoAppHost = "The open folder holds no Aspire AppHost";
+
+    /// <summary>The Requests window, in a folder holding no project a web SDK builds.</summary>
+    public const string NoWebApp = "The open folder holds no ASP.NET Core app";
+
+    /// <summary>The Endpoints window, in a folder holding no web app's routes and no .http or .rest file's requests.</summary>
+    public const string NoWebRequests = "The open folder holds no ASP.NET Core app and no .http file";
+
+    /// <summary>The Step Library, in a folder holding no project that takes Reqnroll's or SpecFlow's packages.</summary>
+    public const string NoStepDefinitions = "The open folder holds no Reqnroll or SpecFlow project";
+
+    /// <summary>Live Visual Tree, in a folder holding no app Passenger's inspector looks into, with none inspected now.</summary>
+    public const string NoInspectedApp = "The open folder holds no Avalonia, WPF, .NET MAUI or Godot app, and no app is inspected";
 
     /// <summary>Set Next Statement asked of a program whose debugger cannot move where a paused thread goes on (a Godot game's
     /// GDScript).</summary>
@@ -167,6 +344,18 @@ public static class Refusals
     /// words (MSB1003); short enough to read whole in the smallest window's status bar.</summary>
     public const string NothingToBuild = "The open folder has no solution or project to build";
 
+    /// <summary>A program whose output said it needs a terminal for a call (<see cref="Run.TerminalNeeds"/>) where the Run
+    /// or Debug window's console gave it pipes.</summary>
+    public static string NeedsTerminal(string program, string call, string window) =>
+        $"{program} needs a terminal for {call}: the {window} window gives it pipes";
+
+    /// <summary>Run or Debug in the Terminal asked for while no program the window's console holds said it needs one.</summary>
+    public static string NoTerminalNeed(string window) => $"No program in the {window} window said it needs a terminal";
+
+    /// <summary>Debug or Profile asked of a configuration running a Node package's script, which Run alone starts.</summary>
+    public static string ScriptOnlyRuns(string name) =>
+        $"{name} runs a package.json script with its package manager, which Run starts: Passenger debugs and profiles .NET programs";
+
     /// <summary>A build asked of a folder whose one kind of project is a Godot project of GDScript alone, which builds nothing.</summary>
     public const string NothingToBuildOfScripts = "The open folder's Godot project is GDScript alone, which Godot runs as it is: there is nothing to build (Run, Debug and Profile start its game)";
 
@@ -174,6 +363,16 @@ public static class Refusals
     /// start Godot and run none until stopped: said before it starts.</summary>
     public static string GoDotTestNeverRuns(string game) =>
         $"{game} never runs its GoDotTest tests: no scene of it calls GoTest.RunTests, neither its main scene nor a test scene (GoDotTest's README makes one in {Testing.GoDotTests.TestFolder}), so Godot is not started for them";
+
+    /// <summary>A built test assembly whose tests its runner could not look through, with what the runner said: a clause, after
+    /// what found no test or a run's tally.</summary>
+    public static string TestsNotFound(string assembly, string framework, string why) => $"the tests in {assembly} ({framework}) could not be found: {why}";
+
+    /// <summary>Run Tests at the caret took no test of the method or class there once the tests were looked for: why, where
+    /// its project's tests could not be found (<see cref="TestsNotFound"/>), else what is likeliest.</summary>
+    public static string NoTestOf(string name, string? unfound) => unfound is null
+        ? $"No test of {name} was found; is the project a test project?"
+        : $"No test of {name} was found: {unfound}";
 
     /// <summary>A test chosen of one of the classes GoDotTest cannot tell apart (<see cref="Testing.GoDotTests.Alike"/>).</summary>
     public static string GoDotTestAlike(string suite, IReadOnlyList<string> classes) =>
@@ -236,6 +435,28 @@ public static class Refusals
     /// <summary>Go to Declaration found nothing to go to where it was asked.</summary>
     public const string NoDeclaration = "Cannot find a declaration to go to";
 
+    /// <summary>No project of the folder is a Reqnroll or SpecFlow one whose bindings the C# server has read.</summary>
+    public const string NoReqnrollProject = "No Reqnroll or SpecFlow project's step definitions are read: open its .feature files, or wait for C# to load";
+
+    /// <summary>A feature's diagnostics with no step definitions read to match its steps against: the C# language server,
+    /// which reads them, runs and did not answer for them (<paramref name="serverRuns"/>), or runs for no folder.</summary>
+    public static string StepsUnmatched(bool serverRuns) =>
+        StepsUnmatchedFor(serverRuns ? "the C# language server did not answer for them" : CSharpNotRunning);
+
+    /// <summary>A feature's diagnostics where its project's last load failed with an error (<paramref name="loadError"/>), so
+    /// the C# language server, which reads the step definitions, holds none of the project's.</summary>
+    public static string StepsUnmatched(string project, string loadError) =>
+        StepsUnmatchedFor($"the C# language server took in nothing of {project}, whose load failed: {loadError}");
+
+    private static string StepsUnmatchedFor(string why) =>
+        $"No step definitions were read to match its steps against ({why}): no step is marked undefined, nor an argument its definition cannot take";
+
+    /// <summary>A step's phrase asked to be written where the editor shows no .feature file.</summary>
+    public const string NoFeature = "The editor shows no .feature file: open the feature to write the step into";
+
+    /// <summary>The Step Library's action asked with no definition chosen there.</summary>
+    public const string NoStepChosen = "No step definition is chosen in the Step Library";
+
     /// <summary>Go to Declaration of an overload an unloaded project's source no longer declares, gone to by its name.</summary>
     public const string OverloadNotInSource = "This overload is not in the source, which has changed since its assembly was built: went to the declarations of that name";
 
@@ -251,6 +472,17 @@ public static class Refusals
     /// <summary>A row of the Explorer (named as it is shown) that is no project, which an action on a project was asked of.</summary>
     public static string NotAProject(string name) => $"{name} is not a project";
 
+    /// <summary>A row of the Explorer (named as it is shown) that Include in Project was asked of, which is no file a shared
+    /// project's items file leaves out.</summary>
+    public static string NotLeftOut(string name) => $"{name} is no file a shared project leaves out";
+
+    /// <summary>A row of the Explorer (named as it is shown) that Exclude from Project was asked of, which is no file a
+    /// shared project's items file names.</summary>
+    public static string NotSharedFile(string name) => $"{name} is no file of a shared project";
+
+    /// <summary>A shared project (named as it is shown), which an action on a project that builds was asked of.</summary>
+    public static string SharedProject(string name) => $"{name} is a shared project: its files build in the projects importing it";
+
     /// <summary>A program, container, resource, game or run (named as it is shown) that has not started, or has ended.</summary>
     public static string NotRunning(string name) => $"{name} is not running";
 
@@ -260,8 +492,23 @@ public static class Refusals
     /// <summary>Hot Reload asked of a program the debugger no longer runs, or never ran.</summary>
     public const string ProgramNotRunning = "The program is not running";
 
+    /// <summary>Hot Reload asked of a program whose build (its project, or one it references) is of another configuration or
+    /// platform than the one the language server reads the code as, the folder's: its edits would be made for other code.</summary>
+    public static string BuiltUnlike(string program, string project, string runs, string read) =>
+        $"{program} runs {project} built as {runs}, while the editor's code is read as the folder builds it, as {read}: Hot Reload would make its changes "
+        + $"for code {program} does not run, so it applies none. Choose {runs} for the folder, or start {program} as the folder builds, to apply them";
+
     /// <summary>The container engine's CLI answers, but its engine does not, and it gave no words of its own.</summary>
     public const string EngineNotRunning = "The container engine is not running";
+
+    /// <summary>An image built for x86-64 alone (SQL Server's, <see cref="BackingService.X64Only"/>) on an Arm engine without
+    /// Rosetta: one that runs no x86-64 image, or emulates x86-64 otherwise (QEMU), under which SQL Server fails as it starts.
+    /// Docker Desktop and Podman are told how they would use Rosetta.</summary>
+    public static string X64OnlyUnrunnable(string what, Containers.EngineState engine) =>
+        $"{what} can't run on this {(OperatingSystem.IsMacOS() ? "Mac" : "machine")}: its image is built for x86-64 alone, and {engine.EngineName} "
+        + (engine.Amd64 == Containers.Amd64Runs.Never ? "runs no x86-64 image here" : $"emulates x86-64 here without Rosetta, under which {what} fails as it starts")
+        + (engine.DockerDesktop ? ". Choose the Apple Virtualization framework and turn on Use Rosetta for x86_64/amd64 emulation on Apple Silicon in Docker Desktop's settings (General)"
+            : engine.IsPodman ? ". Run it on a Podman machine that uses Rosetta" : string.Empty);
 
     /// <summary>A profile asked for while another run of the window is profiled or starting to be: one records at a time.</summary>
     public const string Profiling = "A run is already being profiled";
@@ -281,6 +528,12 @@ public static class Refusals
     /// <summary>Why a program cannot be profiled, or its heap read (<paramref name="doing"/> it), now: the debugger holds it
     /// paused, and its runtime answers the profiler only as it runs.</summary>
     public static string PausedInDebugger(string program, string doing) => $"{program} is paused in the debugger: continue it to {doing}";
+
+    /// <summary>Why a Blazor app's WebAssembly half is not debugged in the browser a run names (<paramref name="where"/>, a
+    /// place in words that begins a sentence): <paramref name="program"/> is known to be no Chromium browser, the one kind
+    /// .NET's browser debug proxy drives.</summary>
+    public static string NotChromium(string where, string program) =>
+        $"{where} names {program}, which is no Chromium browser, and only a Chromium browser debugs them: name Chrome, Edge, Chromium or Brave there to debug them";
 
     /// <summary>A program's metrics asked for while the debugger holds it paused, read once it runs.</summary>
     public static string MetricsWhilePaused(string program) => $"{program} is paused in the debugger: its metrics come once it runs";
@@ -305,13 +558,57 @@ public static class Refusals
         ? $"{name} is the project's web root: ASP.NET Core serves its static files from it"
         : $"{name} holds the project's launch and publish profiles";
 
+    /// <summary>A row Delete only takes out of the solution or a project, its files staying on disk, chosen with others,
+    /// which Delete moves to the Trash at once: Remove takes it chosen alone, asking its own questions.</summary>
+    public static string RemovedAlone(string name, string from) =>
+        $"Delete moves several files and folders to the Trash at once, but {name} only leaves {from}, its files staying on disk: choose it alone to remove it";
+
+    /// <summary>A file or <paramref name="folder"/> of a NuGet package folder, every project's copy of that version, which no
+    /// restore writes again.</summary>
+    public static string OfPackage(string name, string package, bool folder = false) =>
+        $"{name} is a {(folder ? "folder" : "file")} of the package {package}, as NuGet restored it for every project";
+
     /// <summary>A file shown read-only (decompiled, installed, carried by the app, a copy to read), which nothing edits or
     /// saves.</summary>
     public static string ReadOnly(string name) => $"{name} is read-only";
 
+    /// <summary>A path an agent named that its tools may not reach (<see cref="Mcp.AgentReach"/>): outside the open folder
+    /// and the projects its trusted solution and AppHosts name beside it, and to read, outside the files made or installed to
+    /// be read too; <paramref name="changes"/> for one it would change.</summary>
+    public static string OutOfReach(string path, string? folder, bool changes) =>
+        $"{path} is outside {(folder is null ? "any open folder" : $"the open folder {folder}")}: an agent's tools {(changes ? "change" : "read and change")} "
+        + "only the folder's files and, where it is trusted, those of the projects its solution and AppHosts name beside it"
+        + (changes ? string.Empty
+            : ", and read outside them only what Go to Declaration leads to: the packages its projects restore, the SDK's MSBuild files, "
+            + "and the copies Passenger makes to be read (a source generator's code, a library's decompiled or linked source)");
+
+    /// <summary>A path an agent named that is never asked of the disk (<see cref="FoundPaths"/>), as asking would reach
+    /// another machine, open a device or mount a folder.</summary>
+    public static string NeverAsked(string path) =>
+        $"{path} is never asked of the disk: it names another machine's share, a device or a folder mounted from another machine, or is no path";
+
+    /// <summary>A console's or a test's output, which only its program writes; a line typed at its end goes to a program
+    /// reading its input.</summary>
+    public const string OutputReadOnly = "The output is read-only";
+
+    /// <summary>A merge's own sides, which it takes changes from into the result between them.</summary>
+    public const string MergeSideReadOnly = "A merge's sides are read-only: edit the result between them";
+
+    /// <summary>A few lines shown of a file (a usage's, a search's match, a place gone to), not the file itself.</summary>
+    public const string PreviewReadOnly = "The preview is read-only: open its file to change it";
+
+    /// <summary>A text box shown to read and copy from (an error's details, a log, a response, a licence).</summary>
+    public const string TextReadOnly = "The text is read-only";
+
     /// <summary>Why edits found in a file as Passenger read it are not made once the file is another text.</summary>
     public static string ChangedSinceRead(string file) =>
         $"{file} changed after Passenger read it, so the places found there may be where they were before: nothing was changed; try again in a moment";
+
+    /// <summary>Why a rename renamed nothing: <paramref name="why"/>, said as a clause.</summary>
+    public static string NotRenamed(string old, string why) => $"{old} was not renamed: {why}";
+
+    /// <summary>A rename stopped at a file whose text is not what was read of it: the name's place in it, or a server's.</summary>
+    public static string ChangedAsRead(string old, string file) => NotRenamed(old, $"{file} changed as it was read");
 
     /// <summary>An agent's act in Godot's editor from its own Passenger (<c>--mcp</c>), which no editor of the person's reaches.</summary>
     public const string GodotEditorOfPerson = $"{Mcp.McpTools.GodotEditor} acts in the person's own Godot editor, which connects to the Passenger window they use, never to an agent's own: attach to that window (--mcp-attach)";
@@ -375,4 +672,164 @@ public static class Refusals
     /// <summary>Why a line of the file shown cannot be acted on: none is shown, or its tab holds no lines (a preview, a workbook).</summary>
     public static string? NeedsLines(ActionContext context) =>
         context.File is not { } file ? NoFile : file.HoldsText ? null : $"{file.Name} is {file.ShownAs}, with no lines";
+
+    /// <summary>A project whose app runs on a device, an emulator or a simulator has none chosen to run on.</summary>
+    public static string NoRunTarget(string project) =>
+        $"{project} runs on a device, an emulator or a simulator: {ChooseRunTarget}";
+
+    /// <summary>How the person chooses where an app runs, which ends <see cref="NoRunTarget"/>.</summary>
+    public const string ChooseRunTarget = "choose one beside the run configuration";
+
+    /// <summary>A target of a platform Passenger does not run apps on yet.</summary>
+    public static string NotYetOn(string target) =>
+        $"Passenger does not run apps on {target} yet: it runs them on Android devices and emulators and on iOS simulators";
+
+    /// <summary>An iOS app's simulators asked for on a system other than macOS.</summary>
+    public const string IosOnMacAlone = "iOS apps run on simulators only on a Mac, with Xcode";
+
+    /// <summary>The iOS workload could not list simulators (no workload, no Xcode), with how to get them.</summary>
+    public static string NoIos(string problem) =>
+        $"iOS's simulators could not be listed ({problem}): iOS apps need the .NET ios workload (dotnet workload install ios) and the Xcode it names, "
+        + "with an iOS simulator runtime (Xcode's Settings, Components)";
+
+    /// <summary>A Mac Catalyst app profiled, whose sandbox keeps the profiler's port out of its reach.</summary>
+    public static string MacCatalystUnprofiled(string app) =>
+        $"Passenger's profiler does not record a Mac Catalyst app yet, so {app} cannot be profiled: Run starts it";
+
+    /// <summary>A program built for 32-bit x86 debugged (by its build, or a test host's or a process's own processor), which
+    /// Passenger's debugger cannot follow (<see cref="DotnetProcesses.Undebugged32Bit"/>): Run starts it, and built for
+    /// AnyCPU it runs, and debugs, as a 64-bit program.</summary>
+    public static string X86Undebugged(string program) =>
+        $"Could not debug {program}: {DotnetProcesses.Undebugged32Bit}. Run starts it; built for AnyCPU (its PlatformTarget), it runs as a 64-bit program, which debugs";
+
+    /// <summary>A running 32-bit program the debugger was to attach to (a test host a runner started), by the name its tab takes.</summary>
+    public static string X86Unattached(string name) => $"Cannot attach to {name}: {DotnetProcesses.Undebugged32Bit}";
+
+    /// <summary>A 32-bit x86 program run with Hot Reload, which reaches it only through the debugger.</summary>
+    public const string X86Unreloaded = $"it {DotnetProcesses.RunsAs32Bit}, and Hot Reload reaches it only through Passenger's debugger, a 64-bit program";
+
+    /// <summary>A program built for 32-bit x86 run off Windows, the one system .NET runs x86 programs on.</summary>
+    public const string X86OnWindowsAlone = "it is built for 32-bit x86 (its PlatformTarget), which .NET runs only on Windows";
+
+    /// <summary>A 32-bit x86 program whose x86 .NET installation, in <paramref name="root"/>, lacks what it runs on, each by
+    /// the installer that brings it and its version (<see cref="Run.X86Programs.Installers"/>), with where to download each.</summary>
+    public static string X86RuntimeMissing(string root, IReadOnlyList<(string Installer, string Version)> lacking)
+    {
+        string named = Plural.Listed([.. lacking.Select(l => $"{l.Installer} {l.Version}")]);
+        string where = string.Join(", ", lacking.Select(l => $"https://dotnet.microsoft.com/download/dotnet/{l.Version}").Distinct(StringComparer.Ordinal));
+        return $"it {DotnetProcesses.RunsAs32Bit}, on the x86 .NET in {PathNames.Shown(root, null)}, which has no {named}: install the {named} for x86, from {where}";
+    }
+
+    /// <summary>An Android app run where this machine (<paramref name="host"/>, "Linux on Arm64") builds none.</summary>
+    public static string AndroidBuiltElsewhere(string host) => $"Android apps are built only on {AndroidHosts.Builders}: {AndroidHosts.Why(host)}";
+
+    /// <summary>The Android workload could not list devices (no workload, no Android SDK, no Java), with how to get them.</summary>
+    public static string NoAndroid(string problem) =>
+        $"Android's devices could not be listed ({problem}): Android apps need the .NET android workload (dotnet workload install android), the Android SDK "
+        + "(its folder in ANDROID_HOME, or Android Studio's) and a JDK (its folder in JAVA_HOME)";
+
+    /// <summary>The Android SDK lacks the platform the workload builds against, named as its sdkmanager names the package.</summary>
+    public static string NoAndroidPlatform(string package) =>
+        $"The Android SDK lacks {package}, the platform the .NET android workload builds against: install it with the SDK's sdkmanager "
+        + $"(sdkmanager \"{package}\") or Android Studio's SDK Manager";
+
+    /// <summary>The Android workload listed no device or emulator, with how to get one: the SDK's avdmanager named where the SDK
+    /// has it (<paramref name="avdManager"/>).</summary>
+    public static string NoAndroidTarget(string? avdManager) =>
+        "No Android device is connected and no emulator is made: connect a device with USB debugging on, or make an emulator in Android Studio's Device Manager"
+        + (avdManager is null ? string.Empty : $" or with the Android SDK's avdmanager ({avdManager} create avd)");
+
+    /// <summary>An agent's Restart to Update, by its ide_action or its input into Passenger's window: the person restarts
+    /// Passenger, which closes their windows.</summary>
+    public const string RestartIsThePersons = "Only the person restarts Passenger into its update, which closes their windows and ends what runs there: "
+        + "ask them to, with the update's notice in the status bar";
+
+    /// <summary>An attached agent's Exit, by its ide_action or its input into Passenger's window, or its close of the person's
+    /// last window: the person quits Passenger, which ends what runs there.</summary>
+    public const string QuitIsThePersons = "Only the person quits Passenger or closes its last window, which ends what runs there and installs an update made ready: "
+        + "ask them to";
+
+    /// <summary>An attached agent's input closing a window that Settings' Confirm before closing asks the person about, or
+    /// answering that question: the person closes it.</summary>
+    public const string CloseIsThePersons = "Only the person closes this window, which Passenger asks them about first as Settings says (Confirm before closing): "
+        + "ask them to";
+
+    /// <summary>An agent's install of what a mobile project needs: the person installs it, accepting what it asks.</summary>
+    public const string AgentInstallsMobile = "Only the person installs what a mobile project needs (a workload downloads from NuGet, the Android SDK asks them to accept "
+        + "its licences): ask them to, with the banner over Passenger's window";
+
+    /// <summary>Install Workloads with every workload the projects need installed.</summary>
+    public const string NoWorkloadLacking = "No project of the folder lacks a .NET workload";
+
+    /// <summary>Install Android SDK and Java with nothing of Android's lacking.</summary>
+    public const string NothingAndroidLacking = "No Android project of the folder lacks the Android SDK, its packages or a JDK";
+
+    /// <summary>Keep .NET's Assemblies Whole with no Mac Catalyst head whose Debug build trims them.</summary>
+    public const string NothingTrimmed = "No Mac Catalyst head of the folder has a Debug build that trims .NET's own assemblies";
+
+    /// <summary>Make the Mobile Edits with no mobile head needing an edit Passenger makes.</summary>
+    public const string NoMobileEdits = "No mobile app's head of the folder needs an edit Passenger makes";
+
+    /// <summary>A .NET installed for every user that installs workloads into itself, not each user's own folder, which takes
+    /// an administrator's rights: <paramref name="command"/> as an administrator runs it (<see cref="WorkloadInstalls.AsAdministrator"/>).</summary>
+    public static string WorkloadsNeedAdministrator(string root, string command) =>
+        $"The .NET in {PathNames.Shown(root, null)} was installed for every user, so its workloads install only with an administrator's rights: run "
+        + $"{command} in a terminal{(OperatingSystem.IsWindows() ? " run as administrator" : string.Empty)}";
+
+    /// <summary>A Functions app an AppHost asks for, with no Azure Functions Core Tools' func on the PATH to host it.</summary>
+    public static string NoFunc(string project) =>
+        $"{project} is an Azure Functions app, which Azure Functions Core Tools' func runs, and none is on the PATH: install them "
+        + "(https://learn.microsoft.com/azure/azure-functions/functions-run-local#install-the-azure-functions-core-tools)";
+
+    /// <summary>A service an AppHost's orchestrator asked to start with a variable loading code from where another user may
+    /// write (<see cref="LoadingVariables"/>), which it is not.</summary>
+    public static string LoadsOthersCode(string project, string why) => $"{project} was not started: {why}";
+
+    /// <summary>A service an AppHost's orchestrator asked to start outside the open folder and what it reaches beside it
+    /// (<see cref="ProjectSession.Reaches"/>).</summary>
+    public static string NotReached(string project) =>
+        $"{project} was not started: it lies outside the open folder and the projects its solution and AppHosts name beside it";
+
+    /// <summary>A service an AppHost in the open folder names by path in a folder no workspace lends its trust to
+    /// (<see cref="WorkspaceTrust.WhyNotLent"/>), which its orchestrator asked to start.</summary>
+    public static string NotLent(string project, string folder, Unlent why) =>
+        $"{project} was not started: its AppHost names it in {Unlendable(folder, why)}, to which the open folder lends none of its trust, "
+        + "as that would trust what you never chose: open a folder holding both";
+
+    /// <summary>A folder no workspace lends its trust to, said with why.</summary>
+    private static string Unlendable(string folder, Unlent why) => why switch
+    {
+        Unlent.Root => $"the disk's root {folder}",
+        Unlent.HoldsOpen => $"{folder}, which holds the open folder",
+        Unlent.HoldsHome when PathNames.Same(folder, PathNames.Canonical(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile))) => $"your home folder {folder}",
+        Unlent.HoldsHome => $"{folder}, which holds your home folder",
+        _ => folder,
+    };
+
+    /// <summary>A service only an agent's edit of an AppHost in the open folder names by path beside it, which lends it no
+    /// trust (<see cref="Mcp.AgentReach.WroteFor"/>), its orchestrator asking to start it.</summary>
+    public static string NamedByAgent(string project) =>
+        $"{project} was not started: only an agent's edit of its AppHost names it beside the open folder, which lends it no trust until you save that AppHost yourself";
+
+    /// <summary>Profile of a Functions app (its own project's, or an AppHost's), whose worker func starts and the profiler
+    /// does not reach.</summary>
+    public static string FunctionsUnprofiled(string service) =>
+        $"{service} is an Azure Functions app, whose worker Azure Functions Core Tools start: Passenger does not profile it yet";
+
+    /// <summary>Run with Hot Reload of a Functions app, whose worker func starts, which runs on without it.</summary>
+    public const string FunctionsUnreloaded = "Passenger does not apply Hot Reload to an Azure Functions app's worker, which Azure Functions Core Tools start, yet";
+
+    /// <summary>A debugged Functions app whose host started no worker within its time.</summary>
+    public static string NoFunctionsWorker(TimeSpan limit) =>
+        $"Azure Functions Core Tools started no worker for it within {Durations.Said(limit)}";
+
+    /// <summary>The project has no device chosen to run on, where the chooser lists none.</summary>
+    public const string NoTargets = "No device, emulator or simulator is listed for this project: connect a device, or make an emulator with Android Studio's Device Manager";
+
+    /// <summary>A change of NuGet packages asked for while another of the folder's runs.</summary>
+    public const string PackageChangeUnderWay = "A package change is under way";
+
+    /// <summary>A NuGet package's Install, Update or Downgrade while the audit's feeds are still asked which versions have
+    /// known vulnerabilities, so the version put in might be one they name.</summary>
+    public const string VulnerabilitiesUnread = "The feeds have not yet said which versions have known vulnerabilities";
 }

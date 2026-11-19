@@ -181,7 +181,7 @@ public static class MSBuildNavigation
             case MSBuildSymbolKind.File:
                 string full = Full(context.Path, symbol.Name);
                 card.AppendLine(symbol.Name);
-                card.AppendLine(File.Exists(full) ? full : $"{full} is not there");
+                card.AppendLine(!Core.FoundPaths.Askable(full) || There(full) ? full : $"{full} is not there");
                 break;
         }
         string described = card.ToString().TrimEnd();
@@ -189,7 +189,7 @@ public static class MSBuildNavigation
     }
 
     /// <summary>An item element's or item type's card: its items as evaluated, the first's metadata, a package's version
-    /// (its central one under central package management) and a known vulnerability of it.</summary>
+    /// (its central one under central package management) and a known vulnerability or deprecation of it.</summary>
     private static void DescribeItem(StringBuilder card, MSBuildSymbol symbol, MSBuildContext context, VulnerabilityLookup? vulnerabilities)
     {
         MSBuildInsight? insight = context.Insight;
@@ -238,7 +238,7 @@ public static class MSBuildNavigation
         MSBuildInsight? insight = context.Insight;
         if (insight is null)
         {
-            return symbol.Kind == MSBuildSymbolKind.File && File.Exists(Full(context.Path, symbol.Name))
+            return symbol.Kind == MSBuildSymbolKind.File && There(Full(context.Path, symbol.Name))
                 ? [new MSBuildTarget(symbol.Name, new MSBuildPlace(Full(context.Path, symbol.Name), 1, 1))]
                 : [];
         }
@@ -270,7 +270,7 @@ public static class MSBuildNavigation
                 return [.. insight.SdkImports(symbol.Name).Select(f => new MSBuildTarget($"{Path.GetFileName(f)} of {symbol.Name}", new MSBuildPlace(f, 1, 1)))];
             case MSBuildSymbolKind.File:
                 string full = Full(context.Path, symbol.Name);
-                return File.Exists(full) ? [new MSBuildTarget(symbol.Name, new MSBuildPlace(full, 1, 1))] : [];
+                return There(full) ? [new MSBuildTarget(symbol.Name, new MSBuildPlace(full, 1, 1))] : [];
         }
         return [];
     }
@@ -282,17 +282,23 @@ public static class MSBuildNavigation
         return context.Insight?.ImportsAt(context.Path, line, column) ?? [];
     }
 
+    /// <summary>The file a project's text names from its own folder, as the file system names it where the disk may be
+    /// asked of it (<see cref="Core.FoundPaths"/>), else whole as written.</summary>
     private static string Full(string from, string relative)
     {
         try
         {
-            return Core.PathNames.Canonical(Path.GetFullPath(Path.Combine(Path.GetDirectoryName(from)!, relative.Replace('\\', '/'))));
+            string full = Path.GetFullPath(Path.Combine(Path.GetDirectoryName(from)!, relative.Replace('\\', '/')));
+            return Core.FoundPaths.Askable(full) ? Core.PathNames.Canonical(full) : full;
         }
         catch (Exception error) when (error is ArgumentException or NotSupportedException or PathTooLongException)
         {
             return relative;
         }
     }
+
+    /// <summary>Whether a file a project's text names is there, a share's or a device's never asked.</summary>
+    private static bool There(string full) => Core.FoundPaths.Askable(full) && File.Exists(full);
 
     /// <summary>Where a property's value came from: the file and line that last set it, the environment, the command line.</summary>
     private static string Origin(InsightProperty property, MSBuildInsight insight) => property.Origin switch
@@ -344,5 +350,6 @@ public static class MSBuildNavigation
     }
 }
 
-/// <summary>The words of a package version's known vulnerability, as NuGet's audit says them; null for none.</summary>
+/// <summary>The words on a package version: its known vulnerability, as NuGet's audit says it, and its owner's deprecation
+/// of it; null for neither.</summary>
 public delegate string? VulnerabilityLookup(string id, string version);

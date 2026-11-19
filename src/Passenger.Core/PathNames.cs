@@ -108,6 +108,26 @@ public static partial class PathNames
     public static ReadOnlySpan<char> Below(ReadOnlySpan<char> path, string folder) =>
         IsUnder(path, folder) ? path[(folder.AsSpan().TrimEnd(Separators).Length + 1)..] : [];
 
+    /// <summary>The names from a folder down to a path under it in forward slashes ("src/App/App.cs"), as a URL, a glob, a
+    /// container's path or a file the IDE keeps writes one: "." for the folder itself, and null for a path outside it,
+    /// never a "..". A backslash parts names only on Windows; elsewhere it is a letter of one and stays.</summary>
+    public static string? Relative(string path, string folder)
+    {
+        string full = Path.GetFullPath(path);
+        string top = Path.GetFullPath(folder);
+        return IsUnder(full, top) ? Slashed(Below(full, top).ToString())
+            : Alike(full.AsSpan().TrimEnd(Separators), top.AsSpan().TrimEnd(Separators)) ? "." : null;
+    }
+
+    /// <summary>The way from a folder to a path in forward slashes, climbing out of the folder by ".." where the path lies
+    /// outside it ("../Api/Api.csproj"), as one project's file names another: "." for the folder itself, and on Windows a
+    /// path on another drive whole.</summary>
+    public static string Route(string path, string folder) => Slashed(Path.GetRelativePath(folder, path));
+
+    /// <summary>A path with forward slashes between its names: its backslashes made slashes on Windows, where they part
+    /// names, and kept elsewhere, where they are letters of one.</summary>
+    public static string Slashed(string path) => OperatingSystem.IsWindows() ? path.Replace('\\', '/') : path;
+
     /// <summary>Whether a path is a file or folder, or under it.</summary>
     public static bool Within(string path, string place) => Same(path, place) || IsUnder(path, place);
 
@@ -311,9 +331,10 @@ public static partial class PathNames
     /// <summary>Windows' own name for a file or folder, asked of a handle opened for nothing but that (any other program
     /// may still read, write or delete it meanwhile). The name comes as \\?\C:\... or \\?\UNC\server\share\..., which
     /// .NET and every tool spell without the prefix.</summary>
+    [System.Runtime.Versioning.SupportedOSPlatform("windows")]
     private static unsafe string? FinalPath(string path)
     {
-        using SafeFileHandle handle = CreateFile(Openable(path), 0, FileShare.ReadWrite | FileShare.Delete, IntPtr.Zero, FileMode.Open, BackupSemantics, IntPtr.Zero);
+        using SafeFileHandle handle = Kernel32.CreateFile(Openable(path), 0, FileShare.ReadWrite | FileShare.Delete, IntPtr.Zero, FileMode.Open, BackupSemantics, IntPtr.Zero);
         if (handle.IsInvalid)
         {
             return null;
@@ -344,7 +365,7 @@ public static partial class PathNames
     }
 
     /// <summary>A Windows path as it opens: past MAX_PATH only with the prefix that turns Win32's parsing of it off.</summary>
-    private static string Openable(string path) =>
+    internal static string Openable(string path) =>
         path.Length < 260 || path.StartsWith(@"\\?\", StringComparison.Ordinal) ? path
             : path.StartsWith(@"\\", StringComparison.Ordinal) ? @"\\?\UNC\" + path[2..]
             : @"\\?\" + path;
@@ -358,24 +379,17 @@ public static partial class PathNames
             nint told = PathConf(folder, CaseSensitive);
             return told >= 0 ? told == 0 : Marshal.GetLastPInvokeError() is NoEntry or NotFolder ? null : true;
         }
-        using SafeFileHandle handle = CreateFile(Openable(folder), ReadAttributes, FileShare.ReadWrite | FileShare.Delete, IntPtr.Zero, FileMode.Open, BackupSemantics, IntPtr.Zero);
+        using SafeFileHandle handle = Kernel32.CreateFile(Openable(folder), ReadAttributes, FileShare.ReadWrite | FileShare.Delete, IntPtr.Zero, FileMode.Open, BackupSemantics, IntPtr.Zero);
         if (handle.IsInvalid)
         {
             return Marshal.GetLastPInvokeError() is FileNotFound or PathNotFound ? null : true;
         }
         uint flags = 0;
-        return !GetFileInformationByHandleEx(handle, CaseSensitiveInfo, &flags, sizeof(uint)) || (flags & CaseSensitiveFolder) == 0;
+        return !Kernel32.GetFileInformationByHandleEx(handle, CaseSensitiveInfo, &flags, sizeof(uint)) || (flags & CaseSensitiveFolder) == 0;
     }
-
-    [LibraryImport("kernel32.dll", EntryPoint = "CreateFileW", SetLastError = true, StringMarshalling = StringMarshalling.Utf16)]
-    private static partial SafeFileHandle CreateFile(string name, uint access, FileShare share, IntPtr security, FileMode mode, uint flags, IntPtr template);
 
     [LibraryImport("kernel32.dll", EntryPoint = "GetFinalPathNameByHandleW", SetLastError = true)]
     private static unsafe partial uint GetFinalPathNameByHandle(SafeFileHandle file, char* buffer, uint length, uint flags);
-
-    [LibraryImport("kernel32.dll", SetLastError = true)]
-    [return: MarshalAs(UnmanagedType.Bool)]
-    private static unsafe partial bool GetFileInformationByHandleEx(SafeFileHandle file, int kind, uint* information, uint size);
 
     [LibraryImport("libc", EntryPoint = "pathconf", SetLastError = true, StringMarshalling = StringMarshalling.Utf8)]
     private static partial nint PathConf(string path, int name);

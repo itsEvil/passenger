@@ -9,6 +9,7 @@ using Avalonia.Layout;
 using Avalonia.Media;
 using Avalonia.Threading;
 using Passenger.App.Testing;
+using Passenger.Core;
 using Passenger.Editor;
 using Passenger.Text;
 
@@ -22,6 +23,9 @@ namespace Passenger.App.ToolWindows;
 /// none, why. Double-click or F4 goes to a test's source.</summary>
 public sealed class TestsView : DockPanel
 {
+    /// <summary>The column a test's state mark is centred in, an icon's width.</summary>
+    private const double StateColumn = 16;
+
     /// <summary>The most failed tests a group's details show, so choosing a project of thousands shows at once.</summary>
     private const int GroupDetailsLimit = 100;
 
@@ -36,7 +40,7 @@ public sealed class TestsView : DockPanel
         (TestState.Running, "Running Tests", IconKeys.TestRunning, TokenKeys.Test_Running),
     ];
 
-    private readonly ListBox tree;
+    private readonly TreeList tree;
     private readonly TextDocument detailsText = new();
     private readonly DockPanel result;
 
@@ -59,7 +63,7 @@ public sealed class TestsView : DockPanel
     public TestsView(TestTree model)
     {
         Model = model;
-        tree = new ListBox
+        tree = new TreeList
         {
             Classes = { StyleClasses.Tree },
             ItemsSource = model.Rows,
@@ -67,22 +71,25 @@ public sealed class TestsView : DockPanel
         };
         ReusedRows.Use(tree, () => new TestRow(model));
         tree.SelectionChanged += (_, _) => ShowDetails();
-        tree.DoubleTapped += (_, _) =>
+        // A double click and Enter open or close a row with rows under it but a method's, and go to any other.
+        TreeKeys.Attach<TestNode>(tree, model.Toggle, GoTo, new ListActs
         {
-            if (tree.SelectedItem is not TestNode node)
+            Open = () =>
             {
-                return;
-            }
-            if (node.HasChildren && node.Kind != TestNodeKind.Method)
-            {
-                model.Toggle(node);
-            }
-            else
-            {
-                GoToRequested?.Invoke(this, node);
-            }
-        };
-        TreeKeys.Attach<TestNode>(tree, model.Toggle, GoTo);
+                if (tree.SelectedItem is not TestNode node)
+                {
+                    return;
+                }
+                if (node.HasChildren && node.Kind != TestNodeKind.Method)
+                {
+                    model.Toggle(node);
+                }
+                else
+                {
+                    GoToRequested?.Invoke(this, node);
+                }
+            },
+        });
         ListMenus.Attach(tree, () => tree.SelectedItem is not TestNode chosen ? [] :
         [
             ListMenus.Item("Run", Keys(AppActions.RunTests), () => RunRequested?.Invoke(this, false)),
@@ -103,7 +110,7 @@ public sealed class TestsView : DockPanel
             QueueCounts();
         };
         model.ViewChanged += (_, _) => ShowFilters();
-        status = new TextBlock { VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(10, 0), TextTrimming = TextTrimming.CharacterEllipsis };
+        status = new TextBlock { VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(Gaps.Normal, 0), TextTrimming = TextTrimming.CharacterEllipsis };
         status.Classes.Add(StyleClasses.Muted);
         placeholder = new TextBlock { Text = model.EmptyText, Classes = { StyleClasses.EmptyText } };
         model.Rows.CollectionChanged += (_, _) => ShowPlaceholder();
@@ -129,7 +136,7 @@ public sealed class TestsView : DockPanel
         };
         ToolFlow bar = new()
         {
-            Margin = new Thickness(6, 2),
+            Margin = new Thickness(Gaps.Small, Gaps.Hair),
             Children =
             {
                 groupBy,
@@ -183,13 +190,14 @@ public sealed class TestsView : DockPanel
         {
             Document = detailsText,
             IsReadOnly = true,
+            ReadOnlyWhy = Refusals.OutputReadOnly,
             LineCommentPrefix = null,
             ShowLineNumbers = false,
             ShowErrorStripe = false,
             FontSize = 12,
             Highlighter = Links,
             Links = Links.On,
-            Margin = new Thickness(6, 4, 0, 0),
+            Margin = new Thickness(Gaps.Small, Gaps.Tight, 0, 0),
         };
         details.LinkClicked += (_, link) => LinkClicked?.Invoke(this, (LinkTarget)link.Target);
         result.Children.Add(details);
@@ -235,10 +243,15 @@ public sealed class TestsView : DockPanel
 
     public bool HasFocus => tree.IsKeyboardFocusWithin;
 
+    /// <summary>What the window says of the tests last found or run, whole in its tip where the line trims it.</summary>
     public string Status
     {
         get => status.Text ?? string.Empty;
-        set => status.Text = value;
+        set
+        {
+            status.Text = value;
+            ToolTip.SetTip(status, value.Length > 0 ? value : null);
+        }
     }
 
     /// <summary>Tests are being found or run: Stop has something to end, and is disabled while it has not.</summary>
@@ -339,7 +352,7 @@ public sealed class TestsView : DockPanel
 
     private Border Divider()
     {
-        Border line = new() { Width = 1, Height = 18, Margin = new Thickness(4, 0), VerticalAlignment = VerticalAlignment.Center };
+        Border line = new() { Width = 1, Height = 18, Margin = new Thickness(Gaps.Tight, 0), VerticalAlignment = VerticalAlignment.Center };
         line.Bind(Border.BackgroundProperty, line.GetResourceObservable(TokenKeys.Divider));
         return line;
     }
@@ -449,8 +462,6 @@ public sealed class TestsView : DockPanel
         }
     }
 
-    private static string Format(TimeSpan duration) =>
-        duration.TotalSeconds >= 1 ? $"{duration.TotalSeconds:0.0} s" : $"{Math.Max(1, (int)duration.TotalMilliseconds)} ms";
 
     /// <summary>A row of the tree for whichever node the list gives its container, handed another as the list scrolls: it
     /// follows its node's changes only while it is shown, and lets go of them when the list takes it away or gives it
@@ -481,9 +492,9 @@ public sealed class TestsView : DockPanel
             };
             state = new RowIcon { VerticalAlignment = VerticalAlignment.Center };
             label = new TextBlock { VerticalAlignment = VerticalAlignment.Center };
-            duration = new TextBlock { VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(10, 0, 0, 0), FontSize = 12 };
+            duration = new TextBlock { VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(Gaps.Wide, 0, 0, 0), FontSize = 12 };
             duration.Classes.Add(StyleClasses.Muted);
-            earlier = new TextBlock { VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(10, 0, 0, 0), FontSize = 12 };
+            earlier = new TextBlock { VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(Gaps.Wide, 0, 0, 0), FontSize = 12 };
             earlier.Classes.Add(StyleClasses.Muted);
             Children.Add(toggle);
             Children.Add(state);
@@ -569,7 +580,7 @@ public sealed class TestsView : DockPanel
         /// code has changed since.</summary>
         private void ShowState(TestNode node)
         {
-            // Each mark centred in the same 16 wide: the dot running a size smaller, the tick passed a size larger.
+            // Each mark centred in the same column: the dot running a size smaller, the tick passed a size larger.
             (string icon, string brush, double size) = node.State switch
             {
                 TestState.Running => (IconKeys.TestRunning, TokenKeys.Test_Running, 9.0),
@@ -581,8 +592,8 @@ public sealed class TestsView : DockPanel
             state.DataKey = icon;
             state.ForegroundKey = brush;
             state.Width = state.Height = size;
-            state.Margin = new Thickness((16 - size) / 2, 0, ((16 - size) / 2) + 6, 0);
-            duration.Text = node.State is TestState.Passed or TestState.Failed && node.Duration > TimeSpan.Zero ? Format(node.Duration) : string.Empty;
+            state.Margin = new Thickness((StateColumn - size) / 2, 0, ((StateColumn - size) / 2) + Gaps.Small, 0);
+            duration.Text = node.State is TestState.Passed or TestState.Failed && node.Duration > TimeSpan.Zero ? Durations.Said(node.Duration) : string.Empty;
             earlier.Text = node.Kind is not (TestNodeKind.Method or TestNodeKind.Row) ? string.Empty
                 : node.EarlierRun is { } ran ? $"earlier run, {Earlier(ran)}{(node.CodeChanged ? "; code changed" : string.Empty)}"
                 : node.CodeChanged && node.State is not (TestState.NotRun or TestState.Running) ? "code changed"

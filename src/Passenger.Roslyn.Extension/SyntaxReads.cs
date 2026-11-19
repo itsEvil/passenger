@@ -1,3 +1,4 @@
+using System.Collections.Immutable;
 using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.CSharp.Syntax;
 using Microsoft.CodeAnalysis.Text;
@@ -7,8 +8,8 @@ namespace Passenger.Roslyn.Extension;
 
 /// <summary>What the extension's readers of code (routes, configuration, localization, Aspire's code help, Godot's) read of a
 /// call and its text the same way: a place in a document or the Razor file it is made of, whether two paths name one file,
-/// a string constant, a string written as its characters, the name a call is called by, its receiver and the argument it
-/// gives a parameter.</summary>
+/// the documents a path names, a string constant, a string written as its characters, the name a call is called by, its
+/// receiver and the argument it gives a parameter.</summary>
 internal static class SyntaxReads
 {
     /// <summary>An offset in a document as the protocol's line and character.</summary>
@@ -35,6 +36,16 @@ internal static class SyntaxReads
     public static bool SamePath(string? left, string? right) => left is not null && right is not null
         && (PathNames.Same(left, right) || PathNames.Same(PathNames.Canonical(left), PathNames.Canonical(right)));
 
+    /// <summary>The documents of every kind a solution holds of a file. The solution finds a path's documents ignoring case,
+    /// so one of a name differing only in letter case, another file where its folder tells case apart (a file renamed so,
+    /// or its twin), is passed over here.</summary>
+    public static ImmutableArray<DocumentId> DocumentIdsOf(Solution solution, string path) =>
+        solution.GetDocumentIdsWithFilePath(path).RemoveAll(id => TextDocumentOf(solution, id)?.FilePath is not { } held || !PathNames.Same(held, path));
+
+    /// <summary>A document of any kind by its id: C#, additional or analyzer configuration; null for none.</summary>
+    public static TextDocument? TextDocumentOf(Solution solution, DocumentId id) =>
+        (TextDocument?)solution.GetDocument(id) ?? solution.GetAdditionalDocument(id) ?? solution.GetAnalyzerConfigDocument(id);
+
     /// <summary>The string an expression is, when the compiler knows it as a constant.</summary>
     public static string? Constant(ExpressionSyntax? expression, SemanticModel model, CancellationToken cancel) =>
         expression is not null && model.GetConstantValue(expression, cancel) is { HasValue: true, Value: string value } ? value : null;
@@ -50,6 +61,11 @@ internal static class SyntaxReads
         SimpleNameSyntax simple => simple.Identifier.ValueText,
         _ => null,
     };
+
+    /// <summary>The name a call calls by, as <see cref="NameOf"/> reads it or after a <c>?.</c>; null for one named by none
+    /// (a delegate's result called): what a reader checks before binding the call, as a method bound is called by its name.</summary>
+    public static string? CalledBy(InvocationExpressionSyntax call) =>
+        call.Expression is MemberBindingExpressionSyntax binding ? binding.Name.Identifier.ValueText : NameOf(call.Expression);
 
     /// <summary>What a method is called on: the expression before its dot, or an extension method's first argument when it
     /// is called as a static method; null for a static method's type.</summary>

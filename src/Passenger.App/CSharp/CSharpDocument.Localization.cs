@@ -1,4 +1,3 @@
-using System.Text.Json;
 using Passenger.Core;
 using Passenger.Lsp;
 using Passenger.Roslyn.Extension;
@@ -37,6 +36,10 @@ internal sealed record Localized(IReadOnlyList<LocalizedKey> Keys, IReadOnlyList
     }
 }
 
+/// <summary>What a warning of a localized key a language lacks carries for its fix: the key, the file to give it in, its
+/// culture, the resource's base path, and whether the file has the key untranslated (an XLIFF unit still new).</summary>
+internal sealed record LocalizedKeyMark(string Key, string File, string Culture, string Base, bool Untranslated);
+
 public sealed partial class CSharpDocument
 {
     private const string LocalizationDiagnosticSource = "Passenger.Localization";
@@ -63,22 +66,8 @@ public sealed partial class CSharpDocument
     /// <summary>The keys the file's warnings say a language lacks, on a server's line of the text as it stands (any line for
     /// null): each with where it is read, the key, the file to give it in, its culture, the resource's base path, and whether
     /// the file has the key untranslated (an XLIFF unit still new).</summary>
-    internal IReadOnlyList<(TextRange Range, string Key, string File, string Culture, string Base, bool Untranslated)> LocalizationMissingOn(int? line)
-    {
-        List<(TextRange, string, string, string, string, bool)> missing = [];
-        foreach ((Diagnostic diagnostic, TextRange range) in diagnostics.PlacedRanges)
-        {
-            if (diagnostic.Source == LocalizationDiagnosticSource
-                && (line is not { } on || diagnostic.Range.Start.Line <= on && on <= diagnostic.Range.End.Line)
-                && diagnostic.Data is { ValueKind: JsonValueKind.Object } data
-                && JsonMembers.Text(data, "key") is { } key && JsonMembers.Text(data, "file") is { } file
-                && JsonMembers.Text(data, "culture") is { } culture && JsonMembers.Text(data, "base") is { } basePath)
-            {
-                missing.Add((range, key, file, culture, basePath, JsonMembers.Text(data, "untranslated") == "true"));
-            }
-        }
-        return missing;
-    }
+    internal IReadOnlyList<(TextRange Range, string Key, string File, string Culture, string Base, bool Untranslated)> LocalizationMissingOn(int? line) =>
+        [.. OwnOn<LocalizedKeyMark>(LocalizationDiagnosticSource, line).Select(m => (m.Range, m.Data.Key, m.Data.File, m.Data.Culture, m.Data.Base, m.Data.Untranslated))];
 
     /// <summary>The file's reads of localized strings a language lacks, each a warning where its key is written, one a language:
     /// a key of a localizer (<c>IStringLocalizer&lt;T&gt;</c>, <c>IHtmlLocalizer&lt;T&gt;</c>) or a generated resource class that a
@@ -122,26 +111,21 @@ public sealed partial class CSharpDocument
                     Severity = DiagnosticSeverity.Warning,
                     Source = LocalizationDiagnosticSource,
                     Message = gap.Message,
-                    Data = JsonSerializer.SerializeToElement(new Dictionary<string, string>
-                    {
-                        ["key"] = gap.Key,
-                        ["file"] = gap.File.Path,
-                        ["culture"] = gap.Culture,
-                        ["base"] = gap.BasePath,
-                        ["untranslated"] = gap.Untranslated ? "true" : "false",
-                    }),
+                    Data = DataOf(new LocalizedKeyMark(gap.Key, gap.File.Path, gap.Culture, gap.BasePath, gap.Untranslated)),
                 });
             }
         }
         return found;
     }
 
-    /// <summary>Whether the file's text names any of some words: looked through a piece at a time, never copied whole.</summary>
+    /// <summary>Whether the file's text names any of some words (none longer than <see cref="Seam"/>): looked through a
+    /// piece at a time, never copied, the end of each piece kept with the start of the next in one small buffer.</summary>
     private bool Holds(string[] words)
     {
         TextSnapshot text = document.Text.Snapshot;
+        char[] seam = new char[2 * Seam];
+        int carried = 0;
         bool found = false;
-        string carry = string.Empty;
         text.VisitChunks(0, text.Length, chunk =>
         {
             if (found)
@@ -150,13 +134,28 @@ public sealed partial class CSharpDocument
             }
             ReadOnlySpan<char> piece = chunk.Span;
             // A word split between two pieces is found where the end of one meets the start of the next.
-            string seam = carry + new string(piece[..Math.Min(piece.Length, 24)]);
+            int head = Math.Min(piece.Length, Seam);
+            piece[..head].CopyTo(seam.AsSpan(carried));
+            ReadOnlySpan<char> joined = seam.AsSpan(0, carried + head);
             foreach (string word in words)
             {
-                found |= piece.Contains(word, StringComparison.Ordinal) || seam.Contains(word, StringComparison.Ordinal);
+                found |= piece.Contains(word, StringComparison.Ordinal) || joined.Contains(word, StringComparison.Ordinal);
             }
-            carry = piece.Length >= 24 ? new string(piece[^24..]) : (carry + new string(piece))[^Math.Min(24, carry.Length + piece.Length)..];
+            if (piece.Length >= Seam)
+            {
+                piece[^Seam..].CopyTo(seam);
+                carried = Seam;
+            }
+            else
+            {
+                int kept = Math.Min(Seam, carried + piece.Length);
+                seam.AsSpan(carried + piece.Length - kept, kept).CopyTo(seam);
+                carried = kept;
+            }
         });
         return found;
     }
+
+    /// <summary>How much of a piece's end <see cref="Holds"/> keeps to meet the next piece's start.</summary>
+    private const int Seam = 24;
 }

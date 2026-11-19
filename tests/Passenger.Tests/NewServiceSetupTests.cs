@@ -1,3 +1,4 @@
+using Avalonia;
 using Avalonia.Controls;
 using Avalonia.Headless;
 using Avalonia.Headless.XUnit;
@@ -7,6 +8,7 @@ using Passenger.App.Editors;
 using Passenger.App.Explorer;
 using Passenger.App.Run;
 using Passenger.App.Templates;
+using Passenger.App.Workspace;
 using Passenger.Core;
 using Passenger.Editor;
 
@@ -103,6 +105,88 @@ public sealed class NewServiceSetupTests : IDisposable
         {
             window.Close();
         }
+    }
+
+    /// <summary>New Project of Aspire's or MAUI's service defaults, class libraries both though tagged Web API and Service
+    /// (stand-ins with their templates' tags and project files, in a template home of the test's own, and MAUI's own where
+    /// its workload brings it), offers no set-up, saying why; a web API, chosen next, is offered its set-ups.</summary>
+    [AvaloniaFact]
+    public void New_Project_offers_a_service_defaults_library_no_set_up_and_a_web_API_its_set_ups()
+    {
+        TestFolders.Write(place, "Tool/Tool.csproj", TestProjects.Console());
+        TestFolders.Write(place, "Shop.slnx", "<Solution>\n  <Project Path=\"Tool/Tool.csproj\" />\n</Solution>\n");
+        // Outside the folder opened, whose projects the templates' own would join.
+        string templates = TestFolders.Create("svc-templates-");
+        string? hive = ProjectTemplates.Hive;
+        ProjectTemplates.Hive = Directory.CreateDirectory(Path.Combine(templates, "hive")).FullName;
+        ProjectTemplates.Forget();
+        MainWindow? window = null;
+        try
+        {
+            string[] aspire = ["Common", "Aspire", "Cloud", "Web", "Web API", "API", "Service"];
+            DotnetNew(templates, ["install", WriteServiceDefaults(templates, "probe-aspire-servicedefaults", "Aspire Service Defaults", aspire, "Aspire.ServiceDefaults1")]);
+            DotnetNew(templates, ["install", WriteServiceDefaults(templates, "probe-maui-aspire-servicedefaults", ".NET MAUI for Aspire Service Defaults",
+                ["MAUI", .. aspire[1..]], "MauiAspire.1.ServiceDefaults")]);
+            window = Ui.OpenFolder(place, languageServer: false);
+            Ui.Run(window, AppActions.NewProject);
+            NewProjectDialog dialog = Opened(window);
+            string[] libraries = [.. dialog.Templates.Where(t => t.Pack is null && t.ShortNames.Any(n => n.EndsWith("aspire-servicedefaults", StringComparison.Ordinal)))
+                .Select(t => t.ShortName)];
+            Assert.Contains("probe-aspire-servicedefaults", libraries);
+            Assert.Contains("probe-maui-aspire-servicedefaults", libraries);
+            foreach (string library in libraries)
+            {
+                Choose(dialog, library);
+                string name = dialog.Chosen!.Name;
+                Assert.False(dialog.SetupChooser.IsEnabled, $"{name}, a class library, was offered a container or Aspire set-up: {dialog.SetupNote}");
+                Assert.Equal($"{name} is not a service: its project is a class library, which makes no program to run in a container or under Aspire", dialog.SetupNote);
+                Assert.Equal(ProjectSetup.None, dialog.Setup);
+            }
+
+            Choose(dialog, "webapi");
+            Assert.True(dialog.SetupChooser.IsEnabled, $"A web API was offered no set-up: {dialog.SetupNote}");
+            Assert.DoesNotContain("is not a service", dialog.SetupNote, StringComparison.Ordinal);
+            dialog.Cancel();
+        }
+        finally
+        {
+            window?.Close();
+            ProjectTemplates.Hive = hive;
+            ProjectTemplates.Forget();
+            TestFolders.Delete(templates);
+        }
+    }
+
+    /// <summary>A stand-in of a service defaults template, in a folder of its own: the short name, name and tags given, and
+    /// a project as the template's own, which names the .NET SDK and no output type, as its primary output.</summary>
+    private static string WriteServiceDefaults(string templates, string shortName, string name, string[] classifications, string sourceName)
+    {
+        string folder = Directory.CreateDirectory(Path.Combine(templates, shortName, ".template.config")).Parent!.FullName;
+        File.WriteAllText(Path.Combine(folder, ".template.config", "template.json"), $$"""
+            {
+              "$schema": "http://json.schemastore.org/template",
+              "author": "Passenger's tests",
+              "classifications": [ {{string.Join(", ", classifications.Select(c => $"\"{c}\""))}} ],
+              "identity": "Passenger.Tests.{{shortName}}",
+              "groupIdentity": "Passenger.Tests.{{shortName}}.Group",
+              "name": "{{name}}",
+              "shortName": "{{shortName}}",
+              "sourceName": "{{sourceName}}",
+              "preferNameDirectory": true,
+              "tags": { "language": "C#", "type": "project" },
+              "primaryOutputs": [ { "path": "{{sourceName}}.csproj" } ]
+            }
+            """);
+        File.WriteAllText(Path.Combine(folder, $"{sourceName}.csproj"), TestProjects.Library("<IsAspireSharedProject>true</IsAspireSharedProject>"));
+        return PathNames.Canonical(folder);
+    }
+
+    /// <summary>dotnet new with these arguments in the template home in force, as a terminal runs it.</summary>
+    private static void DotnetNew(string folder, string[] arguments)
+    {
+        ChildResult ran = Ui.Await(Waiting.Apart(() => ChildProcesses.RunAsync(ProjectTemplates.NewCommand(arguments, folder), limit: TimeSpan.FromMinutes(2))),
+            $"dotnet new {string.Join(' ', arguments)}", TimeSpan.FromMinutes(2) + TestFolders.Spare);
+        Assert.True(ran.Succeeded, $"dotnet new {string.Join(' ', arguments)} failed:\n{ran.Output}{ran.Error}");
     }
 
     /// <summary>New Project with a Dockerfile while the person types in another open file as its set-up waits for the new
@@ -233,7 +317,7 @@ public sealed class NewServiceSetupTests : IDisposable
             Ui.Run(window, AppActions.FocusExplorer);
             Ui.Run(window, EditorActions.Undo);
             Assert.Equal(2, asked.Count);
-            Assert.Equal("Undo Rename notes.md to guide.md? It changes guide.md.", asked[1].Message);
+            Assert.Equal("Undo Rename notes.md to guide.md? It renames guide.md back to notes.md.", asked[1].Message);
             Assert.True(File.Exists(notes) && !File.Exists(guide), $"The rename's own Undo did not name guide.md back: {window.Status}");
         }
         finally
@@ -244,8 +328,8 @@ public sealed class NewServiceSetupTests : IDisposable
     }
 
     /// <summary>New Project of an MVC app, a folder of megabytes (its scripts and styles): its Undo keeps the folder as each
-    /// file's length and time, not its bytes, so the undo history grows by a small part of the folder; Undo takes the folder
-    /// away and Redo puts every file back as it was.</summary>
+    /// file's length and time, not its bytes, so its command holds a small part of the folder; Undo takes the folder away
+    /// and Redo puts every file back as it was.</summary>
     [AvaloniaFact]
     public void New_Project_of_an_MVC_app_keeps_its_folder_for_Undo_without_its_bytes()
     {
@@ -282,11 +366,10 @@ public sealed class NewServiceSetupTests : IDisposable
                 $"Redo did not put the folder back as it was: {window.Status}");
 
             Ui.Settle();
-            long held = GC.GetTotalMemory(forceFullCollection: true);
-            Assert.True(Undoes(window), "New Project left no command for Undo to take back");
-            window.EditorArea.Commands.Clear();
-            long growth = held - GC.GetTotalMemory(forceFullCollection: true);
-            Assert.True(growth < bytes / 10, $"New Project's Undo held {growth} bytes of the history for a folder of {bytes} bytes in {made.Count} files");
+            CommandHistory.Command? command = window.EditorArea.Commands.ToUndo(null);
+            Assert.True(command is not null, "New Project left no command for Undo to take back");
+            (long held, string most) = HeldBytes.Of(command, o => o is AvaloniaObject || (o is OpenDocument open && window.EditorArea.Documents.Contains(open)));
+            Assert.True(held < bytes / 10, $"New Project's Undo held {held} bytes for a folder of {bytes} bytes in {made.Count} files, the most in {most}");
         }
         finally
         {
@@ -532,7 +615,7 @@ public sealed class NewServiceSetupTests : IDisposable
                 window.Close();
                 Ui.AwaitPumped(window.Ended ?? Task.CompletedTask, "what the closed window started to end", MainWindow.EndLimit + TimeSpan.FromSeconds(5));
             }
-            Detach(volume);
+            TestVolumes.Detach(volume, disk);
         }
     }
 
@@ -545,8 +628,6 @@ public sealed class NewServiceSetupTests : IDisposable
         Assert.True(window.EditorArea.CodeEditor.Document.Snapshot.ToString() == text,
             $"A key typed while the folder was carried did not reach the editor, so the window was not answering: '{window.EditorArea.CodeEditor.Document.Snapshot}'");
     }
-
-    private static void Detach(string volume) => TestVolumes.Detach(volume, Ran);
 
     /// <summary>A system tool run on the thread pool and waited for with the window's loop running.</summary>
     private static ChildResult Ran(string tool, params string[] arguments)
@@ -686,9 +767,7 @@ public sealed class NewServiceSetupTests : IDisposable
         return dialog;
     }
 
-    /// <summary>Whether Undo in the Solution view has a command to take back, asked apart so no reference to it outlives the
-    /// question in the test's frame.</summary>
-    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
+    /// <summary>Whether Undo in the Solution view has a command to take back.</summary>
     private static bool Undoes(MainWindow window) => window.EditorArea.Commands.ToUndo(null) is not null;
 
     /// <summary>Every file the template and set-up made in a project's folder, but what builds write, with its bytes.</summary>

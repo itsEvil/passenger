@@ -1,4 +1,3 @@
-using System.Text.Json;
 using System.Text.RegularExpressions;
 using Passenger.App.State;
 using Passenger.App.Workspace;
@@ -10,7 +9,12 @@ namespace Passenger.App.Run;
 
 /// <summary>The project a launch builds first, for one framework when it has several, into the folder given where its own
 /// would not do (a single-file AppHost's, kept in the state).</summary>
-public sealed record BuildStep(string Project, string? Framework, string? Output = null);
+public sealed record BuildStep(string Project, string? Framework, string? Output = null)
+{
+    /// <summary>Global properties the build is given beyond the build configuration's, which make it a build of its own
+    /// (a MAUI project's plain one for its preview), never checked as up to date; null for none.</summary>
+    public IReadOnlyList<string>? Properties { get; init; }
+}
 
 /// <summary>A web app's build as its browser refresh needs it (<see cref="Debugging.BrowserRefresh"/>): the folder of the SDK
 /// it builds with, its intermediate output folder, the global properties its build is given, and the projects it references
@@ -32,7 +36,8 @@ public sealed partial record LaunchPlan
     /// <summary>The configuration's name, as the windows and the status bar say it.</summary>
     public required string Name { get; init; }
 
-    /// <summary>The copy of its configuration's game it starts, where it starts one of several (<see cref="GameCopies"/>).</summary>
+    /// <summary>The copy of its configuration's game it starts, where it starts one of several (<see cref="GameCopies"/>), or its
+    /// place among a multi-project configuration's projects.</summary>
     public GameCopy? Copy { get; init; }
 
     /// <summary>The program started: the project's apphost (<see cref="ByAppHost"/>), the <c>dotnet</c> host for an assembly,
@@ -42,6 +47,17 @@ public sealed partial record LaunchPlan
     /// <summary>Whether <see cref="Program"/> is the apphost the SDK made beside <see cref="Built"/>, which runs it
     /// (<see cref="AppHosts"/>).</summary>
     public bool ByAppHost { get; init; }
+
+    /// <summary>The x86 .NET installation its program runs on, where it runs as a 32-bit x86 process (<see cref="X86Programs"/>);
+    /// null for any other.</summary>
+    public string? X86Dotnet { get; init; }
+
+    /// <summary>Why Passenger's debugger cannot debug its program: one known to run on Windows as a 32-bit x86 process, by
+    /// its build (<see cref="X86Dotnet"/>) or by its own native header (a test host's apphost a runner names), never a .NET
+    /// assembly's, whose machine is not its processor; null where it can, or where that is not known.</summary>
+    public string? WhyNotDebugged => OperatingSystem.IsWindows() && (X86Dotnet is not null
+        || (System.IO.Path.IsPathRooted(Program) && ProgramProcessors.Of(Program) is [System.Runtime.InteropServices.Architecture.X86]))
+        ? Refusals.X86Undebugged(ProgramName) : null;
 
     /// <summary>The program's arguments, the assembly first when it runs under <c>dotnet</c>.</summary>
     public IReadOnlyList<string> Arguments { get; init; } = [];
@@ -62,6 +78,10 @@ public sealed partial record LaunchPlan
     /// <summary>Set over the IDE's own environment, which the program inherits.</summary>
     public IReadOnlyDictionary<string, string> Environment { get; init; } = new Dictionary<string, string>();
 
+    /// <summary>Whether it runs an Azure Functions app by Azure Functions Core Tools' func (<see cref="Aspire.FunctionsHost"/>),
+    /// which starts the app's own program, its worker, the one a debugger attaches to.</summary>
+    public bool Functions { get; init; }
+
     /// <summary>The project, and the framework of it that runs; null for a test host VSTest describes.</summary>
     public string? Project { get; init; }
 
@@ -72,6 +92,10 @@ public sealed partial record LaunchPlan
 
     /// <summary>The build before launch, or null when the configuration launches what was built last.</summary>
     public BuildStep? Build { get; init; }
+
+    /// <summary>The workspace it was worked out in, whose build configuration its build, dotnet watch and its install on a
+    /// device are given (<see cref="ProjectSession.WorkspaceOfAsync"/>); null for none.</summary>
+    public WorkspaceModel? Workspace { get; init; }
 
     /// <summary>The file the build makes and the launch needs (the project's assembly), checked once the build is done.</summary>
     public string? Built { get; init; }
@@ -90,6 +114,15 @@ public sealed partial record LaunchPlan
 
     /// <summary>Where the browser opens once the program listens, or null when the configuration opens none.</summary>
     public string? BrowserUrl { get; init; }
+
+    /// <summary>The browser its configuration names for its page, as a command line, in place of Settings' (<see cref="PageBrowsers"/>);
+    /// empty for Settings'.</summary>
+    public string BrowserLine { get; init; } = string.Empty;
+
+    /// <summary>The container's service whose HTTP answer at <see cref="BrowserUrl"/> opens the browser, since the engine
+    /// takes connections on its published port before its program listens; null for a program whose port taking a connection
+    /// opens it.</summary>
+    public string? BrowserService { get; init; }
 
     /// <summary>A web app's build, which its browser refresh needs; null for any other program.</summary>
     public WebBuild? Web { get; init; }
@@ -137,6 +170,14 @@ public sealed partial record LaunchPlan
         + $"where {NameOf(server)} runs them itself, prerendering them or rendering them on the server";
 
     private static string NameOf(string project) => System.IO.Path.GetFileNameWithoutExtension(project);
+
+    /// <summary>Where it runs its app other than on this machine (an Android device or emulator), which its start installs it
+    /// on after its build (<see cref="Devices.DeviceLaunches"/>); null for a program of this machine.</summary>
+    public Devices.DeviceLaunch? Device { get; init; }
+
+    /// <summary>The Mac Catalyst app it runs on this machine, which the system opens as it opens an app once its build says
+    /// where it is (<see cref="Devices.MacCatalystApps"/>); null for any other plan.</summary>
+    public Devices.MacCatalystLaunch? MacCatalyst { get; init; }
 
     /// <summary>The folder of the Godot project whose game or editor the plan runs on Godot (<see cref="GodotLaunch"/>);
     /// null for any other plan.</summary>
@@ -203,14 +244,19 @@ public sealed partial record LaunchPlan
     public string ProgramName => GameName ?? System.IO.Path.GetFileNameWithoutExtension(Built ?? Program);
 
     /// <summary>Null when the plan can launch now, its build done: else that the build made no program or apphost (unless
-    /// what starts it builds it), that the working folder is gone ("Could not run Hello: its working folder ... does not exist"),
-    /// unless what starts it builds it there (<see cref="WorksWhereBuilt"/>), or that its windows would reach the person's
-    /// screen from a Passenger nobody sees (<see cref="UnseenApps.WhyNot"/>).</summary>
+    /// what starts it builds it), that the x86 .NET a 32-bit program runs on lacks its frameworks (<see cref="X86Programs.Lacking(string,string,IReadOnlyDictionary{string,string})"/>),
+    /// that the working folder is gone ("Could not run Hello: its working folder ... does not exist"), unless what starts it
+    /// builds it there (<see cref="WorksWhereBuilt"/>), or that its windows would reach the person's screen from a Passenger
+    /// nobody sees (<see cref="UnseenApps.WhyNot"/>).</summary>
     public string? WhyNot(string verb, bool built = true)
     {
         if (built && (Built is { } file && !File.Exists(file) ? file : ByAppHost && !File.Exists(Program) ? Program : null) is { } missing)
         {
             return $"Could not {verb} {ProgramName}: {System.IO.Path.GetFileName(missing)} has not been built";
+        }
+        if (X86Dotnet is { } x86 && Built is { } assembly && X86Programs.Lacking(x86, assembly, Environment) is { Count: > 0 } lacking)
+        {
+            return $"Could not {verb} {ProgramName}: {Refusals.X86RuntimeMissing(x86, lacking)}";
         }
         return !Directory.Exists(WorkingDirectory) && (built || !WorksWhereBuilt)
             ? $"Could not {verb} {ProgramName}: its working folder {WorkingDirectory} does not exist"
@@ -221,13 +267,28 @@ public sealed partial record LaunchPlan
     /// first build makes it (dotnet watch's, for a run with Hot Reload).</summary>
     public bool WorksWhereBuilt => Built is { } file && System.IO.Path.GetDirectoryName(file) is { } output && PathNames.Same(output, WorkingDirectory);
 
+    /// <summary>The desktop app it starts, as <see cref="DesktopPrograms.Started"/> reads it, its apphost read as the assembly
+    /// it runs; null for a program of no UI framework known.</summary>
+    public DesktopProgram? DesktopApp() =>
+        DesktopPrograms.Started(ByAppHost && Built is { } assembly ? assembly : Program, Arguments, WorkingDirectory, Built, Target, DesktopProject, NamedProject);
+
     /// <summary>Works out what a configuration launches among the open folder's projects (of <paramref name="workspace"/>,
     /// whose solution's properties MSBuild is given), asking MSBuild, with no build, where the project builds, where and how
     /// dotnet run runs it, and any property its values name; a Passenger it launches keeps its state in its sandbox/, a Godot
     /// project runs on the Godot <paramref name="godot"/> names or found, its editor on the scene at hand, in the user folders
     /// <paramref name="godotFolders"/> gives, headless where <paramref name="unseen"/> (the process's by default). Throws a <see cref="LaunchException"/> saying why not.</summary>
     public static async Task<LaunchPlan> ResolveAsync(RunConfiguration configuration, IReadOnlyList<ProjectModel> projects, WorkspaceModel? workspace, string stateFolder,
-        CancellationToken cancel = default, string? godot = null, string? atHand = null, IReadOnlyDictionary<string, string>? godotFolders = null, bool? unseen = null)
+        CancellationToken cancel = default, string? godot = null, string? atHand = null, IReadOnlyDictionary<string, string>? godotFolders = null, bool? unseen = null,
+        Func<ProjectModel, Devices.KeptTarget?>? targets = null) =>
+        await ResolveWithinAsync(configuration, projects, workspace, stateFolder, cancel, godot, atHand, godotFolders, unseen, targets) with
+        {
+            Workspace = workspace,
+            BrowserLine = configuration.Browser,
+        };
+
+    private static async Task<LaunchPlan> ResolveWithinAsync(RunConfiguration configuration, IReadOnlyList<ProjectModel> projects, WorkspaceModel? workspace, string stateFolder,
+        CancellationToken cancel, string? godot, string? atHand, IReadOnlyDictionary<string, string>? godotFolders, bool? unseen,
+        Func<ProjectModel, Devices.KeptTarget?>? targets)
     {
         bool headless = unseen ?? PassengerApp.ShowsNoWindow;
         if (configuration.Unsupported is { } why)
@@ -238,6 +299,16 @@ public sealed partial record LaunchPlan
         {
             // Run, Debug and Profile bring containers up themselves (BuildRunController.Containers.cs): no plan of this machine's runs them.
             throw new LaunchException(InContainers(configuration.Name));
+        }
+        if (configuration.IsMultiple)
+        {
+            // Run and Debug start each of its projects as its own configuration does (BuildRunController.Projects.cs).
+            throw new LaunchException(SeveralProjects(configuration.Name));
+        }
+        if (configuration.IsScript)
+        {
+            // Run starts it with its package manager (BuildRunController.Scripts.cs): no .NET program to plan.
+            throw new LaunchException(Refusals.ScriptOnlyRuns(configuration.Name));
         }
         if (configuration.RunsScriptGame)
         {
@@ -265,7 +336,29 @@ public sealed partial record LaunchPlan
         }
         ProjectModel project = projects.FirstOrDefault(p => PathNames.Same(p.Path, configuration.Project))
             ?? throw new LaunchException($"{configuration.Name} cannot run: its project {System.IO.Path.GetFileName(configuration.Project)} is not loaded in the open folder");
-        string? framework = FrameworkOf(configuration.Framework, project);
+        // The target chosen to run on decides the framework built: its platform's, unless the configuration names one of it.
+        Devices.KeptTarget? device = Devices.DeviceTargets.PlatformsOf(project.TargetFrameworks).Count > 0 ? targets?.Invoke(project) : null;
+        if (device is not null && Devices.DeviceTargets.FrameworkFor(project, device.Platform) is null)
+        {
+            device = null;
+        }
+        string? framework = device is not null && Devices.DeviceTargets.PlatformOf(configuration.Framework) != device.Platform && project.TargetFrameworks.Count > 1
+            ? Devices.DeviceTargets.FrameworkFor(project, device.Platform)
+            : FrameworkOf(configuration.Framework, project);
+        Devices.TargetPlatform? platform = device?.Platform ?? Devices.DeviceTargets.PlatformOf(framework ?? project.TargetFrameworks.FirstOrDefault() ?? string.Empty);
+        if (device is null && configuration.Program.Length == 0 && platform is Devices.TargetPlatform.Android or Devices.TargetPlatform.Ios)
+        {
+            throw new LaunchException(Refusals.NoRunTarget(project.Name));
+        }
+        if (configuration.Program.Length == 0 && platform == Devices.TargetPlatform.MacCatalyst && !OperatingSystem.IsMacOS())
+        {
+            throw new LaunchException($"{configuration.Name} cannot run here: a Mac Catalyst app runs only on a Mac");
+        }
+        // The project's own configuration, named for no platform, runs its platform's profile where the target is of that platform.
+        if (platform is { } on && configuration is { LaunchProfile.Length: 0, Program.Length: 0 } && Devices.DeviceTargets.ProfileFor(LaunchProfile.Read(project), on) is { } tied)
+        {
+            configuration = configuration.TakingProfile(project, tied);
+        }
         // Before its build: the program would build here (EnableWindowsTargeting) and then fail to start for want of WindowsDesktop.
         if (configuration.Program.Length == 0 && project.RunsOnlyOnWindows(framework) is { } windows)
         {
@@ -275,7 +368,7 @@ public sealed partial record LaunchPlan
             StringComparer.OrdinalIgnoreCase);
         if (project.GodotFolder is not null)
         {
-            names.Add(MSBuildNames.GodotSdkVersion);
+            names.UnionWith([MSBuildNames.GodotSdkVersion, MSBuildNames.Configuration, MSBuildNames.TargetFramework]);
         }
         if (project.IsWeb)
         {
@@ -289,6 +382,12 @@ public sealed partial record LaunchPlan
             }
         }
         IReadOnlyDictionary<string, string> properties = await EvaluateAsync(project, framework, names, workspace, cancel);
+        // A project naming its one framework in TargetFrameworks evaluates as an outer build, which builds nothing itself.
+        if (framework is null && project.TargetFrameworks is [{ } only] && !properties.ContainsKey(CarriedProperties.TargetPath))
+        {
+            framework = only;
+            properties = await EvaluateAsync(project, framework, names, workspace, cancel);
+        }
         string Expand(string text) => System.Environment.ExpandEnvironmentVariables(
             Macro().Replace(text, macro => properties.GetValueOrDefault(macro.Groups[1].Value, string.Empty)));
         // The configuration's own, its launch profile named as dotnet run names it.
@@ -307,8 +406,14 @@ public sealed partial record LaunchPlan
             : throw new LaunchException($"MSBuild could not say what {project.Name} builds"));
         if ((configuration.Program.Length == 0 || configuration.NamesGodot) && project.GodotFolder is { } game)
         {
+            if (properties.GetValueOrDefault(MSBuildNames.Configuration) is { Length: > 0 } builtAs && !builtAs.Equals(GodotLaunch.RunsConfiguration, StringComparison.OrdinalIgnoreCase))
+            {
+                throw new LaunchException($"{configuration.Name} cannot run: Godot loads a game's {GodotLaunch.RunsConfiguration} build alone, where the build configuration "
+                    + $"chosen builds {project.Name} as {builtAs} (as an export does): choose {GodotLaunch.RunsConfiguration} to run it");
+            }
             return await GodotLaunch.PlanAsync(configuration, project, game, target, framework, Expand, Passenger.App.Godot.GodotUserFolders.Into(Variables(), godotFolders), godot,
-                properties.GetValueOrDefault(MSBuildNames.GodotSdkVersion), headless, cancel, atHand);
+                properties.GetValueOrDefault(MSBuildNames.GodotSdkVersion), headless, cancel, atHand,
+                properties.GetValueOrDefault(MSBuildNames.TargetFramework) is { Length: > 0 } evaluated ? evaluated : null);
         }
         List<string> arguments = [.. CommandLine.Split(Expand(configuration.Arguments))];
         IReadOnlyList<string> ofProject = [];
@@ -317,6 +422,7 @@ public sealed partial record LaunchPlan
         int leading = 0;
         AppHost? host = null;
         string? underDotnet = null;
+        string? x86 = null;
         if (configuration.Program is { Length: > 0 } named)
         {
             program = Executable(Expand(named), project.Folder);
@@ -334,6 +440,11 @@ public sealed partial record LaunchPlan
             arguments.AddRange(ofProject);
             bool assembly = target.EndsWith(".dll", StringComparison.OrdinalIgnoreCase);
             (host, underDotnet) = assembly ? AppHosts.Of(properties, target) : (null, null);
+            if (assembly && (host is { X86: true } || X86Programs.Builds(properties)))
+            {
+                // A 64-bit .NET loads no x86 assembly: Windows runs it on its x86 .NET, as its apphost or the x86 dotnet finds it.
+                x86 = OperatingSystem.IsWindows() ? X86Programs.Root(Variables()) : throw new LaunchException($"{configuration.Name} cannot run here: {Refusals.X86OnWindowsAlone}");
+            }
             if (host is not null)
             {
                 program = host.Program;
@@ -341,7 +452,7 @@ public sealed partial record LaunchPlan
             }
             else if (assembly)
             {
-                program = Dotnet.Host();
+                program = x86 is null ? Dotnet.Host(project.Folder) : System.IO.Path.Combine(x86, Dotnet.HostName);
                 arguments.Insert(0, target);
                 built = target;
                 leading = 1;
@@ -356,22 +467,23 @@ public sealed partial record LaunchPlan
             ? System.IO.Path.TrimEndingDirectorySeparator(PathNames.Canonical(System.IO.Path.Combine(project.Folder, folder)))
             : System.IO.Path.GetDirectoryName(target)!;
         Dictionary<string, string> environment = Variables();
-        // The apphost takes its runtime from the .NET that builds it, as dotnet run's does, or the one the configuration names, over any the IDE inherited.
+        // The apphost takes its runtime from the .NET that builds it (an x86 one's from the x86 .NET), or the one the configuration names, over any the IDE inherited.
         if (host is not null && !environment.Keys.Any(k => k.Equals(host.RootVariable, StringComparison.OrdinalIgnoreCase)))
         {
-            environment[host.RootVariable] = environment.Where(v => v.Key.Equals(RuntimeVariables.Root, StringComparison.OrdinalIgnoreCase)).Select(v => v.Value).FirstOrDefault()
-                ?? Dotnet.Root();
+            environment[host.RootVariable] = host.X86 && x86 is not null ? x86
+                : environment.Where(v => v.Key.Equals(RuntimeVariables.Root, StringComparison.OrdinalIgnoreCase)).Select(v => v.Value).FirstOrDefault() ?? Dotnet.Root(project.Folder);
         }
         string? other = DesktopPrograms.NamedProject(program, arguments, working) is { } runs && !PathNames.Same(runs, project.Path) && !PathNames.Same(runs, project.Folder) ? runs : null;
         if (SandboxedState(built ?? program, environment, stateFolder) is { } sandbox)
         {
             environment[StateStore.Variable] = sandbox;
         }
-        return new LaunchPlan
+        LaunchPlan plan = new()
         {
             Name = configuration.Name,
             Program = program,
             ByAppHost = host is not null,
+            X86Dotnet = x86,
             Arguments = arguments,
             Leading = leading,
             ArgumentsOfProject = ofProject.Count > 0,
@@ -392,7 +504,17 @@ public sealed partial record LaunchPlan
             Web = WebOf(project, framework, properties, workspace, projects),
             Unseen = headless,
             Notes = underDotnet is null ? [] : [$"{configuration.Name} runs as dotnet {System.IO.Path.GetFileName(target)}, not by its apphost: {underDotnet}"],
+            Device = device is { Kind: not Devices.TargetKind.ThisMachine } && configuration.Program.Length == 0 ? new Devices.DeviceLaunch(device, framework ?? project.TargetFrameworks[0]) : null,
+            MacCatalyst = platform == Devices.TargetPlatform.MacCatalyst && configuration.Program.Length == 0
+                ? new Devices.MacCatalystLaunch(framework ?? project.TargetFrameworks[0]) : null,
         };
+        if (configuration.Program.Length > 0 || !project.IsFunctionsApp)
+        {
+            return plan;
+        }
+        // A Functions app runs as dotnet run runs it, by func, whose SDK names it only in a target no evaluation runs.
+        string func = await BackgroundWork.Run(Aspire.FunctionsHost.Func, cancel) ?? throw new LaunchException(Refusals.NoFunc(project.Name));
+        return Aspire.FunctionsHost.Plan(plan, func, [.. plan.OwnArguments]);
     }
 
     /// <summary>A configuration's variables, on Linux with no display in them where nobody is to see what they start.</summary>
@@ -430,6 +552,11 @@ public sealed partial record LaunchPlan
     /// <summary>Why a container configuration has no plan of this machine's: Run, Debug and Profile bring its containers up.</summary>
     public static string InContainers(string name) =>
         $"{name} runs in containers, which Run, Debug and Profile bring up: it starts no program on this computer";
+
+    /// <summary>Why a multi-project configuration has no one plan: Run and Debug start each of its projects, and Profile records
+    /// one program, which a project's own configuration starts.</summary>
+    public static string SeveralProjects(string name) =>
+        $"{name} starts several projects, each as its own configuration starts it: Run and Debug start them together, and Profile records one program, which one of their configurations starts";
 
     /// <summary>The state folder a Passenger launched from this one is given: sandbox/ in this one's, so the two never share
     /// settings, recent solutions, a folder's editors and breakpoints, the log or agents' sockets, and the one debugged
@@ -477,13 +604,13 @@ public sealed partial record LaunchPlan
     {
         if (named is "dotnet" or "dotnet.exe")
         {
-            return Dotnet.Host();
+            return Dotnet.Host(projectFolder);
         }
         if (named.IndexOfAny(['/', '\\']) >= 0 || System.IO.Path.IsPathRooted(named))
         {
             return PathNames.Canonical(System.IO.Path.Combine(projectFolder, named));
         }
-        return Programs.OnPath(named) ?? Programs.OnPath(named + (OperatingSystem.IsWindows() ? ".exe" : string.Empty)) ?? named;
+        return Programs.Command(named) ?? named;
     }
 
     /// <summary>The framework a project runs for: the one <paramref name="chosen"/> names, else the first of its several;
@@ -506,7 +633,7 @@ public sealed partial record LaunchPlan
         }
         if (target is not null)
         {
-            return await AfterTargetAsync(project, names, globals, target, cancel) ?? await EvaluateAsync(project, framework, names, workspace, cancel);
+            return await AfterTargetAsync(project, framework, names, globals, target, cancel) ?? await EvaluateAsync(project, framework, names, workspace, cancel);
         }
         PropertiesAnswer answer;
         try
@@ -524,32 +651,12 @@ public sealed partial record LaunchPlan
             : new Dictionary<string, string>(answer.Values, StringComparer.OrdinalIgnoreCase);
     }
 
-    /// <summary>The properties as they stand once a target has run, through dotnet msbuild; null when it did not run.</summary>
-    private static async Task<IReadOnlyDictionary<string, string>?> AfterTargetAsync(ProjectModel project, IReadOnlyCollection<string> names,
+    /// <summary>The properties as they stand once a target has run, asked of MSBuild; null when it did not run.</summary>
+    private static async Task<IReadOnlyDictionary<string, string>?> AfterTargetAsync(ProjectModel project, string? framework, IReadOnlyCollection<string> names,
         IReadOnlyDictionary<string, string> globals, string target, CancellationToken cancel)
     {
-        List<string> args = ["msbuild", project.Path, "-nologo", $"-target:{target}", .. names.Select(n => $"-getProperty:{n}"), .. globals.Select(p => $"-property:{p.Key}={p.Value}")];
-        ChildResult msbuild = await ChildProcesses.RunAsync(ChildProcesses.DotnetCommand(args, project.Folder), cancel: cancel);
-        string output = msbuild.Output.Trim();
-        if (!msbuild.Succeeded || output.Length == 0)
-        {
-            return null;
-        }
-        try
-        {
-            using JsonDocument read = JsonDocument.Parse(output);
-            if (JsonMembers.Object(read.RootElement, "Properties") is not { } properties)
-            {
-                return null;
-            }
-            return properties.EnumerateObject()
-                .Where(p => p.Value.ValueKind == JsonValueKind.String && p.Value.GetString()!.Length > 0)
-                .ToDictionary(p => p.Name, p => p.Value.GetString()!, StringComparer.OrdinalIgnoreCase);
-        }
-        catch (Exception error) when (error is JsonException or KeyNotFoundException or InvalidOperationException)
-        {
-            return null;
-        }
+        MSBuildAnswer answer = await MSBuildQuestions.AskAsync(project.Path, framework, globals, new MSBuildQuestion([target]) { Properties = [.. names] }, cancel);
+        return answer.Succeeded && answer.Answered ? answer.Properties : null;
     }
 
     /// <summary>An MSBuild property named in a launch profile's value, <c>$(TargetDir)</c>.</summary>

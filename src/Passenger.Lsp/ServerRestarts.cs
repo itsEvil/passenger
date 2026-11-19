@@ -1,23 +1,27 @@
+using System.Diagnostics;
+using Passenger.Core;
+
 namespace Passenger.Lsp;
 
 /// <summary>How often a language server that keeps ending or hanging is started again in its place: three times within
-/// five minutes, after which it is left stopped. Asked on its owner's thread alone.</summary>
+/// five minutes of Stopwatch's clock, after which it is left stopped. Asked on its owner's thread alone.</summary>
 public sealed class ServerRestarts
 {
     private const int Limit = 3;
 
     private static readonly TimeSpan Window = TimeSpan.FromMinutes(5);
 
-    private readonly List<DateTime> restarts = [];
+    /// <summary>When each restart within the window was, a timestamp of Stopwatch's.</summary>
+    private readonly List<long> restarts = [];
 
     /// <summary>How often a server left stopped stopped: "4 times in 5 minutes".</summary>
-    public static string Often => $"{Limit + 1} times in {Window.TotalMinutes:0} minutes";
+    public static string Often => $"{Limit + 1} times in {Durations.Said(Window)}";
 
     /// <summary>Whether a server lost now is started again, which counts as one of its restarts.</summary>
     public bool Again()
     {
-        DateTime now = DateTime.UtcNow;
-        restarts.RemoveAll(at => now - at > Window);
+        long now = Stopwatch.GetTimestamp();
+        restarts.RemoveAll(at => Stopwatch.GetElapsedTime(at, now) > Window);
         if (restarts.Count >= Limit)
         {
             return false;

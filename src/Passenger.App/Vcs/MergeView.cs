@@ -72,14 +72,19 @@ public sealed class MergeView : DockPanel
         Texts = texts;
 
         // The IDE's keymap sends each its keys from the merge's window (IdeKeys).
-        Left = new CodeEditor { IsReadOnly = true, ChangeBackgrounds = true };
+        Left = new CodeEditor { IsReadOnly = true, ReadOnlyWhy = Refusals.MergeSideReadOnly, ChangeBackgrounds = true };
         Left.Show(new TextDocument(texts.Left), SelectionSet.Single(0), default);
         result = new TextDocument(texts.Base);
         started = result.Snapshot;
         Result = new CodeEditor { ChangeBackgrounds = true };
         Result.Show(result, SelectionSet.Single(0), default);
-        Right = new CodeEditor { IsReadOnly = true, ChangeBackgrounds = true };
+        Right = new CodeEditor { IsReadOnly = true, ReadOnlyWhy = Refusals.MergeSideReadOnly, ChangeBackgrounds = true };
         Right.Show(new TextDocument(texts.Right), SelectionSet.Single(0), default);
+        string language = Languages.Language.ForPath(name).Id;
+        foreach (CodeEditor pane in (CodeEditor[])[Left, Result, Right])
+        {
+            ThemeLanguages.Follow(pane, language);
+        }
         state = [.. chunks.Select(c => new Resolution(c.BaseStart, c.BaseEnd, !c.LeftChanged, !c.RightChanged, false))];
         states[started] = state;
         leftStrip = Strip(MergeSide.Left);
@@ -103,7 +108,7 @@ public sealed class MergeView : DockPanel
         applyNonConflicting.Content = new PathIcon { RenderTransform = new RotateTransform(90) };
         ((PathIcon)applyNonConflicting.Content).Bind(PathIcon.DataProperty, applyNonConflicting.GetResourceObservable(IconKeys.ApplyNonConflicts));
         resolveSimple = ToolButtons.Of(IconKeys.Wand, "Resolve Simple Conflicts", ResolveSimpleConflicts);
-        Border rule = new() { Width = 1, Height = 16, Margin = new Thickness(6, 0) };
+        Border rule = new() { Width = 1, Height = 16, Margin = new Thickness(Gaps.Small, 0) };
         rule.Bind(Border.BackgroundProperty, rule.GetResourceObservable(TokenKeys.Divider));
         Children.Add(DiffLines.Bar(name, Step, status, [applyNonConflicting, resolveSimple, rule]));
         Children.Add(sides);
@@ -446,8 +451,8 @@ public sealed class MergeView : DockPanel
             : $"{Count(changes, "change", "No changes")}, {Count(conflicts, "conflict", "No conflicts")}";
         applyNonConflicting.IsEnabled = changes > 0;
         resolveSimple.IsEnabled = changes > 0 || Enumerable.Range(0, chunks.Count).Any(i => chunks[i].IsConflict && !Done(i) && !state[i].Taken && simple[i] is not null);
-        leftStrip.InvalidateVisual();
-        rightStrip.InvalidateVisual();
+        leftStrip.Refresh();
+        rightStrip.Refresh();
 
         static string Count(int count, string what, string none) => count switch
         {
@@ -592,8 +597,8 @@ public sealed class MergeView : DockPanel
     /// <summary>Keeps the three sides level as any of them scrolls: a line maps through the changes above it.</summary>
     private void Follow(CodeEditor from)
     {
-        leftStrip.InvalidateVisual();
-        rightStrip.InvalidateVisual();
+        leftStrip.Refresh();
+        rightStrip.Refresh();
         if (following)
         {
             return;
@@ -626,12 +631,20 @@ public sealed class MergeView : DockPanel
     });
 
     /// <summary>Whether a key is the merge's own, which the IDE's keymap leaves to it: Next and Previous Difference, and
-    /// Accept Left Side and Accept Right Side, Ctrl+Cmd+Right and Left on the Mac, Ctrl+Alt+R and A elsewhere.</summary>
-    public static bool TakesKey(KeyEventArgs e) => DiffLines.Step(e) != 0 || IsAccept(e);
+    /// Accept Left Side and Accept Right Side (<see cref="AcceptKeys"/>).</summary>
+    public static bool TakesKey(KeyEventArgs e) => DiffLines.Step(e) != 0 || AcceptedBy(e) is not null;
 
-    private static bool IsAccept(KeyEventArgs e) => OperatingSystem.IsMacOS()
-        ? e.KeyModifiers == (KeyModifiers.Control | KeyModifiers.Meta) && e.Key is Key.Right or Key.Left
-        : e.KeyModifiers == (KeyModifiers.Control | KeyModifiers.Alt) && e.Key is Key.R or Key.A;
+    /// <summary>Accept Left Side's or Accept Right Side's keys: Ctrl+Cmd+Right and Left on the Mac, Ctrl+Alt+R and A elsewhere.</summary>
+    private static Keystroke AcceptKeys(MergeSide side) => OperatingSystem.IsMacOS()
+        ? new(side == MergeSide.Left ? Key.Right : Key.Left, KeyModifiers.Control | KeyModifiers.Meta)
+        : new(side == MergeSide.Left ? Key.R : Key.A, KeyModifiers.Control | KeyModifiers.Alt);
+
+    /// <summary>The side whose Accept a key is, or null for any other key.</summary>
+    private static MergeSide? AcceptedBy(KeyEventArgs e)
+    {
+        Keystroke pressed = Keystroke.From(e);
+        return pressed == AcceptKeys(MergeSide.Left) ? MergeSide.Left : pressed == AcceptKeys(MergeSide.Right) ? MergeSide.Right : null;
+    }
 
     private void OnKeyDown(object? sender, KeyEventArgs e)
     {
@@ -640,9 +653,9 @@ public sealed class MergeView : DockPanel
             Step(step);
             e.Handled = true;
         }
-        else if (IsAccept(e))
+        else if (AcceptedBy(e) is { } side)
         {
-            AcceptAtCaret(e.Key is Key.Right or Key.R ? MergeSide.Left : MergeSide.Right);
+            AcceptAtCaret(side);
             e.Handled = true;
         }
     }
@@ -674,7 +687,9 @@ public sealed class MergeView : DockPanel
     /// <summary>The strip between a side and the result: each change of that side not dealt with is a band from its lines
     /// to the result's, with the arrow that takes it and the X that ignores it at the side's end.</summary>
     private DiffStrip Strip(MergeSide side) =>
-        new(() => Bands(side), side, side == MergeSide.Left ? Left : Right, () => true, ignores: true, (band, ignore, keys) =>
+        new(() => Bands(side), side, side == MergeSide.Left ? Left : Right, () => true, ignores: true, (_, ignore) => ignore
+            ? ($"Ignore {side} Side", null)
+            : ($"Accept {side} Side", AcceptKeys(side).Display()), (band, ignore, keys) =>
         {
             if (ignore)
             {

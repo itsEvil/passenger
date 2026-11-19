@@ -188,10 +188,11 @@ public sealed class CodeAssistTests : IClassFixture<CodeAssistTests.Project>
         window.Close();
     }
 
-    /// <summary>Go to Symbol lists the solution's own declarations, never what a source generator wrote for them: a
-    /// [GeneratedRegex] method is found in its own file, and nothing at a generated file's name.</summary>
+    /// <summary>Go to Symbol lists the solution's own declarations first, never a source generator's part of one of them: a
+    /// [GeneratedRegex] method is found in its own file alone, and what only the generator declares comes after, said to be
+    /// generated, nothing at a path no file is at.</summary>
     [AvaloniaFact]
-    public void Go_to_Symbol_lists_a_generated_methods_own_declaration_and_nothing_a_generator_wrote()
+    public void Go_to_Symbol_lists_a_generated_methods_own_declaration_alone_and_what_only_a_generator_wrote_after()
     {
         project.Write("Words.cs", "using System.Text.RegularExpressions;\n\nstatic partial class Words\n{\n"
             + "    [GeneratedRegex(@\"\\w+\")]\n    public static partial Regex Word();\n}\n");
@@ -203,7 +204,12 @@ public sealed class CodeAssistTests : IClassFixture<CodeAssistTests.Project>
             window.KeyTextInput("Word");
             Ui.WaitFor(() => popup.IsSettled && popup.Rows.Any(r => r.Where?.StartsWith("Words.cs:", StringComparison.Ordinal) == true),
                 () => $"Word's own declaration among the server's symbols: [{string.Join(", ", popup.Rows.Select(r => $"{r.Name} {r.Where}"))}]");
-            Assert.DoesNotContain(popup.Rows, r => r.Where is { } where && (where.Contains(".g.cs", StringComparison.Ordinal) || where.StartsWith('/')));
+            SymbolRow[] rows = [.. popup.Rows];
+            string Listed() => string.Join(", ", rows.Select(r => $"{r.Name} {r.Where}"));
+            Assert.True(rows.Count(r => r.Name.StartsWith("Word(", StringComparison.Ordinal) || r.Name == "Word") == 1
+                && rows.SkipWhile(r => r.Generated is null).All(r => r.Generated is not null && r.Where?.Contains(".g.cs (generated):", StringComparison.Ordinal) == true),
+                $"Go to Symbol listed the method more than once, or a generator's symbol before the person's or unsaid: {Listed()}");
+            Assert.DoesNotContain(rows, r => r.Where is { } where && where.StartsWith('/'));
         }
         finally
         {
@@ -255,6 +261,136 @@ public sealed class CodeAssistTests : IClassFixture<CodeAssistTests.Project>
         Ui.Click(button);
     }
 
+    [AvaloniaTheory]
+    [InlineData("ENTER", "")]
+    [InlineData("TAB", "")]
+    [InlineData("ENTER", " ")]
+    [InlineData("TAB", "\t")]
+    public void Declaration_completion_leaves_the_caret_after_one_separator(string key, string existing)
+    {
+        string path = project.PathOf("Program.cs");
+        File.WriteAllText(path, existing + "\n" + File.ReadAllText(path));
+        MainWindow window = project.Open("Program.cs");
+        CodeEditor editor = window.EditorArea.CodeEditor;
+        editor.Focus();
+        editor.GoTo(new TextPosition(0, 0));
+        Type("pu");
+        Ui.WaitFor(() => window.Assist.CompletionLabels.FirstOrDefault() == "public", "public offered");
+        string before = editor.Document.Snapshot.ToString();
+        Ui.Press(window, key);
+        Ui.Settle();
+        string prefix = "public" + (existing.Length == 0 ? " " : existing);
+        Assert.StartsWith(prefix + "\nclass Program", editor.Document.Snapshot.ToString(), StringComparison.Ordinal);
+        Assert.Equal(prefix.Length, editor.Selections.Primary.Caret);
+
+        Ui.Press(window, Ui.Shortcut(EditorActions.Undo));
+        Assert.Equal(before, editor.Document.Snapshot.ToString());
+        Ui.Press(window, Ui.Shortcut(EditorActions.Redo));
+        Assert.StartsWith(prefix + "\nclass Program", editor.Document.Snapshot.ToString(), StringComparison.Ordinal);
+        Assert.Equal(prefix.Length, editor.Selections.Primary.Caret);
+
+        Type("sta");
+        Ui.WaitFor(() => window.Assist.CompletionLabels.FirstOrDefault() == "static", "static offered after public");
+        Ui.Press(window, key);
+        Ui.Settle();
+        prefix += "static ";
+        Assert.StartsWith(prefix + "\nclass Program", editor.Document.Snapshot.ToString(), StringComparison.Ordinal);
+        Assert.Equal(prefix.Length, editor.Selections.Primary.Caret);
+        Type("cla");
+        Ui.WaitFor(() => window.Assist.CompletionLabels.FirstOrDefault() == "class", "class offered after static");
+        Ui.Press(window, key);
+        Ui.Settle();
+        prefix += "class ";
+        Assert.StartsWith(prefix + "\nclass Program", editor.Document.Snapshot.ToString(), StringComparison.Ordinal);
+        Assert.Equal(prefix.Length, editor.Selections.Primary.Caret);
+        window.KeyTextInput("Example {}");
+        Ui.Settle();
+        Assert.StartsWith(prefix + "Example {}", editor.Document.Snapshot.ToString(), StringComparison.Ordinal);
+        window.Close();
+
+        void Type(string letters)
+        {
+            foreach (char letter in letters)
+            {
+                window.KeyTextInput(letter.ToString());
+                Ui.Settle();
+            }
+        }
+    }
+
+    /// <summary>Where the code takes a type, the name typed lists first what is of that type, as Roslyn's own matching says
+    /// it fits, ahead of a name that begins as well, which stays listed: in an if's condition, an argument and a return.</summary>
+    [AvaloniaFact]
+    public void Completion_lists_first_the_names_of_the_type_the_place_takes_keeping_the_rest()
+    {
+        MainWindow window = project.Open("Fits.cs");
+        CodeEditor editor = window.EditorArea.CodeEditor;
+        editor.Focus();
+        Fits(window, editor, "if (", "a", "aef", "abc", "an if's condition takes a bool");
+        Fits(window, editor, "Name(", "c", "caption", "count", "Name takes a string");
+        Fits(window, editor, "return ", "a", "aef", "abc", "Check returns a bool");
+        Assert.True(editor.Document.Snapshot.ToString() == FitsCode, "Completion changed the file it only listed names for");
+        window.Close();
+    }
+
+    /// <summary>Types a letter after some text, where the list first shows <paramref name="fitting"/>, keeps
+    /// <paramref name="other"/> (a name that begins as well, of another type) and lets the letter go again.</summary>
+    private static void Fits(MainWindow window, CodeEditor editor, string after, string letter, string fitting, string other, string why)
+    {
+        Ui.PlaceAfter(editor, after);
+        Ui.Settle();
+        window.KeyTextInput(letter);
+        Ui.WaitFor(() => window.Assist.CompletionNarrowedBy == letter && window.Assist.CompletionLabels.Contains(other), $"the list after '{after}{letter}'");
+        IReadOnlyList<string> labels = window.Assist.CompletionLabels;
+        Assert.True(labels.FirstOrDefault() == fitting,
+            $"After '{after}{letter}' the list showed [{string.Join(", ", labels.Take(5))}] first, not {fitting}, though {why}: the name meant would be a key further down");
+        Ui.Press(window, "ESCAPE");
+        Ui.Press(window, "BACK");
+        Ui.Settle();
+    }
+
+    /// <summary>A C# name holding marks (नमस्ते's virama and vowel sign), one name to Roslyn, is narrowed by and replaced whole:
+    /// a list asked for after it is typed, and one opened by its first letter that its marks typed on narrow; and Find Usages
+    /// names it whole.</summary>
+    [AvaloniaFact]
+    public void A_name_holding_marks_is_narrowed_by_and_replaced_whole()
+    {
+        MainWindow window = project.Open("Marks.cs");
+        CodeEditor editor = window.EditorArea.CodeEditor;
+        editor.Focus();
+        Ui.PlaceAfter(editor, "return ");
+        window.KeyTextInput("नमस्त");
+        Ui.Press(window, "control SPACE", settle: false);
+        Ui.WaitFor(() => window.Assist.CompletionNarrowedBy == "नमस्त" && window.Assist.CompletionLabels.FirstOrDefault() == "नमस्ते",
+            () => $"नमस्ते first in the list asked for after नमस्त, narrowed by {window.Assist.CompletionNarrowedBy ?? "nothing, the list closed"}: [{string.Join(", ", window.Assist.CompletionLabels.Take(5))}]");
+        Ui.Press(window, "ENTER");
+        Assert.True(editor.Document.Snapshot.ToString().Contains("        return नमस्ते;\n", StringComparison.Ordinal),
+            $"नमस्ते was not put in place of नमस्त whole: the line reads {editor.Document.Snapshot.GetLineText(editor.CaretPosition.Line)}");
+
+        Ui.PlaceAfter(editor, "int twice = ");
+        foreach (string letter in new[] { "न", "म", "स", "\u094D", "त" })
+        {
+            window.KeyTextInput(letter);
+            Ui.Settle();
+        }
+        Ui.WaitFor(() => window.Assist.CompletionNarrowedBy == "नमस्त" && window.Assist.CompletionLabels.FirstOrDefault() == "नमस्ते",
+            () => $"नमस्ते first in the list its first letter opened, narrowed through its virama by {window.Assist.CompletionNarrowedBy ?? "nothing, the list closed"}");
+        Ui.Press(window, "ENTER");
+        Assert.True(editor.Document.Snapshot.ToString().Contains("        int twice = नमस्ते;\n", StringComparison.Ordinal),
+            $"नमस्ते was not put in place of what was typed: the line reads {editor.Document.Snapshot.GetLineText(editor.CaretPosition.Line)}");
+
+        Ui.PlaceAfter(editor, "int न");
+        Ui.Run(window, AppActions.FindUsages);
+        Ui.WaitFor(() => window.Find.Shown == "Usages of नमस्ते", () => $"the Find window naming नमस्ते whole, where it shows {window.Find.Shown}");
+        window.Close();
+    }
+
+    /// <summary>A method whose places each take a type, one local of that type and one of another type beginning as its
+    /// name does.</summary>
+    private const string FitsCode = "static class Fits\n{\n    public static bool Check()\n    {\n        int abc = 1;\n        bool aef = true;\n"
+        + "        int count = 2;\n        string caption = \"\";\n        if ()\n        {\n        }\n        Name();\n        return ;\n    }\n\n"
+        + "    private static void Name(string text)\n    {\n    }\n}\n";
+
     [AvaloniaFact]
     public void CamelHumps_typed_offer_the_names_they_start_after_the_prefix_matches_and_enter_writes_the_one_chosen()
     {
@@ -282,10 +418,12 @@ public sealed class CodeAssistTests : IClassFixture<CodeAssistTests.Project>
             $"Typing lIO offered [{string.Join(", ", window.Assist.CompletionLabels.Take(5))}], not LastIndexOf then LastIndexOfAny");
         Ui.Press(window, "ENTER");
         Ui.Settle();
-        Assert.Contains("int at = \"text\".LastIndexOf", editor.Document.Snapshot.ToString(), StringComparison.Ordinal);
+        Assert.Contains("int at = \"text\".LastIndexOf()", editor.Document.Snapshot.ToString(), StringComparison.Ordinal);
 
         // A name the humps start comes after every name the letters begin.
-        window.KeyTextInput("('x');");
+        window.KeyTextInput("'x'");
+        window.KeyTextInput(")");
+        window.KeyTextInput(";");
         Ui.Press(window, "ENTER");
         window.KeyTextInput("bool plain = \"text\".");
         Ui.Settle();
@@ -316,6 +454,67 @@ public sealed class CodeAssistTests : IClassFixture<CodeAssistTests.Project>
                 Ui.Settle();
             }
         }
+    }
+
+    /// <summary>With Vim mode on, completion opens as insert mode types, and one Escape closes it and leaves insert mode, as
+    /// Vim's Escape does, where a second press would be needed if the list took the key alone.</summary>
+    [AvaloniaFact]
+    public void With_vim_mode_one_escape_closes_completion_and_leaves_insert_mode()
+    {
+        MainWindow window = project.Open("Program.cs");
+        CodeEditor editor = window.EditorArea.CodeEditor;
+        try
+        {
+            window.ApplySettings(window.Settings with { VimMode = true });
+            Ui.PlaceAfter(editor, "static void Main()\n    {\n");
+            Ui.Type(window, "I", "i");
+            Assert.Equal(VimMode.Insert, editor.VimModeShown);
+            window.KeyTextInput("        System.");
+            Ui.WaitFor(() => window.Assist.IsCompletionOpen, "System's members");
+            Ui.Press(window, "ESCAPE");
+            Assert.False(window.Assist.IsCompletionOpen, "Escape left completion open");
+            Assert.True(editor.VimModeShown == VimMode.Normal, "Escape closed completion but left Vim in insert mode");
+            Assert.Equal('.', editor.Document.Snapshot[editor.Selections.Primary.Caret]);
+        }
+        finally
+        {
+            window.Close();
+        }
+    }
+
+    /// <summary>A list the server is still answering is let go by an Escape, and by the caret moved back over the dot that
+    /// asked for it: its answer, held until then, opens nothing, where System's members opened after the Escape, or at the
+    /// caret before the dot.</summary>
+    [AvaloniaFact]
+    public void A_list_still_asked_for_is_let_go_by_an_escape_or_the_caret_moved_out_of_its_name()
+    {
+        MainWindow window = project.Open("Program.cs");
+        CodeEditor editor = window.EditorArea.CodeEditor;
+        Passenger.Lsp.LanguageServer server = window.CSharpService!.Session!.Server;
+        string method = server.ExtensionProblem is null ? Passenger.Roslyn.Extension.ExtensionMethods.Completion : Passenger.Lsp.LspMethods.Completion;
+        Ui.PlaceAfter(editor, "static void Main()\n    {\n");
+        window.KeyTextInput("        System");
+        Ui.Settle();
+        foreach (string away in (string[])["ESCAPE", "LEFT"])
+        {
+            TaskCompletionSource answered = new(TaskCreationOptions.RunContinuationsAsynchronously);
+            Task held = server.HoldNextAnswer(method, _ => true, answered.Task);
+            try
+            {
+                window.KeyTextInput(".");
+                Ui.AwaitPumped(held, "System's members, answered and held");
+                Ui.Press(window, away, settle: false);
+            }
+            finally
+            {
+                answered.SetResult();
+            }
+            Ui.Settle();
+            Assert.False(window.Assist.IsCompletionOpen,
+                $"System's members asked for and let go by {away} opened once their answer came: {string.Join(", ", window.Assist.CompletionLabels.Take(5))}");
+            Ui.Press(window, away == "LEFT" ? "DELETE" : "BACK_SPACE");
+        }
+        window.Close();
     }
 
     [AvaloniaFact]
@@ -408,7 +607,9 @@ public sealed class CodeAssistTests : IClassFixture<CodeAssistTests.Project>
 
         Ui.Press(window, "ENTER");
         Ui.Settle();
-        window.KeyTextInput("();");
+        // Max's overloads taking a selector put the caret between its call's brackets, which ')' types over.
+        window.KeyTextInput(")");
+        window.KeyTextInput(";");
         string text = editor.Document.Snapshot.ToString();
         Assert.True(text.StartsWith("using System.Linq;\n", StringComparison.Ordinal), $"Choosing Max did not add the using it needs above:\n{text}");
         string line = editor.Document.Snapshot.GetLineText(editor.CaretPosition.Line);
@@ -416,6 +617,164 @@ public sealed class CodeAssistTests : IClassFixture<CodeAssistTests.Project>
             $"What was typed after choosing Max, its using added above, did not follow it: '{line}'\n{text}");
         Assert.Equal(line.Length, editor.CaretPosition.Column);
         window.Close();
+    }
+
+    /// <summary>A method chosen by Enter is written with its call's brackets: the caret between them where an overload
+    /// takes arguments, its signature shown, and after them where none does, its name typed whole too; a method given where
+    /// a delegate is asked for (an Action, a System.Delegate) stays a method group, without them.</summary>
+    [AvaloniaFact]
+    public void A_method_chosen_from_the_list_is_written_called_the_caret_inside_its_brackets_when_it_takes_arguments()
+    {
+        MainWindow window = project.Open("Program.cs");
+        CodeEditor editor = window.EditorArea.CodeEditor;
+        string Line() => editor.Document.Snapshot.GetLineText(editor.CaretPosition.Line);
+        Ui.PlaceAfter(editor, "int result = Helper.Twice(2);");
+        editor.Focus();
+
+        Ui.Press(window, "ENTER");
+        window.KeyTextInput("int doubled = Helper.");
+        Ui.Settle();
+        window.KeyTextInput("Tw");
+        Ui.WaitFor(() => window.Assist.CompletionLabels.FirstOrDefault() == "Twice", "Helper.Twice among its members");
+        Ui.Press(window, "ENTER");
+        Ui.Settle();
+        Assert.True(Line() == "        int doubled = Helper.Twice()" && editor.CaretPosition.Column == Line().Length - 1,
+            $"Twice, which takes a value, was not written called with the caret between its brackets: '{Line()}', the caret at {editor.CaretPosition.Column}");
+        Ui.WaitFor(() => window.Assist.SignatureText?.Contains("int value", StringComparison.Ordinal) == true, "Twice's signature");
+        window.KeyTextInput("3");
+        window.KeyTextInput(")");
+        window.KeyTextInput(";");
+        Assert.Equal("        int doubled = Helper.Twice(3);", Line());
+
+        Ui.Press(window, "ENTER");
+        window.KeyTextInput("System.Console.");
+        Ui.Settle();
+        window.KeyTextInput("Clea");
+        Ui.WaitFor(() => window.Assist.CompletionLabels.FirstOrDefault() == "Clear", "Console.Clear among the members");
+        Ui.Press(window, "ENTER");
+        Ui.Settle();
+        Assert.True(Line() == "        System.Console.Clear()" && editor.CaretPosition.Column == Line().Length,
+            $"Clear, which takes nothing, was not written called with the caret after its brackets: '{Line()}', the caret at {editor.CaretPosition.Column}");
+        window.KeyTextInput(";");
+
+        Ui.Press(window, "ENTER");
+        window.KeyTextInput("System.Action clear = System.Console.");
+        Ui.Settle();
+        window.KeyTextInput("Clea");
+        Ui.WaitFor(() => window.Assist.CompletionLabels.FirstOrDefault() == "Clear", "Console.Clear among the members");
+        Ui.Press(window, "ENTER");
+        Ui.Settle();
+        Assert.True(Line() == "        System.Action clear = System.Console.Clear" && editor.CaretPosition.Column == Line().Length,
+            $"Clear given to an Action was written as a call rather than the method itself: '{Line()}'");
+        window.KeyTextInput(";");
+
+        Ui.Press(window, "ENTER");
+        window.KeyTextInput("System.Delegate any = System.Console.");
+        Ui.Settle();
+        window.KeyTextInput("Clea");
+        Ui.WaitFor(() => window.Assist.CompletionLabels.FirstOrDefault() == "Clear", "Console.Clear among the members");
+        Ui.Press(window, "ENTER");
+        Ui.Settle();
+        Assert.True(Line() == "        System.Delegate any = System.Console.Clear",
+            $"Clear given to a System.Delegate was written as a call rather than the method itself: '{Line()}'");
+        window.KeyTextInput(";");
+
+        // A name typed whole changes nothing as it goes in, and is called all the same.
+        Ui.Press(window, "ENTER");
+        window.KeyTextInput("System.Console.");
+        Ui.Settle();
+        window.KeyTextInput("Clear");
+        Ui.WaitFor(() => window.Assist.CompletionLabels.FirstOrDefault() == "Clear", "Console.Clear among the members");
+        Ui.Press(window, "ENTER");
+        Ui.Settle();
+        Assert.True(Line() == "        System.Console.Clear()" && editor.CaretPosition.Column == Line().Length,
+            $"Clear, typed whole and chosen, was not written called with the caret after its brackets: '{Line()}', the caret at {editor.CaretPosition.Column}");
+        window.Close();
+    }
+
+    /// <summary>A method chosen by Enter is written at once, its brackets following as the server says it is called there,
+    /// and one Undo takes back both; a key typed before that answer came is what follows the name, and no brackets come.</summary>
+    [AvaloniaFact]
+    public void A_method_chosen_is_written_at_once_its_brackets_following_in_its_step_of_undo_unless_typed_on_before_they_came()
+    {
+        MainWindow window = project.Open("Program.cs");
+        CodeEditor editor = window.EditorArea.CodeEditor;
+        string Line() => editor.Document.Snapshot.GetLineText(editor.CaretPosition.Line);
+        Ui.PlaceAfter(editor, "int result = Helper.Twice(2);");
+        editor.Focus();
+
+        Ui.Press(window, "ENTER");
+        window.KeyTextInput("int tripled = Helper.");
+        Ui.Settle();
+        window.KeyTextInput("Tw");
+        Ui.WaitFor(() => window.Assist.CompletionLabels.FirstOrDefault() == "Twice", "Helper.Twice among its members");
+        TaskCompletionSource answered = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        Task held = window.CSharpService!.Session!.Server.HoldNextAnswer(Passenger.Lsp.LspMethods.DispatchDocumentExtensionMessage, AsksCall, answered.Task);
+        try
+        {
+            Ui.Press(window, "ENTER", settle: false);
+            Ui.PumpUntil(() => held.IsCompleted, "the server's answer whether Twice is called there, held");
+            Assert.True(Line() == "        int tripled = Helper.Twice" && editor.CaretPosition.Column == Line().Length,
+                $"Twice was not written at once, before the server said whether it is called there: '{Line()}', the caret at {editor.CaretPosition.Column}");
+            window.KeyTextInput("(");
+            window.KeyTextInput("3");
+            window.KeyTextInput(")");
+            window.KeyTextInput(";");
+        }
+        finally
+        {
+            answered.SetResult();
+        }
+        Ui.Settle();
+        Assert.Equal("        int tripled = Helper.Twice(3);", Line());
+
+        Ui.Press(window, "ENTER");
+        window.KeyTextInput("int doubled = Helper.");
+        Ui.Settle();
+        window.KeyTextInput("Tw");
+        Ui.WaitFor(() => window.Assist.CompletionLabels.FirstOrDefault() == "Twice", "Helper.Twice among its members");
+        Ui.Press(window, "ENTER");
+        Ui.Settle();
+        Assert.Equal("        int doubled = Helper.Twice()", Line());
+        Ui.Press(window, Ui.Shortcut(EditorActions.Undo));
+        Assert.True(Line() == "        int doubled = Helper.Tw",
+            $"One Undo after Twice was written called left '{Line()}', where it takes back the name and its brackets together");
+        window.Close();
+    }
+
+    /// <summary>How Passenger's extension is asked whether a method just written is called.</summary>
+    private static bool AsksCall(object parameters) =>
+        parameters is Passenger.Lsp.RoslynExtension.DispatchExtensionMessageParams { MessageName: Passenger.Roslyn.Extension.Handlers.CompletionCall };
+
+    /// <summary>With Settings' parentheses for a method chosen from completion turned off, a method chosen by Enter is
+    /// written as its name alone, the caret after it.</summary>
+    [AvaloniaFact]
+    public void With_parentheses_turned_off_a_method_chosen_from_the_list_is_written_as_its_name_alone()
+    {
+        MainWindow window = project.Open("Program.cs");
+        CodeEditor editor = window.EditorArea.CodeEditor;
+        string Line() => editor.Document.Snapshot.GetLineText(editor.CaretPosition.Line);
+        void Change(Func<AppSettings, AppSettings> change) => window.ApplySettings(change(window.Settings));
+        try
+        {
+            Change(s => s with { CompletionParentheses = false });
+            Ui.PlaceAfter(editor, "int result = Helper.Twice(2);");
+            editor.Focus();
+            Ui.Press(window, "ENTER");
+            window.KeyTextInput("int doubled = Helper.");
+            Ui.Settle();
+            window.KeyTextInput("Tw");
+            Ui.WaitFor(() => window.Assist.CompletionLabels.FirstOrDefault() == "Twice", "Helper.Twice among its members");
+            Ui.Press(window, "ENTER");
+            Ui.Settle();
+            Assert.True(Line() == "        int doubled = Helper.Twice" && editor.CaretPosition.Column == Line().Length,
+                $"With parentheses turned off, Twice was not written as its name alone with the caret after it: '{Line()}', the caret at {editor.CaretPosition.Column}");
+        }
+        finally
+        {
+            Change(s => s with { CompletionParentheses = true });
+            window.Close();
+        }
     }
 
     /// <summary>What Roslyn's server package carries under Visual Studio's terms rather than an open-source licence and
@@ -455,18 +814,13 @@ public sealed class CodeAssistTests : IClassFixture<CodeAssistTests.Project>
         Assert.Contains("System.Console.WriteLine", editor.Document.Snapshot.ToString(), StringComparison.Ordinal);
 
         // Razor's start is where the server first loads Visual Studio's assemblies; a failed load logs the name.
-        int server = window.CSharpService!.Session!.Server.ProcessId;
+        string path = window.CSharpService!.Session!.Server.LogPath;
         string log = string.Empty;
-        Ui.WaitFor(() => (log = ServerLog(server)).Contains("Razor extension startup finished.", StringComparison.Ordinal), "the language server's Razor support to start");
+        Ui.WaitFor(() => (log = Ui.Shared(path)).Contains("Razor extension startup finished.", StringComparison.Ordinal), "the language server's Razor support to start");
         string[] looked = [.. log.Split('\n').Where(line => LeftOut.Any(name => line.Contains(name, StringComparison.Ordinal)))];
         Assert.True(looked.Length == 0, $"The language server looked for an assembly Passenger leaves out, so something it does needs it:\n{string.Join('\n', looked)}");
         window.Close();
     }
-
-    /// <summary>The log of the language server with this process, as a person opening the logs folder would find it.</summary>
-    private static string ServerLog(int process) =>
-        Directory.EnumerateFiles(Passenger.App.CSharp.CSharpService.LogFolder, $"server-*-{process}.log").FirstOrDefault() is { } path
-            ? Ui.Shared(path) : string.Empty;
 
     /// <summary>Find Usages says so with no search yet and shows nothing else; it groups usages by what they do,
     /// project and file, previews the chosen one beside a divider that drags, keeps each search, goes to a usage on
@@ -695,6 +1049,47 @@ public sealed class CodeAssistTests : IClassFixture<CodeAssistTests.Project>
         Assert.True(editor.Document.Snapshot.ToString() == Ragged[..start] + chosen,
             $"Reformat Code with Chosen() selected left the file as:\n{editor.Document.Snapshot}");
         Assert.Equal("Reformatted", window.Status);
+        window.Close();
+    }
+
+    /// <summary>Settings' Reformat on save: File, Save lays the changed file out as Reformat Code does before writing it, and
+    /// one Undo takes the layout back; a language server that does not answer in time leaves the file saved as typed,
+    /// saying why; turned off, the file is saved as typed.</summary>
+    [AvaloniaFact]
+    public void Reformat_on_save_lays_a_file_out_before_writing_it_as_one_step_of_undo_and_without_the_server_or_turned_off_saves_it_as_typed()
+    {
+        const string Laid = "using System.Text;\nusing System;\nusing System.Collections.Generic;\n\nstatic class Messy\n{\n    public static int Count()\n    {\n"
+            + "        List<string> names = [];\n        Console.WriteLine(names.Count);\n        int extra = names.Count;\n        return names.Count;\n    }\n}\n";
+        MainWindow window = project.Open("Messy.cs");
+        CodeEditor editor = window.EditorArea.CodeEditor;
+        OpenDocument document = window.EditorArea.Active!;
+        string path = project.PathOf("Messy.cs");
+        window.ApplySettings(window.Settings with { ReformatOnSave = true });
+        editor.ApplyEdits([new TextEdit(editor.Document.Snapshot.ToString().IndexOf("      return", StringComparison.Ordinal), 0, "        int  extra=names.Count;\n")]);
+        string typed = editor.Document.Snapshot.ToString();
+        Ui.Run(window, AppActions.Save);
+        Ui.WaitFor(() => !document.IsModified, "Messy.cs saved");
+        Assert.True(File.ReadAllText(path) == Laid, $"Save with Reformat on save on did not write the file laid out:\n{File.ReadAllText(path)}");
+        Ui.Run(window, EditorActions.Undo);
+        Assert.True(editor.Document.Snapshot.ToString() == typed, $"One Undo did not take the save's layout back:\n{editor.Document.Snapshot}");
+
+        // The server held from answering: the save goes on with the text as typed once the save's limit has passed.
+        TaskCompletionSource released = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        Task held = window.CSharpService!.Session!.Server.HoldNext(Passenger.Lsp.LspMethods.Formatting, _ => true, released.Task);
+        Ui.Run(window, AppActions.Save, settle: false);
+        Ui.PumpUntil(() => !document.IsModified, "Messy.cs saved with no answer from its language server", TimeSpan.FromMinutes(1));
+        released.SetResult();
+        Assert.True(held.IsCompleted, "The save did not ask the language server for its layout");
+        Assert.True(File.ReadAllText(path) == typed, $"A save the server gave no layout in time did not write the file as typed:\n{File.ReadAllText(path)}");
+        Assert.True(window.Status?.StartsWith("Reformat on save was not applied to Messy.cs: its language server did not answer within", StringComparison.Ordinal) == true,
+            $"The status bar did not say why the file was saved as typed: {window.Status}");
+
+        window.ApplySettings(window.Settings with { ReformatOnSave = false });
+        editor.ApplyEdits([new TextEdit(editor.Document.Snapshot.ToString().IndexOf("      return", StringComparison.Ordinal), 0, "        int  more=1;\n")]);
+        string kept = editor.Document.Snapshot.ToString();
+        Ui.Run(window, AppActions.Save);
+        Ui.WaitFor(() => !document.IsModified, "Messy.cs saved again");
+        Assert.True(File.ReadAllText(path) == kept, $"Save with Reformat on save off did not write the file as typed:\n{File.ReadAllText(path)}");
         window.Close();
     }
 
@@ -1004,6 +1399,27 @@ public sealed class CodeAssistTests : IClassFixture<CodeAssistTests.Project>
         window.Close();
     }
 
+    [AvaloniaFact]
+    public void Places_to_choose_from_are_kept_in_the_Find_window_where_Find_in_Files_results_are_kept()
+    {
+        MainWindow window = project.Open("Separated.cs");
+        try
+        {
+            window.ApplySettings(window.Settings with { FindResults = Passenger.App.FindResults.FindWindow });
+            Ui.PlaceAfter(window.EditorArea.CodeEditor, "    int Val");
+            Ui.Run(window, AppActions.GoToImplementation);
+            Ui.WaitFor(() => window.Find.Rows.Count(r => r.Usage is not null) == 2,
+                () => $"the two implementations listed in the Find window, where it shows {window.Find.Shown} with {window.Find.Rows.Count(r => r.Usage is not null)} rows");
+            Assert.True(window.DockHost.IsShown(ToolWindowIds.Find) && window.Assist.Offered.Count == 0 && window.Find.IsKeyboardFocusWithin,
+                "The implementations kept in the Find window were offered in a popup too, or the Find window, open, has not the keys");
+        }
+        finally
+        {
+            window.ApplySettings(new Passenger.App.Settings.AppSettings());
+            window.Close();
+        }
+    }
+
     /// <summary>The server counts a line at each break in Separators.cs's and Separated.cs's comments that the editor does
     /// not, so a place it names is read in the file's own text, a file not open as it is on disk: Go to Symbol's rows, Go to
     /// Declaration and Implementation, what an agent asks of the code, and the lines an agent's refactoring changed.</summary>
@@ -1053,8 +1469,10 @@ public sealed class CodeAssistTests : IClassFixture<CodeAssistTests.Project>
         Passenger.App.Mcp.Place declared = Assert.Single(Await(tools.Definition("Separated.cs", 14, 39), "the declaration an agent asks for"));
         Assert.Equal(("Separators.cs", 4, 23, "public static int Value()"), (declared.Path, declared.Line, declared.Column, declared.Text));
         Assert.Contains("14:38 public int Value() => Separators.Value();",
-            Assert.Single(Await(tools.Usages("Separators.cs", 4, 23), "the usages an agent asks for").Files, f => f.Path == "Separated.cs").Places);
-        Assert.Contains(Await(tools.FindSymbol("FirstSeparated"), "the symbol an agent looks for"), s => s.Line == 7);
+            Assert.Single(Await(tools.Usages("Separators.cs", 4, 23), "the usages an agent asks for").Files, f => f.Path == "Separated.cs").Places!);
+        ModelContextProtocol.Protocol.CallToolResult symbols = Await(tools.FindSymbol("FirstSeparated"), "the symbol an agent looks for");
+        Assert.Contains(System.Text.Json.JsonDocument.Parse(((ModelContextProtocol.Protocol.TextContentBlock)symbols.Content[0]).Text).RootElement.EnumerateArray(),
+            s => s.GetProperty("line").GetInt32() == 7);
         Assert.Contains("FirstSeparated (class, line 7)", Await(tools.Outline("Separated.cs"), "the outline an agent asks for"), StringComparison.Ordinal);
 
         // A parameter added to Separators.Value: its declaration on the editor's line 4, its call in Separated.cs on 14.
@@ -1155,11 +1573,13 @@ public sealed class CodeAssistTests : IClassFixture<CodeAssistTests.Project>
 
         window.OpenFile(project.PathOf("Program.cs"));
         Ui.Settle();
-        Ui.PlaceAfter(editor, "        in");
-        Ui.Press(window, Ui.Shortcut(AppActions.GoToDeclaration));
-        Ui.WaitFor(() => window.EditorArea.Active?.IsDecompiled == true, "the decompiled source to open");
-        Passenger.App.Workspace.OpenDocument decompiled = window.EditorArea.Active!;
+        Passenger.App.Workspace.OpenDocument decompiled = Decompiled(window, "        in");
         Assert.Equal("Int32.cs", decompiled.Name);
+        // Off Windows, in the server's own temporary folder, among those of the person's own.
+        if (Passenger.Lsp.RoslynServerFolder.Temporaries(Passenger.App.CSharp.CSharpService.ServerCache) is { } own)
+        {
+            Assert.True(PathNames.IsUnder(decompiled.Path, PathNames.Canonical(own)), $"The language server wrote {decompiled.Path}, outside the temporary folders of the person's own its servers are given, {own}");
+        }
         Assert.Contains("struct Int32", decompiled.Text.Snapshot.ToString(), StringComparison.Ordinal);
         Assert.Contains("struct Int32", decompiled.Text.Snapshot.GetLineText(editor.CaretPosition.Line), StringComparison.Ordinal);
 
@@ -1169,6 +1589,112 @@ public sealed class CodeAssistTests : IClassFixture<CodeAssistTests.Project>
         Assert.Equal(before, decompiled.Text.Snapshot.ToString());
         Assert.True(editor.IsReadOnly);
         window.Close();
+    }
+
+    /// <summary>Code Cleanup, Optimize Imports and Reformat Code grey on a library type's decompiled source, which the
+    /// language server serves, saying it is read-only, and Code Cleanup's keys there say so and change nothing.</summary>
+    [AvaloniaFact]
+    public void Code_cleanup_and_optimize_imports_grey_on_a_decompiled_file_saying_it_is_read_only()
+    {
+        MainWindow window = project.Open("Program.cs");
+        Passenger.App.Workspace.OpenDocument decompiled = Decompiled(window, "        in");
+        string before = decompiled.Text.Snapshot.ToString();
+
+        foreach (string action in new[] { AppActions.CodeCleanup, AppActions.OptimizeUsings, AppActions.Reformat })
+        {
+            Assert.True(window.Actions.WhyNot(action, window.Actions.Context()) == $"{decompiled.Name} is read-only",
+                $"{action} on the decompiled {decompiled.Name}, which nothing can change, is offered or greyed saying: {window.Actions.WhyNot(action, window.Actions.Context())}");
+        }
+        Ui.Run(window, AppActions.CodeCleanup);
+        Assert.Equal($"{decompiled.Name} is read-only", window.Status);
+        Assert.Equal(before, decompiled.Text.Snapshot.ToString());
+        window.Close();
+    }
+
+    /// <summary>On a library type's decompiled source, every action of the Code and Refactor menus that would change the file
+    /// greys saying it is read-only (those of another language's files saying that instead), and those that only fold it
+    /// or act on the language server stay enabled, as do Go to Declaration and Find Usages, which only read it; Rename's
+    /// key there says so and changes nothing.</summary>
+    [AvaloniaFact]
+    public void Every_action_of_the_code_and_refactor_menus_that_would_change_a_decompiled_file_greys_saying_it_is_read_only()
+    {
+        MainWindow window = project.Open("Program.cs");
+        Passenger.App.Workspace.OpenDocument decompiled = Decompiled(window, "        in");
+        string before = decompiled.Text.Snapshot.ToString();
+        string readOnly = $"{decompiled.Name} is read-only";
+        HashSet<string> reading = [EditorActions.Unfold, EditorActions.UnfoldAll, EditorActions.Fold, EditorActions.FoldToDefinitions, EditorActions.FoldAll,
+            EditorActions.UnfoldDocComments, EditorActions.FoldDocComments, EditorActions.ToggleFold, AppActions.ToggleSolutionAnalysis, AppActions.RestartCSharpServer];
+        HashSet<string> otherLanguage = [AppActions.OrderScriptParts, AppActions.ExtractResource, AppActions.ExtractStyle];
+
+        ActionContext context = window.Actions.Context();
+        List<string> offered = [];
+        List<string> greyed = [];
+        foreach (string id in MainMenu.Build(window.Actions.All).Where(m => m.Title is "Code" or "Refactor").SelectMany(ActionsIn))
+        {
+            string? why = window.Actions.WhyNot(id, context);
+            if (reading.Contains(id) ? why is not null : otherLanguage.Contains(id) ? why is null : why != readOnly)
+            {
+                (reading.Contains(id) ? greyed : offered).Add($"{id} ({why ?? "enabled"})");
+            }
+        }
+        foreach (string id in new[] { AppActions.GoToDeclaration, AppActions.FindUsages })
+        {
+            if (window.Actions.WhyNot(id, context) is { } why)
+            {
+                greyed.Add($"{id} ({why})");
+            }
+        }
+        Assert.True(offered.Count == 0, $"On the decompiled {decompiled.Name}, which nothing can change, these are offered or greyed for another reason: {string.Join(", ", offered)}");
+        Assert.True(greyed.Count == 0, $"On the decompiled {decompiled.Name}, these only read it but are greyed: {string.Join(", ", greyed)}");
+
+        Ui.Run(window, AppActions.Rename);
+        Assert.Equal(readOnly, window.Status);
+        Assert.Equal(before, decompiled.Text.Snapshot.ToString());
+        window.Close();
+
+        static IEnumerable<string> ActionsIn(MenuEntry menu) => menu.Action is { } id ? [id] : (menu.Items ?? []).SelectMany(ActionsIn);
+    }
+
+    /// <summary>A library type's source the language server decompiled for one window stays where it was written, and Go
+    /// to Declaration there opens it again, after another window's server, a program of its own, decompiles one too.</summary>
+    [AvaloniaFact]
+    public void A_library_types_source_decompiled_for_one_window_stays_as_another_windows_server_decompiles_one()
+    {
+        MainWindow window = project.Open("Program.cs");
+        string written = Decompiled(window, "        in").Path;
+        string other = TestFolders.Create("assist-beside-");
+        File.WriteAllText(Path.Combine(other, "Beside.csproj"), TestProjects.Console());
+        File.WriteAllText(Path.Combine(other, "Program.cs"), "class Program\n{\n    static void Main()\n    {\n        string text = \"\";\n    }\n}\n");
+        Restore.Run(other);
+        MainWindow beside = Ui.OpenFolder(other);
+        try
+        {
+            beside.OpenFile("Program.cs");
+            Ui.WaitFor(() => beside.CSharpService is { IsReady: true }, () => $"the other window's language server to load its project ({beside.CSharpService?.State})", TimeSpan.FromMinutes(3));
+            string besides = Decompiled(beside, "        str").Path;
+            Assert.True(File.Exists(written), $"{written}, the source of Int32 the first window's server decompiled, was deleted as the other window's server decompiled {besides}");
+        }
+        finally
+        {
+            beside.Close();
+        }
+        Passenger.App.Workspace.OpenDocument shown = window.EditorArea.Active!;
+        Assert.True(window.EditorArea.CloseTab(window.EditorArea.Groups.First(g => g.Has(shown)), shown), $"{shown.Name}'s tab did not close");
+        window.OpenFile(project.PathOf("Program.cs"));
+        Ui.Settle();
+        Assert.Equal(written, Decompiled(window, "        in").Path);
+        window.Close();
+    }
+
+    /// <summary>Go to Declaration from the first keyword after <paramref name="before"/> in the file shown, a library type
+    /// the language server decompiles, and the file it opens once the editor shows it.</summary>
+    private static Passenger.App.Workspace.OpenDocument Decompiled(MainWindow window, string before)
+    {
+        Ui.PlaceAfter(window.EditorArea.CodeEditor, before);
+        Ui.Press(window, Ui.Shortcut(AppActions.GoToDeclaration));
+        Ui.WaitFor(() => window.EditorArea.Active?.IsDecompiled == true,
+            () => $"the decompiled source to open: the window shows {window.EditorArea.Active?.Path}, saying {window.Status}, C# {window.CSharpService?.State}{Ui.IdeLogTail()}{Ui.ServerLogTail()}");
+        return window.EditorArea.Active!;
     }
 
     [Gate]
@@ -1792,6 +2318,68 @@ public sealed class CodeAssistTests : IClassFixture<CodeAssistTests.Project>
     private static ListBoxItem OfferedRow(MainWindow window, string title) =>
         window.GetVisualDescendants().OfType<ListBoxItem>().FirstOrDefault(row => row.GetVisualDescendants().OfType<TextBlock>().Any(t => t.Text == title))
         ?? throw new Xunit.Sdk.XunitException($"No row of the list of choices shows {title}");
+
+    /// <summary>In a window at its smallest with the default layout, the Explorer open leaving the editor narrower than a
+    /// card's words would be, the hover card and Parameter Info each show whole in the editor, held to its width: the
+    /// signature and its documentation wrap inside the card, none of their words cut at the editor's edge or trimmed.</summary>
+    [AvaloniaFact]
+    public void A_hover_card_and_parameter_info_in_an_editor_at_the_windows_smallest_width_show_whole_their_words_wrapping()
+    {
+        MainWindow window = project.Open("Joins.cs", width: MainWindow.SmallestWidth, height: MainWindow.SmallestHeight);
+        CodeEditor editor = window.EditorArea.CodeEditor;
+        Rect layer = Layer(window);
+        Assert.True(layer.Width < 300, $"The default layout at the window's smallest width was to leave the editor narrower than a card's signature; it is {layer.Width} wide");
+
+        Ui.PlaceAfter(editor, "=> Jo");
+        Ui.Run(window, AppActions.QuickDocumentation);
+        Ui.WaitFor(() => window.Assist.HoverText?.Contains("Joins the values", StringComparison.Ordinal) == true, "the card over Join with its documentation");
+        TextBlock signature = Untrimmed(WholeInEditor(window, window.Assist.HoverCard!, "The hover card"), "The hover card");
+        Assert.True(signature.TextLayout.TextLines.Count > 1, $"Join's signature, wider than the editor, was to wrap in the card; it is one line, '{signature.Text}'");
+        Ui.Press(window, "ESCAPE");
+
+        Ui.PlaceAfter(editor, "=> Join(");
+        Ui.Run(window, AppActions.ParameterInfo);
+        Ui.WaitFor(() => window.Assist.SignatureText?.Contains("is put between", StringComparison.Ordinal) == true, "Join's parameter info with its separator's documentation");
+        signature = Untrimmed(WholeInEditor(window, window.Assist.SignatureCard!, "Parameter Info"), "Parameter Info");
+        Assert.True(signature.TextLayout.TextLines.Count > 1, $"Join's signature, wider than the editor, was to wrap in Parameter Info; it is one line, '{signature.Text}'");
+        Ui.Press(window, "ESCAPE");
+        window.Close();
+    }
+
+    /// <summary>A card's words, none trimmed to an ellipsis; its first block of them.</summary>
+    private static TextBlock Untrimmed(IReadOnlyList<TextBlock> words, string what)
+    {
+        Assert.True(words.Count > 0, $"{what} shows no words");
+        foreach (TextBlock said in words)
+        {
+            Assert.True(said.TextLayout.TextLines.All(l => !l.HasCollapsed), $"{what} trims '{said.Text}' where its words were to wrap whole");
+        }
+        return words[0];
+    }
+
+    /// <summary>Where the editor's layer of popups lies in its window.</summary>
+    internal static Rect Layer(MainWindow window)
+    {
+        Canvas assist = window.EditorArea.AssistLayer;
+        return new Rect(assist.TranslatePoint(default, window) ?? default, assist.Bounds.Size);
+    }
+
+    /// <summary>A card shown in the editor whole: inside its layer, every block of its words laid out across inside the card
+    /// (a list of rows in it scrolls up and down); its blocks of words, in order.</summary>
+    internal static IReadOnlyList<TextBlock> WholeInEditor(MainWindow window, Control card, string what)
+    {
+        Rect layer = Layer(window);
+        Rect at = new(card.TranslatePoint(default, window) ?? default, card.Bounds.Size);
+        Assert.True(layer.Inflate(0.5).Contains(at), $"{what} runs past the editor's edge, cut there: it lies at {at} in the editor at {layer}");
+        List<TextBlock> words = [.. card.GetVisualDescendants().OfType<TextBlock>().Where(t => t.IsEffectivelyVisible && !string.IsNullOrEmpty(t.Text))];
+        foreach (TextBlock said in words)
+        {
+            Rect lies = new(said.TranslatePoint(default, window) ?? default, said.Bounds.Size);
+            Assert.True(lies.X >= at.X - 0.5 && lies.Right <= at.Right + 0.5 && said.TextLayout.Width <= said.Bounds.Width + 0.5,
+                $"'{said.Text}' runs past {what} at {at}: it lies at {lies}, {said.TextLayout.Width:0.#} wide");
+        }
+        return words;
+    }
 
     [Gate]
     [AvaloniaFact]
@@ -2459,65 +3047,33 @@ public sealed class CodeAssistTests : IClassFixture<CodeAssistTests.Project>
             : null;
     }
 
-    /// <summary>The server's completion list is read where its answer arrives, never on the UI thread: a list of
-    /// hundreds more items (a file with the usings a project's implicit ones bring, against one with none) costs the UI
-    /// thread, from the key to the list open, less than a third of what reading those items takes, counted rather than
-    /// timed. The window starts a server of its own: the class's warm server, once another test had it index the types
-    /// of namespaces not imported, lists them in both files, each list cut at the server's thousand.</summary>
+    /// <summary>Call Hierarchy at a use of a method declared in another file shows it and its callers as at its declaration,
+    /// and at a record's positional property, from a use in another file or at its declaration, shows the property with the
+    /// members that read or set it, each at its first use, as for any property; what the property calls is nothing, as an
+    /// auto-property's.</summary>
     [AvaloniaFact]
-    public void A_statements_completion_list_is_read_off_the_UI_thread()
+    public void Call_hierarchy_at_a_use_in_another_file_and_at_a_records_positional_property_shows_its_callers()
     {
-        string bare = project.PathOf("Bare.cs");
-        string used = project.PathOf("Used.cs");
-        MainWindow window = Ui.OpenFolder(project.Folder, autosaves: false);
-        window.OpenFile(bare);
-        Ui.Settle();
-        Assert.True(window.CSharpService?.IsReady, window.CSharpService?.State);
-        (int fewItems, long fewRead, long fewFrame) = StatementCompletion(window, bare);
-        (int manyItems, long manyRead, long manyFrame) = StatementCompletion(window, used);
-        TestContext.Current.TestOutputHelper?.WriteLine(
-            $"{fewItems} items: read in {fewRead / 1024} KB, opened from the key in {fewFrame / 1024} KB; {manyItems} items: {manyRead / 1024} KB, {manyFrame / 1024} KB");
-        Assert.True(manyItems > fewItems + 300, $"With the usings a statement's completion listed {manyItems} items, against {fewItems} without");
-        Assert.True(manyFrame - fewFrame < (manyRead - fewRead) / 3,
-            $"A list of {manyItems} items opened with {manyFrame / 1024} KB allocated on the UI thread from the key, against {fewFrame / 1024} KB for {fewItems} items: "
-            + $"a third or more of the {(manyRead - fewRead) / 1024} KB reading the extra items takes, so they were read there");
-        window.Close();
-    }
+        MainWindow window = project.Open("Program.cs");
+        Ui.PlaceAfter(window.EditorArea.CodeEditor, "Helper.Tw");
+        Assert.Null(Ui.Await(window.ShowCallHierarchyAsync(), "the call hierarchy at a use of Twice"));
+        Assert.Equal(["Helper.Twice(int) Helper.cs:3", "  Program.Main() Program.cs:5"], Listed());
 
-    /// <summary>A statement's completion in a file: how many items it lists, what reading its answer allocates (the
-    /// same list asked for from the thread pool, the window's thread waiting), and what the UI thread allocates from
-    /// the key until the list is open, whichever of its frames the answer lands in; the least of three.</summary>
-    private static (int Items, long Read, long Frame) StatementCompletion(MainWindow window, string path)
-    {
-        window.OpenFile(path);
-        CodeEditor editor = window.EditorArea.CodeEditor;
-        Ui.PlaceAfter(editor, "        int total = 0;");
-        window.KeyTextInput(" ");
-        editor.Focus();
-        Ui.Settle();
-        Passenger.Lsp.LspDocument lsp = window.CSharpService!.For(window.EditorArea.Active!)!.Lsp!;
-        int caret = editor.Selections.Primary.Caret;
-        long read = long.MaxValue;
-        int items = 0;
-        for (int i = 0; i < 3; i++)
+        foreach ((string file, string at) in new[] { ("ReleaseReaders.cs", "release.Vers"), ("Releases.cs", "record Release(string Vers") })
         {
-            long before = GC.GetTotalAllocatedBytes(precise: true);
-            Passenger.Lsp.CompletionList? list = Ui.Idle(Waiting.Apart(() => lsp.CompletionAsync(caret, null)), "the statement's completion asked from the thread pool").List;
-            read = Math.Min(read, GC.GetTotalAllocatedBytes(precise: true) - before);
-            items = list?.Items.Count ?? 0;
+            window.OpenFile(project.PathOf(file));
+            Ui.Settle();
+            Ui.PlaceAfter(window.EditorArea.CodeEditor, at);
+            Assert.Null(Ui.Await(window.ShowCallHierarchyAsync(), $"the call hierarchy after {at}"));
+            Assert.Equal("Calls of Release.Version", window.Hierarchy.Title);
+            Assert.Equal(["Release.Version Releases.cs:1", "  ReleaseReaders.Of(Release) ReleaseReaders.cs:3", "  ReleaseReaders.Next(Release) ReleaseReaders.cs:5"], Listed());
         }
-        long frame = long.MaxValue;
-        for (int round = 0; round < 3; round++)
-        {
-            long before = GC.GetAllocatedBytesForCurrentThread();
-            window.KeyTextInput("S");
-            Ui.Pumped(() => window.Assist.IsCompletionOpen, TimeSpan.FromSeconds(60));
-            frame = Math.Min(frame, GC.GetAllocatedBytesForCurrentThread() - before);
-            Assert.True(window.Assist.IsCompletionOpen, $"Completion never opened for a statement in {Path.GetFileName(path)}");
-            Ui.Press(window, "ESCAPE");
-            Ui.Press(window, "BACK_SPACE");
-        }
-        return (items, read, frame);
+        Task callees = window.Hierarchy.ChooseAsync(first: false);
+        Ui.WaitFor(() => callees.IsCompleted, "what Release.Version calls");
+        Assert.Equal(["Release.Version Releases.cs:1"], Listed());
+        window.Close();
+
+        string[] Listed() => [.. window.Hierarchy.Rows.Select(r => $"{new string(' ', r.Depth * 2)}{r.Node.Item.Name} {Path.GetFileName(r.Node.Path)}:{r.Node.Where.Line + 1}")];
     }
 
     /// <summary>Typing on into an open completion list narrows it off the UI thread in the rows the list has: as each letter
@@ -2587,6 +3143,432 @@ public sealed class CodeAssistTests : IClassFixture<CodeAssistTests.Project>
         return (items, key);
     }
 
+    /// <summary>The completion list shows its rows in ten places kept for good, so a key that changes how many rows it
+    /// shows lays out only those that came onto the screen or left it: narrowing a class's members from 200 rows to 100, 10
+    /// and 1 and widening them back costs the UI thread, key for key, less than a key that hands every row on screen another
+    /// member does, counted rather than timed; so does each Down once the list scrolls, which hands each row the next member.</summary>
+    [AvaloniaFact]
+    public void A_key_that_changes_how_many_rows_the_completion_list_shows_lays_out_only_the_rows_that_came_or_went()
+    {
+        MainWindow window = Ui.OpenFolder(project.Folder, autosaves: false);
+        window.OpenFile(project.PathOf("Pantry.cs"));
+        CodeEditor editor = window.EditorArea.CodeEditor;
+        Ui.Settle();
+        Assert.True(window.CSharpService?.IsReady, window.CSharpService?.State);
+        Ui.PlaceAfter(editor, "        int total = 0;");
+        editor.Focus();
+        Ui.Press(window, "ENTER");
+        window.KeyTextInput("total += Pantry");
+        Ui.Settle();
+        window.KeyTextInput(".");
+        Ui.WaitFor(() => window.Assist.IsCompletionOpen, "Pantry's members after its dot");
+        window.KeyTextInput("Ration");
+        Ui.WaitFor(() => window.Assist.CompletionNarrowedBy == "Ration" && window.Assist.CompletionLabels.Count == 200,
+            () => $"Pantry's members narrowed by Ration to the 200 shown, where the list shows {window.Assist.CompletionLabels.Count}");
+        string typed = "Ration";
+        long reworded = long.MaxValue;
+        Dictionary<string, long> changed = [];
+        for (int round = 0; round < 3; round++)
+        {
+            // Ration100 to Ration109 in place of Ration000 to Ration009: every row on screen another member.
+            reworded = Math.Min(reworded, Key("1", 100));
+            Key("BACK_SPACE", 200);
+            foreach ((string key, int rows, string what) in new[]
+            {
+                ("0", 100, "200 rows to 100, the same on screen"), ("0", 10, "100 rows to 10, the same on screen"), ("0", 1, "10 rows to 1, 9 leaving the screen"),
+                ("BACK_SPACE", 10, "1 row to 10, 9 coming back"), ("BACK_SPACE", 100, "10 rows to 100, the same on screen"), ("BACK_SPACE", 200, "100 rows to 200, the same on screen"),
+            })
+            {
+                long cost = Key(key, rows);
+                changed[what] = Math.Min(changed.GetValueOrDefault(what, long.MaxValue), cost);
+            }
+        }
+        // Past the rows first on screen, the list scrolled.
+        for (int i = 0; i < 12; i++)
+        {
+            Ui.Press(window, "DOWN");
+        }
+        Assert.Equal("Ration012", window.Assist.CompletionChosen);
+        long scrolled = long.MaxValue;
+        for (int i = 0; i < 3; i++)
+        {
+            long before = GC.GetAllocatedBytesForCurrentThread();
+            Ui.Press(window, "DOWN", settle: false);
+            Ui.Draw();
+            scrolled = Math.Min(scrolled, GC.GetAllocatedBytesForCurrentThread() - before);
+            Ui.Settle();
+        }
+        Assert.Equal("Ration015", window.Assist.CompletionChosen);
+        TestContext.Current.TestOutputHelper?.WriteLine($"A key handing every row on screen another member: {reworded / 1024} KB on the UI thread; "
+            + string.Join("; ", changed.Select(c => $"{c.Key}: {c.Value / 1024} KB")) + $"; a Down scrolling the list: {scrolled / 1024} KB");
+        foreach ((string what, long cost) in changed)
+        {
+            Assert.True(cost < reworded,
+                $"A key taking Pantry's members from {what} allocated {cost / 1024} KB on the UI thread, against {reworded / 1024} KB for a key handing every row on screen another member: "
+                + "it laid out rows that neither came nor went, or made their places anew");
+        }
+        Assert.True(scrolled < reworded,
+            $"A Down scrolling the completion list a row allocated {scrolled / 1024} KB on the UI thread, against {reworded / 1024} KB for a key handing every row on screen another member: "
+            + "the scroll laid its rows out anew");
+        Ui.Press(window, "ESCAPE");
+        window.Close();
+
+        // The least the UI thread allocates from a key to the list it leaves drawn, the list then showing as many rows.
+        long Key(string key, int rows)
+        {
+            typed = key == "BACK_SPACE" ? typed[..^1] : typed + key;
+            long before = GC.GetAllocatedBytesForCurrentThread();
+            if (key == "BACK_SPACE")
+            {
+                Ui.Press(window, key, settle: false);
+            }
+            else
+            {
+                window.KeyTextInput(key);
+            }
+            Ui.Pumped(() => window.Assist.CompletionNarrowedBy == typed, TimeSpan.FromSeconds(30));
+            Ui.Draw();
+            long cost = GC.GetAllocatedBytesForCurrentThread() - before;
+            Assert.True(window.Assist.CompletionNarrowedBy == typed && window.Assist.CompletionLabels.Count == rows,
+                $"Narrowed by '{typed}' the list shows {window.Assist.CompletionLabels.Count} rows, not {rows}");
+            Ui.Settle();
+            return cost;
+        }
+    }
+
+    /// <summary>A completion list of more rows than it shows scrolls by the wheel turned over it, two rows a notch as a
+    /// scrolled view goes, and by a click on its bar's track, a screen at a time, the row chosen staying chosen; the server's
+    /// types of namespaces not imported, held until the list is scrolled, join it with the rows scrolled to still shown; a
+    /// Down from the row chosen, scrolled away, brings the list back to the row after it.</summary>
+    [AvaloniaFact]
+    public void A_completion_list_scrolls_by_the_wheel_and_its_bar_its_choice_staying()
+    {
+        MainWindow window = Ui.OpenFolder(project.Folder, autosaves: false);
+        window.OpenFile(project.PathOf("Pantry.cs"));
+        CodeEditor editor = window.EditorArea.CodeEditor;
+        Ui.Settle();
+        Assert.True(window.CSharpService?.IsReady, window.CSharpService?.State);
+        Ui.PlaceAfter(editor, "        int total = 0;");
+        editor.Focus();
+        Ui.Press(window, "ENTER");
+        Ui.Settle();
+        // The server's types of namespaces not imported indexed, so the part held below has items to join the list with.
+        Passenger.Lsp.LspDocument lsp = window.CSharpService!.For(window.EditorArea.Active!)!.Lsp!;
+        int caret = editor.Selections.Primary.Caret;
+        Task<int>? asking = null;
+        Ui.WaitFor(() =>
+        {
+            if (asking is { IsCompleted: true } asked)
+            {
+                if (asked.IsCompletedSuccessfully && Ui.Await(asked, "the types of namespaces not imported") > 0)
+                {
+                    return true;
+                }
+                asking = null;
+            }
+            asking ??= Waiting.Apart(() => LaterItemsAsync(lsp, caret));
+            return false;
+        }, "the server's types of namespaces not imported, indexed");
+        Passenger.Lsp.LanguageServer server = window.CSharpService!.Session!.Server;
+        TaskCompletionSource released = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        Task held = server.HoldNextAnswer(Passenger.Roslyn.Extension.ExtensionMethods.LaterCompletion, _ => true, released.Task);
+        try
+        {
+            window.KeyTextInput("R");
+            Ui.PumpUntil(() => window.Assist.CompletionNarrowedBy == "R", "a statement's list opened by R");
+            window.KeyTextInput("ation");
+            Ui.PumpUntil(() => window.Assist.CompletionNarrowedBy == "Ration" && window.Assist.CompletionLabels.Count == 200 && FirstShown() == "Ration000",
+                $"a statement's list narrowed by Ration to the 200 shown, Ration000 first, where it shows {FirstShown()} first of {window.Assist.CompletionLabels.Count}");
+            Ui.AwaitPumped(held, "the types of namespaces not imported, come and held unanswered");
+            Assert.Equal("Ration000", window.Assist.CompletionChosen);
+            Rect list = window.Assist.CompletionPlace ?? throw new InvalidOperationException("The completion list shows, yet has no place");
+            window.MouseMove(list.Center);
+            window.MouseWheel(list.Center, new Vector(0, -1));
+            Ui.Draw();
+            Assert.True((window.Assist.CompletionChosen, FirstShown()) == ("Ration000", "Ration002"),
+                $"A notch of the wheel down over the list shows {FirstShown()} first, {window.Assist.CompletionChosen} chosen, not Ration002 with Ration000 still chosen");
+        }
+        finally
+        {
+            released.TrySetResult();
+        }
+        Ui.Settle();
+        Assert.True((window.Assist.CompletionChosen, FirstShown()) == ("Ration000", "Ration002"),
+            $"With the types of namespaces not imported joined, the list scrolled to Ration002 shows {FirstShown()} first, {window.Assist.CompletionChosen} chosen: it went back to the row chosen");
+        Avalonia.Controls.Primitives.ScrollBar bar = window.EditorArea.AssistLayer.GetVisualDescendants().OfType<Avalonia.Controls.Primitives.ScrollBar>().Single(b => b.IsEffectivelyVisible);
+        Ui.Click(bar.GetVisualDescendants().OfType<RepeatButton>().Single(b => b.Name == "PART_PageDownButton"));
+        Assert.True((window.Assist.CompletionChosen, FirstShown()) == ("Ration000", "Ration012"),
+            $"A click on the list's bar below its thumb shows {FirstShown()} first, {window.Assist.CompletionChosen} chosen, not Ration012 with Ration000 still chosen");
+        Ui.Press(window, "DOWN");
+        Assert.True((window.Assist.CompletionChosen, FirstShown()) == ("Ration001", "Ration001"),
+            $"Down from Ration000 scrolled away shows {FirstShown()} first, {window.Assist.CompletionChosen} chosen, not the list back at Ration001, chosen");
+        Ui.Press(window, "ESCAPE");
+        window.Close();
+
+        string? FirstShown() => window.Assist.CompletionRowControls.OfType<Avalonia.Controls.Panel>().FirstOrDefault()?.Children.OfType<TextBlock>().FirstOrDefault()?.Text;
+
+        static async Task<int> LaterItemsAsync(Passenger.Lsp.LspDocument lsp, int caret) =>
+            (await lsp.CompletionAsync(caret, null)).List?.Later is { } later ? (await later)?.Items.Count ?? 0 : 0;
+    }
+
+    /// <summary>A window's completion list is laid out once as the window opens, off screen: its first list shows in row
+    /// controls made then, so the first list a person asks for waits for no control to be made, styled or shaped.</summary>
+    [AvaloniaFact]
+    public void A_windows_first_completion_list_shows_in_the_rows_laid_out_as_the_window_opened()
+    {
+        MainWindow window = project.Open("Program.cs");
+        CodeEditor editor = window.EditorArea.CodeEditor;
+        Ui.Settle();
+        IReadOnlyList<Avalonia.Controls.Control> ahead = window.Assist.CompletionRowsLaidOut;
+        Assert.True(ahead.Count >= 10 && !window.Assist.IsCompletionOpen,
+            $"The window opened with {ahead.Count} completion rows laid out, the list {(window.Assist.IsCompletionOpen ? "showing" : "hidden")}: its first list would make its own");
+        Ui.PlaceAfter(editor, "int result = Helper.Twice(2);");
+        editor.Focus();
+        Ui.Press(window, "ENTER");
+        window.KeyTextInput("S");
+        Ui.WaitFor(() => window.Assist.CompletionNarrowedBy == "S", "a statement's list narrowed by S");
+        IReadOnlyList<Avalonia.Controls.Control> shown = window.Assist.CompletionRowControls;
+        Assert.True(shown.Count > 0 && shown.All(ahead.Contains),
+            $"The window's first list showed {shown.Count(row => !ahead.Contains(row))} of its {shown.Count} rows in controls it made then, not those laid out as the window opened");
+        Ui.Press(window, "ESCAPE");
+        window.Close();
+    }
+
+    /// <summary>A statement's first letters show what is in scope while the server's types of namespaces not imported, held
+    /// unanswered, are still to come; once they come they join the list, the row chosen meanwhile still chosen and the
+    /// caret where it was, and typing on asks the server for no list. A name nothing in scope fits shows no list until
+    /// they come, then theirs.</summary>
+    [AvaloniaFact]
+    public void A_statements_first_rows_show_before_the_types_of_namespaces_not_imported_which_join_them_leaving_the_choice()
+    {
+        MainWindow window = project.Open("Program.cs");
+        CodeEditor editor = window.EditorArea.CodeEditor;
+        Ui.PlaceAfter(editor, "int result = Helper.Twice(2);");
+        editor.Focus();
+        Ui.Press(window, "ENTER");
+        Ui.Settle();
+        // Roslyn lists the types of namespaces not imported once it has indexed them, so the name is typed again until it has.
+        Ui.WaitFor(() =>
+        {
+            Typed("Str");
+            bool indexed = window.Assist.CompletionLabels.Contains("StringBuilder");
+            Ui.Press(window, "ESCAPE");
+            Erased(3);
+            if (!indexed)
+            {
+                Ui.Hold(TimeSpan.FromMilliseconds(250), "a pause before the name is typed again, as a person retries");
+            }
+            return indexed;
+        }, "StringBuilder, of a namespace Program.cs does not import, in a statement's list");
+        Passenger.Lsp.LanguageServer server = window.CSharpService!.Session!.Server;
+        Passenger.Lsp.LspDocument lsp = window.CSharpService!.For(window.EditorArea.Active!)!.Lsp!;
+
+        TaskCompletionSource released = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        Task held = server.HoldNextAnswer(Passenger.Roslyn.Extension.ExtensionMethods.LaterCompletion, _ => true, released.Task);
+        try
+        {
+            TypedPumped("St");
+            Ui.AwaitPumped(held, "the types of namespaces not imported, come and held unanswered");
+            IReadOnlyList<string> inScope = window.Assist.CompletionLabels;
+            Assert.True(inScope.Count > 1 && inScope.Contains("string") && !inScope.Contains("String"),
+                $"Narrowed by 'St' before the types of namespaces not imported came, the list showed [{string.Join(", ", inScope)}]");
+            Ui.Press(window, "DOWN", settle: false);
+            Ui.PumpUntil(() => window.Assist.CompletionChosen == inScope[1], $"{inScope[1]}, the second row, chosen");
+            int caret = editor.Selections.Primary.Caret;
+            released.SetResult();
+            Ui.WaitFor(() => window.Assist.CompletionLabels.Any(label => !inScope.Contains(label)), "the types of namespaces not imported joining the list as they came");
+            IReadOnlyList<string> joined = window.Assist.CompletionLabels;
+            Assert.True(window.Assist.CompletionChosen == inScope[1] && editor.Selections.Primary.Caret == caret && window.Assist.CompletionNarrowedBy == "St",
+                $"As the types of namespaces not imported joined the list, the chosen row went from {inScope[1]} to {window.Assist.CompletionChosen}, the caret from {caret} "
+                + $"to {editor.Selections.Primary.Caret}: Enter would put in another name than the one chosen");
+            Assert.True(inScope.Where(joined.Contains).SequenceEqual(joined.Where(inScope.Contains)),
+                $"What was in scope showed [{string.Join(", ", inScope)}], and joined by the rest [{string.Join(", ", joined.Take(12))}…]: one list in two orders");
+
+            Task asked = server.HoldNext(lsp.CompletionMethod, _ => true, Task.CompletedTask);
+            Typed("r");
+            Assert.True(window.Assist.CompletionLabels.Contains("StringBuilder"), $"Narrowed by 'Str' the list joined showed [{string.Join(", ", window.Assist.CompletionLabels.Take(12))}…]");
+            Assert.False(asked.IsCompleted, "Typing on into the list joined by the types of namespaces not imported asked the server for the list again");
+            Ui.Press(window, "ESCAPE");
+            Erased(3);
+        }
+        finally
+        {
+            released.TrySetResult();
+        }
+
+        TaskCompletionSource releasedAgain = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        Task heldAgain = server.HoldNextAnswer(Passenger.Roslyn.Extension.ExtensionMethods.LaterCompletion, _ => true, releasedAgain.Task);
+        try
+        {
+            TypedPumped("String");
+            window.KeyTextInput("B");
+            window.KeyTextInput("u");
+            Ui.AwaitPumped(heldAgain, "the types of namespaces not imported, come and held unanswered");
+            Ui.PumpUntil(() => !window.Assist.IsCompletionOpen, "the list closed on 'StringBu', which nothing in scope fits");
+            releasedAgain.SetResult();
+            Ui.WaitFor(() => window.Assist.CompletionLabels.FirstOrDefault() == "StringBuilder", "StringBuilder listed as the types of namespaces not imported came");
+            Assert.Equal("StringBu", window.Assist.CompletionNarrowedBy);
+            Ui.Press(window, "ESCAPE");
+        }
+        finally
+        {
+            releasedAgain.TrySetResult();
+        }
+        window.Close();
+
+        void Typed(string letters)
+        {
+            foreach (char letter in letters)
+            {
+                window.KeyTextInput(letter.ToString());
+                Ui.Settle();
+            }
+        }
+
+        void Erased(int letters)
+        {
+            for (int i = 0; i < letters; i++)
+            {
+                Ui.Press(window, "BACK_SPACE");
+            }
+        }
+
+        // Each letter's rows awaited without waiting for the IDE to be quiet, which it is not while an answer is held.
+        void TypedPumped(string letters)
+        {
+            string typed = string.Empty;
+            foreach (char letter in letters)
+            {
+                typed += letter;
+                window.KeyTextInput(letter.ToString());
+                Ui.PumpUntil(() => window.Assist.CompletionNarrowedBy == typed, $"the list narrowed by '{typed}'");
+            }
+        }
+    }
+
+    /// <summary>A statement's list is the server's whole list, asked for once for the name: each key typed on narrows it here
+    /// with no word to the server, and costs the UI thread what a key into a far shorter list does, counted rather than
+    /// timed. The lists differ in length alone: a statement in Pantry's method and in Silo's lists each class's fields
+    /// and the same rest, Silo's thousands more than the thousand the server cuts a list it is let cut to.</summary>
+    [AvaloniaFact]
+    public void A_statements_whole_list_narrows_here_as_its_name_is_typed_asking_the_server_nothing()
+    {
+        MainWindow window = Ui.OpenFolder(project.Folder, autosaves: false);
+        window.OpenFile(project.PathOf("Pantry.cs"));
+        Ui.Settle();
+        Assert.True(window.CSharpService?.IsReady, window.CSharpService?.State);
+        (int fewItems, long fewKey) = StatementNarrowed(window, project.PathOf("Pantry.cs"));
+        (int manyItems, long manyKey) = StatementNarrowed(window, project.PathOf("Silo.cs"));
+        TestContext.Current.TestOutputHelper?.WriteLine(
+            $"A key narrowing a statement's list of {fewItems} items allocated {fewKey / 1024} KB on the UI thread; of {manyItems} items, {manyKey / 1024} KB");
+        Assert.True(manyItems > 1000 && manyItems >= fewItems + 3700,
+            $"A statement in Silo listed {manyItems} items and one in Pantry {fewItems}: the server cut the longer list");
+        // Less than the least object for each item the longer list has more: whatever is made of an item is made off it.
+        Assert.True(manyKey - fewKey < (manyItems - fewItems) * 24L,
+            $"A key narrowing a statement's list of {manyItems} items allocated {manyKey / 1024} KB on the UI thread, against {fewKey / 1024} KB for {fewItems} "
+            + $"items, {(manyKey - fewKey) / (manyItems - fewItems)} bytes for each item more: it scored them or made their rows there");
+        window.Close();
+    }
+
+    /// <summary>A statement's list of more than 10,000 items, a class's 13,500 fields among the types in reach, lists the
+    /// 12,000 the name typed finds alike in the server's order, from its 1,000s on: none of those past its 10,000th item
+    /// ahead of one before; and the server still describes the list's last item, which it finds by its sort text.</summary>
+    [AvaloniaFact]
+    public void A_statements_list_of_more_than_ten_thousand_lists_the_names_found_alike_in_the_servers_order()
+    {
+        string folder = PathNames.Canonical(TestFolders.Create("assist-lots-"));
+        TestFolders.Write(folder, "Lots.csproj", TestProjects.Console());
+        string yard = TestFolders.Write(folder, "Yard.cs", "static class Yard\n{\n" + string.Concat(Enumerable.Range(0, 1_500).Select(i => $"    public static int Bin{i:0000};\n"))
+            + string.Concat(Enumerable.Range(0, 12_000).Select(i => $"    public static int Lot{i:00000};\n"))
+            + "\n    public static int Tally()\n    {\n        int total = 0;\n        return total;\n    }\n}\n");
+        Restore.Run(Path.Combine(folder, "Lots.csproj"));
+        MainWindow window = Ui.OpenFolder(folder, autosaves: false);
+        try
+        {
+            window.OpenFile(yard);
+            Ui.Settle();
+            Assert.True(window.CSharpService?.IsReady, window.CSharpService?.State);
+            CodeEditor editor = window.EditorArea.CodeEditor;
+            Ui.PlaceAfter(editor, "        int total = 0;");
+            editor.Focus();
+            Ui.Press(window, "ENTER");
+            Ui.Settle();
+            string typed = string.Empty;
+            foreach (string letter in new[] { "L", "o", "t" })
+            {
+                typed += letter;
+                window.KeyTextInput(letter);
+                Ui.WaitFor(() => window.Assist.CompletionNarrowedBy == typed, $"a statement's list narrowed by {typed}");
+            }
+            Passenger.Lsp.LspDocument lsp = window.CSharpService!.For(window.EditorArea.Active!)!.Lsp!;
+            int caret = editor.Selections.Primary.Caret;
+            Passenger.Lsp.CompletionList whole = Ui.Await(Waiting.Apart(() => lsp.CompletionAsync(caret, null)), "a statement's list").List!;
+            List<string> served = [.. whole.Items.Select(i => i.Label).Where(l => l.StartsWith("Lot", StringComparison.Ordinal))];
+            int first = whole.Items.FindIndex(i => i.Label.StartsWith("Lot", StringComparison.Ordinal));
+            Assert.True(first >= 1_000 && whole.Items.Count > 10_000 && whole.Items.Skip(10_000).Any(i => i.Label.StartsWith("Lot", StringComparison.Ordinal)),
+                $"A statement's list of {whole.Items.Count} items has the fields from its {first}th, not from its 1,000s to past its 10,000th, which this test is about");
+            IReadOnlyList<string> shown = window.Assist.CompletionLabels;
+            Assert.True(shown.Count > 0 && shown.SequenceEqual(served.Take(shown.Count)),
+                $"Narrowed by 'Lot' the list shows {string.Join(", ", shown.Take(5))} first, where the server lists {string.Join(", ", served.Take(5))} first: "
+                + "names the server lists past its 10,000th item go ahead of those it lists before them");
+            Passenger.Lsp.CompletionItem last = whole.Items[^1];
+            Passenger.Lsp.CompletionItem? described = Ui.Await(Waiting.Apart(() => lsp.ResolveAsync(last)), $"{last.Label} described");
+            Assert.True(described?.Documentation is not null,
+                $"The server described nothing of {last.Label}, the list's last item, sorted by {last.SortText}: it found no item of its list that sorts so");
+            Ui.Press(window, "ESCAPE");
+        }
+        finally
+        {
+            window.Close();
+        }
+    }
+
+    /// <summary>A statement begun in a class's own method and its name typed a letter at a time: how many items the list
+    /// has, whole, and the least the UI thread allocates from a key to the narrower list shown, the server asked nothing
+    /// after the list's first letter.</summary>
+    private static (int Items, long Key) StatementNarrowed(MainWindow window, string path)
+    {
+        string type = Path.GetFileNameWithoutExtension(path);
+        window.OpenFile(path);
+        CodeEditor editor = window.EditorArea.CodeEditor;
+        Ui.PlaceAfter(editor, "        int total = 0;");
+        editor.Focus();
+        Ui.Press(window, "ENTER");
+        Ui.Settle();
+        window.KeyTextInput("R");
+        Ui.WaitFor(() => window.Assist.CompletionNarrowedBy == "R" && window.Assist.CompletionLabels.Contains("Ration000"), $"a statement's list in {type} narrowed by R");
+        Passenger.Lsp.LspDocument lsp = window.CSharpService!.For(window.EditorArea.Active!)!.Lsp!;
+        int caret = editor.Selections.Primary.Caret;
+        Passenger.Lsp.CompletionList? whole = Ui.Await(Waiting.Apart(() => lsp.CompletionAsync(caret, null)), $"a statement's list in {type}").List;
+        Assert.True(whole is { IsIncomplete: false }, $"The server said a statement's list of {whole?.Items.Count} items in {type} left items out");
+        TaskCompletionSource released = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        Task asked = window.CSharpService!.Session!.Server.HoldNext(lsp.CompletionMethod, _ => true, released.Task);
+        string typed = "R";
+        long key = long.MaxValue;
+        try
+        {
+            foreach (string letter in new[] { "a", "t", "i", "o", "n" })
+            {
+                typed += letter;
+                long before = GC.GetAllocatedBytesForCurrentThread();
+                window.KeyTextInput(letter);
+                Ui.Pumped(() => window.Assist.CompletionNarrowedBy == typed, TimeSpan.FromSeconds(30));
+                key = Math.Min(key, GC.GetAllocatedBytesForCurrentThread() - before);
+                Assert.True(window.Assist.CompletionNarrowedBy == typed, $"The list never showed its rows for '{typed}'");
+                Ui.Settle();
+                Assert.False(asked.IsCompleted, $"Typing '{letter}' into a statement's whole list in {type} asked the server for the list again");
+            }
+            Assert.True(window.Assist.CompletionLabels.FirstOrDefault() == "Ration000",
+                $"Narrowed by '{typed}' the list shows {string.Join(", ", window.Assist.CompletionLabels.Take(5))} first");
+        }
+        finally
+        {
+            released.TrySetResult();
+        }
+        Ui.Press(window, "ESCAPE");
+        return (whole!.Items.Count, key);
+    }
+
     /// <summary>Two methods laid out wrongly, the second's first line indented two spaces too far.</summary>
     private const string SelectedLines = "static class Selected\n{\n    public static int First( int a,int b )\n    {\n        return a+b;\n    }\n\n"
         + "      public static int Second(int a, int b)\n    {\n        return a * b;\n    }\n}\n";
@@ -2642,6 +3624,9 @@ public sealed class CodeAssistTests : IClassFixture<CodeAssistTests.Project>
             // Each one test's own, which no other file uses: written by the test, it cost the warm server before and after it.
             File.WriteAllText(PathOf("Pairs.cs"), "class Counter(int start)\n{\n    public int Start => start;\n}\n\nrecord Pair(int Left, int Right)\n{\n"
                 + "    public static int Sum(Pair pair) => pair.Left + new Counter(pair.Right).Start;\n}\n");
+            File.WriteAllText(PathOf("Releases.cs"), "record Release(string Version, int Downloads);\n");
+            File.WriteAllText(PathOf("ReleaseReaders.cs"), "static class ReleaseReaders\n{\n    public static string Of(Release release) => release.Version;\n\n"
+                + "    public static Release Next(Release release) => release with { Version = \"2.0\" };\n}\n");
             File.WriteAllText(PathOf("Mixed.cs"), "static class Mixed\n{\n    /* Pasted:\u2028one,\r\ntwo,\u0085three. */\n    public static int Value()\n    {\n        int total = 1;\n          return total;\n    }\n}\n");
             File.WriteAllText(PathOf("Halves.cs"), "static class Halves\n{\n    /* one,\r\ntwo,\r\nthree. */\n    public static int Value()\n    {\n        int total = 1;\n        return total;\n    }\n}\n");
             File.WriteAllText(PathOf("Average.cs"), "using System.Collections.Generic;\n\nstatic class Average\n{\n    public static double Of(IEnumerable<int> values)\n    {\n"
@@ -2649,6 +3634,8 @@ public sealed class CodeAssistTests : IClassFixture<CodeAssistTests.Project>
                 + "        return total / count;\n    }\n}\n");
             File.WriteAllText(PathOf("Casts.cs"), "static class Casts\n{\n    public static int Three() => (int)3;\n}\n");
             File.WriteAllText(PathOf("Ragged.cs"), Ragged);
+            File.WriteAllText(PathOf("Fits.cs"), FitsCode);
+            File.WriteAllText(PathOf("Marks.cs"), "static class Marks\n{\n    public static int Greet()\n    {\n        int नमस्ते = 1;\n        int twice = ;\n        return ;\n    }\n}\n");
             File.WriteAllText(PathOf("Wide.cs"), "static class Wide\n{\n    public static int Four()\n    {\n        return Area.Of(2, 2);\n    }\n}\n", Encoding.Unicode);
             File.WriteAllText(PathOf("Actions.cs"), "static class Actions\n{\n    public static int Go()\n    {\n        int half = Half(4);\n"
                 + "        Missing gone = null;\n        return half;\n    }\n\n    private static int Half(int value) => value / 2;\n}\n");
@@ -2671,6 +3658,8 @@ public sealed class CodeAssistTests : IClassFixture<CodeAssistTests.Project>
             // Two classes alike but for how many members they have, every one named alike, fewer than the server's thousand.
             File.WriteAllText(PathOf("Pantry.cs"), Rations("Pantry", 220));
             File.WriteAllText(PathOf("Granary.cs"), Rations("Granary", 980));
+            // A class of thousands of fields, whose statements list far more than the server's thousand.
+            File.WriteAllText(PathOf("Silo.cs"), Rations("Silo", 4000));
             // The first build makes bin, which a reset would take for a file the test added: made now, the folder stays as reset.
             Directory.CreateDirectory(PathOf("bin"));
         }
@@ -2685,6 +3674,99 @@ public sealed class CodeAssistTests : IClassFixture<CodeAssistTests.Project>
         /// copy has, so no documentation shows for .NET's types.</summary>
         public bool ReferencePackDownloaded =>
             File.ReadAllText(PathOf("obj/project.assets.json")).Contains("\"name\": \"Microsoft.NETCore.App.Ref\"", StringComparison.Ordinal);
+    }
+}
+
+/// <summary>What reading the language server's completion costs, counted on every thread: the class runs alone, as whatever a
+/// class beside the window tests allocates meanwhile would count as the read's.</summary>
+[Collection(Alone.Name)]
+public sealed class CodeAssistBytesTests : IClassFixture<CodeAssistTests.Project>
+{
+    private readonly CodeAssistTests.Project project;
+
+    public CodeAssistBytesTests(CodeAssistTests.Project project)
+    {
+        this.project = project;
+        project.Reset();
+    }
+
+    /// <summary>The server's completion list is read where its answer arrives, never on the UI thread: a list of
+    /// hundreds more items (a file with the usings a project's implicit ones bring, against one with none) costs the UI
+    /// thread, from the key to the list open, less than a third of what reading those items takes, counted rather than
+    /// timed. The window starts a server of its own: a warm server, once a test had it index the types of namespaces not
+    /// imported, lists them whole in both files, which leaves the two lists near enough alike.</summary>
+    [AvaloniaFact]
+    public void A_statements_completion_list_is_read_off_the_UI_thread()
+    {
+        string bare = project.PathOf("Bare.cs");
+        string used = project.PathOf("Used.cs");
+        MainWindow window = Ui.OpenFolder(project.Folder, autosaves: false);
+        window.OpenFile(bare);
+        Ui.Settle();
+        Assert.True(window.CSharpService?.IsReady, window.CSharpService?.State);
+        (int fewItems, long fewRead, long fewFrame) = StatementCompletion(window, bare);
+        (int manyItems, long manyRead, long manyFrame) = StatementCompletion(window, used);
+        TestContext.Current.TestOutputHelper?.WriteLine(
+            $"{fewItems} items: read in {fewRead / 1024} KB, opened from the key in {fewFrame / 1024} KB; {manyItems} items: {manyRead / 1024} KB, {manyFrame / 1024} KB");
+        Assert.True(manyItems > fewItems + 300, $"With the usings a statement's completion listed {manyItems} items, against {fewItems} without");
+        Assert.True(manyFrame - fewFrame < (manyRead - fewRead) / 3,
+            $"A list of {manyItems} items opened with {manyFrame / 1024} KB allocated on the UI thread from the key, against {fewFrame / 1024} KB for {fewItems} items: "
+            + $"a third or more of the {(manyRead - fewRead) / 1024} KB reading the extra items takes, so they were read there");
+        window.Close();
+    }
+
+    /// <summary>A statement's completion in a file: how many items it lists, what reading its answer allocates (the
+    /// same list asked for from the thread pool, the window's thread waiting), and what the UI thread allocates from the
+    /// key until the list is open, whichever of its frames the answer lands in; the least of three. Its later part is
+    /// held in each round until Escape: one joined before it leaves the popup, for the next round, rows to lay out again
+    /// (200 for 54), which the UI thread pays as though it read the items.</summary>
+    private static (int Items, long Read, long Frame) StatementCompletion(MainWindow window, string path)
+    {
+        window.OpenFile(path);
+        CodeEditor editor = window.EditorArea.CodeEditor;
+        Ui.PlaceAfter(editor, "        int total = 0;");
+        window.KeyTextInput(" ");
+        editor.Focus();
+        Ui.Settle();
+        Passenger.Lsp.LspDocument lsp = window.CSharpService!.For(window.EditorArea.Active!)!.Lsp!;
+        int caret = editor.Selections.Primary.Caret;
+        long read = long.MaxValue;
+        int items = 0;
+        for (int i = 0; i < 3; i++)
+        {
+            long before = GC.GetTotalAllocatedBytes(precise: true);
+            Passenger.Lsp.CompletionList? list = Ui.Idle(Waiting.Apart(() => lsp.CompletionAsync(caret, null)), "the statement's completion asked from the thread pool").List;
+            read = Math.Min(read, GC.GetTotalAllocatedBytes(precise: true) - before);
+            items = list?.Items.Count ?? 0;
+            if (list?.Later is { } later)
+            {
+                // Asked for as the list came: landed, it is no answer a round below would hold in place of its own.
+                Ui.Await(later, "the later part of the statement's completion asked from the thread pool");
+            }
+        }
+        Passenger.Lsp.LanguageServer server = window.CSharpService!.Session!.Server;
+        long frame = long.MaxValue;
+        for (int round = 0; round < 3; round++)
+        {
+            TaskCompletionSource released = new(TaskCreationOptions.RunContinuationsAsynchronously);
+            Task held = server.HoldNextAnswer(Passenger.Roslyn.Extension.ExtensionMethods.LaterCompletion, _ => true, released.Task);
+            try
+            {
+                long before = GC.GetAllocatedBytesForCurrentThread();
+                window.KeyTextInput("S");
+                Ui.Pumped(() => window.Assist.IsCompletionOpen, TimeSpan.FromSeconds(60));
+                frame = Math.Min(frame, GC.GetAllocatedBytesForCurrentThread() - before);
+                Assert.True(window.Assist.IsCompletionOpen, $"Completion never opened for a statement in {Path.GetFileName(path)}");
+                Ui.AwaitPumped(held, $"the later part of a statement's completion in {Path.GetFileName(path)}, come and held unanswered");
+                Ui.Press(window, "ESCAPE");
+                Ui.Press(window, "BACK_SPACE");
+            }
+            finally
+            {
+                released.TrySetResult();
+            }
+        }
+        return (items, read, frame);
     }
 }
 

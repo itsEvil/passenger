@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Runtime.CompilerServices;
 
 namespace Passenger.Core;
@@ -22,6 +23,10 @@ public static class BackgroundWork
 
     private static volatile Action<Action>? toUiThread;
 
+    /// <summary>The innermost scope of <see cref="EndingAtOnce"/> this thread has open, if any.</summary>
+    [ThreadStatic]
+    private static AtOnce? atOnce;
+
     public static int Pending => (int)Volatile.Read(ref state);
 
     public static void Begin([CallerFilePath] string file = "", [CallerLineNumber] int line = 0)
@@ -35,7 +40,7 @@ public static class BackgroundWork
                 {
                     Begun[file] = lines = [];
                 }
-                lines.Add((line, DateTime.UtcNow.Ticks));
+                lines.Add((line, Stopwatch.GetTimestamp()));
             }
         }
     }
@@ -58,16 +63,17 @@ public static class BackgroundWork
         }
     }
 
-    /// <summary>Each hold now, as named while watched: the file and line that took it and when (UTC), the oldest first;
-    /// the count is <see cref="Pending"/>'s, the names as near as an End that names only its file lets them be.</summary>
-    public static IReadOnlyList<(string What, DateTime Since)> Held()
+    /// <summary>Each hold now, as named while watched: the file and line that took it and when (a timestamp of Stopwatch's),
+    /// the oldest first; the count is <see cref="Pending"/>'s, the names as near as an End that names only its file lets them
+    /// be.</summary>
+    public static IReadOnlyList<(string What, long Since)> Held()
     {
         lock (Scopes)
         {
             return [.. Scopes.Select(s => (s.Where, s.Since))
                 .Concat(Begun.SelectMany(b => b.Value.Select(l => (Where: $"{Path.GetFileName(b.Key)}:{l.Line}", l.Since))))
                 .OrderBy(h => h.Since)
-                .Select(h => ($"background work begun at {h.Where}", new DateTime(h.Since, DateTimeKind.Utc)))];
+                .Select(h => ($"background work begun at {h.Where}", h.Since))];
         }
     }
 
@@ -129,6 +135,11 @@ public static class BackgroundWork
     /// there later, after what the UI thread was given to do before it.</summary>
     public static void Install(Action<Action> postToUiThread) => toUiThread = postToUiThread;
 
+    /// <summary>While open, a function or action this thread gives <c>Run</c> runs on it at once, so its task has ended
+    /// before the caller awaits it, as when the thread pool outruns the caller: for a test of what the caller does then.
+    /// Closed on the thread that opened it.</summary>
+    public static AtOnce EndingAtOnce() => atOnce = new AtOnce(atOnce);
+
     /// <summary>Work for the thread pool (Task.Run's), held until its answer is back on the caller's thread: an await
     /// on the UI thread lets go only there, so what it then draws is in the frame a screenshot waits for. Not for what
     /// the UI thread may block on (the window's end), which it could never come back to.</summary>
@@ -136,6 +147,11 @@ public static class BackgroundWork
     {
         using (Scope(file, line))
         {
+            if (atOnce is { } now)
+            {
+                now.Count(cancel);
+                return work();
+            }
             return await Task.Run(work, cancel);
         }
     }
@@ -154,6 +170,12 @@ public static class BackgroundWork
     {
         using (Scope(file, line))
         {
+            if (atOnce is { } now)
+            {
+                now.Count(cancel);
+                work();
+                return;
+            }
             await Task.Run(work, cancel);
         }
     }
@@ -181,13 +203,24 @@ public static class BackgroundWork
     /// <inheritdoc cref="Unheld{T}(Func{T}, CancellationToken)"/>
     public static Task Unheld(Func<Task> work, CancellationToken cancel = default) => Task.Run(work, cancel);
 
-    /// <summary>Unheld work on a thread of its own, for work that blocks its thread for long (a trace read to its end).</summary>
-    public static Task<T> UnheldThread<T>(Func<T> work) =>
-        Task.Factory.StartNew(work, CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default);
+    /// <summary>Unheld work on a thread of its own, for work that blocks its thread for long (a trace read to its end), in no
+    /// caller's context, which would be held for as long as the work lasts (<see cref="ApartThreads"/>).</summary>
+    public static Task<T> UnheldThread<T>(Func<T> work)
+    {
+        using (ExecutionContext.SuppressFlow())
+        {
+            return Task.Factory.StartNew(work, CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default);
+        }
+    }
 
     /// <inheritdoc cref="UnheldThread{T}(Func{T})"/>
-    public static Task UnheldThread(Action work) =>
-        Task.Factory.StartNew(work, CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default);
+    public static Task UnheldThread(Action work)
+    {
+        using (ExecutionContext.SuppressFlow())
+        {
+            return Task.Factory.StartNew(work, CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default);
+        }
+    }
 
     /// <summary>Takes one hold off the count, if there is one and, for a scope's, the count is still of its generation.</summary>
     private static void Release(long? generation)
@@ -204,11 +237,39 @@ public static class BackgroundWork
         }
     }
 
+    /// <summary>A scope of <see cref="EndingAtOnce"/>, with how much work it ran.</summary>
+    public sealed class AtOnce : IDisposable
+    {
+        private readonly AtOnce? outer;
+        private bool closed;
+
+        internal AtOnce(AtOnce? outer) => this.outer = outer;
+
+        /// <summary>How many pieces of work ran at once while it was open.</summary>
+        public int Ran { get; private set; }
+
+        /// <summary>Counts a piece of work about to run at once, unless it was stopped before it began.</summary>
+        internal void Count(CancellationToken cancel)
+        {
+            cancel.ThrowIfCancellationRequested();
+            Ran++;
+        }
+
+        public void Dispose()
+        {
+            if (!closed)
+            {
+                closed = true;
+                atOnce = outer;
+            }
+        }
+    }
+
     private sealed class Hold(long generation, string file, int line) : IDisposable
     {
         private int ended;
 
-        public long Since { get; } = InFlight.Watched ? DateTime.UtcNow.Ticks : 0;
+        public long Since { get; } = InFlight.Watched ? Stopwatch.GetTimestamp() : 0;
 
         public string Where => $"{Path.GetFileName(file)}:{line}";
 

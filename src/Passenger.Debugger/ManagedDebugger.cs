@@ -48,6 +48,10 @@ public partial class ManagedDebugger
     internal int ModuleSet_Version { get; private set; }
     private bool _isAttached;
     private int? _pendingAttachProcessId;
+    private (string Relay, string? Modules, string? Token)? _pendingRelay;
+
+    /// <summary>The process attached to, by its id where the adapter runs, while held; 0 for none.</summary>
+    private int _attachedId;
 
     /// <summary>The process an attach is to take hold of, from the attach request until its runtime has been let go (or was
     /// running already); 0 when there is none. One held at its start (DOTNET_DefaultDiagnosticPortSuspend) waits there for
@@ -58,6 +62,14 @@ public partial class ManagedDebugger
     /// attached to: only such a program ends with a client that goes without disconnecting (<see cref="AbandonAsync"/>).</summary>
     private bool _launched;
     private bool _justMyCode;
+
+    /// <summary>The assemblies the client carries into the program, by name, never the user's code (<see cref="Carry"/>).</summary>
+    private HashSet<string> _carried = new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>Takes the names of the assemblies the client carries into the program for this session, before it launches
+    /// or attaches: their code, however built, is never the user's, so Just My Code steps through it and over it.</summary>
+    public void Carry(IReadOnlyList<string> assemblies) => _carried = new HashSet<string>(assemblies, StringComparer.OrdinalIgnoreCase);
+
     private bool _stopAtEntry;
     private EntryBreakpoint? _entryBreakpoint;
     private sealed record EntryBreakpoint(ICorDebugFunctionBreakpoint CorBreakpoint, ModuleInfo Module, int MethodToken, int IlOffset);
@@ -87,6 +99,10 @@ public partial class ManagedDebugger
     private int _exitReported;
     private int _terminatedReported;
     private TaskCompletionSource _exitTold = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+    /// <summary>Why the debugging ended other than by the program's end or the client's asking: the runtime's own debugging
+    /// of the program failed (<see cref="HandleDebuggerError"/>), after which it answers nothing; null until then.</summary>
+    public string? Failure { get; private set; }
 
     /// <summary>Tells the client its debugging has ended, once, after the program's end was told: for a launched program as
     /// its process ends, whatever became of the runtime's word of it, which mscordbi may lose tearing down.</summary>
@@ -407,7 +423,9 @@ public partial class ManagedDebugger
         SymbolsWanted? wanted;
         try
         {
-            wanted = thread?.ActiveFrame is ICorDebugILFrame frame && FindModule(frame.Function.Module) is { } module ? WantedFor(module) : null;
+            // A step stops where it lands, hidden code too, where a data breakpoint shows the frame that wrote.
+            ICorDebugFrame? stopsIn = thread is null ? null : e is StepCompleteCorDebugManagedCallbackEventArgs ? thread.ActiveFrame : TopFrame(thread);
+            wanted = stopsIn is ICorDebugILFrame frame && FindModule(frame.Function.Module) is { } module ? WantedFor(module) : null;
         }
         catch (Exception error) when (Failures.OfRuntime(error))
         {
@@ -441,7 +459,19 @@ public partial class ManagedDebugger
             {
                 return;
             }
-            _logger?.Invoke($"Event: {e.GetType().Name}{(DispatchThread(e) is int thread ? $" on thread {thread}" : "")}");
+            if (FailAtModule is { } failing && e is LoadModuleCorDebugManagedCallbackEventArgs load && _process is { } held
+                && string.Equals(Path.GetFileName(load.Module.Name), failing, StringComparison.OrdinalIgnoreCase))
+            {
+                _logger?.Invoke($"Held: the load of {failing} taken as the runtime's failure");
+                e = new DebuggerErrorCorDebugManagedCallbackEventArgs(held, HeldFailure, 0);
+            }
+            _logger?.Invoke($"Event: {e.GetType().Name}{(DispatchThread(e) is int thread ? $" on thread {thread}" : "")}"
+                + (e is DebuggerErrorCorDebugManagedCallbackEventArgs error ? $": 0x{error.ErrorHR:X8}, code {error.ErrorCode}" : ""));
+            if (Failure is not null && e is not (ExitProcessCorDebugManagedCallbackEventArgs or DebuggerErrorCorDebugManagedCallbackEventArgs))
+            {
+                // Its process answers nothing since its debugging failed: no continue, which would throw, is asked of it.
+                return;
+            }
             switch (e)
             {
                 case LogMessageCorDebugManagedCallbackEventArgs a: HandleLogMessage(sender, a); break;
@@ -461,6 +491,7 @@ public partial class ManagedDebugger
                 case DataBreakpointCorDebugManagedCallbackEventArgs a: await HandleDataBreakpoint(a).ConfigureAwait(false); break;
                 case FunctionRemapOpportunityCorDebugManagedCallbackEventArgs a: HandleFunctionRemapOpportunity(a); break;
                 case FunctionRemapCompleteCorDebugManagedCallbackEventArgs a: HandleFunctionRemapComplete(a); break;
+                case DebuggerErrorCorDebugManagedCallbackEventArgs a: await HandleDebuggerError(a).ConfigureAwait(false); break;
                 case EvalCompleteCorDebugManagedCallbackEventArgs or EvalExceptionCorDebugManagedCallbackEventArgs when IsAbandonedEvaluationsEnd(e): LetGoAbandonedEvaluation(e); break;
                 case EvalCompleteCorDebugManagedCallbackEventArgs or EvalExceptionCorDebugManagedCallbackEventArgs: break; // don't continue on these, as they are being used for expression evaluation
                 default:
@@ -525,6 +556,7 @@ public partial class ManagedDebugger
             process.Dispose();
         }
         _isAttached = true;
+        _attachedId = processId;
         ConfigureExceptionCallbacks();
 
         _logger?.Invoke($"Attached to process: {processId}");
@@ -555,6 +587,38 @@ public partial class ManagedDebugger
         }
     }
 
+    /// <summary>Takes hold of an app through Passenger's relay in it: the relay's ICorDebug, the app's own runtime's, is
+    /// driven as a local one is, and the app's start goes on once the attach is made.</summary>
+    private void PerformRelayAttach(string relay, string? modules, string? token)
+    {
+        _logger?.Invoke($"Attaching through the relay at {relay}");
+        Relay.RelayConnection connection = Relay.RelayConnection.Connect(relay, token, TimeSpan.FromSeconds(60), _logger);
+        _exited.Reset();
+        ICorDebug corDebug = Relay.RemoteObjects.Start(connection, new Relay.DeviceModules(modules), _logger);
+        corDebug.Initialize();
+        corDebug.SetManagedHandler(_callbacks);
+        int processId = (int)connection.ProcessId;
+        ICorDebugProcess process = corDebug.DebugActiveProcess(processId, false);
+        _process = process;
+        _corDebug = corDebug;
+        // The app's process is on its device: its end is its runtime's word, else its relay's stream ending with it.
+        connection.WhenGone(() =>
+        {
+            if (!_exited.IsSet)
+            {
+                _logger?.Invoke("The relay's stream ended before the runtime said the process exited: its end is the process's");
+                QueueEvent(this, new ExitProcessCorDebugManagedCallbackEventArgs(process));
+            }
+        });
+        connection.Go();
+        _isAttached = true;
+        _attachedId = processId;
+        ConfigureExceptionCallbacks();
+        _logger?.Invoke($"Attached through the relay to process {processId}");
+        OnAttached?.Invoke(processId);
+        SendAllBreakpointEvents();
+    }
+
     private void SendAllBreakpointEvents()
     {
         // Every breakpoint is unverified until it binds again.
@@ -582,6 +646,7 @@ public partial class ManagedDebugger
             _stepInTargets.Clear();
             _writtenAt = null;
             _stoppedShort = null;
+            _steppedIntoHidden = null;
         }
         if (!EvalStatus.IsRunning && (TakeDeferredEvent() || TakePendingPause()))
         {
@@ -609,6 +674,7 @@ public partial class ManagedDebugger
         // A step's calls' values are shown at its own stop; one that stops anywhere else stops showing them.
         EndReturnWatch();
         EndSmartStep();
+        _heldYield = null;
         if (reason != StopReasons.Step)
         {
             ForgetReturnedValues();
@@ -673,6 +739,22 @@ public partial class ManagedDebugger
 
     private ICorDebugStepper? _stepper;
 
+    /// <summary>A test's hold: the stepping thread's breakpoint where it leaves an async method at an await is let go
+    /// unhandled, the thread running on, and handed over only as its step's end comes, as the runtime once handed both under
+    /// load.</summary>
+    public static bool LateYield { get; set; }
+
+    /// <summary>A test's hold: the load of the module of this file name is taken as the runtime's word that its debugging
+    /// of the program failed for good (<see cref="HandleDebuggerError"/>), as it once said under load.</summary>
+    public static string? FailAtModule { get; set; }
+
+    /// <summary>The failure <see cref="FailAtModule"/> stands in for the runtime's with: E_FAIL.</summary>
+    private const int HeldFailure = unchecked((int)0x80004005);
+
+    /// <summary>The breakpoint <see cref="LateYield"/> holds back, and the one it is handing over, which is not held again.</summary>
+    private BreakpointCorDebugManagedCallbackEventArgs? _heldYield;
+    private BreakpointCorDebugManagedCallbackEventArgs? _handedYield;
+
     internal void Log(string message) => _logger?.Invoke(message);
 
     /// <summary>Ends the step's stepper as its thread leaves an async method at an await, the async stepper's step going on
@@ -681,6 +763,20 @@ public partial class ManagedDebugger
     {
         _stepper?.TryDeactivate();
         _stepper = null;
+        EndReturnGuard();
+    }
+
+    /// <summary>A step out standing guard over the return of a step's frame, with the step it guards. Just My Code off, over a
+    /// frame whose caller is native code, which the runtime's stepper loses: the guard's end is the step's
+    /// (<see cref="AboveShownCaller"/>). Just My Code on, over a frame with none of the user's code below it to go back to
+    /// (<see cref="GoesBackToUsersCode"/>): the guard's end ends the step with no stop, the program running on.</summary>
+    private (ICorDebugStepper Guard, ICorDebugStepper Step, bool RunsOn)? _returnGuard;
+
+    /// <summary>Ends a step's guard, with the step it guards or when another step begins.</summary>
+    private void EndReturnGuard()
+    {
+        _returnGuard?.Guard.TryDeactivate();
+        _returnGuard = null;
     }
 
     /// <summary>The step over an await goes on from where its run resumed, on this thread, which need not be the one that
@@ -697,7 +793,7 @@ public partial class ManagedDebugger
     /// not the user's code.</summary>
     internal bool StopStepAt(ICorDebugThread thread)
     {
-        if (thread.ActiveFrame is not ICorDebugILFrame frame || (_justMyCode && !IsUserCodeFrame(frame)) || FindModule(frame.Function.Module) is not { } module
+        if (TopFrame(thread) is not ICorDebugILFrame frame || (_justMyCode && !IsUserCodeFrame(frame)) || FindModule(frame.Function.Module) is not { } module
             || module.MetadataReader.IsCurrentSequencePointHidden(frame.Function.Token, frame.IP.pnOffset, ModuleMetadataReader.VersionOf(frame))
             || GetSourceInfoAtFrame(frame, _justMyCode is false) is not { } source)
         {
@@ -738,9 +834,12 @@ public partial class ManagedDebugger
         BeginStep(handler.CreateStepper(), thread, handler, justMyCode: true, stepper => stepper.StepOut());
 
     /// <summary>Makes a stepper (a frame's, or a thread's outside managed code) the step in progress: it stops nowhere
-    /// unmapped, and, Just My Code, only in the user's code; <paramref name="step"/> says where it goes.</summary>
+    /// unmapped, and, Just My Code, only in the user's code, ending where its frame returns if none of that code is below
+    /// it to go back to, as the runtime's would stop in whatever of it the thread runs next; <paramref name="step"/> says
+    /// where it goes.</summary>
     private ICorDebugStepper BeginStep(ICorDebugStepper stepper, ICorDebugThread thread, ICorDebugFrame? from, bool justMyCode, Action<ICorDebugStepper> step)
     {
+        EndReturnGuard();
         stepper.SetUnmappedStopMask(CorDebugUnmappedStop.STOP_NONE);
         if (justMyCode)
         {
@@ -749,7 +848,60 @@ public partial class ManagedDebugger
         step(stepper);
         _stepper = stepper;
         _stepping = (thread.Id, from is null ? null : RangeOf(from));
+        if (justMyCode && from is not null && !GoesBackToUsersCode(thread, from))
+        {
+            ICorDebugStepper guard = Intercepting(from.CreateStepper());
+            guard.SetUnmappedStopMask(CorDebugUnmappedStop.STOP_NONE);
+            guard.StepOut();
+            _returnGuard = (guard, stepper, RunsOn: true);
+            _logger?.Invoke($"  None of the user's code is below {FrameTold(from)}: a step out of it stands guard, the step ending as it returns");
+        }
         return stepper;
+    }
+
+    /// <summary>Whether a frame, once it returns, goes back to the user's code on its thread: a frame of theirs below it
+    /// before native code, or past native code that called the frame itself (a static constructor's, a native library's
+    /// callback's). Not where it returns to code that is not theirs with none of theirs below (a web request's, a window's
+    /// event loop, a timer's): what that thread runs next comes of something else, never of the step.</summary>
+    private bool GoesBackToUsersCode(ICorDebugThread thread, ICorDebugFrame frame)
+    {
+        if (RangeOf(frame) is not { } stepping)
+        {
+            return true;
+        }
+        bool found = false;
+        List<ICorDebugChain> chains = [.. thread.EnumerateChains()];
+        for (int at = chains.FindLastIndex(chain => chain.Reason is CorDebugChainReason.CHAIN_FUNC_EVAL) + 1; at < chains.Count; at++)
+        {
+            if (!chains[at].IsManaged)
+            {
+                continue;
+            }
+            bool returnsHere = false;
+            foreach (ICorDebugFrame below in chains[at].EnumerateFrames())
+            {
+                if (!found)
+                {
+                    found = RangeOf(below) == stepping;
+                    continue;
+                }
+                if (below is ICorDebugInternalFrame)
+                {
+                    continue;
+                }
+                if (IsUserCodeFrame(below))
+                {
+                    _logger?.Invoke($"  The user's {FrameTold(below)} is below it: the step goes on to their code as its frame returns");
+                    return true;
+                }
+                returnsHere = true;
+            }
+            if (returnsHere)
+            {
+                return false;
+            }
+        }
+        return !found;
     }
 
     /// <summary>A step under way whose frame an exception will unwind, to a handler outside the user's code: the runtime's
@@ -774,10 +926,12 @@ public partial class ManagedDebugger
     }
 
     /// <summary>A step from a frame, the thread's top one unless another is given, set up without letting the program go:
-    /// through its statement, or the IL range given.</summary>
+    /// through its statement, or the IL range given. Without Just My Code, a frame whose caller is native code, whose return
+    /// the runtime's stepper loses, is stepped out of as the hidden frame below that code that returns to the frame shown,
+    /// whose step out also stands guard over its other steps (<see cref="AboveShownCaller"/>).</summary>
     internal ICorDebugStepper SetupStepper(ICorDebugThread thread, StepType stepType, ICorDebugFrame? from = null, (int Start, int End)? through = null)
     {
-        ICorDebugFrame frame = from ?? thread.ActiveFrame;
+        ICorDebugFrame? frame = from ?? TopFrame(thread);
         if (frame is not ICorDebugILFrame ilFrame)
         {
             throw new InvalidOperationException("Active frame is not an IL frame");
@@ -788,10 +942,14 @@ public partial class ManagedDebugger
             throw new InvalidOperationException("A step operation is already in progress");
         }
 
-        ICorDebugStepper stepper = frame.CreateStepper();
-        stepper.SetInterceptMask(CorDebugIntercept.INTERCEPT_ALL & ~(CorDebugIntercept.INTERCEPT_SECURITY | CorDebugIntercept.INTERCEPT_CLASS_INIT));
+        ICorDebugILFrame? below = _justMyCode ? null : AboveShownCaller(thread, frame);
+        if (stepType is StepType.StepOut && below is not null)
+        {
+            _logger?.Invoke($"Stepper set on thread {thread.Id}: out of {FrameTold(frame)}, whose caller is native code, as out of {FrameTold(below)}");
+            return BeginStep(Intercepting(below.CreateStepper()), thread, below, justMyCode: false, stepper => stepper.StepOut());
+        }
         bool justMyCode = _justMyCode && _asyncStepper?.SeesFrameLeave(thread, frame) is not true;
-        return BeginStep(stepper, thread, frame, justMyCode, stepper =>
+        ICorDebugStepper begun = BeginStep(Intercepting(frame.CreateStepper()), thread, frame, justMyCode, stepper =>
         {
             if (stepType == StepType.StepOut)
             {
@@ -811,6 +969,81 @@ public partial class ManagedDebugger
             COR_DEBUG_STEP_RANGE range = new() { startOffset = checked((uint)start), endOffset = checked((uint)end) };
             stepper.StepRange(stepIn, [range], 1);
         });
+        if (below is not null)
+        {
+            ICorDebugStepper guard = Intercepting(below.CreateStepper());
+            guard.SetUnmappedStopMask(CorDebugUnmappedStop.STOP_NONE);
+            guard.StepOut();
+            _returnGuard = (guard, begun, RunsOn: false);
+            _logger?.Invoke($"  Its frame's caller is native code: a step out of {FrameTold(below)} stands guard over its return");
+        }
+        return begun;
+    }
+
+    /// <summary>A stepper that stops in the runtime's interceptors but its class initialization and security checks.</summary>
+    private static ICorDebugStepper Intercepting(ICorDebugStepper stepper)
+    {
+        stepper.SetInterceptMask(CorDebugIntercept.INTERCEPT_ALL & ~(CorDebugIntercept.INTERCEPT_SECURITY | CorDebugIntercept.INTERCEPT_CLASS_INIT));
+        return stepper;
+    }
+
+    /// <summary>For a frame whose caller is native code, which called it from below a frame the stack shows (the runtime's
+    /// class initialization, called by the code that read the class through its hidden helpers): the frame directly above
+    /// that shown one, the hidden helper it called, whose step out returns there. Null where the frame's caller is managed,
+    /// or the shown frame called the native code itself.</summary>
+    private ICorDebugILFrame? AboveShownCaller(ICorDebugThread thread, ICorDebugFrame frame)
+    {
+        if (RangeOf(frame) is not { } stepping)
+        {
+            return null;
+        }
+        List<ICorDebugChain> chains = [.. thread.EnumerateChains()];
+        int at = chains.FindLastIndex(chain => chain.Reason is CorDebugChainReason.CHAIN_FUNC_EVAL) + 1;
+        bool? callerManaged = null;
+        for (; at < chains.Count && callerManaged is null; at++)
+        {
+            if (chains[at].IsManaged)
+            {
+                callerManaged = CallerIn(chains[at], stepping);
+            }
+        }
+        if (callerManaged is not false || at >= chains.Count || chains[at].IsManaged)
+        {
+            return null;
+        }
+        for (; at < chains.Count; at++)
+        {
+            if (!chains[at].IsManaged)
+            {
+                continue;
+            }
+            ICorDebugFrame? above = null;
+            foreach (ICorDebugFrame below in chains[at].EnumerateFrames())
+            {
+                if (below is ICorDebugILFrame && !IsHiddenFrame(below))
+                {
+                    return above as ICorDebugILFrame;
+                }
+                above = below;
+            }
+        }
+        return null;
+    }
+
+    /// <summary>Whether a frame of the chain, known by its stack range, has a managed caller in the chain after it; null
+    /// where the chain does not hold the frame.</summary>
+    private static bool? CallerIn(ICorDebugChain chain, StackRange stepping)
+    {
+        bool found = false;
+        foreach (ICorDebugFrame frame in chain.EnumerateFrames())
+        {
+            if (found && frame is not ICorDebugInternalFrame)
+            {
+                return true;
+            }
+            found = found || RangeOf(frame) == stepping;
+        }
+        return found ? false : null;
     }
 
     /// <summary>The IL a step from a frame's statement (the one at its IP, or at the IL offset given) steps through: its
@@ -1043,10 +1276,31 @@ public partial class ManagedDebugger
         return frame;
     }
 
-    /// <summary>The thread's managed frames from its stop down. An evaluation given up, still running on the thread, is a
+    /// <summary>The thread's managed frames from its stop down, as its stack shows them: those of <see cref="FramesOnStack"/>
+    /// but code its attributes hide (<see cref="ModuleMetadataReader.IsHiddenFrame"/>), on every runtime: a helper compiled
+    /// code calls, a program's method so marked, and from .NET 11, whose runtime no longer leaves them out itself, its
+    /// exception dispatch above the frame that threw and its call of the entry point.</summary>
+    internal IEnumerable<ICorDebugFrame> EnumerateFramesForThread(ICorDebugThread thread)
+    {
+        bool leaf = _steppedIntoHidden == thread.Id;
+        foreach (ICorDebugFrame frame in FramesOnStack(thread))
+        {
+            if (leaf || !IsHiddenFrame(frame))
+            {
+                yield return frame;
+            }
+            leaf = false;
+        }
+    }
+
+    /// <summary>A thread a step stopped in hidden code on, Just My Code off: its frames show that code's frame on top, where
+    /// the stop is and the next step goes from, until the program runs on.</summary>
+    private int? _steppedIntoHidden;
+
+    /// <summary>Every managed frame of the thread from its stop down. An evaluation given up, still running on the thread, is a
     /// chain of its own above the stop's (CHAIN_FUNC_EVAL, ending at its [Func Eval] frame): its frames are left out, so a
     /// frame's depth names the same frame as before the evaluation began.</summary>
-    internal static IEnumerable<ICorDebugFrame> EnumerateFramesForThread(ICorDebugThread thread)
+    private static IEnumerable<ICorDebugFrame> FramesOnStack(ICorDebugThread thread)
     {
         List<ICorDebugChain> chains = [.. thread.EnumerateChains()];
         int stop = chains.FindLastIndex(chain => chain.Reason is CorDebugChainReason.CHAIN_FUNC_EVAL) + 1;
@@ -1061,6 +1315,21 @@ public partial class ManagedDebugger
             {
                 yield return frame;
             }
+        }
+    }
+
+    /// <summary>The frame a thread stands in as its stack shows it, where hidden code may run above it.</summary>
+    internal ICorDebugFrame? TopFrame(ICorDebugThread thread) => EnumerateFramesForThread(thread).FirstOrDefault();
+
+    private bool IsHiddenFrame(ICorDebugFrame frame)
+    {
+        try
+        {
+            return frame is ICorDebugILFrame il && FindModule(il.Function.Module, reread: false) is { } module && module.MetadataReader.IsHiddenFrame(il.Function.Token);
+        }
+        catch (Exception error) when (Failures.OfRuntime(error))
+        {
+            return false;
         }
     }
 
@@ -1152,8 +1421,9 @@ public partial class ManagedDebugger
         {
             return; // A client may terminate, then disconnect, each of which ends the session here, which needs doing only once.
         }
-        // A process that has exited is the runtime's to tear down: nothing below may call into it.
-        bool exited = _exited.IsSet;
+        // An exited process is the runtime's to tear down, and a failed one answers nothing: nothing below may call into either.
+        bool failed = Failure is not null;
+        bool exited = _exited.IsSet || failed;
         // Only a let-go runs held threads off: an exited program's throw when asked their id, failing the disconnect.
         bool runsOff = letGo && !exited;
         // The threads the runtime holds inside its handling of a breakpoint or a step's end, run off it before the detach.
@@ -1226,8 +1496,10 @@ public partial class ManagedDebugger
         {
             // A step under way would stop the program as it runs off its stop, and fails the detach.
             _stepper?.TryDeactivate();
+            _returnGuard?.Guard.TryDeactivate();
         }
         _stepper = null!;
+        _returnGuard = null;
         _stepping = null;
         _stepAfterEvaluation = null;
         _unhandledByUser = null;
@@ -1292,12 +1564,14 @@ public partial class ManagedDebugger
                 _process.TryContinue(false);
             }
         }
-        else if (_corDebug is not null)
+        else if (_corDebug is not null && (!failed || _exited.IsSet))
         {
+            // One whose debugging failed is never neutered while its process lives, so it goes with the adapter.
             ShutDown(_corDebug);
         }
 
         _isAttached = false;
+        _attachedId = 0;
         _process = null;
         _corDebug = null;
 
@@ -1312,9 +1586,9 @@ public partial class ManagedDebugger
     /// releases the runtime's objects) under it.</summary>
     private void ShutDown(ICorDebug corDebug)
     {
-        DateTime until = DateTime.UtcNow + TimeSpan.FromSeconds(5);
+        Deadline until = Deadline.In(TimeSpan.FromSeconds(5));
         int result;
-        while ((result = corDebug.TryTerminate()) == Cor.CORDBG_E_ILLEGAL_SHUTDOWN_ORDER && DateTime.UtcNow < until)
+        while ((result = corDebug.TryTerminate()) == Cor.CORDBG_E_ILLEGAL_SHUTDOWN_ORDER && !until.Passed)
         {
             Thread.Sleep(20);
         }

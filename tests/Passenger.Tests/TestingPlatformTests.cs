@@ -40,7 +40,7 @@ public sealed class TestingPlatformTests : TestingPlatformFolders, IClassFixture
         Ui.WaitFor(() => !window.Tests.IsBusy && Method(window, "Two_and_two_make_four")?.State is TestState.Passed or TestState.Failed, "the run of every test", TimeSpan.FromSeconds(180));
         TestNode four = Method(window, "Two_and_two_make_four")!;
         Assert.True(four.State == TestState.Passed, $"An xUnit v3 test on the Testing Platform alone did not pass, so the project was not run through the platform's protocol:\n{four.Details}\n{window.BottomPanel.Tests.Status}");
-        Assert.Equal("Tests passed: 4, failed: 1, skipped: 1 of 6", System.Text.RegularExpressions.Regex.Replace(window.BottomPanel.Tests.Status, @" in \d+\.\d s$", string.Empty));
+        Assert.Equal("Tests passed: 4, failed: 1, skipped: 1 of 6", System.Text.RegularExpressions.Regex.Replace(window.BottomPanel.Tests.Status, $" in {SaidWhile.Pattern}$", string.Empty));
         Assert.Contains("adding two and two", four.Details, StringComparison.Ordinal);
         TestNode five = Method(window, "Two_and_two_make_five")!;
         Assert.Equal(TestState.Failed, five.State);
@@ -142,7 +142,7 @@ public sealed class TestingPlatformTests : TestingPlatformFolders, IClassFixture
         Ui.WaitFor(() => !window.Tests.IsBusy && Method(window, "Keeps")?.State is not (null or TestState.NotRun or TestState.Running), "the run of every test", TimeSpan.FromSeconds(240));
         Assert.True(Method(window, "Adds")!.State == TestState.Passed, $"The VSTest project's test did not pass:\n{Method(window, "Adds")!.Details}\n{window.BottomPanel.Tests.Status}");
         Assert.True(Method(window, "Keeps")!.State == TestState.Passed, $"The MSTest project on the platform's runner did not pass:\n{Method(window, "Keeps")!.Details}\n{window.BottomPanel.Tests.Status}");
-        Assert.Equal("Tests passed: 7, failed: 0 of 7", System.Text.RegularExpressions.Regex.Replace(window.BottomPanel.Tests.Status, @" in \d+\.\d s$", string.Empty));
+        Assert.Equal("Tests passed: 7, failed: 0 of 7", System.Text.RegularExpressions.Regex.Replace(window.BottomPanel.Tests.Status, $" in {SaidWhile.Pattern}$", string.Empty));
         window.Tests.Tree.Toggle(Method(window, "Counts")!);
         window.Tests.Tree.Toggle(Method(window, "Repeats")!);
         // Rows of one name are told apart by the order they came in.
@@ -243,12 +243,12 @@ public sealed class TestingPlatformDebuggingTests : TestingPlatformFolders, ICla
         CodeEditor editor = window.EditorArea.CodeEditor;
         editor.GoTo(new TextPosition(10, 8));
         Task<int> held = hold.Held(TimeSpan.FromMinutes(3));
-        int host = 0;
+        OwnProcess host = default;
         try
         {
             // Not settled: the start holds the window's background work while the debugger waits for the test host.
             Assert.True(window.Perform(AppActions.DebugTests), $"Debug Tests did not start: {Ui.Said(window)}");
-            host = Ui.AwaitPumped(held, "the build, then the test host's runtime to come to the hold", TimeSpan.FromMinutes(3));
+            host = OwnProcess.Of(Ui.AwaitPumped(held, "the build, then the test host's runtime to come to the hold", TimeSpan.FromMinutes(3)));
             TestNode four = Method(window, "Two_and_two_make_four")!;
             Assert.Equal(TestState.Running, four.State);
 
@@ -260,7 +260,7 @@ public sealed class TestingPlatformDebuggingTests : TestingPlatformFolders, ICla
             Assert.Equal(TestState.NotRun, four.State);
             Assert.DoesNotContain(editor.TestMarks, m => m.Kind == TestMarkKind.Running);
             string? why = window.BottomPanel.Tests.Status;
-            Assert.True(why is not null && System.Text.RegularExpressions.Regex.IsMatch(why, @"^Tests passed: 0, failed: 0 of 0 in \d+\.\d s, stopped$"),
+            Assert.True(why is not null && System.Text.RegularExpressions.Regex.IsMatch(why, $@"^Tests passed: 0, failed: 0 of 0 in {SaidWhile.Pattern}, stopped$"),
                 $"A debugged run Stop ended as its test host started did not say it was stopped, but '{why}' (the status bar '{window.Status}')");
             Assert.True(window.Status == why, $"The status bar's last word on the stopped run is '{window.Status}', where the Unit Tests window says '{why}'");
             string debugged = window.BottomPanel.Debug.Console.Document.Snapshot.ToString();
@@ -270,7 +270,7 @@ public sealed class TestingPlatformDebuggingTests : TestingPlatformFolders, ICla
         }
         finally
         {
-            Processes.Kill(host);
+            host.Kill();
         }
         window.Close();
 
@@ -368,9 +368,9 @@ public sealed class TestingPlatformBytesTests(ITestOutputHelper testOutput) : ID
     public void Dispose() => TestFolders.Delete(folder);
 
     /// <summary>A run of 2,000 tests, a tenth failing and a seventh writing output, is told by its test host as test nodes
-    /// read straight from the bytes they came in, each test looked up by its key without making it: the run costs the IDE
-    /// at most twice the JSON of its results, least of three, and every result reads as the run with protocol traces on
-    /// (whose trace gives the JSON) read it.</summary>
+    /// read straight from the bytes they came in, each node's uid and name the strings its test was found with and each test
+    /// looked up by its key without making it: the run costs the IDE at most twice the JSON of its results, least of three, and
+    /// every result reads as the run with protocol traces on (whose trace gives the JSON) read it.</summary>
     [Fact]
     public async Task A_runs_results_cost_at_most_twice_their_JSON_to_read()
     {
@@ -388,7 +388,7 @@ public sealed class TestingPlatformBytesTests(ITestOutputHelper testOutput) : ID
         TestAssembly assembly = new(new ProjectModel(project, "Sums.Tests", "Exe", [TestProjects.Framework], [], [], true), TestProjects.Framework,
             Path.Combine(folder, "bin", "Debug", TestProjects.Framework, "Sums.Tests.dll"));
         using TestingPlatformRunner runner = new();
-        IReadOnlyList<TestItem> tests = await runner.DiscoverAsync([assembly], cancel: cancel);
+        IReadOnlyList<TestItem> tests = (await runner.DiscoverAsync([assembly], cancel: cancel)).Tests;
         Assert.Equal(Rows, tests.Count);
         TestItem first = tests.Single(t => t.Row == "Adds_up(row: 9)");
         Assert.Equal(("Sums.Tests.RowTests.Adds_up", source, KeyValuePair.Create("Area", "Sums")), (first.FullyQualifiedName, first.Path, Assert.Single(first.Traits)));
@@ -457,7 +457,7 @@ public sealed class TestHostLastWordsTests
             for (int round = 1; round <= 20; round++)
             {
                 List<string> said = [];
-                IReadOnlyList<TestItem> found = await runner.DiscoverAsync([assembly], line =>
+                FoundTests found = await runner.DiscoverAsync([assembly], line =>
                 {
                     lock (said)
                     {
@@ -469,7 +469,7 @@ public sealed class TestHostLastWordsTests
                 {
                     failure = string.Join("\n", said);
                 }
-                Assert.True(found.Count == 0 && failure.Contains("(exit code 3)", StringComparison.Ordinal) && failure.EndsWith($"\n{LastWords}", StringComparison.Ordinal),
+                Assert.True(found.Tests.Count == 0 && failure.Contains("(exit code 3)", StringComparison.Ordinal) && failure.EndsWith($"\n{LastWords}", StringComparison.Ordinal),
                     $"Round {round}: the test host that wrote '{LastWords}' as it exited was said to fail with '{failure}'");
             }
         }

@@ -1,6 +1,9 @@
 using Avalonia;
-using Avalonia.Collections;
+using Avalonia.Automation;
+using Avalonia.Automation.Peers;
 using Avalonia.Controls;
+using Avalonia.Controls.Primitives;
+using Avalonia.Controls.Templates;
 using Avalonia.Input;
 using Avalonia.Interactivity;
 using Avalonia.Layout;
@@ -12,8 +15,9 @@ namespace Passenger.App.CSharp;
 
 /// <summary>A card over the editor: hover information, a diagnostic's message, a signature. Code is
 /// set in the editor's font, prose in the interface's, a problem in its severity's colour. A paused program's value with
-/// members is its row of the stop's values (<see cref="AddValues"/>), which the card then takes the pointer and the keys for.</summary>
-internal sealed class InfoCard : Border, IHoverCard
+/// members is its row of the stop's values (<see cref="AddValues"/>), which the card then takes the pointer and the keys for.
+/// A screen reader meets it as a tooltip called by what it is for (Parameter Info).</summary>
+internal sealed class InfoCard : Border, IHoverCard, IHeldToEditor, IHeardPopup
 {
     /// <summary>The most a card of words is wide; one of a value's rows takes a width of the popups' (<see cref="PopupFrame"/>).</summary>
     private const double WordsWidth = 640;
@@ -21,20 +25,28 @@ internal sealed class InfoCard : Border, IHoverCard
     /// <summary>The most rows of a value the card shows before it scrolls.</summary>
     private const int MostRows = 16;
 
-    private readonly StackPanel parts = new() { Spacing = 6 };
+    private readonly StackPanel parts = new() { Spacing = Gaps.Small };
 
     /// <summary>The width a card of values has taken: it only grows while it shows them, so a row closed never narrows it
     /// under the pointer.</summary>
     private double fitted;
 
-    public InfoCard()
+    /// <summary>The most it is wide of itself, a card of words' or of a value's rows', before any narrower room holds it.</summary>
+    private double widest = WordsWidth;
+
+    public InfoCard(string called)
     {
+        Called = called;
         Classes.Add(StyleClasses.Popup);
-        Padding = new Thickness(10, 8);
+        Padding = PopupFrame.CardInset;
         MaxWidth = WordsWidth;
         Child = parts;
         IsHitTestVisible = false;
     }
+
+    public AutomationControlType Role => AutomationControlType.ToolTip;
+
+    public string Called { get; }
 
     public bool IsEmpty => parts.Children.Count == 0;
 
@@ -74,8 +86,12 @@ internal sealed class InfoCard : Border, IHoverCard
         Usable = false;
         fitted = 0;
         IsHitTestVisible = false;
+        widest = WordsWidth;
         MaxWidth = WordsWidth;
     }
+
+    /// <summary>Held to a room narrower than it would be, its words wrapping to it; as wide as it takes of itself in a wider one.</summary>
+    public void Within(double room) => MaxWidth = Math.Min(widest, Math.Max(0, room));
 
     /// <summary>A value's rows, which open in the card: it takes the pointer and the keys, a width of the popups', growing as
     /// rows open, and scrolls past <see cref="MostRows"/> rows or the room it is given.</summary>
@@ -85,6 +101,7 @@ internal sealed class InfoCard : Border, IHoverCard
         values.MaxHeight = Math.Max(ListRow.Height * 4, Math.Min(ListRow.Height * MostRows, room - Padding.Top - Padding.Bottom)) + values.Padding.Top + values.Padding.Bottom;
         parts.Children.Add(values);
         IsHitTestVisible = true;
+        widest = PopupFrame.Wide;
         MaxWidth = PopupFrame.Wide;
         values.Tree.Rows.CollectionChanged += (_, _) =>
         {
@@ -101,11 +118,12 @@ internal sealed class InfoCard : Border, IHoverCard
         {
             return base.MeasureOverride(availableSize);
         }
-        // The narrowest of the popups' widths that holds every row as it would lay out, else the widest a card takes.
+        // The narrowest of the popups' widths holding every row as laid out, else the widest; in a narrower room, the room.
         double natural = base.MeasureOverride(new Size(double.PositiveInfinity, availableSize.Height)).Width;
         double wanted = PopupFrame.Widths.Where(w => w <= PopupFrame.Wide).FirstOrDefault(w => w >= natural, PopupFrame.Wide);
-        fitted = Math.Max(fitted, wanted);
-        return new Size(fitted, base.MeasureOverride(new Size(fitted, availableSize.Height)).Height);
+        fitted = Math.Max(fitted, Math.Min(wanted, availableSize.Width));
+        double width = Math.Min(fitted, availableSize.Width);
+        return new Size(width, base.MeasureOverride(new Size(width, availableSize.Height)).Height);
     }
 
     public void AddCode(string code) => parts.Children.Add(new TextBlock
@@ -146,7 +164,7 @@ internal sealed class InfoCard : Border, IHoverCard
                 parts.Children.Add(new StackPanel
                 {
                     Orientation = Orientation.Horizontal,
-                    Spacing = 6,
+                    Spacing = Gaps.Small,
                     Children = { play, new TextBlock { Text = preview.Named, FontSize = 12.5, VerticalAlignment = VerticalAlignment.Center, Foreground = Brush(TokenKeys.TextMuted) } },
                 });
                 Usable = true;
@@ -219,15 +237,15 @@ internal sealed record CompletionRow(Lsp.CompletionItem Item, string Letter, str
     public string Label => Item.Label + (Item.LabelDetails?.Detail ?? string.Empty);
 }
 
-/// <summary>A place in the completion list, kept from one filter to the next: the row it shows now, which its control
-/// follows while shown (<see cref="CompletionRowView"/>).</summary>
-internal sealed class CompletionSlot(CompletionRow row) : System.ComponentModel.INotifyPropertyChanged
+/// <summary>A place in the completion list, kept for good: the row it shows now, which its control follows while shown
+/// (<see cref="CompletionRowView"/>); none where the list has fewer rows than places, the place then hidden.</summary>
+internal sealed class CompletionSlot : System.ComponentModel.INotifyPropertyChanged
 {
     private static readonly System.ComponentModel.PropertyChangedEventArgs RowChanged = new(nameof(Row));
 
-    private CompletionRow row = row;
+    private CompletionRow? row;
 
-    public CompletionRow Row
+    public CompletionRow? Row
     {
         get => row;
         set
@@ -244,91 +262,272 @@ internal sealed class CompletionSlot(CompletionRow row) : System.ComponentModel.
     public event System.ComponentModel.PropertyChangedEventHandler? PropertyChanged;
 }
 
-/// <summary>The completion list: rows under the caret, the selected one highlighted, ten at a time. Its places are kept as
-/// the list is filtered (<see cref="CompletionSlot"/>), each given the row it shows now, so a key that narrows the list
-/// changes the words in the rows' controls rather than making them anew: the list's containers and their controls stay.</summary>
-internal sealed class CompletionPopup : Border
+/// <summary>The completion list: rows under the caret, the selected one highlighted, ten at a time, scrolled by its own
+/// bar and the wheel. Its ten places (<see cref="CompletionSlot"/>) are made once, each with its container and controls,
+/// and handed the rows they show now: a key that narrows the list, a move past its edge and a scroll change the words in
+/// the places' controls, and a list of fewer rows hides the places it leaves, so a key lays out only the rows it changed,
+/// and no container is ever let go of, to be attached and styled again.</summary>
+internal sealed class CompletionPopup : Border, IHeardPopup
 {
-    private readonly AvaloniaList<CompletionSlot> slots = [];
+    /// <summary>How many rows the list shows at once.</summary>
+    private const int Shown = 10;
 
-    /// <summary>The item the selection was last said to be on, so a filter that leaves it there says nothing.</summary>
+    /// <summary>How far a turn of the wheel by one notch scrolls, as a scroll viewer scrolls.</summary>
+    private const double WheelStep = 50;
+
+    private readonly CompletionSlot[] slots = [.. Enumerable.Range(0, Shown).Select(_ => new CompletionSlot())];
+    private readonly ScrollBar bar;
+
+    private IReadOnlyList<CompletionRow> rows = [];
+
+    /// <summary>The row shown in the first place.</summary>
+    private int top;
+
+    /// <summary>The row chosen, shown or scrolled away; -1 with none.</summary>
+    private int chosen = -1;
+
+    /// <summary>Whether the list is handing its places their rows, its selection then its own rather than the person's.</summary>
+    private bool placing;
+
+    /// <summary>What the wheel has turned short of a whole row.</summary>
+    private double turned;
+
+    /// <summary>The item the selection was last said to be on, so a filter or an answer that leaves it there says nothing.</summary>
     private Lsp.CompletionItem? told;
+
+    /// <summary>Whether the list is being laid out ahead (<see cref="LayOutAhead"/>), its choice no one's to hear of.</summary>
+    private bool ahead;
+
+    /// <summary>The least and the most a list is wide of itself, as its rows make it, in an editor that has the room.</summary>
+    private const double LeastWidth = 280;
+    private const double MostWidth = 620;
 
     public CompletionPopup()
     {
         Classes.Add(StyleClasses.Popup);
-        MinWidth = 280;
-        MaxWidth = 620;
-        Padding = new Thickness(0, 4);
+        MinWidth = LeastWidth;
+        MaxWidth = MostWidth;
+        Padding = ListRow.PopupList;
+        // Its places stand in a plain panel, which lets go of none it hides; its own scrolling never moves them.
         List = new ListBox
         {
             Classes = { StyleClasses.Tree },
-            MaxHeight = 26 * 10,
             ItemsSource = slots,
+            ItemsPanel = new FuncTemplate<Panel?>(() => new StackPanel()),
+            AutoScrollToSelectedItem = false,
+            [ScrollViewer.VerticalScrollBarVisibilityProperty] = ScrollBarVisibility.Disabled,
         };
+        // The popup is the list a screen reader meets, its rows straight under it.
+        AutomationProperties.SetAccessibilityView(List, AccessibilityView.Raw);
         ReusedRows.Use(List, () => new CompletionRowView(this));
-        List.SelectionChanged += (_, _) => FollowSelected();
-        Child = List;
+        List.ContainerPrepared += (_, e) => e.Container.IsVisible = slots[e.Index].Row is not null;
+        List.SelectionChanged += (_, _) =>
+        {
+            if (!placing && List.SelectedIndex >= 0)
+            {
+                // The person's click on a row.
+                chosen = top + List.SelectedIndex;
+                FollowSelected();
+            }
+        };
+        bar = new ScrollBar
+        {
+            Orientation = Orientation.Vertical,
+            HorizontalAlignment = HorizontalAlignment.Right,
+            Minimum = 0,
+            SmallChange = 1,
+            LargeChange = Shown,
+            ViewportSize = Shown,
+            IsVisible = false,
+        };
+        bar.ValueChanged += (_, e) =>
+        {
+            if (!placing)
+            {
+                ScrollTo((int)Math.Round(e.NewValue), fromBar: true);
+            }
+        };
+        // Heard on its way in, before the list's own view, which a fraction of a pixel's rounding lets take it.
+        AddHandler(PointerWheelChangedEvent, OnWheel, RoutingStrategies.Tunnel);
+        Child = new Panel { Children = { List, bar } };
     }
 
     public ListBox List { get; }
 
-    /// <summary>The selection moved to another item: another row chosen, or the row chosen showing another item.</summary>
+    public AutomationControlType Role => AutomationControlType.List;
+
+    public string Called => "Completion";
+
+    /// <summary>Held to a room narrower than it would be, even than its least width, its names and details ending in an
+    /// ellipsis rather than past the editor's edge; as wide as its rows make it in a wider one.</summary>
+    public void Within(double room)
+    {
+        MinWidth = Math.Min(LeastWidth, Math.Max(0, room));
+        MaxWidth = Math.Min(MostWidth, Math.Max(0, room));
+    }
+
+    /// <summary>The selection moved to another item (<see cref="Lsp.CompletionItem.Same"/>): another row chosen, or the row
+    /// chosen showing another item; never the same item a list answered again lists anew.</summary>
     public event EventHandler? SelectedChanged;
 
     /// <summary>A XAML colour's own swatch for its badge, null for an item badged by its kind.</summary>
     public Func<Lsp.CompletionItem, IBrush?>? Swatch { get; set; }
 
-    public CompletionRow? Selected => (List.SelectedItem as CompletionSlot)?.Row;
+    public CompletionRow? Selected => chosen >= 0 && chosen < rows.Count ? rows[chosen] : null;
 
-    public IReadOnlyList<CompletionRow> Rows => [.. slots.Select(s => s.Row)];
+    /// <summary>Where the row chosen stands among <see cref="Rows"/>; -1 with none.</summary>
+    public int ChosenAt => Selected is null ? -1 : chosen;
 
-    /// <summary>Rows in the list's places, the first chosen: the places there already show their new rows, the rest are
-    /// added or taken away at the end.</summary>
-    public void Show(IReadOnlyList<CompletionRow> rows)
+    public IReadOnlyList<CompletionRow> Rows => rows;
+
+    /// <summary>The list's rows, the first chosen, scrolled only as far as shows the one chosen. Rows of the name already
+    /// shown (<paramref name="sameName"/>: a list grown by items as they came, or answered again) keep the item chosen where
+    /// it is among them, and, where the person had scrolled away from it, the rows scrolled to, wherever they now stand.</summary>
+    public void Show(IReadOnlyList<CompletionRow> rows, bool sameName = false)
     {
-        int kept = Math.Min(rows.Count, slots.Count);
-        for (int i = 0; i < kept; i++)
+        Lsp.CompletionItem? stays = sameName ? Selected?.Item : null;
+        Lsp.CompletionItem? first = sameName && chosen >= 0 && (chosen < top || chosen >= top + Shown) && top < this.rows.Count ? this.rows[top].Item : null;
+        this.rows = rows;
+        chosen = rows.Count > 0 ? 0 : -1;
+        if (stays is not null && IndexOf(stays) is >= 0 and int kept)
         {
-            slots[i].Row = rows[i];
+            chosen = kept;
         }
-        if (slots.Count > rows.Count)
+        if (first is null)
         {
-            slots.RemoveRange(rows.Count, slots.Count - rows.Count);
+            Place();
+            return;
         }
-        else if (rows.Count > kept)
+        if (IndexOf(first) is >= 0 and int scrolled)
         {
-            slots.AddRange(rows.Skip(kept).Select(row => new CompletionSlot(row)));
+            top = scrolled;
         }
-        int first = rows.Count > 0 ? 0 : -1;
-        if (List.SelectedIndex != first)
+        ScrollTo(top, fromBar: false);
+    }
+
+    /// <summary>Where an item stands among the rows, however many answers ago it was listed; -1 where it is not.</summary>
+    private int IndexOf(Lsp.CompletionItem item)
+    {
+        for (int i = 0; i < rows.Count; i++)
         {
-            List.SelectedIndex = first;
+            if (Lsp.CompletionItem.Same(rows[i].Item, item))
+            {
+                return i;
+            }
         }
-        FollowSelected();
-        if (rows.Count > 0)
+        return -1;
+    }
+
+    /// <summary>The list laid out once before it is first shown, so its first list costs what any other does: the rows'
+    /// controls made with their containers, styled and their words shaped. Shown and hidden again within one turn of the
+    /// window's thread, it is never drawn; placed in its window, as a list off it lays out no row it would not see. The
+    /// rows stay in their places for the first list to show its own in, and nothing hears of their choice.</summary>
+    public void LayOutAhead(IReadOnlyList<CompletionRow> rows)
+    {
+        ahead = true;
+        try
         {
-            List.ScrollIntoView(0);
+            Canvas.SetLeft(this, 0);
+            Canvas.SetTop(this, 0);
+            Show(rows);
+            IsVisible = true;
+            UpdateLayout();
+        }
+        finally
+        {
+            IsVisible = false;
+            ahead = false;
+            told = null;
         }
     }
 
     public void Move(int step)
     {
-        int count = List.ItemCount;
-        if (count == 0)
+        if (rows.Count == 0)
         {
             return;
         }
-        List.SelectedIndex = Math.Clamp(List.SelectedIndex + step, 0, count - 1);
-        List.ScrollIntoView(List.SelectedIndex);
+        chosen = Math.Clamp(chosen + step, 0, rows.Count - 1);
+        Place();
+    }
+
+    /// <summary>The rows from the one chosen scrolled into view, by as few as show it, and handed to the places.</summary>
+    private void Place()
+    {
+        if (chosen >= 0 && chosen < top)
+        {
+            top = chosen;
+        }
+        else if (chosen >= top + Shown)
+        {
+            top = chosen - Shown + 1;
+        }
+        ScrollTo(top, fromBar: false);
+    }
+
+    /// <summary>The places handed the rows from <paramref name="first"/> on, as far as the rows go, the rest hidden; the
+    /// chosen row selected where it shows. The bar is moved to match unless it moved them (<paramref name="fromBar"/>),
+    /// its thumb then where the pointer holds it.</summary>
+    private void ScrollTo(int first, bool fromBar)
+    {
+        top = Math.Clamp(first, 0, Math.Max(0, rows.Count - Shown));
+        placing = true;
+        try
+        {
+            for (int i = 0; i < Shown; i++)
+            {
+                CompletionRow? row = top + i < rows.Count ? rows[top + i] : null;
+                slots[i].Row = row;
+                List.ContainerFromIndex(i)?.IsVisible = row is not null;
+            }
+            int selected = chosen >= top && chosen < top + Shown ? chosen - top : -1;
+            if (List.SelectedIndex != selected)
+            {
+                List.SelectedIndex = selected;
+            }
+            bar.IsVisible = rows.Count > Shown;
+            bar.Maximum = Math.Max(0, rows.Count - Shown);
+            if (!fromBar)
+            {
+                bar.Value = top;
+            }
+        }
+        finally
+        {
+            placing = false;
+        }
+        FollowSelected();
+    }
+
+    /// <summary>A turn of the wheel over the list scrolls it a row for each part of a notch that makes one, the choice
+    /// staying where it is; the list's own view, which never scrolls, is not given it.</summary>
+    private void OnWheel(object? sender, PointerWheelEventArgs e)
+    {
+        e.Handled = true;
+        if (rows.Count <= Shown)
+        {
+            return;
+        }
+        turned -= e.Delta.Y * WheelStep / ListRow.Height;
+        int step = (int)turned;
+        turned -= step;
+        if (step != 0)
+        {
+            ScrollTo(top + step, fromBar: false);
+        }
     }
 
     private void FollowSelected()
     {
-        Lsp.CompletionItem? now = Selected?.Item;
-        if (!ReferenceEquals(now, told))
+        if (ahead)
         {
-            told = now;
+            return;
+        }
+        Lsp.CompletionItem? now = Selected?.Item;
+        bool same = Lsp.CompletionItem.Same(now, told);
+        told = now;
+        if (!same)
+        {
             SelectedChanged?.Invoke(this, EventArgs.Empty);
         }
     }
@@ -361,31 +560,40 @@ internal sealed class CompletionRowView : DockPanel
             Width = 16,
             Height = 16,
             Classes = { StyleClasses.KindBadge },
-            Margin = new Thickness(0, 0, 8, 0),
+            Margin = new Thickness(0, 0, Gaps.Normal, 0),
             VerticalAlignment = VerticalAlignment.Center,
             Child = letter,
         };
-        detail = new TextBlock
-        {
-            [DockPanel.DockProperty] = Dock.Right,
-            Foreground = InfoCard.Brush(TokenKeys.TextMuted),
-            FontSize = 12,
-            Margin = new Thickness(12, 0, 4, 0),
-            TextTrimming = TextTrimming.CharacterEllipsis,
-            MaxWidth = 200,
-            VerticalAlignment = VerticalAlignment.Center,
-        };
+        // The name first, the detail at the row's end in what it leaves: a list narrowed to its room cuts the detail first.
         label = new TextBlock
         {
+            [DockPanel.DockProperty] = Dock.Left,
             FontFeatures = Fonts.NoLigatures,
             FontSize = 12.5,
             TextTrimming = TextTrimming.CharacterEllipsis,
             VerticalAlignment = VerticalAlignment.Center,
         }.InCodeFont();
+        detail = new TextBlock
+        {
+            Foreground = InfoCard.Brush(TokenKeys.TextMuted),
+            FontSize = 12,
+            Margin = ListRow.Detail,
+            TextTrimming = TextTrimming.CharacterEllipsis,
+            MaxWidth = 200,
+            HorizontalAlignment = HorizontalAlignment.Right,
+            VerticalAlignment = VerticalAlignment.Center,
+        };
         Children.Add(badge);
-        Children.Add(detail);
         Children.Add(label);
-        this.Showing<CompletionSlot>(slot => Show(slot.Row));
+        Children.Add(detail);
+        AutomationProperties.SetLabeledBy(this, label);
+        this.Showing<CompletionSlot>(slot =>
+        {
+            if (slot.Row is { } row)
+            {
+                Show(row);
+            }
+        });
     }
 
     private void Show(CompletionRow row)
@@ -400,7 +608,7 @@ internal sealed class CompletionRowView : DockPanel
 
 /// <summary>A titled list to choose from (fixes, definitions, usages, surround templates): Up and Down, Enter or a double
 /// click to choose, a choice's digit to choose it at once.</summary>
-internal sealed class ChoicePopup : Border
+internal sealed class ChoicePopup : Border, IHeardPopup
 {
     private readonly ListBox list;
 
@@ -422,7 +630,7 @@ internal sealed class ChoicePopup : Border
         Classes.Add(StyleClasses.Popup);
         MinWidth = 320;
         MaxWidth = 760;
-        Padding = new Thickness(0, 6);
+        Padding = ListRow.PopupList;
         list = new ListBox
         {
             Classes = { StyleClasses.Tree },
@@ -430,18 +638,19 @@ internal sealed class ChoicePopup : Border
             ItemsSource = choices,
             SelectedIndex = choices.Count > 0 ? 0 : -1,
         };
+        // The popup is the list a screen reader meets, its rows straight under it.
+        AutomationProperties.SetAccessibilityView(list, AccessibilityView.Raw);
         ReusedRows.Use(list, () => ChoiceRow(numbered));
         Child = new StackPanel
         {
-            Spacing = 4,
+            Spacing = Gaps.Tight,
             Children =
             {
-                new TextBlock { Text = title, Classes = { StyleClasses.PopupTitle }, Margin = new Thickness(12, 2, 12, 2) },
+                new TextBlock { Text = title, Classes = { StyleClasses.PopupTitle }, Margin = new Thickness(Gaps.Wide, Gaps.Hair) },
                 list,
             },
         };
-        list.AddHandler(KeyDownEvent, OnKeyDown, RoutingStrategies.Tunnel);
-        list.DoubleTapped += (_, _) => Choose();
+        ListKeys.Act(list, new ListActs { Open = Choose, Keys = TakeDigit });
         list.SelectionChanged += (_, _) => Moved?.Invoke(this, list.SelectedItem as Choice);
         Dispatcher.UIThread.Post(() =>
         {
@@ -453,24 +662,28 @@ internal sealed class ChoicePopup : Border
         }, DispatcherPriority.Loaded);
     }
 
+    public AutomationControlType Role => AutomationControlType.List;
+
+    public string Called => Title;
+
+    /// <summary>Where the choice selected stands among <see cref="Titles"/>; -1 with none.</summary>
+    public int ChosenAt => list.SelectedIndex;
+
     /// <summary>The choice made.</summary>
     public event EventHandler<Choice>? Done;
 
     /// <summary>The choice the list has selected now, as Up and Down move it.</summary>
     public event EventHandler<Choice?>? Moved;
 
-    private void OnKeyDown(object? sender, KeyEventArgs e)
+    /// <summary>A choice's digit chooses it at once.</summary>
+    private bool TakeDigit(KeyEventArgs e)
     {
-        if (e.Key == Key.Enter)
+        if (Digit(e.Key) is not { } digit || list.ItemsSource is not IEnumerable<Choice> choices || choices.FirstOrDefault(c => c.Mnemonic == digit) is not { } marked)
         {
-            Choose();
-            e.Handled = true;
+            return false;
         }
-        else if (Digit(e.Key) is { } digit && list.ItemsSource is IEnumerable<Choice> choices && choices.FirstOrDefault(c => c.Mnemonic == digit) is { } marked)
-        {
-            Done?.Invoke(this, marked);
-            e.Handled = true;
-        }
+        Done?.Invoke(this, marked);
+        return true;
     }
 
     /// <summary>A choice's row: its digit when the list has them, its words, and its detail muted, in code's font for code.</summary>
@@ -479,7 +692,8 @@ internal sealed class ChoicePopup : Border
         TextBlock digit = new TextBlock { Width = 10, IsVisible = numbered, VerticalAlignment = VerticalAlignment.Center }.InCodeFont();
         TextBlock text = new() { VerticalAlignment = VerticalAlignment.Center };
         TextBlock detail = new() { FontSize = 12, TextTrimming = TextTrimming.CharacterEllipsis, MaxWidth = 460, VerticalAlignment = VerticalAlignment.Center };
-        StackPanel row = new() { Orientation = Orientation.Horizontal, Spacing = 10, Height = ListRow.Height, Children = { digit, text, detail } };
+        StackPanel row = new() { Orientation = Orientation.Horizontal, Spacing = Gaps.Normal, Height = ListRow.Height, Children = { digit, text, detail } };
+        AutomationProperties.SetLabeledBy(row, text);
         string? detailFont = null;
         return row.Showing<Choice>(choice =>
         {
@@ -516,7 +730,7 @@ internal sealed record Choice(string Text, string Detail, object Value, bool Det
 /// own caption, names what a refactoring makes). For a
 /// type declared in files named after it, Also rename files to reflect this change is a check box under it, with the
 /// files it would rename, clicked while the keys stay with the name.</summary>
-internal sealed class RenameBox : Border
+internal sealed class RenameBox : Border, IHeardPopup
 {
     private readonly TextBox name;
     private readonly StackPanel body;
@@ -524,15 +738,18 @@ internal sealed class RenameBox : Border
 
     public RenameBox(string current, string caption = "Rename")
     {
+        Called = caption;
         Classes.Add(StyleClasses.Popup);
-        Padding = new Thickness(8, 6);
+        Padding = new Thickness(Gaps.Normal, Gaps.Small);
         name = new TextBox { Text = current, Classes = { StyleClasses.Search }, MinWidth = 220 }.InCodeFont();
+        TextBlock captioned = new() { Text = caption, Classes = { StyleClasses.Muted }, FontSize = 11 };
+        AutomationProperties.SetLabeledBy(name, captioned);
         body = new StackPanel
         {
-            Spacing = 4,
+            Spacing = Gaps.Tight,
             Children =
             {
-                new TextBlock { Text = caption, Classes = { StyleClasses.Muted }, FontSize = 11 },
+                captioned,
                 name,
             },
         };
@@ -544,6 +761,11 @@ internal sealed class RenameBox : Border
             name.SelectAll();
         }, DispatcherPriority.Loaded);
     }
+
+    public AutomationControlType Role => AutomationControlType.Group;
+
+    /// <summary>What the box asks for, its caption.</summary>
+    public string Called { get; }
 
     /// <summary>The new name, or null when cancelled.</summary>
     public event EventHandler<string?>? Done;

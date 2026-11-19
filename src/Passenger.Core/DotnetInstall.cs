@@ -141,7 +141,7 @@ public static class DotnetInstall
                 if (done / Megabyte != said)
                 {
                     said = done / Megabyte;
-                    stage(string.Create(CultureInfo.InvariantCulture, $"Downloading the .NET SDK {sdk.Version}: {said} MB{(length is > 0 ? $" of {length.Value / Megabyte} MB" : string.Empty)}"));
+                    stage($"Downloading the .NET SDK {sdk.Version}: {Sizes.Said(done)}{(length is > 0 ? $" of {Sizes.Said(length.Value)}" : string.Empty)}");
                 }
             }
         }
@@ -152,6 +152,7 @@ public static class DotnetInstall
         return Convert.ToHexStringLower(sha512.GetHashAndReset());
     }
 
+    /// <summary>How far a download goes between the stages that say it.</summary>
     private const long Megabyte = 1024 * 1024;
 
     /// <summary>A step of a download, given up when no byte comes for <see cref="Stall"/>.</summary>
@@ -165,7 +166,7 @@ public static class DotnetInstall
         }
         catch (OperationCanceledException) when (!cancel.IsCancellationRequested)
         {
-            throw new DotnetInstallFailed(string.Create(CultureInfo.InvariantCulture, $"The .NET SDK did not download: nothing came for {Stall.TotalSeconds:0} s"));
+            throw new DotnetInstallFailed(string.Create(CultureInfo.InvariantCulture, $"The .NET SDK did not download: nothing came for {Durations.Said(Stall)}"));
         }
     }
 
@@ -214,7 +215,7 @@ public static class DotnetInstall
             why = ChildResult.FirstLineOf(error.Message);
         }
         PassengerLog.Write(string.Create(CultureInfo.InvariantCulture,
-            $"Install .NET SDK {sdk.Version}: first run {Stopwatch.GetElapsedTime(began).TotalSeconds:0.0} s, answering {answer ?? said}"));
+            $"Install .NET SDK {sdk.Version}: first run {Durations.Said(Stopwatch.GetElapsedTime(began))}, answering {answer ?? said}"));
         if (answer is null)
         {
             throw new DotnetInstallFailed($"The .NET SDK {sdk.Version} did not start, so it was not installed: {why}");
@@ -265,9 +266,9 @@ public static class DotnetInstall
 
         public void Log(bool installed, DotnetMerge merge)
         {
-            string each = string.Join(", ", took.Select(t => string.Create(CultureInfo.InvariantCulture, $"{t.Step} {t.Took.TotalSeconds:0.0} s")));
+            string each = string.Join(", ", took.Select(t => string.Create(CultureInfo.InvariantCulture, $"{t.Step} {Durations.Said(t.Took)}")));
             string waits = merge.HeldSteps > 0
-                ? string.Create(CultureInfo.InvariantCulture, $"; the moves waited {merge.Held.TotalSeconds:0.0} s in all for Windows to let go of {merge.HeldSteps} held entries")
+                ? string.Create(CultureInfo.InvariantCulture, $"; the moves waited {Durations.Said(merge.Held)} in all for Windows to let go of {merge.HeldSteps} held entries")
                 : string.Empty;
             string pieces = merge.Piecemeal > 0
                 ? string.Create(CultureInfo.InvariantCulture, $"; {merge.Piecemeal} folders came in entry by entry, a file under them being open")

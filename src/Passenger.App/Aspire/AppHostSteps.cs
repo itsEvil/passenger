@@ -43,11 +43,12 @@ public static class AppHostSteps
 
     private static int made;
 
-    /// <summary>The deploy steps an AppHost declares, each with why it cannot run here where a login it needs is missing
-    /// (the engine asked once, where a step needs it); none, saying why, for one that cannot be asked or deploys nothing.</summary>
-    public static async Task<DeployOffer> OfferAsync(ProjectModel host, Containers.ContainerEngine engine, CancellationToken cancel)
+    /// <summary>The deploy steps an AppHost declares, run as the build configuration chosen gives it (<paramref name="configured"/>),
+    /// each with why it cannot run here where a login it needs is missing (the engine asked once, where a step needs it);
+    /// none, saying why, for one that cannot be asked or deploys nothing.</summary>
+    public static async Task<DeployOffer> OfferAsync(ProjectModel host, IReadOnlyList<string> configured, Containers.ContainerEngine engine, CancellationToken cancel)
     {
-        AppHostStepsRead read = await ReadAsync(host.Path, HostingVersionOf(host), host.WindowsTargeting, cancel);
+        AppHostStepsRead read = await ReadAsync(host.Path, HostingVersionOf(host), host.WindowsTargeting, configured, cancel);
         if (read.Problem is { } problem)
         {
             return new DeployOffer([], problem);
@@ -66,17 +67,17 @@ public static class AppHostSteps
 
     /// <summary>The Aspire an AppHost hosts with: its Aspire.Hosting reference's version, else its AppHost SDK's.</summary>
     public static string? HostingVersionOf(ProjectModel host) =>
-        host.Packages.Where(p => (p.Name.Equals(HostingPackage, StringComparison.OrdinalIgnoreCase) || p.Name.Equals(AppHostPackage, StringComparison.OrdinalIgnoreCase))
+        host.Packages.Where(p => (p.Name.Equals(HostingPackage, StringComparison.OrdinalIgnoreCase) || p.Name.Equals(Host.AspireHosts.Package, StringComparison.OrdinalIgnoreCase))
             && p.Version is { Length: > 0 }).Select(p => p.Version).FirstOrDefault()
         ?? host.Property(Host.CarriedProperties.AspireHostingSDKVersion);
 
     private const string HostingPackage = "Aspire.Hosting";
 
-    private const string AppHostPackage = "Aspire.Hosting.AppHost";
-
-    /// <summary>The steps of an AppHost of a hosting version, or why none: its version, a build that failed (its last words
-    /// said), an AppHost that ended or answered nothing within the limit.</summary>
-    public static async Task<AppHostStepsRead> ReadAsync(string project, string? hostingVersion, bool windowsTargeting, CancellationToken cancel)
+    /// <summary>The steps of an AppHost of a hosting version, run as <paramref name="configured"/> gives it (the build
+    /// configuration chosen), or why none: its version, a build that failed (its last words said), an AppHost that ended or
+    /// answered nothing within the limit.</summary>
+    public static async Task<AppHostStepsRead> ReadAsync(string project, string? hostingVersion, bool windowsTargeting, IReadOnlyList<string> configured,
+        CancellationToken cancel)
     {
         if (AppHostPipeline.WhyNotListed(hostingVersion) is { } why)
         {
@@ -120,8 +121,8 @@ public static class AppHostSteps
         Process host;
         try
         {
-            ProcessStartInfo start = ChildProcesses.DotnetCommand(["run", "--project", project, "--no-launch-profile",
-                .. windowsTargeting ? (string[])[$"-p:{MSBuildNames.EnableWindowsTargeting}=true"] : [], "--", .. AppHostPipeline.ListArguments],
+            ProcessStartInfo start = ChildProcesses.DotnetCommand(["run", "--project", project, "--no-launch-profile", .. configured,
+                .. windowsTargeting ? (string[])[PropertySwitch.Of(MSBuildNames.EnableWindowsTargeting, "true")] : [], "--", .. AppHostPipeline.ListArguments],
                 Path.GetDirectoryName(project));
             start.Environment[AspireVariables.BackchannelPath] = socket;
             start.Environment[AspireVariables.InteractivityEnabled] = "false";
@@ -156,7 +157,7 @@ public static class AppHostSteps
         }
         catch (OperationCanceledException) when (!cancel.IsCancellationRequested)
         {
-            return new AppHostStepsRead([], $"it gave no steps within {Waits.Of(ReadLimit).TotalMinutes:0} minutes{Said()}");
+            return new AppHostStepsRead([], $"it gave no steps within {Durations.Said(Waits.Of(ReadLimit))}{Said()}");
         }
         catch (JsonRpcFailed failed)
         {

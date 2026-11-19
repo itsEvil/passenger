@@ -1,4 +1,5 @@
 using Microsoft.CodeAnalysis.CSharp;
+using Passenger.Core;
 
 namespace Passenger.Xaml.Metadata;
 
@@ -19,8 +20,17 @@ public sealed class TypeSystem
     private readonly Dictionary<string, CSharpParseOptions> parsing = new(StringComparer.Ordinal);
     private readonly IReadOnlyList<string> globalUsings;
 
-    public TypeSystem(IReadOnlyList<AssemblyTypes> assemblies, IReadOnlyList<SourceTypes> sources, string assemblyName, IReadOnlyList<string>? implicitUsings = null)
+    /// <summary>The types of the assemblies and C# given; <paramref name="implied"/> are the xmlns definitions a dialect's
+    /// compiler adds to the project's own assembly (<see cref="Dialects.XamlDialect.ImpliedDefinitions"/>), and
+    /// <paramref name="generated"/> what source generators add to the C#'s types, each a part of the type the C# declares.</summary>
+    public TypeSystem(IReadOnlyList<AssemblyTypes> assemblies, IReadOnlyList<SourceTypes> sources, string assemblyName, IReadOnlyList<string>? implicitUsings = null,
+        IReadOnlyList<XmlnsDefinition>? implied = null, IReadOnlyList<GeneratedPart>? generated = null)
     {
+        Dictionary<string, GeneratedPart> made = new(StringComparer.Ordinal);
+        foreach (GeneratedPart part in generated ?? [])
+        {
+            made[part.FullName] = part;
+        }
         AssemblyName = assemblyName;
         Assemblies = assemblies;
         foreach (AssemblyTypes assembly in assemblies)
@@ -33,12 +43,17 @@ public sealed class TypeSystem
                     Index(type);
                 }
             }
-            Definitions(assembly.Attributes, assembly.Name);
+            Definitions(assembly.Attributes, assembly.Name, own: false);
         }
         List<string> usings = [.. implicitUsings ?? []];
         foreach (IGrouping<string, ClrType> parts in sources.SelectMany(s => s.Types).GroupBy(t => t.FullName, StringComparer.Ordinal))
         {
-            ClrType type = parts.Count() == 1 ? parts.First() : Merged([.. parts]);
+            List<ClrType> all = [.. parts];
+            if (made.TryGetValue(parts.Key, out GeneratedPart? part))
+            {
+                all.Add(Generated([.. parts], part));
+            }
+            ClrType type = all.Count == 1 ? all[0] : Merged(all);
             this.parts[type.FullName] = [.. parts.Select(p => p.Origin.Place).OfType<SourcePlace>()];
             if (byName.TryGetValue(type.FullName, out ClrType? metadata))
             {
@@ -50,12 +65,14 @@ public sealed class TypeSystem
         foreach (SourceTypes source in sources)
         {
             usings.AddRange(source.GlobalUsings);
-            Definitions(source.Attributes, assemblyName);
+            Definitions(source.Attributes, assemblyName, own: true);
             if (source.Parsing is { } options)
             {
                 parsing[source.Path] = options;
             }
         }
+        definitions.AddRange(implied ?? []);
+        Aggregate();
         globalUsings = [.. usings.Distinct(StringComparer.Ordinal)];
         Namespaces = [.. byNamespace.Keys.Where(n => n.Length > 0).Order(StringComparer.Ordinal)];
     }
@@ -298,19 +315,66 @@ public sealed class TypeSystem
         }
     }
 
-    private void Definitions(IReadOnlyList<ClrAttribute> attributes, string assembly)
+    /// <summary>An assembly's xmlns definitions and prefixes: each in the assembly its <c>AssemblyName</c> names, else its
+    /// own; MAUI's global namespace is mapped by the project's own assembly alone (<paramref name="own"/>), as MAUI's
+    /// compiler reads it.</summary>
+    private void Definitions(IReadOnlyList<ClrAttribute> attributes, string assembly, bool own)
     {
         foreach (ClrAttribute attribute in attributes)
         {
             if (attribute.ShortName == "XmlnsDefinition" && attribute.StringArgument(0) is { } uri && attribute.StringArgument(1) is { } clr)
             {
-                definitions.Add(new XmlnsDefinition(uri, clr, assembly));
+                if (uri == Dialects.MauiDialect.GlobalUri && !own)
+                {
+                    continue;
+                }
+                string named = attribute.Named.FirstOrDefault(n => n.Key == "AssemblyName").Value is string full && full.Length > 0 ? full.Split(',')[0].Trim() : assembly;
+                definitions.Add(new XmlnsDefinition(uri, clr, named));
             }
             else if (attribute.ShortName == "XmlnsPrefix" && attribute.StringArgument(0) is { } prefixed && attribute.StringArgument(1) is { } prefix)
             {
                 prefixes.TryAdd(prefixed, prefix);
             }
         }
+    }
+
+    /// <summary>A definition that maps a namespace to another xmlns URI rather than a CLR namespace (MAUI's global one to
+    /// MAUI's own) maps it to that URI's CLR namespaces, each in its own assembly.</summary>
+    private void Aggregate()
+    {
+        List<XmlnsDefinition> pointers = [.. definitions.Where(d => d.ClrNamespace.Contains("://", StringComparison.Ordinal))];
+        if (pointers.Count == 0)
+        {
+            return;
+        }
+        definitions.RemoveAll(d => d.ClrNamespace.Contains("://", StringComparison.Ordinal));
+        HashSet<XmlnsDefinition> known = [.. definitions];
+        foreach (XmlnsDefinition pointer in pointers)
+        {
+            foreach (XmlnsDefinition pointed in definitions.Where(d => d.Uri == pointer.ClrNamespace).ToList())
+            {
+                XmlnsDefinition aggregated = new(pointer.Uri, pointed.ClrNamespace, pointed.AssemblyName);
+                if (known.Add(aggregated))
+                {
+                    definitions.Add(aggregated);
+                }
+            }
+        }
+    }
+
+    /// <summary>A part of a type of the project's own C# holding the members generators add to it that its own parts do not
+    /// declare themselves (a toolkit's member read from its field or method, a partial property), placed in no file of its own.</summary>
+    private static ClrType Generated(IReadOnlyList<ClrType> written, GeneratedPart part)
+    {
+        ClrType first = written[0];
+        return new ClrType(first.Namespace, first.MetadataName, first.Kind, first.Origin with { Place = null }, type =>
+        {
+            HashSet<(string, MemberKind, int)> declared = [.. written.SelectMany(p => p.Members).Select(Key)];
+            return ClrTypeDetails.None with { Members = [.. part.Members.Select(m => m.Of(type)).Where(m => !declared.Contains(Key(m)))] };
+        }, first.DeclaringTypeName);
+
+        // A method by its parameters' count too, as overloads are each a member.
+        static (string, MemberKind, int) Key(ClrMember member) => (member.Name, member.Kind, member.Kind == MemberKind.Method ? member.Parameters.Count : 0);
     }
 
     /// <summary>A partial type's parts as one: every part's members and attributes, the base whichever part names it.</summary>

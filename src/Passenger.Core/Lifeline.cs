@@ -9,7 +9,9 @@ namespace Passenger.Core;
 /// On Windows each child is in the runtime's job object (KillOnParentExit), which the system kills once Passenger's
 /// handle to it is gone. macOS has neither a job nor a parent-death signal: there each child leads a session and process
 /// group of its own, and a watchdog shell reading a pipe only Passenger writes kills every group still alive once that
-/// pipe closes, which it does however Passenger's process ends. Linux is treated as macOS is.</summary>
+/// pipe closes, which it does however Passenger's process ends. The watchdog is no process of Passenger's tree, so a kill
+/// of the tree (a test runner's of a hung host) leaves it to end what lives outside it, an app the system started for
+/// Passenger among them. Linux is treated as macOS is.</summary>
 internal static partial class Lifeline
 {
     private const int SigKill = 9;
@@ -20,6 +22,13 @@ internal static partial class Lifeline
     /// <summary>How often groups with no process left are struck off the watchdog's list, so it never kills a group whose
     /// number the system has since given to another.</summary>
     private static readonly TimeSpan PruneEvery = TimeSpan.FromSeconds(10);
+
+    /// <summary>How often a killed group is killed again while a process is left in it (<see cref="KillGroup(int)"/>).</summary>
+    private static readonly TimeSpan KillAgainEvery = TimeSpan.FromMilliseconds(5);
+
+    /// <summary>How long a killed group is killed again at most: its processes and what they forked as it was killed are
+    /// gone long before, zombies their parents reap included.</summary>
+    private static readonly TimeSpan KillAgainFor = TimeSpan.FromSeconds(5);
 
     /// <summary>The watchdog: "+N" puts group N on its list and "-N" strikes it off; "!C" makes C the command it runs last,
     /// after every group still listed at the end of its input is killed. It writes nothing, and a terminal's hangup or
@@ -40,6 +49,13 @@ internal static partial class Lifeline
         if [ -n "$last" ]; then eval "$last"; fi
         """;
 
+    /// <summary>Starts the watchdog (<c>$1</c>, named <c>$2</c>) on this shell's input and ends at once, so the system takes
+    /// the watchdog for its own: it is in no process tree of Passenger's.</summary>
+    private const string Apart = """
+        exec 3<&0
+        /bin/sh -c "$1" "$2" 0<&3 3<&- &
+        """;
+
     /// <summary>JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE: a job's processes end as its last handle closes.</summary>
     private const uint KillOnJobClose = 0x2000;
 
@@ -52,7 +68,7 @@ internal static partial class Lifeline
     /// <summary>On Windows, the jobs of the children whose whole family ends with them (<see cref="HoldFamily"/>), by id.</summary>
     private static readonly Dictionary<int, SafeFileHandle> Families = [];
     private static Process? watchdog;
-    private static string? atEnd;
+    private static readonly SortedDictionary<string, string> AtEnds = new(StringComparer.Ordinal);
     private static bool unavailable;
     private static Timer? pruning;
 
@@ -90,21 +106,32 @@ internal static partial class Lifeline
         }
     }
 
-    /// <summary>Has the watchdog run a one-line shell command once Passenger's process has ended and its children's groups
-    /// are killed, in place of the one given before: for what no group holds, such as the containers an engine runs for
-    /// Passenger, which only a command to that engine ends. Nothing on Windows, which has no watchdog.</summary>
-    public static void AtEnd(string command)
+    /// <summary>Has the watchdog run a one-line shell command, <paramref name="key"/>'s in place of the one it gave before
+    /// (none: nothing of its), once Passenger's process has ended and its children's groups are killed: for what no group
+    /// holds, such as the containers an engine runs or a simulator it boots, which only a command ends. Each key's command
+    /// runs in a subshell of its own, in turn. Nothing on Windows, which has no watchdog.</summary>
+    public static void AtEnd(string key, string? command)
     {
-        if (OperatingSystem.IsWindows() || command.Contains('\n', StringComparison.Ordinal))
+        if (OperatingSystem.IsWindows() || command is not null && command.Contains('\n', StringComparison.Ordinal))
         {
             return;
         }
         lock (Gate)
         {
-            atEnd = command;
-            Tell($"!{command}");
+            if (command is { Length: > 0 })
+            {
+                AtEnds[key] = command;
+            }
+            else if (!AtEnds.Remove(key))
+            {
+                return;
+            }
+            Tell($"!{Last()}");
         }
     }
+
+    /// <summary>The commands run last, each in a subshell, so one's exit or failure leaves the next to run. Under the gate.</summary>
+    private static string Last() => string.Join("; ", AtEnds.Values.Select(command => $"( {command} )"));
 
     /// <summary>On Windows, puts a child that has just started in a job of its own, which every process it starts from then
     /// on joins, so <see cref="KillGroup"/> ends them all, those whose own parent has gone among them (a restore's MSBuild
@@ -151,6 +178,14 @@ internal static partial class Lifeline
         {
             return;
         }
+        KillGroup(group);
+    }
+
+    /// <summary><see cref="KillGroup(Process)"/> of a child by its id, read before anything let go of its process. The
+    /// system's kill of a group passes over a process forked into it at that moment, which then runs on; so a group that
+    /// had a process to kill is killed again, off the caller's thread, until the system says none is left in it.</summary>
+    public static void KillGroup(int group)
+    {
         if (OperatingSystem.IsWindows())
         {
             SafeFileHandle? job;
@@ -162,12 +197,38 @@ internal static partial class Lifeline
             job?.Dispose();
             return;
         }
+        if (Signalled(group))
+        {
+            UnawaitedWork.Observe(BackgroundWork.Run(() => KillAgainAsync(group)));
+        }
+    }
+
+    /// <summary>Whether a child's group is still listed (on Windows, its family still held): not yet found empty.</summary>
+    public static bool Holds(int group)
+    {
         lock (Gate)
         {
-            if (Groups.Contains(group))
-            {
-                Libc.Signal(-group, SigKill);
-            }
+            return OperatingSystem.IsWindows() ? Families.ContainsKey(group) : Groups.Contains(group);
+        }
+    }
+
+    /// <summary>Kills every process now in a group still listed: whether the system found one to kill.</summary>
+    private static bool Signalled(int group)
+    {
+        lock (Gate)
+        {
+            return Groups.Contains(group) && Libc.Signal(-group, SigKill) == 0;
+        }
+    }
+
+    /// <summary>Kills a group again until it has no process left, or <see cref="KillAgainFor"/> has passed: what a kill
+    /// passed over is in the group by the next.</summary>
+    private static async Task KillAgainAsync(int group)
+    {
+        Deadline until = Deadline.In(KillAgainFor);
+        while (Signalled(group) && !until.Passed)
+        {
+            await Task.Delay(KillAgainEvery).ConfigureAwait(false);
         }
     }
 
@@ -185,6 +246,9 @@ internal static partial class Lifeline
             }
         }
     }
+
+    /// <summary>What the watchdog of Passenger's process <paramref name="ide"/> is named, last on its command line.</summary>
+    public static string NameOf(int ide) => string.Create(System.Globalization.CultureInfo.InvariantCulture, $"passenger-watchdog-{ide}");
 
     /// <summary>Writes a line to the watchdog. One that was ended by hand is replaced, and its successor is given every
     /// group listed, so the line need not be written again.</summary>
@@ -205,11 +269,11 @@ internal static partial class Lifeline
         }
     }
 
-    /// <summary>The watchdog, started with the first child (again if it was ended by hand, with every group listed). Null
-    /// where there is no shell to be it: children still run, only nothing ends them on a crash.</summary>
+    /// <summary>The watchdog, started with the first child (again if it was ended by hand, with every group listed), as
+    /// its input takes a line. Null where there is no shell to be it: children still run, only nothing ends them on a crash.</summary>
     private static Process? Watchdog()
     {
-        if (unavailable || watchdog is { } running && DotnetProcesses.Runs(running))
+        if (unavailable || watchdog is { } running && Reads(running))
         {
             return watchdog;
         }
@@ -218,7 +282,7 @@ internal static partial class Lifeline
         try
         {
             // Its own session too, so a terminal's Ctrl+C or hangup, which ends Passenger, leaves it to do its work.
-            ProcessStartInfo start = new("/bin/sh", ["-c", Watch])
+            ProcessStartInfo start = new("/bin/sh", ["-c", Apart, "sh", Watch, NameOf(Environment.ProcessId)])
             {
                 UseShellExecute = false,
                 CreateNoWindow = true,
@@ -230,9 +294,9 @@ internal static partial class Lifeline
             {
                 started.StandardInput.Write($"+{group}\n");
             }
-            if (atEnd is not null)
+            if (AtEnds.Count > 0)
             {
-                started.StandardInput.Write($"!{atEnd}\n");
+                started.StandardInput.Write($"!{Last()}\n");
             }
             started.StandardInput.Flush();
             watchdog = started;
@@ -242,6 +306,21 @@ internal static partial class Lifeline
             unavailable = true;
         }
         return watchdog;
+    }
+
+    /// <summary>Whether the watchdog still reads its input: an empty line, which it passes over, is refused once it has gone.</summary>
+    private static bool Reads(Process watching)
+    {
+        try
+        {
+            watching.StandardInput.Write('\n');
+            watching.StandardInput.Flush();
+            return true;
+        }
+        catch (IOException)
+        {
+            return false;
+        }
     }
 
     [LibraryImport("kernel32.dll", EntryPoint = "CreateJobObjectW", SetLastError = true, StringMarshalling = StringMarshalling.Utf16)]

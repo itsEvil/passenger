@@ -303,13 +303,13 @@ public sealed class LocalHistoryTests : IDisposable
         using (history.During("Git checkout"))
         {
             File.WriteAllText(shop, Saved1);
-            history.Noticed([shop]);
+            history.Noticed([shop], []);
             Ui.WaitFor(() => history.Snapshot().Events.Any(e => e.Name == "Git checkout"), "the checkout's change kept under its name");
         }
         // Heard a moment after the checkout ended, as its own writes are, but written past its moment.
         File.WriteAllText(shop, Saved2);
         File.SetLastWriteTimeUtc(shop, DateTime.UtcNow + TimeSpan.FromMinutes(1));
-        history.Noticed([shop]);
+        history.Noticed([shop], []);
         Ui.Settle();
 
         (IReadOnlyList<HistoryEvent> events, IReadOnlyDictionary<string, string?> known) = history.Snapshot();
@@ -318,6 +318,82 @@ public sealed class LocalHistoryTests : IDisposable
             $"A change written after the checkout's moment was kept as {string.Join(", ", rows.Select(r => r.Title))}, not an external change above the checkout");
         Assert.Equal(Saved1, Encoding.UTF8.GetString(history.Content(rows[0].Version!)!));
         Assert.Equal(Original, Encoding.UTF8.GetString(history.Content(rows[1].Version!)!));
+        window.Close();
+    }
+
+    /// <summary>A save written while Local History reads its file for a change the watcher heard before it (the last save's,
+    /// heard late) is kept once, as the save: the history reads the save's bytes before the save's own record comes, as an
+    /// external change, and that record takes its place, never kept beside it with an external change back to what the
+    /// save wrote over.</summary>
+    [AvaloniaFact]
+    public void A_save_written_as_the_history_reads_its_file_for_a_change_heard_before_is_kept_once_as_the_save()
+    {
+        string shop = Write("Shop.cs", Original);
+        MainWindow window = Open("Shop.cs");
+        LocalHistory history = window.LocalHistory!;
+        Save(window, 2, 4, "long ");
+        using ManualResetEventSlim release = new();
+        int reads = 0;
+        void Held(string path)
+        {
+            if (PathNames.Same(path, shop) && Interlocked.Increment(ref reads) == 1)
+            {
+                release.Wait(TimeSpan.FromSeconds(30).Scaled());
+            }
+        }
+        history.Reading += Held;
+        try
+        {
+            // The watcher's word of the first save, read only once the second is written.
+            history.Noticed([shop], []);
+            Ui.PumpUntil(() => Volatile.Read(ref reads) > 0, "Local History reading Shop.cs for the change heard");
+            window.EditorArea.CodeEditor.GoTo(new TextPosition(6, 8));
+            window.KeyTextInput("count++; ");
+            Ui.Run(window, AppActions.Save, settle: false);
+            Ui.PumpUntil(() => window.EditorArea.Active?.IsModified == false, "Shop.cs saved again");
+            Assert.Equal(Saved2, File.ReadAllText(shop));
+            release.Set();
+            Ui.Settle();
+        }
+        finally
+        {
+            release.Set();
+            history.Reading -= Held;
+        }
+
+        (IReadOnlyList<HistoryEvent> events, IReadOnlyDictionary<string, string?> known) = history.Snapshot();
+        IReadOnlyList<HistoryRow> rows = HistoryRows.OfFile(events, known, shop);
+        Assert.True(rows.Count == 2 && rows.All(r => r.Title == "Change"),
+            $"Two saves, the second written as the first's change heard was read, were kept as {string.Join(", ", rows.Select(r => r.Title))}, not two changes");
+        Assert.Equal(Saved1, Encoding.UTF8.GetString(history.Content(rows[0].Version!)!));
+        Assert.Equal(Original, Encoding.UTF8.GetString(history.Content(rows[1].Version!)!));
+        window.Close();
+    }
+
+    /// <summary>A folder the watcher names though nothing came in it, as Windows names one as a file in it is first read
+    /// since it was written (a scanner's read, a build's), brings no change: its files, made as the folder opened and never
+    /// looked at or saved here, are not kept as made by another program. A folder that comes is looked in, its file kept.</summary>
+    [AvaloniaFact]
+    public void A_folder_named_as_a_file_in_it_is_first_read_brings_no_change_where_a_folder_that_comes_brings_its_files()
+    {
+        Write("Shop.cs", Original);
+        string project = Write("Lib/Lib.csproj", "<Project Sdk=\"Microsoft.NET.Sdk\" />\n");
+        string notes = Write("Lib/Notes.txt", "a note\n");
+        // Made as the folder opens, however long the window takes to open.
+        File.SetCreationTimeUtc(project, DateTime.UtcNow + TimeSpan.FromMinutes(1));
+        File.SetCreationTimeUtc(notes, DateTime.UtcNow + TimeSpan.FromMinutes(1));
+        MainWindow window = Open("Shop.cs");
+        LocalHistory history = window.LocalHistory!;
+        history.Noticed([Path.GetDirectoryName(project)!], []);
+        Ui.WaitFor(() => !history.IsRecording, "the history to read the folder Windows named");
+
+        string readme = Write("Docs/Readme.md", "# Docs\n");
+        Ui.WaitFor(() => HistoryRows.OfFolder(history.Snapshot().Events, folder).Any(r => r.Files.Contains(readme, PathNames.Comparer)),
+            "the folder that came looked in, its file kept");
+        Ui.WaitFor(() => !history.IsRecording, "the history to keep what it heard");
+        IReadOnlyList<HistoryRow> rows = HistoryRows.OfFolder(history.Snapshot().Events, folder);
+        Assert.True(!rows.Any(r => r.Files.Any(f => PathNames.Within(f, Path.GetDirectoryName(project)!))),
+            $"The folder Windows names as a file in it is first read is kept as changed by another program: {string.Join("; ", rows.Select(r => $"{r.Title} [{string.Join(", ", r.Files.Select(Path.GetFileName))}]"))}");
         window.Close();
     }
 
@@ -362,6 +438,52 @@ public sealed class LocalHistoryTests : IDisposable
         Assert.Equal(LocalHistory.ExternalChange, its.Rows[0].Title);
         Ui.Landed(() => its.Diff?.Left.Document.Snapshot.ToString() == "class Piece0\n{\n}\n", "the tree's file as it came");
         window.Close();
+    }
+
+    /// <summary>A state folder inside the open folder, named through a link to it (as macOS names its temporary folder
+    /// through /var), has what the history writes there heard by the folder's watcher and kept by nothing: a change made
+    /// elsewhere is kept once, and once its write is heard the history neither reads its own files nor writes again.</summary>
+    [AvaloniaFact]
+    public void What_the_history_writes_in_a_state_folder_inside_the_open_folder_is_heard_and_starts_no_more_writes()
+    {
+        string shop = Write("Shop.cs", Original);
+        string linked = Path.Combine(TestFolders.Create("history-link-"), "open");
+        TestFolders.LinkFolder(linked, folder);
+        string state = PathNames.Canonical(Path.Combine(folder, "state"));
+        MainWindow window = Open("Shop.cs", state: Path.Combine(linked, "state"), keeping: new HistoryKeeping());
+        LocalHistory history = window.LocalHistory!;
+        string log = Path.Combine(PathNames.Canonical(history.Root), "changes.log");
+        ConcurrentQueue<string> read = new();
+        history.Reading += read.Enqueue;
+        long heardAt = -1;
+        window.FolderWatcher!.Changed += (_, changes) =>
+        {
+            if (changes.Paths.Contains(log))
+            {
+                heardAt = new FileInfo(log).Length;
+            }
+        };
+        try
+        {
+            File.WriteAllText(shop, Saved1);
+            Ui.WaitFor(() => HistoryRows.OfFile(history.Snapshot().Events, history.Snapshot().Known, shop).Count > 0, "the change made elsewhere kept");
+            Ui.WaitFor(() => File.Exists(log) && heardAt >= new FileInfo(log).Length, () => $"the history's log heard as long as it is ({heardAt} of {new FileInfo(log).Length} bytes)");
+            Ui.Settle();
+            long written = new FileInfo(log).Length;
+            Ui.Hold(TimeSpan.FromSeconds(1), "longer than the watcher takes to hear a write and the history to keep it, for a write heard to bring another");
+
+            Assert.True(new FileInfo(log).Length == written, $"Local History wrote its log again, {new FileInfo(log).Length - written} bytes, after hearing its own write in the state folder: it keeps its own writes, for good");
+            string[] own = [.. read.Where(p => PathNames.Within(p, state))];
+            Assert.True(own.Length == 0, $"Local History read {own.Length} files of its own state folder, which it keeps none of: {string.Join(", ", own.Take(5))}");
+            HistoryRow[] rows = [.. HistoryRows.OfFolder(history.Snapshot().Events, folder)];
+            Assert.True(rows.All(r => r.Files.All(f => !PathNames.Within(f, state))),
+                $"The folder's history lists the state folder's files: {string.Join("; ", rows.Select(r => $"{r.Title} [{string.Join(", ", r.Files)}]"))}");
+        }
+        finally
+        {
+            history.Reading -= read.Enqueue;
+            window.Close();
+        }
     }
 
     [AvaloniaFact]
@@ -472,6 +594,47 @@ public sealed class LocalHistoryTests : IDisposable
         window.Close();
     }
 
+    /// <summary>A folder's revert to a set before one of its files was made moves that file to the Trash in the revert's
+    /// command: one Undo, asked once, writes the other file back and brings the one made back out of the Trash.</summary>
+    [AvaloniaFact]
+    public void A_folders_revert_to_before_a_file_was_made_moves_it_to_the_Trash_and_one_undo_brings_it_back()
+    {
+        const string A = "class A\n{\n}\n";
+        const string B = "class B\n{\n}\n";
+        string a = Write("src/A.cs", A);
+        string src = Path.Combine(folder, "src");
+        string b = Path.Combine(src, "B.cs");
+        MainWindow window = Open("src/A.cs");
+        Save(window, 0, 0, "sealed ");
+        Assert.Null(window.CreateFile(src, "B.cs", B));
+        foreach (Passenger.App.Workspace.OpenDocument open in window.EditorArea.Documents.ToList())
+        {
+            window.EditorArea.Close(open);
+        }
+        Ui.Settle();
+        Ui.WaitFor(() => !window.LocalHistory!.IsRecording, "the save and the new file kept");
+        HistoryRow first = HistoryRows.OfFolder(window.LocalHistory!.Snapshot().Events, src).Single(r => r.Title == "Modify A.cs");
+
+        Assert.Null(Ui.AwaitPumped(window.RevertLocalHistoryAsync(src, first.Set), "the revert"));
+        Assert.True(File.ReadAllText(a) == A && !File.Exists(b), $"The revert did not put A.cs back and take B.cs away: {window.Status}");
+        Assert.True(File.ReadAllText(Path.Combine(trash, "B.cs")) == B, "The revert did not move B.cs to the Trash");
+
+        List<string> asked = [];
+        window.Confirm = (_, question, _) =>
+        {
+            asked.Add(question);
+            return Task.FromResult(true);
+        };
+        Ui.ClickRow(window, Show(window, a));
+        Ui.Run(window, EditorActions.Undo);
+        Ui.WaitFor(() => File.Exists(b) && File.ReadAllText(a) == "sealed " + A,
+            () => $"one Undo to take back the revert: A.cs '{File.ReadAllText(a)}', B.cs {(File.Exists(b) ? "back" : "gone")}, {window.Status}");
+        Assert.Equal(B, File.ReadAllText(b));
+        Assert.True(asked.Count == 1 && asked[0].Contains("brings back B.cs", StringComparison.Ordinal), $"Undo of the revert asked: {string.Join(" | ", asked)}");
+        Assert.Empty(Directory.EnumerateFileSystemEntries(trash));
+        window.Close();
+    }
+
     /// <summary>A change kept twice in the log two Passengers on the same state append to, as an external change by the one
     /// that heard it and under its own name by the one that made it, in either order, lists once under its maker's name.</summary>
     [AvaloniaFact]
@@ -506,6 +669,72 @@ public sealed class LocalHistoryTests : IDisposable
         window.Close();
 
         static string Hash(string text) => LocalHistory.Hash(System.Text.Encoding.UTF8.GetBytes(text));
+    }
+
+    /// <summary>On macOS and Linux a backslash is a letter of a file's name, so its history is kept under that name and a
+    /// later Passenger on the same state lists it, where a slash in its place named another file.</summary>
+    [AvaloniaFact]
+    public void A_files_history_kept_under_a_name_holding_a_backslash_is_listed_by_a_later_passenger_on_the_same_state()
+    {
+        Assert.SkipWhen(OperatingSystem.IsWindows(), "A backslash parts a path's names on Windows, so no file's name there holds one");
+        string state = TestFolders.Create("history-state-");
+        Write(@"Shop\Copy.cs", Original);
+        MainWindow first = Open(@"Shop\Copy.cs", state, new HistoryKeeping());
+        Save(first, 2, 4, "long ");
+        first.Close();
+        Ui.Settle();
+
+        MainWindow later = Open(@"Shop\Copy.cs", state, new HistoryKeeping());
+        HistoryTab history = ShowFromFileMenu(later, "Show History…");
+        Ui.Settle();
+        Assert.True(history.Rows.Any(r => r.Title == "Change"),
+            $"A later Passenger on the same state listed none of the save kept for Shop\\Copy.cs, only [{string.Join(", ", history.Rows.Select(r => r.Title))}]: its history was kept under Shop/Copy.cs, another file's name");
+        later.Close();
+    }
+
+    /// <summary>A label put while another Passenger on the same state holds the history, writing its log anew as a prune
+    /// does and for longer than a change waits to say so, is in the log once that Passenger lets go: written after the
+    /// rewrite, never beside it into the log the rewrite then replaces.</summary>
+    [AvaloniaFact]
+    public void A_label_put_while_another_passenger_on_the_same_state_writes_the_log_anew_is_kept_after_its_rewrite()
+    {
+        string state = TestFolders.Create("history-state-");
+        Write("Shop.cs", Original);
+        string root = Path.Combine(Passenger.App.State.ProjectState.FolderOf(state, folder), "localHistory");
+        Directory.CreateDirectory(root);
+        string log = Path.Combine(root, "changes.log");
+        long now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+        File.WriteAllText(log, string.Concat(
+            $"{{\"s\":1,\"t\":{now - 2000},\"k\":\"label\",\"n\":\"Dropped by the other\"}}\n",
+            $"{{\"s\":2,\"t\":{now - 1000},\"k\":\"label\",\"n\":\"Kept by the other\"}}\n"));
+        MainWindow window = Open("Shop.cs", state, new HistoryKeeping());
+        Assert.Equal(PathNames.Canonical(root), PathNames.Canonical(window.LocalHistory!.Root));
+
+        // The other Passenger's prune: the history held (its lock beside the log), the log read, and written anew without
+        // its oldest line once longer than a change waits for the history has passed, or once the log grew meanwhile.
+        using ManualResetEventSlim held = new();
+        Task<bool> other = Waiting.Apart(() =>
+        {
+            using FileStream holding = new(Path.Combine(root, "changes.lock"), FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None);
+            string[] read = File.ReadAllLines(log);
+            long length = new FileInfo(log).Length;
+            held.Set();
+            bool grew = Waiting.Until(() => new FileInfo(log).Length != length, TimeSpan.FromSeconds(15), scaled: false);
+            AtomicFile.Write(log, Encoding.UTF8.GetBytes(string.Concat(read.Skip(1).Select(line => line + "\n"))));
+            return grew;
+        });
+        Ui.PumpUntil(() => held.IsSet, "the other Passenger to hold the history");
+        Ui.ChooseFromEditorMenu(window, "Local History", "Put Label…");
+        window.KeyTextInput("Mine");
+        Ui.Press(window, "ENTER", settle: false);
+        bool written = Ui.AwaitPumped(other, "the other Passenger to write the log anew and let go");
+        Ui.Settle();
+
+        string[] labels = [.. File.ReadAllLines(log).Select(line => System.Text.Json.Nodes.JsonNode.Parse(line)?["n"]?.GetValue<string>()).OfType<string>()];
+        Assert.False(written, "The label was written into the log while another Passenger held the history to write it anew");
+        Assert.True(labels.Contains("Mine"), $"The label put while another Passenger on the same state wrote the log anew was lost to its rewrite: the log holds [{string.Join(", ", labels)}]");
+        Assert.Equal(["Kept by the other", "Mine"], labels);
+        window.Close();
     }
 
     /// <summary>A revert follows only what it changes: a file's text put back leaves every Explorer row as it was, with Go to

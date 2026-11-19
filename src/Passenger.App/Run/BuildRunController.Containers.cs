@@ -1,16 +1,19 @@
+using System.Diagnostics;
 using Passenger.App.Containers;
 using Passenger.App.Debugging;
 using Passenger.App.ToolWindows;
 using Passenger.Core;
+using Passenger.Workspace;
 
 namespace Passenger.App.Run;
 
 /// <summary>Run of a container configuration: Compose's model of its files read, Passenger's override written, its .NET
 /// services built on the host (fast mode), its services brought up and waited for, their merged log followed in the Run
-/// console, the browser opened once the launched service's published port answers, and the Containers window shown its
-/// project; Stop takes it down, and Rerun builds again and restarts only the services whose build changed. Debug brings it
-/// up the same way with the services it debugs held at their start, and attaches a session to each in its container (the
-/// adapter there over docker exec), its tab's console its container's log; Run with Hot Reload attaches to each quietly.</summary>
+/// console, the browser opened once the launched service answers HTTP at its published port, and the Containers window
+/// shown its project; Stop takes it down, and Rerun builds again and restarts only the services whose build changed. Debug
+/// brings it up the same way with the services it debugs held at their start, and attaches a session to each in its
+/// container (the adapter there over docker exec), its tab's console its container's log; Run with Hot Reload attaches to
+/// each quietly.</summary>
 public sealed partial class BuildRunController
 {
     /// <summary>The container run under way, if any (its services up, its log followed).</summary>
@@ -169,11 +172,19 @@ public sealed partial class BuildRunController
             }
         }
         work.Say($"Reading {chosen.Name}'s compose files…");
+        (WorkspaceModel? configured, string? unconfigured) = await session.WorkspaceOfAsync(chosen);
+        if (unconfigured is not null)
+        {
+            return Said(unconfigured);
+        }
         ContainerPlan plan;
         try
         {
-            plan = await ContainerPlans.ResolveAsync(chosen, session.Projects, session.Workspace, parts.StateFolder(), engine, session.Containers.Labels, work.Stopping);
+            plan = await ContainerPlans.ResolveAsync(chosen, session.Projects, configured, parts.StateFolder(), engine, session.Containers.Labels, work.Stopping)
+                with { Workspace = configured };
             later = [.. later.Where(s => plan.Dotnet.Any(d => d.Service == s && d.Action == ServiceStart.DontStart && d.Unfit is null))];
+            // A run let go of whose Compose project this one brings up again is this one's now.
+            session.RunsLetGo.RemoveAll(r => r.Plan.ProjectName == plan.ProjectName);
             plan = later.Count > 0 ? plan.StartingLater(later) : plan;
             parts.Views.Problems.ShowContainers([]);
         }
@@ -226,12 +237,12 @@ public sealed partial class BuildRunController
         if (plan.Builds.Count > 0)
         {
             work.Say($"Building {string.Join(", ", plan.Builds.Select(Path.GetFileNameWithoutExtension))}…");
-            BuildOutcome built = await BuildForAsync(plan.Builds, work.Stopping, work, reading: () => FollowBuilt(sessions));
+            BuildOutcome built = await BuildForAsync(plan.Builds, work.Stopping, work, reading: () => FollowBuilt(sessions), configured: plan.Workspace);
             if (!built.Succeeded)
             {
                 return Checkpoint(work, chosen.Name) is { } stopped ? Said(stopped) : built.Message;
             }
-            if (plan.Dotnet.FirstOrDefault(d => d.Starts && !File.Exists(Path.Combine(d.Output, d.Assembly + ".dll"))) is { } unbuilt)
+            if (plan.Running.FirstOrDefault(d => !File.Exists(Path.Combine(d.Output, d.Assembly + ".dll"))) is { } unbuilt)
             {
                 return Said($"Could not run {chosen.Name}: {unbuilt.Assembly}.dll has not been built in {unbuilt.Output}");
             }
@@ -380,8 +391,8 @@ public sealed partial class BuildRunController
             return following;
         }
         string what = ServicesStarted(chosen.Name, how, Plural.Listed([.. debugged.Select(s => s.Service)]));
-        parts.Say($"{what}{(how == RunStart.Run ? ":" : ";")} {Plural.Of(plan.Dotnet.Count(d => plan.Starts(d.Service)), ".NET service")} from Passenger's build"
-            + $"{(plan.Mode == ContainerMode.Images ? " images" : string.Empty)}, {Plural.Of(plan.Backing.Count, "other service")}; Stop takes them down"
+        parts.Say($"{what}{(how == RunStart.Run ? ":" : ";")} {Plural.Of(plan.Running.Count(), ".NET service")} from Passenger's build"
+            + $"{(plan.Mode == ContainerMode.Images ? " images" : string.Empty)}, {Plural.Of(plan.Backing.Count(plan.Touched.Contains), "other service")}; Stop takes them down"
             + (notes.Count > 0 ? $" ({string.Join("; ", notes)})" : string.Empty),
             // What dev-certs said of a certificate that did not come is in the Run window.
             unexported ? StatusPlace.Window(parts.Dock, ToolWindowIds.Run) : null);
@@ -389,23 +400,28 @@ public sealed partial class BuildRunController
         if (plan.BrowserUrl is not null && await run.BrowserUrlAsync(CancellationToken.None) is { } url)
         {
             run.Address = url;
-            parts.OpenBrowser(new LaunchPlan { Name = chosen.Name, Program = engine.Cli!, WorkingDirectory = plan.Folder, BrowserUrl = url }, session.Runner.Ended);
+            parts.OpenBrowser(new LaunchPlan
+            {
+                Name = chosen.Name, Program = engine.Cli!, WorkingDirectory = plan.Folder, BrowserUrl = url, BrowserService = plan.LaunchService ?? chosen.Name, BrowserLine = chosen.Browser,
+            }, session.Runner.Ended);
         }
         return null;
     }
 
     /// <summary>Containers of the run's Compose project, of the services its <c>up</c> makes, that this Passenger did not make
-    /// (the person's own, from their own <c>docker compose up</c>): Compose would make them again with Passenger's labels and
-    /// settings, and Stop would then remove them. The person is asked first (Replace Them, after which they are this run's,
-    /// or Cancel); an agent's run, and an IDE with nobody to ask, replaces none and refuses, saying why. Null when it may go
-    /// on, else what it says.</summary>
+    /// for this folder (the person's own, from their own <c>docker compose up</c>, or another window's run of a project of the
+    /// same name): Compose would make them again with this run's labels and settings, and Stop would then remove them. The
+    /// person is asked first (Replace Them, after which they are this run's, or Cancel); an agent's run, and an IDE with
+    /// nobody to ask, replaces none and refuses, saying why. Null when it may go on, else what it says.</summary>
     private async Task<string?> ReplacesOthersAsync(string starting, ContainerPlan plan, ContainerEngine engine, Working work)
     {
         ChildResult listed;
+        ChildResult ours;
         try
         {
             listed = await BackgroundWork.Run(() => engine.RunAsync(["ps", "-a", "--filter", $"label={ComposeLabels.Project}={plan.ProjectName}", "--format",
-                $"{{{{.Names}}}}\t{{{{.Label \"{ComposeLabels.Service}\"}}}}\t{{{{.Label \"{ContainerLabels.Machine}\"}}}}\t{{{{.Label \"{ContainerLabels.Process}\"}}}}"],
+                $"{{{{.Names}}}}\t{{{{.Label \"{ComposeLabels.Service}\"}}}}"], ContainerEngine.AskLimit, work.Stopping));
+            ours = await BackgroundWork.Run(() => engine.RunAsync(["ps", "-a", .. ContainerLabels.Ours(plan.ProjectName, session.Folder), "--format", "{{.Names}}"],
                 ContainerEngine.AskLimit, work.Stopping));
         }
         catch (Exception unasked) when (ChildFailures.Of(unasked))
@@ -413,19 +429,20 @@ public sealed partial class BuildRunController
             // An engine that does not list them now refuses up's own commands next, which says why.
             return null;
         }
-        // Not trimmed: a container without Passenger's labels ends its line in empty columns.
+        HashSet<string> own = new(ours.Output.Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries), StringComparer.Ordinal);
+        // Not trimmed: a container of no service ends its line in an empty column.
         string[] others = [.. listed.Output.Split('\n', StringSplitOptions.RemoveEmptyEntries)
             .Select(line => line.TrimEnd('\r').Split('\t'))
-            .Where(row => row.Length == 4 && plan.Touched.Contains(row[1]) && (row[2] != ContainerLabels.MachineValue || row[3] != ContainerLabels.ProcessValue))
+            .Where(row => row.Length == 2 && plan.Touched.Contains(row[1]) && !own.Contains(row[0]))
             .Select(row => row[0])];
-        if (!listed.Succeeded || others.Length == 0)
+        if (!listed.Succeeded || !ours.Succeeded || others.Length == 0)
         {
             return null;
         }
         string named = string.Join(", ", others);
         if (NoOneToAsk() is { } why)
         {
-            return $"{starting} was not run: it would replace {named} of {plan.ProjectName}, which Passenger did not make, and {why}; "
+            return $"{starting} was not run: it would replace {named} of {plan.ProjectName}, which Passenger did not make for this folder, and {why}; "
                 + "remove them first, or run it from the window";
         }
         bool replace = false;
@@ -443,7 +460,7 @@ public sealed partial class BuildRunController
             }
         }
         work.Stopping.ThrowIfCancellationRequested();
-        return replace ? null : $"{starting} was not run: {named} of {plan.ProjectName}, which Passenger did not make, were left as they are";
+        return replace ? null : $"{starting} was not run: {named} of {plan.ProjectName}, which Passenger did not make for this folder, were left as they are";
     }
 
     /// <summary>The container run whose log ended by itself while it is asked whether its containers still run, which keeps
@@ -475,26 +492,88 @@ public sealed partial class BuildRunController
             return;
         }
         // A log followed again that ends at once is not followed for good: the run is said to have ended.
-        bool atOnce = followedAgainAt is { } at && DateTime.UtcNow - at < TimeSpan.FromSeconds(2);
+        bool atOnce = followedAgainAt is { } at && Stopwatch.GetElapsedTime(at) < TimeSpan.FromSeconds(2);
         if (!up || atOnce || run.IsStopped || session.ContainerRun != run || run.Engine.Cli is not { } cli)
         {
             RunLogEnded(code);
             return;
         }
         parts.Views.Run.Append($"{run.Plan.Name}'s services still run: following their log again\n");
-        followedAgainAt = DateTime.UtcNow;
+        followedAgainAt = Stopwatch.GetTimestamp();
         if (Started(session.Runner.Start(cli, run.LogsSince(since), run.Plan.Folder, ContainerEngine.Variables)) is not null)
         {
             RunLogEnded(code);
         }
     }
 
-    /// <summary>When a container run's log was last followed again.</summary>
-    private DateTime? followedAgainAt;
+    /// <summary>When a container run's log was last followed again, a timestamp of <see cref="Stopwatch.GetTimestamp"/>'s.</summary>
+    private long? followedAgainAt;
 
-    /// <summary>How a container run whose log stopped is said: taken down by Stop, its backing services kept, or its
-    /// services all ended by themselves.</summary>
-    private string ContainersEnded(ContainerRun run) => !run.IsStopped ? $"{ran}'s services have all ended"
+    /// <summary>Whether Detach acts on the container run under way: one is under way, and Detach is the run's whole (see
+    /// <see cref="DetachesWhole"/>) or the chosen session is one of its services'.</summary>
+    public bool DetachesContainers(ActionContext context, DebugSession? chosen) =>
+        Containers is { } run && IsRunning && (DetachesWhole(context, chosen) || ServiceDebuggedBy(chosen!)?.Run == run);
+
+    /// <summary>Whether Detach lets go of the container run whole: asked from the Run window, the run's own, or with no session
+    /// of a program chosen; else, a service's debug tab chosen, it lets go of that service's program alone.</summary>
+    private static bool DetachesWhole(ActionContext context, DebugSession? chosen) =>
+        context.ToolWindow?.Id == ToolWindowIds.Run || chosen is not { State: not DebugState.Ended };
+
+    /// <summary>Why Detach cannot act on the container run under way now: none is; let go of whole, it is still coming up,
+    /// the profiler records one of its services (Stop ends the recording), or Hot Reload changed one, which no debugger is
+    /// let go of; of one service, what the debugger says of its session.</summary>
+    public string? WhyNotDetachContainers(ActionContext context, DebugSession? chosen) =>
+        Containers is not { } run || !IsRunning ? NoContainerRun
+        : !DetachesWhole(context, chosen) ? session.Debug.WhyNotDetachOf(chosen!)
+        : run.IsComingUp ? $"{run.Name} is still coming up"
+        : run.Profiled is { } profiled ? $"The profiler records {profiled.Name} of {run.Name}: Stop ends the recording, and Detach lets go of a run nothing records"
+        : run.Services.FirstOrDefault(s => run.HotReloadChanged(session.Debug, s)) is { } changed ? DebugController.LetsNoDebuggerGo(run.SessionName(changed))
+        : null;
+
+    /// <summary>Detach of the container run under way, said in the Run window and the status. Whole (from the Run window, or
+    /// with no service's debug tab chosen): the debugger lets go of each service it holds (running on), Compose's watch ends,
+    /// and its log is no longer followed; Run, Debug and Stop no longer act on it, the Containers window still lists its
+    /// containers to stop there, and the folder's end takes them down as it takes all it started. Of the service whose tab is
+    /// chosen: the debugger lets go of its program alone, the run going on as it was. Null once done, else why not.</summary>
+    public async Task<string?> DetachContainersAsync(ActionContext context, DebugSession? chosen)
+    {
+        UiThread.Check();
+        if (WhyNotDetachContainers(context, chosen) is { } why)
+        {
+            return Said(why);
+        }
+        ContainerRun run = Containers!;
+        if (!DetachesWhole(context, chosen) && ServiceDebuggedBy(chosen!) is ({ } of, { } service))
+        {
+            if (await session.Debug.DetachAsync(chosen) is { } refused)
+            {
+                return Said(refused);
+            }
+            string one = $"Detached from {service.Name} of {of.Name}: the debugger let go of it alone, and the run goes on as it was";
+            parts.Views.Run.Append($"{one}\n");
+            parts.Say(one, StatusPlace.Window(parts.Dock, ToolWindowIds.Run));
+            return null;
+        }
+        foreach (IRunService each in run.Services)
+        {
+            await session.Debug.DetachAsync(run.SessionName(each));
+        }
+        run.LetGo();
+        session.RunsLetGo.Add(run);
+        parts.Views.Run.Append($"{LetGoSaid(run.Name)}\n");
+        // Its log's end is said as the run's (RunLogEnded): what Detach did.
+        session.Runner.Stop();
+        RunningChanged?.Invoke(this, EventArgs.Empty);
+        return null;
+    }
+
+    /// <summary>What Detach of a container run whole says.</summary>
+    private static string LetGoSaid(string name) => $"Detached from {name}: its containers run on until the Containers window stops them or the folder closes";
+
+    /// <summary>How a container run whose log stopped is said: let go of by Detach, taken down by Stop, its backing services
+    /// kept, or its services all ended by themselves.</summary>
+    private string ContainersEnded(ContainerRun run) => run.IsLetGo ? LetGoSaid(ran)
+        : !run.IsStopped ? $"{ran}'s services have all ended"
         : run.Plan.KeepBacking && run.Plan.Backing.Count > 0 ? $"{ran} stopped: its .NET services were taken down, {string.Join(", ", run.Plan.Backing)} kept running"
         : $"{ran} stopped: its containers were taken down";
 
@@ -518,7 +597,8 @@ public sealed partial class BuildRunController
                 {
                     return Said(unsaved);
                 }
-                BuildOutcome built = await BuildForAsync(run.Plan.Builds, work.Stopping, work, reading: () => FollowBuilt(again.Select(a => (a.Service.Name, a.HotReload))));
+                BuildOutcome built = await BuildForAsync(run.Plan.Builds, work.Stopping, work, reading: () => FollowBuilt(again.Select(a => (a.Service.Name, a.HotReload))),
+                    configured: run.Plan.Workspace);
                 if (!built.Succeeded)
                 {
                     return Said(built.Message);
@@ -562,7 +642,7 @@ public sealed partial class BuildRunController
         using (work)
         {
             using IDisposable held = BackgroundWork.Scope();
-            List<DotnetService> dotnet = [.. run.Plan.Dotnet.Where(d => d.Starts && run.Plan.Touched.Contains(d.Service))];
+            List<DotnetService> dotnet = [.. run.Plan.Running];
             List<string> others = [.. run.Plan.Touched.Where(s => dotnet.All(d => d.Service != s))];
             await EndSessionsAsync(run, dotnet);
             try

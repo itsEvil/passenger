@@ -82,7 +82,7 @@ internal static class DesignTimeBuilds
             {
                 using CancellationTokenRegistration stopping = cancel.Register(BuildManager.DefaultBuildManager.CancelAllSubmissions);
                 await Parallel.ForEachAsync(asked.Projects, new ParallelOptions { MaxDegreeOfParallelism = Environment.ProcessorCount, CancellationToken = cancel },
-                    async (path, _) => built(await Build(path, collection, context, global, diagnostics, cancel).ConfigureAwait(false))).ConfigureAwait(false);
+                    async (path, _) => built(await Build(path, collection, context, Own(path), diagnostics, cancel).ConfigureAwait(false))).ConfigureAwait(false);
             }
             finally
             {
@@ -90,6 +90,9 @@ internal static class DesignTimeBuilds
                 // A referenced project's output or a file changed before the next request: nothing of this one is reused.
                 BuildManager.DefaultBuildManager.ResetCaches();
             }
+
+            Dictionary<string, string> Own(string path) => asked.Each?.ContainsKey(path) == true
+                ? new(HostProperties.Of(global, asked.Each, path), StringComparer.OrdinalIgnoreCase) : global;
         }
         finally
         {
@@ -205,6 +208,7 @@ internal static class DesignTimeBuilds
             IReadOnlyList<string> frameworks = Evaluation.FrameworksOf(outer);
             List<Project> each = frameworks.Count == 0 ? [outer] : [.. frameworks.Select(f => Evaluation.Load(path, collection, context, global, f))];
             loaded.AddRange(each.Where(p => p != outer));
+            looked.AddRange(Evaluation.ConfigsLookedFor(each));
             FileGlobs[] globs = [.. outer.GetAllGlobs().Select(g => new FileGlobs([.. g.IncludeGlobs.Select(Full)], [.. g.Excludes.Select(Full)], [.. g.Removes.Select(Full)]))];
             List<RoslynProjectFileInfo> infos = [];
             List<BuildDiagnostic> said = [];
@@ -304,7 +308,7 @@ internal static class DesignTimeBuilds
             DefaultNamespace = Property(CarriedProperties.RootNamespace) ?? string.Empty,
             TargetFramework = Property(MSBuildNames.TargetFramework),
             TargetFrameworkIdentifier = Property("TargetFrameworkIdentifier"),
-            TargetFrameworkVersion = Property("TargetFrameworkVersion"),
+            TargetFrameworkVersion = Property(MSBuildNames.TargetFrameworkVersion),
             ProjectAssetsFilePath = Property(CarriedProperties.ProjectAssetsFile),
             CommandLineArgs = arguments,
             Documents = [.. instance.GetItems("Compile").Where(i => !Path.GetFileName(i.EvaluatedInclude).StartsWith("TemporaryGeneratedFile_", StringComparison.Ordinal)).Select(i => Document(i, directory))],
@@ -369,8 +373,27 @@ internal static class DesignTimeBuilds
 
         public void Initialize(IEventSource eventSource)
         {
-            eventSource.ErrorRaised += (_, e) => Add(e.BuildEventContext, new BuildDiagnostic(true, e.Message ?? string.Empty, e.ProjectFile ?? string.Empty));
-            eventSource.WarningRaised += (_, e) => Add(e.BuildEventContext, new BuildDiagnostic(false, e.Message ?? string.Empty, e.ProjectFile ?? string.Empty));
+            eventSource.ErrorRaised += (_, e) =>
+                Add(e.BuildEventContext, new BuildDiagnostic(true, Placed(e.Message, e.File, e.LineNumber, e.ColumnNumber, e.ProjectFile), e.ProjectFile ?? string.Empty));
+            eventSource.WarningRaised += (_, e) =>
+                Add(e.BuildEventContext, new BuildDiagnostic(false, Placed(e.Message, e.File, e.LineNumber, e.ColumnNumber, e.ProjectFile), e.ProjectFile ?? string.Empty));
+        }
+
+        /// <summary>A message about a file of the project's own other than its project file (a .feature a generator read)
+        /// begun with that file from the project's folder and its place, as MSBuild writes one: "Features/A.feature(2,1): ".</summary>
+        private static string Placed(string? message, string? file, int line, int column, string? project)
+        {
+            if (string.IsNullOrEmpty(file) || Path.GetDirectoryName(project) is not { Length: > 0 } folder)
+            {
+                return message ?? string.Empty;
+            }
+            string full = Path.GetFullPath(file, folder);
+            if (PathNames.Same(full, project!) || !PathNames.IsUnder(full, folder))
+            {
+                return message ?? string.Empty;
+            }
+            string place = line <= 0 ? string.Empty : column <= 0 ? $"({line})" : $"({line},{column})";
+            return $"{PathNames.Shown(full, folder)}{place}: {message}";
         }
 
         private void Add(BuildEventContext? context, BuildDiagnostic diagnostic)

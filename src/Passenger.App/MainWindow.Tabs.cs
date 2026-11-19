@@ -1,6 +1,7 @@
 using Avalonia.Controls;
 using Avalonia.Layout;
 using Passenger.App.Editors;
+using Passenger.App.Settings;
 using Passenger.App.Workspace;
 using A = Passenger.App.AppActions;
 
@@ -39,7 +40,9 @@ public partial class MainWindow
 
     /// <summary>A tab's menu items, in their order: the file's path and Open In as the Explorer's row has them, an HTML
     /// page's browser too.</summary>
-    private static MenuEntry[] TabMenuItems(OpenDocument file) =>
+    private static MenuEntry[] TabMenuItems(OpenDocument file) => file.Tool is not null
+        ? Items(A.CloseTab, A.CloseOtherTabs, A.CloseAllTabs, null, A.MoveToOppositeGroup, null, A.DockToolWindow)
+        :
     [
         .. Items(A.CloseTab, A.CloseOtherTabs, A.CloseAllTabs, A.CloseUnpinned, A.CloseTabsLeft, A.CloseTabsRight, null,
             A.SplitRight, A.SplitDown, A.MoveToOppositeGroup, A.Unsplit, A.UnsplitAll, null,
@@ -90,8 +93,8 @@ public partial class MainWindow
             }
         }, _ => Editors.CanReopen ? null : "No tab has been closed", (2, 0));
         // Found by older names too.
-        Tab(A.SplitRight, "Split Right", c => Editors.Split(TabOf(c)!.Value.Group, TabOf(c)!.Value.File, Orientation.Horizontal, move: false), Refusals.NeedsFile, (2, 1), ["Split Vertically"]);
-        Tab(A.SplitDown, "Split Down", c => Editors.Split(TabOf(c)!.Value.Group, TabOf(c)!.Value.File, Orientation.Vertical, move: false), Refusals.NeedsFile, (2, 2), ["Split Horizontally"]);
+        Tab(A.SplitRight, "Split Right", c => Editors.Split(TabOf(c)!.Value.Group, TabOf(c)!.Value.File, Orientation.Horizontal, move: false), Splits, (2, 1), ["Split Vertically"]);
+        Tab(A.SplitDown, "Split Down", c => Editors.Split(TabOf(c)!.Value.Group, TabOf(c)!.Value.File, Orientation.Vertical, move: false), Splits, (2, 2), ["Split Horizontally"]);
         Tab(A.Unsplit, "Unsplit", c => Editors.Unsplit(GroupOf(c), all: false), NotSplit, (2, 3));
         Tab(A.UnsplitAll, "Unsplit All", c => Editors.Unsplit(GroupOf(c), all: true), NotSplit, (2, 4));
 
@@ -111,6 +114,33 @@ public partial class MainWindow
         int IndexOf(ActionContext c) => TabOf(c)!.Value.Group.Tabs.Select(t => t.Document).ToList().IndexOf(TabOf(c)!.Value.File);
 
         string? NotSplit(ActionContext c) => Editors.IsSplit(GroupOf(c)) ? null : "The editor is not split";
+
+        // A tool window's view stands in one place, so its tab moves between groups but is never shown twice.
+        string? Splits(ActionContext c) => Refusals.NeedsFile(c) ?? (TabOf(c)?.File.Tool is { } tool ? $"{tool.Window.Title} shows in one place at a time" : null);
+    }
+
+    /// <summary>The theme's default layout as the dock's default, once every tool window is added: what the window opens on
+    /// where no layout is kept, and what Restore Default Layout goes back to; and the arrangement it gives where the person
+    /// set none.</summary>
+    private void FollowThemeLayout()
+    {
+        EventHandler follow = (_, _) =>
+        {
+            Dock.UseDefault(Themes.Layout);
+            FollowArrangement(settingsStore.Effective);
+        };
+        follow(null, EventArgs.Empty);
+        Themes.LayoutChanged += follow;
+        Closed += (_, _) => Themes.LayoutChanged -= follow;
+    }
+
+    /// <summary>The window's arrangement in force, the person's where they set it, else the theme's: where the editor's tabs
+    /// stand, how the tool windows are named and whether one closed leaves its stripe.</summary>
+    private void FollowArrangement(AppSettings next)
+    {
+        Editors.TabsPlace = next.TabsPlace();
+        Dock.TitledTabs = next.ToolWindowsAs() == ToolWindowLook.TitledTabs;
+        Dock.ClosesOffStripe = next.ClosedWindows() == ClosedToolWindows.LeaveStripe;
     }
 
     /// <summary>The tab an action acts on: the one whose menu it was chosen from, else the one the active group shows.</summary>
@@ -128,12 +158,13 @@ public partial class MainWindow
     /// <summary>The tab menu, its items run on the tab it opened on.</summary>
     private void FillTabMenu(TabMenu opening)
     {
-        ActionContext context = new(opening.Document, opening.Group.Editor, null, null, session.Debug.IsDebugging ? session.Debug.Session?.State : null)
-        {
-            Tab = (opening.Group, opening.Document),
-        };
+        ActionContext context = TabContext(opening.Group, opening.Document);
         opening.Menu.ItemsSource = TabMenuItems(opening.Document).Select(entry => FlyoutEntry(entry, context)).ToList();
     }
+
+    /// <summary>Where a tab action runs on one tab of a group, whatever is shown or has the keys when it runs.</summary>
+    private ActionContext TabContext(EditorGroup group, OpenDocument file) =>
+        new(file, group.Editor, null, null, session.Debug.IsDebugging ? session.Debug.Session?.State : null) { Tab = (group, file) };
 
     private static MenuEntry[] Items(params string?[] ids) => [.. ids.Select(id => new MenuEntry(id))];
 }

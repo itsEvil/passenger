@@ -66,6 +66,10 @@ public sealed class ProjectHost : IAsyncDisposable
         startedFor = (folder, globalJson);
     }
 
+    /// <summary>The folders the host was handed out for (<see cref="ProjectHosts.ForAsync"/>), whose MSBuild files it may
+    /// have run and whose tasks it may hold loaded; read and written under the hosts' gate.</summary>
+    internal HashSet<string> Served { get; } = new(PathNames.Comparer);
+
     /// <summary>Whether its SDK is the one a folder picks, known without asking dotnet: the host was started for that folder,
     /// whose global.json stands as it did, and found the SDK as dotnet does there.</summary>
     public bool StartedFor(string folder) => PathNames.Same(startedFor.Folder, folder) && Dotnet.GlobalJsonOver(folder) == startedFor.GlobalJson;
@@ -114,24 +118,44 @@ public sealed class ProjectHost : IAsyncDisposable
         try
         {
             // No SDK to load without the person's dotnet, whichever runtime the host runs on.
-            dotnet = Dotnet.Host();
+            dotnet = Dotnet.Host(folder);
         }
         catch (FileNotFoundException missing)
         {
             throw new ProjectHostFailed(missing.Message, missing) { MissingSdk = MissingSdk.NoDotnet(missing.Message) };
         }
+        // Translated, the host is x64 code, and an Arm64 SDK's MSBuild would end it as it loads.
+        if (Dotnet.Translated && !Dotnet.IsX64(dotnet))
+        {
+            string said = $"{dotnet} is no x64 program, and this x64 Passenger loads MSBuild only from an x64 .NET SDK";
+            throw new ProjectHostFailed(said) { MissingSdk = MissingSdk.OtherProcessor(said) };
+        }
+        // An x64 dotnet with no SDK, where the system's own has one, is the same want: the host would load none.
+        if (Dotnet.Translated && DotnetMachine.Read(folder).SystemsOwn is { } own)
+        {
+            string said = $"{Path.GetDirectoryName(PathNames.Canonical(dotnet))} holds no .NET SDK, and the .NET SDK {own.NewestSdk} in {own.Root} is the system's "
+                + "own processor's: this x64 Passenger loads MSBuild only from an x64 .NET SDK";
+            throw new ProjectHostFailed(said) { MissingSdk = MissingSdk.OtherProcessor(said) };
+        }
         ProcessStartInfo start;
         try
         {
             // Run in the IDE's folder, not the one it evaluates for, which may be deleted under it.
-            start = ChildProcesses.ConservingMemory(onMachine ? ChildProcesses.DotnetCommand([Assembly, "--folder", folder]) : ChildProcesses.HelperCommand(Assembly, ["--folder", folder]));
+            start = ChildProcesses.ConservingMemory(onMachine
+                ? ChildProcesses.DotnetCommand(dotnet, [Assembly, "--folder", folder], null)
+                : ChildProcesses.HelperCommand(Assembly, ["--folder", folder]));
         }
         catch (FileNotFoundException missing)
         {
             throw new ProjectHostFailed($"the project host could not start: {missing.Message}", missing);
         }
         // The installation MSBuild's SDK resolvers and tools take, which the helper host is no part of.
-        start.Environment[RuntimeVariables.HostPath] = dotnet;
+        ChildProcesses.NamingDotnet(start, folder);
+        if (Dotnet.Translated)
+        {
+            // The locator finds its SDK where DOTNET_ROOT says, which may name the system's own rather than the x64 one chosen.
+            start.Environment[RuntimeVariables.Root] = Path.GetDirectoryName(PathNames.Canonical(dotnet));
+        }
         // The newest runtime there is, a prerelease too, for a host on the machine's and for what MSBuild starts.
         start.Environment[RuntimeVariables.RollForwardToPrerelease] = "1";
         start.RedirectStandardInput = true;
@@ -191,7 +215,7 @@ public sealed class ProjectHost : IAsyncDisposable
     {
         Reply reply = Reply.Read(first);
         return reply.Error is { } error ? throw new ProjectHostFailed(error) { MissingSdk = MissingSdk.From(error) }
-            : reply.Value.IsEmpty || reply.Partial || JsonSerializer.Deserialize<HostReady>(reply.Value, HostJson.Options) is not { } ready
+            : reply.Value.IsEmpty || reply.Partial || JsonSerializer.Deserialize<HostReady>(reply.Value, PeerJson.Options) is not { } ready
                 ? throw new ProjectHostFailed("the project host did not say which SDK it loaded")
             : ready;
     }
@@ -209,12 +233,14 @@ public sealed class ProjectHost : IAsyncDisposable
     }
 
     /// <summary>Evaluates projects, handing each over as it is evaluated (a multi-targeted one twice: its outer evaluation,
-    /// then complete), on the reader's thread; done once every one has been.</summary>
-    public async Task<EvaluateDone> EvaluateAsync(IReadOnlyList<string> projects, IReadOnlyDictionary<string, string> properties, Action<EvaluatedProject> evaluated, CancellationToken cancel = default)
+    /// then complete), on the reader's thread; done once every one has been. Some projects may take properties of their own
+    /// beyond those given all (<paramref name="each"/>, by path).</summary>
+    public async Task<EvaluateDone> EvaluateAsync(IReadOnlyList<string> projects, IReadOnlyDictionary<string, string> properties, Action<EvaluatedProject> evaluated, CancellationToken cancel = default,
+        IReadOnlyDictionary<string, IReadOnlyDictionary<string, string>>? each = null)
     {
         await GiveProgramsAsync(projects, cancel).ConfigureAwait(false);
-        return await AskAsync<EvaluateDone>(HostMethods.Evaluate, new EvaluateParams(projects, properties),
-            partial => evaluated(JsonSerializer.Deserialize<EvaluatedProject>(partial, HostJson.Options)!), cancel).ConfigureAwait(false)
+        return await AskAsync<EvaluateDone>(HostMethods.Evaluate, new EvaluateParams(projects, properties) { Each = each },
+            partial => evaluated(JsonSerializer.Deserialize<EvaluatedProject>(partial, PeerJson.Options)!), cancel).ConfigureAwait(false)
             ?? throw new ProjectHostFailed("the project host gave no answer for its evaluation");
     }
 
@@ -263,14 +289,16 @@ public sealed class ProjectHost : IAsyncDisposable
     }
 
     /// <summary>Builds projects at design time, handing each over as its builds end, on the reader's thread; done once
-    /// every one has been.</summary>
-    public async Task<BuildDone> BuildAsync(IReadOnlyList<string> projects, IReadOnlyDictionary<string, string> properties, Action<BuiltProject> built, CancellationToken cancel = default)
+    /// every one has been. Some projects may take properties of their own beyond those given all (<paramref name="each"/>,
+    /// by path).</summary>
+    public async Task<BuildDone> BuildAsync(IReadOnlyList<string> projects, IReadOnlyDictionary<string, string> properties, Action<BuiltProject> built, CancellationToken cancel = default,
+        IReadOnlyDictionary<string, IReadOnlyDictionary<string, string>>? each = null)
     {
         Interlocked.Increment(ref building);
         try
         {
             await GiveProgramsAsync(projects, cancel).ConfigureAwait(false);
-            return await AskAsync<BuildDone>(HostMethods.Build, new BuildParams(projects, properties),
+            return await AskAsync<BuildDone>(HostMethods.Build, new BuildParams(projects, properties) { Each = each },
                 partial => built(BuiltProject.Read(partial)), cancel).ConfigureAwait(false)
                 ?? throw new ProjectHostFailed("the project host gave no answer for its builds");
         }
@@ -300,6 +328,13 @@ public sealed class ProjectHost : IAsyncDisposable
             ?? throw new ProjectHostFailed("the project host gave no answer for the project's properties");
     }
 
+    /// <summary>Each project a build of a solution builds under the solution configuration named (else the one a build given
+    /// none takes), with the configuration and platform it gives it, and the configurations the solution declares; or why
+    /// MSBuild could not read the solution.</summary>
+    public async Task<SolutionBuild> SolutionBuildAsync(string solution, CancellationToken cancel = default, SolutionConfiguration? chosen = null) =>
+        await AskAsync<SolutionBuild>(HostMethods.Solution, new SolutionParams(solution, chosen?.Configuration, chosen?.Platform), null, cancel).ConfigureAwait(false)
+            ?? throw new ProjectHostFailed("the project host gave no answer for the solution's build");
+
     /// <summary>What a build of one project with these global properties reads and makes, as its evaluations say, or why a
     /// build of it reads more than that.</summary>
     public async Task<BuildInputs> InputsAsync(string project, IReadOnlyDictionary<string, string> properties, CancellationToken cancel = default) =>
@@ -323,7 +358,7 @@ public sealed class ProjectHost : IAsyncDisposable
         TaskCompletionSource held = new(TaskCreationOptions.RunContinuationsAsynchronously);
         Task<bool?> asked = AskAsync<bool?>(HostMethods.Hold, new HoldParams(), partial =>
         {
-            HoldState state = JsonSerializer.Deserialize<HoldState>(partial, HostJson.Options)!;
+            HoldState state = JsonSerializer.Deserialize<HoldState>(partial, PeerJson.Options)!;
             if (state.Held)
             {
                 held.TrySetResult();
@@ -352,7 +387,7 @@ public sealed class ProjectHost : IAsyncDisposable
     /// handed to <paramref name="partial"/> as they come, as their bytes, on the reader's thread.</summary>
     private async Task<T?> AskAsync<T>(string method, object parameters, Action<ReadOnlySpan<byte>>? partial, CancellationToken cancel)
     {
-        (int id, Task<object?> answered) = pending.Add(new Asked(partial, static result => result.IsEmpty ? null : JsonSerializer.Deserialize<T>(result, HostJson.Options)));
+        (int id, Task<object?> answered) = pending.Add(new Asked(partial, static result => result.IsEmpty ? null : JsonSerializer.Deserialize<T>(result, PeerJson.Options)));
         lock (spoiling)
         {
             if (spoiling.GetValueOrDefault(method) > 0)
@@ -439,7 +474,7 @@ public sealed class ProjectHost : IAsyncDisposable
     /// <summary>A request on its way to the host, whose answer, if any, is matched by its id.</summary>
     private void Send(int id, string method, object parameters)
     {
-        string line = JsonSerializer.Serialize(new HostRequest(id, method, JsonSerializer.SerializeToElement(parameters, parameters.GetType(), HostJson.Options)), HostJson.Options);
+        string line = JsonSerializer.Serialize(new HostRequest(id, method, JsonSerializer.SerializeToElement(parameters, parameters.GetType(), PeerJson.Options)), PeerJson.Options);
         try
         {
             lock (writing)
@@ -604,21 +639,27 @@ public static class ProjectHosts
     private static readonly SemaphoreSlim Gate = new(1, 1);
     private static readonly List<ProjectHost> Running = [];
 
-    /// <summary>The host for a folder's SDK: one running already, else one started for it, which a folder deleted since
-    /// is refused (<see cref="ProjectHostFailed"/>). Found on the thread pool, whoever asks: what the gate is held over
-    /// (the SDK asked, a host started) is every window's.</summary>
+    /// <summary>The host for a folder's SDK: one running already, else one started for it, which a folder deleted since,
+    /// or one not trusted (<see cref="WorkspaceTrust"/>), whose projects MSBuild would run, is refused
+    /// (<see cref="ProjectHostFailed"/>). Found on the thread pool, whoever asks: what the gate is held over (the SDK asked,
+    /// a host started) is every window's.</summary>
     public static Task<ProjectHost> ForAsync(string folder, CancellationToken cancel = default) =>
         // Not held, each caller holding its own wait: on a caller's thread, one busy or never running again would keep the gate.
         BackgroundWork.Unheld(() => FindAsync(folder, cancel), cancel);
 
     private static async Task<ProjectHost> FindAsync(string folder, CancellationToken cancel)
     {
+        if (!WorkspaceTrust.Trusts(folder))
+        {
+            throw new ProjectHostFailed(WorkspaceTrust.Untrusted);
+        }
         await Gate.WaitAsync(cancel).ConfigureAwait(false);
         try
         {
             Running.RemoveAll(h => h.HasExited);
             if (Running.FirstOrDefault(h => h.StartedFor(folder)) is { } own)
             {
+                own.Served.Add(folder);
                 return own;
             }
             if (!Directory.Exists(folder))
@@ -638,16 +679,37 @@ public static class ProjectHosts
                     wanted = null;
                 }
                 // A host's SDK is MSBuild's folder, named for its version under the sdk folder of the dotnet the folder takes.
-                string? root = wanted is null ? null : Dotnet.Find()?.Root;
+                string? root = wanted is null ? null : Dotnet.Find(folder)?.Root;
                 if (root is not null && Running.FirstOrDefault(h => PathNames.Same(Path.TrimEndingDirectorySeparator(h.Sdk), Path.Combine(root, "sdk", wanted!))) is { } same)
                 {
+                    same.Served.Add(folder);
                     return same;
                 }
             }
             ProjectHost started = await ProjectHost.StartAsync(folder, cancel).ConfigureAwait(false);
             PassengerLog.Write($"Project host (process {started.ProcessId}) started with the .NET SDK {started.Version} for {folder}");
+            started.Served.Add(folder);
             Running.Add(started);
             return started;
+        }
+        finally
+        {
+            Gate.Release();
+        }
+    }
+
+    /// <summary>Ends the hosts handed out for a folder or one under it (one whose trust was taken back), which may hold its
+    /// tasks loaded: what each was asked fails as at a host's own end, so another window's asks go to a host started anew.</summary>
+    public static async Task EndServingAsync(string folder, string why)
+    {
+        await Gate.WaitAsync().ConfigureAwait(false);
+        try
+        {
+            foreach (ProjectHost host in Running.Where(h => h.Served.Any(f => PathNames.Within(f, folder))).ToList())
+            {
+                Running.Remove(host);
+                host.End(why);
+            }
         }
         finally
         {

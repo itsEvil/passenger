@@ -64,7 +64,7 @@ public sealed class GameFramesView : DockPanel
     private readonly FrameChart chart;
     private readonly TextBlock summary;
     private readonly TreeRows<GameRow> rows = [];
-    private readonly ListBox table;
+    private readonly TreeList table;
     private readonly TextBlock placeholder;
     private readonly BandOverTable shown;
     private IReadOnlyList<GameFrame> frames = [];
@@ -80,13 +80,13 @@ public sealed class GameFramesView : DockPanel
         ScrollViewer strip = FramesTable.Strip(chart);
         StackPanel legend = FramesTable.Legend([("Physics", TokenKeys.Graph_1), ("GDScript", TokenKeys.Graph_0), ("C# (sampled)", TokenKeys.Graph_2), ("Godot", TokenKeys.TextMuted)]);
         summary = FramesTable.Muted(string.Empty);
-        summary.Margin = new Thickness(12, 6, 12, 2);
+        summary.Margin = new Thickness(Gaps.Wide, Gaps.Small, Gaps.Wide, Gaps.Hair);
         summary.TextWrapping = TextWrapping.Wrap;
         TextBlock joining = FramesTable.Muted(Joining);
-        joining.Margin = new Thickness(12, 0, 12, 6);
+        joining.Margin = new Thickness(Gaps.Wide, 0, Gaps.Wide, Gaps.Small);
         joining.TextWrapping = TextWrapping.Wrap;
         // On the legend's line, so the table under the band keeps its room in a short panel.
-        frameLink = new Button { Classes = { StyleClasses.Link }, Margin = new Thickness(12, 2, 12, 0), HorizontalAlignment = HorizontalAlignment.Right };
+        frameLink = new Button { Classes = { StyleClasses.Link }, Margin = new Thickness(Gaps.Wide, Gaps.Hair, Gaps.Wide, 0), HorizontalAlignment = HorizontalAlignment.Right };
         ToolTip.SetTip(frameLink, "The call tree of the frame alone, both languages together, its costliest function chosen");
         frameLink.Click += (_, _) =>
         {
@@ -98,7 +98,6 @@ public sealed class GameFramesView : DockPanel
         ColumnTitles titles = ColumnTitles.OfNumbers(("Function", 0), ("Own time", NumberWidth), ("Time in all", NumberWidth), ("Calls", NumberWidth),
             ("In Godot's API", NumberWidth + 16));
         table = FramesTable.Table(rows, () => RowOf(titles));
-        table.DoubleTapped += (_, _) => Open();
         TreeKeys.Attach<GameRow>(table, Toggle, OpenRow);
         shown = new BandOverTable(new StackPanel { Children = { new DockPanel { Children = { legend, frameLink } }, strip, summary, joining } }, titles, table);
         placeholder = FramesTable.Placeholder(NoFrames);
@@ -278,14 +277,6 @@ public sealed class GameFramesView : DockPanel
             + $"in all.{drawn} Choose a frame for its own.";
     }
 
-    private void Open()
-    {
-        if (table.SelectedItem is GameRow row && !OpenRow(row))
-        {
-            Toggle(row);
-        }
-    }
-
     /// <summary>A function's row opened: its script at its line, or its C# source; false for any other row.</summary>
     private bool OpenRow(GameRow row)
     {
@@ -308,7 +299,7 @@ public sealed class GameFramesView : DockPanel
     {
         TextBlock place = FramesTable.Muted(string.Empty);
         place.VerticalAlignment = VerticalAlignment.Center;
-        place.Margin = new Thickness(8, 0, 0, 0);
+        place.Margin = new Thickness(Gaps.Normal, 0, 0, 0);
         place.TextTrimming = TextTrimming.CharacterEllipsis;
         (StackPanel named, RowIcon chevron, TextBlock name) = FramesTable.Named<GameRow>(Toggle, place);
         TextBlock[] numbers = [FramesTable.Number(), FramesTable.Number(), FramesTable.Number(), FramesTable.Number()];
@@ -320,7 +311,7 @@ public sealed class GameFramesView : DockPanel
             name.Text = shown.Name;
             name.FontWeight = shown.Depth == 0 ? FontWeight.SemiBold : FontWeight.Normal;
             place.Text = shown.Place ?? string.Empty;
-            named.Margin = new Thickness(shown.Depth * 14, 0, 0, 0);
+            named.Margin = new Thickness(shown.Depth * Gaps.Indent, 0, 0, 0);
             FramesTable.Put(numbers[0], shown.Own is { } own ? $"{own:N1} ms" : string.Empty);
             FramesTable.Put(numbers[1], shown.All is { } all ? $"{all:N1} ms" : string.Empty);
             FramesTable.Put(numbers[2], shown.Calls is { } calls ? $"{calls:N0}" : string.Empty);

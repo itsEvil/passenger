@@ -215,10 +215,39 @@ public sealed record FileText(string Text, Encoding Encoding, bool HasBom, bool 
 
     private static byte[] FromDisk(string path)
     {
-        using FileStream stream = new(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
-        using MemoryStream bytes = new();
-        stream.CopyTo(bytes);
-        return bytes.ToArray();
+        using FileStream stream = new(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete, bufferSize: 0);
+        return ReadRest(stream, []);
+    }
+
+    /// <summary>A file's bytes: <paramref name="begun"/>, what was read of <paramref name="stream"/> first, and the rest, in
+    /// one array of the length the stream has, read on to its end where it has grown since (another program writing it),
+    /// short where it has shrunk; a stream of no length (a pipe) read as it comes.</summary>
+    public static byte[] ReadRest(Stream stream, ReadOnlySpan<byte> begun)
+    {
+        if (!stream.CanSeek || stream.Length > Array.MaxLength)
+        {
+            using MemoryStream all = new();
+            all.Write(begun);
+            stream.CopyTo(all);
+            return all.ToArray();
+        }
+        byte[] bytes = new byte[Math.Max(stream.Length, begun.Length)];
+        begun.CopyTo(bytes);
+        int read = begun.Length + stream.ReadAtLeast(bytes.AsSpan(begun.Length), bytes.Length - begun.Length, throwOnEndOfStream: false);
+        if (read < bytes.Length)
+        {
+            return bytes[..read];
+        }
+        int more = stream.ReadByte();
+        if (more < 0)
+        {
+            return bytes;
+        }
+        using MemoryStream grown = new();
+        grown.Write(bytes);
+        grown.WriteByte((byte)more);
+        stream.CopyTo(grown);
+        return grown.ToArray();
     }
 
     /// <summary>A file about to be written by a save, so a folder watcher takes it for the change it is rather than a
@@ -263,17 +292,53 @@ public sealed record FileText(string Text, Encoding Encoding, bool HasBom, bool 
         FileText written = unheld is null ? new FileText(text, encoding, bom, crBreaks) : new FileText(text, new UTF8Encoding(false), false, crBreaks);
         Writing?.Invoke(path);
         Write(path, Encoded(text, written.Encoding, written.HasBom, crBreaks), written.Encoding, makeFolder);
-        return (written, unheld is null ? null : $"{Path.GetFileName(path)} was saved as UTF-8: {FileEncoding.Of(encoding, bom).Name} cannot hold '{unheld}'");
+        return (written, Converted(path, encoding, bom, unheld));
     }
+
+    /// <summary>What a save says of a text its encoding could not hold, written as UTF-8; null where it held it all.</summary>
+    private static string? Converted(string path, Encoding encoding, bool bom, string? unheld) =>
+        unheld is null ? null : $"{Path.GetFileName(path)} was saved as UTF-8: {FileEncoding.Of(encoding, bom).Name} cannot hold '{unheld}'";
 
     /// <summary>Writes a file the IDE makes as its .editorconfig asks, as <see cref="Save"/> writes: each of the text's breaks
     /// as <c>end_of_line</c> says (else '\n'), in the encoding <c>charset</c> names (else UTF-8 without a BOM).</summary>
     public static (FileText Written, string? Converted) SaveNew(string path, string text)
     {
+        (string conventional, FileEncoding charset, bool crBreaks) = Conventional(path, text);
+        return Save(path, conventional, charset.Encoding, charset.Bom, crBreaks);
+    }
+
+    /// <summary>Writes a file the IDE makes, as <see cref="SaveNew"/> does, only where no file is there yet: one there
+    /// already, or made by another program while this one is written, is left as it is. What was written, or null where a
+    /// file was there.</summary>
+    public static (FileText Written, string? Converted)? SaveNewOnly(string path, string text)
+    {
+        if (File.Exists(path) || new FileInfo(path).LinkTarget is not null)
+        {
+            return null;
+        }
+        (string conventional, FileEncoding charset, bool crBreaks) = Conventional(path, text);
+        string? unheld = Unheld(charset.Encoding, conventional);
+        FileText written = unheld is null ? new FileText(conventional, charset.Encoding, charset.Bom, crBreaks) : new FileText(conventional, new UTF8Encoding(false), false, crBreaks);
+        byte[] bytes = Encoded(conventional, written.Encoding, written.HasBom, crBreaks);
+        Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(path))!);
+        bool placed = false;
+        Writing?.Invoke(path);
+        AtomicFile.Write(path, bytes, null, SaveSuffix, (temporary, at) => placed = AtomicFile.MoveNew(temporary, at));
+        if (!placed)
+        {
+            return null;
+        }
+        Wrote?.Invoke(path, null, bytes);
+        return (written, Converted(path, charset.Encoding, charset.Bom, unheld));
+    }
+
+    /// <summary>A new file's text, encoding and breaks as its .editorconfig asks: each break as <c>end_of_line</c> says (else
+    /// '\n'), in the encoding <c>charset</c> names (else UTF-8 without a BOM).</summary>
+    private static (string Text, FileEncoding Charset, bool CrBreaks) Conventional(string path, string text)
+    {
         EditorConfig conventions = EditorConfig.For(path);
-        FileEncoding charset = conventions.Charset ?? FileEncoding.Utf8;
         LineSeparator separator = conventions.EndOfLine ?? LineSeparator.LF;
-        return Save(path, LineEndings.In(text, separator.Held()), charset.Encoding, charset.Bom, separator == LineSeparator.CR);
+        return (LineEndings.In(text, separator.Held()), conventions.Charset ?? FileEncoding.Utf8, separator == LineSeparator.CR);
     }
 
     /// <summary>Writes a file's new text as the file was stored (<paramref name="had"/>), as <see cref="Save"/> writes: its
@@ -294,7 +359,7 @@ public sealed record FileText(string Text, Encoding Encoding, bool HasBom, bool 
     }
 
     /// <summary>Writes a file's bytes as they were, as a save writes: Local History's revert of a file not open, or of one
-    /// deleted since, and a file landed whole.</summary>
+    /// deleted since, a file landed whole, and a copy's bytes made again.</summary>
     public static void Restore(string path, byte[] bytes)
     {
         Writing?.Invoke(path);
@@ -487,15 +552,15 @@ public sealed record FileText(string Text, Encoding Encoding, bool HasBom, bool 
         }
     }
 
-    /// <summary>Puts the written file in the target's place: a move, but on Windows over a target with what a move would
-    /// lose (<see cref="WindowsFileMetadata.MoveKeeps"/>: its attributes, its own ACL, its streams, Zone.Identifier's too),
-    /// where ReplaceFile keeps them. The old file it sets aside meanwhile is named as a save's own
-    /// (<see cref="IsSaving(string)"/>), never as a file come and gone, and deleted once the new one has its place.</summary>
+    /// <summary>Puts the written file in the target's place: a move (<see cref="AtomicFile.Move"/>), but on Windows over a
+    /// target with what a move would lose (<see cref="WindowsFileMetadata.MoveKeeps"/>: its attributes, its own ACL, its
+    /// streams, Zone.Identifier's too), where ReplaceFile keeps them. The old file it sets aside meanwhile is named as a
+    /// save's own (<see cref="IsSaving(string)"/>), never as a file come and gone, and deleted once the new one has its place.</summary>
     private static void Over(string temporary, string target)
     {
         if (!OperatingSystem.IsWindows() || !File.Exists(target) || WindowsFileMetadata.MoveKeeps(target, temporary))
         {
-            File.Move(temporary, target, overwrite: true);
+            AtomicFile.Move(temporary, target);
             return;
         }
         string setAside = Path.Join(Path.GetDirectoryName(target), Guid.NewGuid().ToString("N") + SaveSuffix);
@@ -506,7 +571,7 @@ public sealed record FileText(string Text, Encoding Encoding, bool HasBom, bool 
         catch (Exception refused) when (refused is IOException or UnauthorizedAccessException && !File.Exists(target) && File.Exists(temporary))
         {
             // ERROR_UNABLE_TO_MOVE_REPLACEMENT_2: the old file is set aside but the new one could not take its name; the move gives it.
-            File.Move(temporary, target, overwrite: true);
+            AtomicFile.Move(temporary, target);
         }
         finally
         {

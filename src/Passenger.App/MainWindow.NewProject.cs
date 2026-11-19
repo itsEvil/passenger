@@ -23,12 +23,13 @@ public partial class MainWindow
         actions!.Add(new IdeAction(AppActions.NewSolution, "New Solution…", "IDE", _ => ShowNewSolution())
         {
             WhyNot = _ => WithoutAnySdk(),
-            Menus = [new MenuPlace("File", 0, -1)],
+            Menus = [new MenuPlace("File", 0, -2)],
         });
         actions.Add(new IdeAction(AppActions.NewProject, "New Project…", "IDE", _ => ShowNewProject(ChosenSolutionFolder()))
         {
             WhyNot = _ => Solution is null ? Refusals.NoSolution : WithoutAnySdk(),
         });
+        Activated += (_, _) => ProjectTemplates.LookAgain();
     }
 
     /// <summary>dotnet new's templates read ahead of New Solution (where it puts a solution) once a person's window is up,
@@ -46,9 +47,16 @@ public partial class MainWindow
     /// <summary>New Solution: the dialog over this window, and the solution opened, built, once it is made.</summary>
     public NewProjectDialog ShowNewSolution()
     {
-        NewProjectDialog dialog = new(BesideLast(), null, ContainersWhyNot(), settings.GodotExecutable);
+        NewProjectDialog dialog = new(BesideLast(), null, ContainersWhyNot(), settings.GodotExecutable) { Workloads = InstallAskedWorkloadsAsync, WorkloadPlace = WorkloadFoldersAsync };
         dialog.Closed += (_, _) =>
         {
+            // What Passenger made is the person's own code, opened trusted, but in a Git repository only the person trusts.
+            if (dialog.Created is { } created && (created.Solution is not null || created.Game)
+                && PathNames.Canonical(created.Solution is { } named ? Path.GetDirectoryName(named)! : created.Folder) is { } own
+                && WorkspaceTrust.TrustsAlone(own))
+            {
+                TrustFolder(own);
+            }
             if (dialog.Created is { Solution: { } solution } made)
             {
                 IdeErrors.Observe(OpenNewSolutionAsync(solution, made));
@@ -63,6 +71,10 @@ public partial class MainWindow
         return dialog;
     }
 
+    /// <summary>New Project's Install of a workload, the person's ask: the window's one install of workloads, asking nothing more.</summary>
+    public Task<(bool Installed, string Said, string? ToRun)> InstallAskedWorkloadsAsync(IReadOnlyList<string> ids, Action<string> stages, Action<string> lines, CancellationToken stop) =>
+        InstallWorkloadsAsync(ids, asks: false, stages, lines, stop);
+
     /// <summary>Add, New Project: the dialog over this window for a project in the open solution, in a solution folder
     /// (by its path in the solution) or at its top; null with no solution open.</summary>
     public NewProjectDialog? ShowNewProject(string? into)
@@ -74,7 +86,7 @@ public partial class MainWindow
         }
         ProjectTarget target = new(solution.Path, into, [.. solution.Projects.Select(p => Path.GetFileNameWithoutExtension(p.Path))],
             Projects.FirstOrDefault(p => p.Exists && p.IsAspireHost)?.Name);
-        NewProjectDialog dialog = new(ProjectFolderFor(solution, into), target, ContainersWhyNot(), settings.GodotExecutable);
+        NewProjectDialog dialog = new(ProjectFolderFor(solution, into), target, ContainersWhyNot(), settings.GodotExecutable) { Workloads = InstallAskedWorkloadsAsync, WorkloadPlace = WorkloadFoldersAsync };
         dialog.Closed += (_, _) =>
         {
             if (dialog.Created is { } made && Solution?.Path == solution.Path)

@@ -119,6 +119,48 @@ public class CreateFromUsageTests
         Assert.Contains($"<local:{key} x:Key=\"{key}\" />", XamlFiles.Applied(window, fix.Edits(window)), StringComparison.Ordinal);
     }
 
+    /// <summary>A converter's key holding marks names its class and file whole, as C# reads a name, and what it makes compiles.</summary>
+    [Fact]
+    public void A_converter_made_for_a_key_holding_marks_names_its_class_and_file_whole()
+    {
+        const string Key = "मूल्यConverter";
+        string window = "<Window xmlns=\"https://github.com/avaloniaui\" xmlns:x=\"http://schemas.microsoft.com/winfx/2006/xaml\">\n"
+            + $"    <TextBlock Text=\"{{Binding Price, Converter={{StaticResource {Key}}}}}\" />\n</Window>\n";
+        XamlFile file = XamlFiles.Read("MainWindow.axaml", window, AvaloniaDialect.Instance);
+        XamlFix fix = Assert.IsType<XamlFix>(CreateFromUsage.Converter(file, Key));
+        XamlFileChange made = Assert.Single(fix.Others);
+        Assert.True(made.Path == XamlFiles.PathOf(Key + ".cs"), $"The converter for {Key} was made as {Path.GetFileName(made.Path)}, its name cut at its marks");
+        Assert.Contains($"public class {Key} : IValueConverter", made.Made, StringComparison.Ordinal);
+        IReadOnlyList<Diagnostic> errors = Errors(made.Made!);
+        Assert.True(errors.Count == 0, $"The converter made for the key '{Key}' does not compile:\n{string.Join("\n", errors)}\n{made.Made}");
+        Assert.Contains($"<local:{Key} x:Key=\"{Key}\" />", XamlFiles.Applied(window, fix.Edits(window)), StringComparison.Ordinal);
+    }
+
+    /// <summary>A converter's namespace is written as its view's code-behind writes its own, block or file-scoped, the
+    /// code-behind's namespace named with marks.</summary>
+    [Theory]
+    [InlineData("namespace गिनती\n{\n    public partial class MainWindow\n    {\n    }\n}\n", false)]
+    [InlineData("namespace गिनती;\n\npublic partial class MainWindow\n{\n}\n", true)]
+    public void A_converter_writes_its_namespace_as_a_code_behind_named_with_marks_writes_its_own(string behind, bool scoped)
+    {
+        DirectoryInfo folder = Directory.CreateTempSubdirectory("passenger-unit-");
+        try
+        {
+            string view = Path.Combine(folder.FullName, "MainWindow.axaml");
+            File.WriteAllText(view + ".cs", behind);
+            string window = "<Window xmlns=\"https://github.com/avaloniaui\" xmlns:x=\"http://schemas.microsoft.com/winfx/2006/xaml\">\n"
+                + "    <TextBlock Text=\"{Binding Title, Converter={StaticResource ShoutConverter}}\" />\n</Window>\n";
+            XamlFile file = new(view, XmlTree.Parse(window), XamlFiles.Project(AvaloniaDialect.Instance));
+            string made = Assert.Single(Assert.IsType<XamlFix>(CreateFromUsage.Converter(file, "ShoutConverter")).Others).Made!;
+            Assert.True(made.Contains(scoped ? ";\n\npublic class ShoutConverter" : "\n{\n    public class ShoutConverter", StringComparison.Ordinal),
+                $"The converter's namespace is not written {(scoped ? "file-scoped" : "in a block")} as its code-behind writes its own:\n{made}");
+        }
+        finally
+        {
+            folder.Delete(recursive: true);
+        }
+    }
+
     /// <summary>The errors a file of C# compiles with, Avalonia's IValueConverter declared beside it.</summary>
     private static IReadOnlyList<Diagnostic> Errors(string code)
     {

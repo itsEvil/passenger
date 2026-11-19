@@ -4,6 +4,7 @@ using Avalonia.Controls.Presenters;
 using Avalonia.Controls.Primitives;
 using Avalonia.Headless.XUnit;
 using Avalonia.Media;
+using Avalonia.Styling;
 using Avalonia.VisualTree;
 using Passenger.App;
 using Passenger.App.Debugging;
@@ -17,7 +18,8 @@ namespace Passenger.Tests;
 
 /// <summary>A dialog's buttons as a person sees them: each one's words centred in it, unless it reads as text (a link,
 /// a crumb); a dialog's text buttons, the default among them, one height and one corner radius; the default button and
-/// Cancel in the platform's order, the default rightmost on macOS and first elsewhere, a popup's as a dialog's.
+/// Cancel in the platform's order, the default rightmost on macOS and first elsewhere, a popup's as a dialog's; a plain
+/// button and the default one lit under the pointer and deeper while pressed.
 /// <see cref="Check"/> is the rule, which the tests that open the other dialogs (a refactoring's, Conflicts, a feed's)
 /// hold their dialogs to as well.</summary>
 public sealed class DialogButtonsTests : IDisposable
@@ -35,11 +37,12 @@ public sealed class DialogButtonsTests : IDisposable
     }
 
     [AvaloniaTheory]
-    [InlineData(Look.Passenger)]
-    [InlineData(Look.Harbour)]
-    public void Every_dialog_has_its_buttons_words_centred_and_its_text_buttons_alike_with_the_default_where_Rider_puts_it(Look look)
+    [InlineData(CarriedThemes.Own)]
+    [InlineData("Harbour")]
+    [InlineData("Cubicle")]
+    public void Every_dialog_has_its_buttons_words_centred_and_its_text_buttons_alike_with_the_default_where_Rider_puts_it(string look)
     {
-        using IDisposable worn = UiRulesTests.Wearing(look);
+        using IDisposable worn = CarriedThemes.Wearing(look);
         // A solution, which Add Aspire Orchestration adds to; no C# language server, which no dialog here asks of.
         File.WriteAllText(Path.Combine(folder, "Dialogs.slnx"), "<Solution />\n");
         MainWindow window = Ui.OpenFolder(folder, languageServer: false);
@@ -99,11 +102,13 @@ public sealed class DialogButtonsTests : IDisposable
 
     /// <summary>Holds a dialog's buttons to the rule: each one shown has its words (or icon) centred in it unless it
     /// reads as text; its text buttons (plain or the default) are one height and one corner radius; and the default
-    /// button and Cancel, when it has both, stand in the platform's order. Returns the dialog.</summary>
+    /// button and Cancel, when it has both, stand in the platform's order. Holds its whole layout too: no words cut and
+    /// nothing drawn over another, at its least width and at display scale 2 (LayoutFaults). Returns the dialog.</summary>
     public static T Check<T>(T dialog) where T : Window
     {
         Ui.Settle();
         string title = dialog.Title ?? dialog.GetType().Name;
+        LayoutFaults.Hold(dialog, title);
         Button[] shown = [.. dialog.GetVisualDescendants().OfType<Button>()
             .Where(b => b is not ToggleButton and not RepeatButton && b.IsEffectivelyVisible && b.Bounds.Width > 0 && b.Bounds.Height > 0)];
         foreach (Button button in shown.Where(b => !b.Classes.Any(ReadAsText.Contains)))
@@ -141,10 +146,10 @@ public sealed class DialogButtonsTests : IDisposable
             InPlatformOrder(dialog, title, chosen, cancel);
         }
 
-        // A plain button: its own ground (white in light) inside a field's edge.
-        Color plain = Token(dialog, TokenKeys.Button);
+        // A plain button: its own ground (white in light) inside a field's edge, lit where the pointer is over it.
         foreach (Button button in text.Where(b => !b.Classes.Contains(StyleClasses.Primary) && b.IsEffectivelyEnabled))
         {
+            Color plain = Token(dialog, button.IsPressed ? TokenKeys.ButtonPressed : button.IsPointerOver ? TokenKeys.ButtonHover : TokenKeys.Button);
             ContentPresenter frame = button.GetVisualDescendants().OfType<ContentPresenter>().First(p => p.Name == "PART_ContentPresenter");
             Assert.True(frame.Background is ISolidColorBrush ground && ground.Color == plain && frame.BorderThickness.Left > 0,
                 $"In {title}, {Name(button)} is drawn on {(frame.Background as ISolidColorBrush)?.Color} with an edge of {frame.BorderThickness}, where Rider's plain button has its own ground and a field's edge");
@@ -215,6 +220,49 @@ public sealed class DialogButtonsTests : IDisposable
                 $"In {title}, '{ask.Content}' is not at the footer's left, level with the buttons");
         }
         return dialog;
+    }
+
+    /// <summary>Settings' Cancel, a plain button, and OK, the default one, each drawn in its ground at rest, lit under a
+    /// person's pointer and deeper while pressed, in Dark and Light: so a press shows, Apply's too, which leaves the dialog
+    /// open.</summary>
+    [AvaloniaFact]
+    public void A_plain_button_and_the_default_one_are_drawn_lit_under_the_pointer_and_deeper_while_pressed()
+    {
+        MainWindow window = Ui.OpenFolder(folder, languageServer: false);
+        try
+        {
+            foreach (ThemeVariant variant in (ThemeVariant[])[ThemeVariant.Dark, ThemeVariant.Light])
+            {
+                foreach ((string words, string rest, string over, string held) in ((string, string, string, string)[])[
+                    ("Cancel", TokenKeys.Button, TokenKeys.ButtonHover, TokenKeys.ButtonPressed), ("OK", TokenKeys.Accent, TokenKeys.AccentHover, TokenKeys.AccentPressed)])
+                {
+                    SettingsDialog settings = window.ShowSettings();
+                    settings.RequestedThemeVariant = variant;
+                    Ui.Settle();
+                    Button button = Shown(settings, words);
+                    // Clear of its words and inside its edge and rounded corners.
+                    Point ground = button.TranslatePoint(new Point(6, button.Bounds.Height / 2), settings)!.Value;
+                    Color atRest = Ui.Pixel(settings, ground);
+                    Ui.Hover(button);
+                    Color underPointer = Ui.Pixel(settings, ground);
+                    Color pressed = default;
+                    Ui.ClickAcross(button, () =>
+                    {
+                        Ui.Settle();
+                        pressed = Ui.Pixel(settings, ground);
+                    });
+                    string drawn = $"{words} in {variant} is drawn {atRest} at rest, {underPointer} under the pointer and {pressed} pressed";
+                    Assert.True(atRest != underPointer && underPointer != pressed && pressed != atRest,
+                        $"{drawn}: a person sees no change as the pointer comes over it or presses it");
+                    Assert.True(atRest == Token(settings, rest) && underPointer == Token(settings, over) && pressed == Token(settings, held),
+                        $"{drawn}, where its theme gives {Token(settings, rest)}, {Token(settings, over)} and {Token(settings, held)}");
+                }
+            }
+        }
+        finally
+        {
+            window.Close();
+        }
     }
 
     /// <summary>A popup's default button and Cancel stand as a dialog's do: Add CLR Exception Breakpoints' Add and the

@@ -27,6 +27,12 @@ public sealed class TypeRenameTests : IClassFixture<RestoredFolders>, IDisposabl
 
     private const string Shapes = "namespace Shop;\n\npublic class Circle\n{\n}\n\npublic class Square\n{\n    public Circle Inside() => new Circle();\n}\n";
 
+    private const string Shelf = "namespace Shop;\n\npublic class shelf\n{\n    public int Width;\n}\n";
+
+    private const string Stock = "namespace Shop;\n\npublic static class Stock\n{\n    public static shelf Open() => new shelf();\n}\n";
+
+    private const string Crate = "namespace Shop;\n\npublic class Crate\n{\n}\n";
+
     private readonly string folder;
 
     public TypeRenameTests(RestoredFolders folders) => folder = PathNames.Canonical(folders.Take("type-rename-", made =>
@@ -44,6 +50,9 @@ public sealed class TypeRenameTests : IClassFixture<RestoredFolders>, IDisposabl
         TestFolders.Write(project, "Basket.cs", "namespace Shop;\n\npublic partial class Basket\n{\n    public int Count;\n}\n");
         TestFolders.Write(project, "Basket.Lines.cs", "namespace Shop;\n\npublic partial class Basket\n{\n    public int Lines;\n}\n");
         TestFolders.Write(project, "BasketExtras.cs", "namespace Shop;\n\npublic partial class Basket\n{\n    public int Extras;\n}\n");
+        TestFolders.Write(project, "shelf.cs", Shelf);
+        TestFolders.Write(project, "Stock.cs", Stock);
+        TestFolders.Write(project, "crate.cs", Crate);
         TestGit.Init(project);
         return project;
     }));
@@ -95,7 +104,7 @@ public sealed class TypeRenameTests : IClassFixture<RestoredFolders>, IDisposabl
         Assert.Equal(Order.Replace("Order", "Purchase", StringComparison.Ordinal), document.Text.Snapshot.ToString());
 
         Ui.Run(window, EditorActions.Undo);
-        Assert.Equal([("Undo", "Undo Rename Order to Purchase? It changes Purchase.cs and Till.cs.")], asked);
+        Assert.Equal([("Undo", "Undo Rename Order to Purchase? It changes Purchase.cs and Till.cs, and renames Purchase.cs back to Order.cs.")], asked);
         Assert.True(File.Exists(OrderPath), $"Undo did not rename Purchase.cs back: {window.Status}");
         Assert.False(File.Exists(PurchasePath), "Undo left Purchase.cs");
         Assert.Equal(OrderPath, document.Path);
@@ -108,11 +117,44 @@ public sealed class TypeRenameTests : IClassFixture<RestoredFolders>, IDisposabl
         Assert.Equal(string.Empty, Git("status", "--porcelain"));
 
         Ui.Run(window, EditorActions.Redo);
-        Assert.Equal(("Redo", "Redo Rename Order to Purchase? It changes Order.cs and Till.cs."), asked[^1]);
+        Assert.Equal(("Redo", "Redo Rename Order to Purchase? It changes Order.cs and Till.cs, and renames Order.cs to Purchase.cs."), asked[^1]);
         Assert.True(File.Exists(PurchasePath), $"Redo did not rename Order.cs again: {window.Status}");
         Assert.Equal(PurchasePath, document.Path);
         Assert.Equal(Order.Replace("Order", "Purchase", StringComparison.Ordinal), document.Text.Snapshot.ToString());
         Assert.Equal(Till.Replace("Order", "Purchase", StringComparison.Ordinal), File.ReadAllText(till));
+        window.Close();
+    }
+
+    /// <summary>A class renamed with its file in the editor, and another an agent renames, each list as renamed, and the
+    /// Commit window commits both as renames: Till.cs, whose class and uses of the first both changed, changed past what
+    /// git finds alike, so the window offers the moves first, and they are a commit of their own before the edits.</summary>
+    [AvaloniaFact]
+    public void A_class_renamed_with_its_file_and_one_an_agent_renames_commit_as_renames_the_moves_first_where_git_would_lose_one()
+    {
+        string till = Path.Combine(folder, "Till.cs");
+        string register = Path.Combine(folder, "Register.cs");
+        MainWindow window = Open("Order.cs");
+        Answer(window);
+
+        RenameAt(window, "class Ord", "Purchase");
+        Ui.WaitFor(() => window.Vcs.Changes.Any(c => c.Kind == ChangeKind.Renamed && c.Path == PurchasePath && c.From == OrderPath), "Git to list Order.cs renamed to Purchase.cs");
+        string said = Ui.Await(new Passenger.App.Mcp.PassengerTools(window).Rename("Register", symbol: "Till"), "the agent's rename");
+        Assert.True(File.Exists(register), $"The agent's rename left Till.cs: {said}");
+        Ui.WaitFor(() => window.Vcs.Changes.Any(c => c.Kind == ChangeKind.Renamed && c.Path == register && c.From == till), "Git to list Till.cs renamed to Register.cs");
+
+        Passenger.App.ToolWindows.CommitView commit = window.CommitView;
+        window.Perform(AppActions.Commit);
+        Ui.WaitFor(() => commit.OffersMovesFirst, () => $"the offer to commit the moves first, where Git lists {string.Join(", ", window.Vcs.Changes.Select(c => $"{c.Name} ({c.Kind})"))}");
+        Assert.Equal("Committed with its edits, Register.cs would no longer be seen by Git as renamed from Till.cs: too much of it changed. "
+            + "Committing the moves first, on their own, keeps its history.", commit.MovesSaid);
+        Assert.Equal("Rename 2 files", commit.MovesMessage);
+        commit.Message = "Rename the order and the till";
+        Ui.ClickButton(commit, "Commit");
+        Ui.WaitFor(() => window.Vcs.Changes.Count == 0 && !window.Vcs.IsBusy, () => $"the commits, where the status bar says '{window.Status}'");
+
+        Assert.Equal("Rename the order and the till\nRename 2 files", Git("log", "-2", "--format=%s").Trim());
+        Assert.Equal(["R100\tOrder.cs\tPurchase.cs", "R100\tTill.cs\tRegister.cs"], Shown("HEAD~1"));
+        Assert.Equal(["M\tPurchase.cs", "M\tRegister.cs"], Shown("HEAD"));
         window.Close();
     }
 
@@ -164,10 +206,10 @@ public sealed class TypeRenameTests : IClassFixture<RestoredFolders>, IDisposabl
     }
 
     /// <summary>Rename on a file in the Solution view offers to rename the class it is named after, which renames it and its
-    /// uses, every row but the file's own staying the row it was, and Undo there takes both back, asked first; a form's
-    /// files nested under it go along; and a file holding types
-    /// of other names keeps its name when one of them is renamed, is renamed alone in the Solution view, and named back by
-    /// Undo there.</summary>
+    /// uses, every row but the file's own staying the row it was, and Undo there takes both back, asked first in words that
+    /// name the file's name going back too; a form's files nested under it go along; and a file holding types of other
+    /// names keeps its name when one of them is renamed, is renamed alone in the Solution view, and named back by Undo
+    /// there.</summary>
     [AvaloniaFact]
     public void Renaming_a_file_in_the_solution_view_offers_to_rename_its_class_takes_a_forms_nested_files_and_renames_a_file_of_other_types_alone()
     {
@@ -196,7 +238,7 @@ public sealed class TypeRenameTests : IClassFixture<RestoredFolders>, IDisposabl
 
         Choose(window, PurchasePath);
         Ui.Run(window, EditorActions.Undo);
-        Assert.Equal([("Undo", "Undo Rename Order to Purchase? It changes Till.cs and Purchase.cs.")], asked);
+        Assert.Equal([("Undo", "Undo Rename Order to Purchase? It changes Till.cs and Purchase.cs, and renames Purchase.cs back to Order.cs.")], asked);
         Assert.True(File.Exists(OrderPath), $"Undo did not rename Purchase.cs back: {window.Status}");
         Assert.False(File.Exists(PurchasePath), "Undo left Purchase.cs");
         Assert.Equal(Order, File.ReadAllText(OrderPath));
@@ -236,7 +278,7 @@ public sealed class TypeRenameTests : IClassFixture<RestoredFolders>, IDisposabl
         asked.Clear();
         Choose(window, figures);
         Ui.Run(window, EditorActions.Undo);
-        Assert.Equal([("Undo", "Undo Rename Shapes.cs to Figures.cs? It changes Figures.cs.")], asked);
+        Assert.Equal([("Undo", "Undo Rename Shapes.cs to Figures.cs? It renames Figures.cs back to Shapes.cs.")], asked);
         Assert.True(File.Exists(shapes), $"Undo did not name Figures.cs back: {window.Status}");
         Assert.Equal("Shapes.cs", window.EditorArea.Active?.Name);
         window.Close();
@@ -596,6 +638,95 @@ public sealed class TypeRenameTests : IClassFixture<RestoredFolders>, IDisposabl
         window.Close();
     }
 
+    /// <summary>Show Context Actions' Fix name violation on a class named like its file renames the file with it, in letter
+    /// case alone, as Rename does: the tab follows, the language server takes the file under its new name, and one Undo takes
+    /// the class, its use and the file's name back, asked first. With Also rename files to reflect this change turned off,
+    /// the fix leaves the file's name as Rename does. Where the file kept its name, the server went on offering to rename it.</summary>
+    [AvaloniaFact]
+    public void Fix_name_violation_on_a_class_named_like_its_file_renames_the_file_in_letter_case_and_undo_takes_both_back()
+    {
+        string lower = Path.Combine(folder, "shelf.cs");
+        string upper = Path.Combine(folder, "Shelf.cs");
+        string stock = Path.Combine(folder, "Stock.cs");
+        MainWindow window = Open("shelf.cs");
+        List<(string Title, string Text)> asked = Answer(window);
+        OpenDocument document = window.EditorArea.Active!;
+
+        ContextAction(window, "class she", "Fix name violation: Shelf");
+        Ui.WaitFor(() => Names().Contains("Shelf.cs"), () => $"shelf.cs to be renamed Shelf.cs with its class: {window.Status}; the folder holds {string.Join(", ", Names())}");
+
+        Assert.DoesNotContain("shelf.cs", Names());
+        Assert.True(ReferenceEquals(document, Assert.Single(window.EditorArea.Documents)), "The renamed file's tab was closed and opened again");
+        Assert.Equal(upper, document.Path);
+        Assert.Equal("Shelf.cs", window.EditorArea.Active?.Name);
+        Assert.Equal(Shelf.Replace("shelf", "Shelf", StringComparison.Ordinal), document.Text.Snapshot.ToString());
+        Assert.Equal(Stock.Replace("shelf", "Shelf", StringComparison.Ordinal), File.ReadAllText(stock));
+        Ui.WaitFor(() => window.CSharpService?.For(document)?.Lsp?.Uri.EndsWith("/Shelf.cs", StringComparison.Ordinal) == true, "the language server to take the file as Shelf.cs");
+        Passenger.App.Mcp.PassengerTools tools = new(window);
+        Ui.WaitFor(() => !Ui.Await(tools.CodeActions("Shelf.cs", 3, 14), "the actions at Shelf").Any(a => a.StartsWith("Rename file", StringComparison.Ordinal)),
+            "the language server to hold the file as Shelf.cs, offering to rename it no more");
+
+        window.EditorArea.CodeEditor.Focus();
+        Ui.Run(window, EditorActions.Undo);
+        Assert.Equal([("Undo", "Undo Fix name violation: Shelf? It changes Shelf.cs and Stock.cs, and renames Shelf.cs back to shelf.cs.")], asked);
+        Assert.Contains("shelf.cs", Names());
+        Assert.DoesNotContain("Shelf.cs", Names());
+        Assert.Equal(lower, document.Path);
+        Assert.Equal(Shelf, document.Text.Snapshot.ToString());
+        Assert.Equal(Stock, File.ReadAllText(stock));
+
+        window.Assist.RenameSettings = window.Assist.RenameSettings with { RenameFiles = false };
+        ContextAction(window, "class she", "Fix name violation: Shelf");
+        Ui.WaitFor(() => document.Text.Snapshot.ToString().Contains("class Shelf", StringComparison.Ordinal), () => $"the fix with the file option off: {window.Status}");
+        Assert.Contains("shelf.cs", Names());
+        Assert.Equal(lower, document.Path);
+        window.Close();
+    }
+
+    /// <summary>Show Context Actions' Rename file to Crate.cs on a file named like its class in another letter case renames
+    /// the file, where it said nothing and left the name, and Undo in the Solution view names it back, as it does a file
+    /// renamed there.</summary>
+    [AvaloniaFact]
+    public void Rename_file_to_its_class_in_another_letter_case_renames_the_file_and_undo_names_it_back()
+    {
+        MainWindow window = Open("crate.cs");
+        Answer(window);
+        OpenDocument document = window.EditorArea.Active!;
+
+        ContextAction(window, "class Cra", "Rename file to Crate.cs");
+        Ui.WaitFor(() => Names().Contains("Crate.cs"), () => $"crate.cs to be renamed Crate.cs: {window.Status}; the folder holds {string.Join(", ", Names())}");
+
+        Assert.DoesNotContain("crate.cs", Names());
+        Assert.Equal(Path.Combine(folder, "Crate.cs"), document.Path);
+        Assert.Equal("Crate.cs", window.EditorArea.Active?.Name);
+        Assert.Equal(Crate, File.ReadAllText(Path.Combine(folder, "Crate.cs")));
+
+        Choose(window, Path.Combine(folder, "Crate.cs"));
+        Ui.Run(window, EditorActions.Undo);
+        Assert.Contains("crate.cs", Names());
+        Assert.DoesNotContain("Crate.cs", Names());
+        Assert.Equal(Path.Combine(folder, "crate.cs"), document.Path);
+        window.Close();
+    }
+
+    /// <summary>The C# files in the folder by their names as the disk spells them.</summary>
+    private IReadOnlyList<string> Names() => [.. Directory.GetFiles(folder, "*.cs").Select(Path.GetFileName).OfType<string>().Order(StringComparer.Ordinal)];
+
+    /// <summary>Show Context Actions by its key at the end of a piece of the active file, and the action of that title
+    /// chosen once offered.</summary>
+    internal static void ContextAction(MainWindow window, string after, string title)
+    {
+        Ui.PlaceAfter(window.EditorArea.CodeEditor, after);
+        window.EditorArea.CodeEditor.Focus();
+        Ui.Press(window, "alt ENTER");
+        Ui.WaitFor(() => window.Assist.Offered.Contains(title), () => $"Show Context Actions to offer {title}: [{string.Join("; ", window.Assist.Offered)}]");
+        for (int i = window.Assist.Offered.ToList().IndexOf(title); i > 0; i--)
+        {
+            Ui.Press(window, "DOWN");
+        }
+        Ui.Press(window, "ENTER");
+    }
+
     private MainWindow Open(string file)
     {
         MainWindow window = Ui.OpenFolder(folder, autosaves: false);
@@ -681,4 +812,8 @@ public sealed class TypeRenameTests : IClassFixture<RestoredFolders>, IDisposabl
     }
 
     private string Git(params string[] arguments) => TestGit.Run(folder, arguments);
+
+    /// <summary>What a commit changed as git shows it, renames found.</summary>
+    private string[] Shown(string commit) =>
+        [.. Git("show", "--name-status", "--format=", "-M", commit).Split('\n', StringSplitOptions.RemoveEmptyEntries).Order(StringComparer.Ordinal)];
 }

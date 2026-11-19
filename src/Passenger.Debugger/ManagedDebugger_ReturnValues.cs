@@ -103,7 +103,7 @@ public partial class ManagedDebugger
     /// statement.</summary>
     private async Task TakeWatchedReturn(ICorDebugThread thread, WatchedCall call)
     {
-        if (_returnWatch is not { } watch || thread.Id != watch.ThreadId || EnumerateFramesForThread(thread).FirstOrDefault() is not ICorDebugILFrame frame
+        if (_returnWatch is not { } watch || thread.Id != watch.ThreadId || TopFrame(thread) is not ICorDebugILFrame frame
             || RangeOf(frame) != watch.Frame || Read(frame, call.CallOffset) is not { } value)
         {
             _logger?.Invoke($"The breakpoint after the call at IL_{call.CallOffset:X4} on thread {thread.Id} is not the step's: another frame's, or no value is there");
@@ -345,14 +345,7 @@ public partial class ManagedDebugger
             ICorDebugValue boxed = await thread.CreateEval().NewParameterizedObjectNoConstructorAsync(ProcessRuntimeEventsUntilEvalEvent, EvalStatus, boxClass,
                 typeArguments.Length, typeArguments.Length == 0 ? null : typeArguments, throwOnException: true) ?? throw new InvalidOperationException($"No box was made for the {typeName} returned");
             ICorDebugHandleValue handle = boxed as ICorDebugHandleValue ?? ((ICorDebugHeapValue2)boxed.UnwrapDebugValue()).CreateHandle(CorDebugHandleType.HANDLE_STRONG);
-            ICorDebugGenericValue inside = (ICorDebugGenericValue)handle.UnwrapDebugValue();
-            unsafe
-            {
-                fixed (byte* pointer = bytes)
-                {
-                    inside.SetValue((nint)pointer);
-                }
-            }
+            ((ICorDebugGenericValue)handle.UnwrapDebugValue()).SetValue(bytes);
             return new ReturnedValue(method, handle, typeName, aliasType, null);
         }
         catch (Exception error) when (error is EvalException || Failures.OfRuntime(error))

@@ -234,8 +234,10 @@ public partial class ManagedDebugger
         return ((ICorDebugClass2)module.GetClassFromToken(definition)).GetParameterizedType(valueType ? CorElementType.VALUETYPE : CorElementType.CLASS, arguments.Length, arguments);
     }
 
-    private static string? AssemblyNameOf(ModuleInfo module) =>
-        module.MetadataReader.PeMetadataReader is { IsAssembly: true } reader ? reader.GetString(reader.GetAssemblyDefinition().Name) : null;
+    private static string? AssemblyNameOf(ModuleInfo module) => AssemblyNameOf(module.MetadataReader);
+
+    private static string? AssemblyNameOf(ModuleMetadataReader metadata) =>
+        metadata.PeMetadataReader is { IsAssembly: true } reader ? reader.GetString(reader.GetAssemblyDefinition().Name) : null;
 
     /// <summary>The [DebuggerTypeProxy] made for a value, or null when its constructor throws, so the value opens into
     /// its own members rather than the exception's.</summary>
@@ -526,9 +528,10 @@ public partial class ManagedDebugger
         return PrimitiveTypes.Named(closed)?.Keyword ?? (global ? $"global::{closed}" : closed);
     }
 
-    public static CorDebugValueValueResult GetCorDebugGenericValue_Value_AsString(ICorDebugGenericValue corDebugGenericValue)
+    public static unsafe CorDebugValueValueResult GetCorDebugGenericValue_Value_AsString(ICorDebugGenericValue corDebugGenericValue)
     {
-        IntPtr buffer = Marshal.AllocHGlobal(corDebugGenericValue.Size);
+        // Read by its type's width, never past the room, whatever size the value says: what it leaves unwritten reads as zero.
+        nint buffer = (nint)NativeMemory.AllocZeroed((nuint)Math.Max(corDebugGenericValue.Size, sizeof(long)));
         try
         {
             corDebugGenericValue.GetValue(buffer);
@@ -563,7 +566,7 @@ public partial class ManagedDebugger
         }
         finally
         {
-            Marshal.FreeHGlobal(buffer);
+            NativeMemory.Free((void*)buffer);
         }
     }
 

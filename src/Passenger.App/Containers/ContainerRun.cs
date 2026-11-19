@@ -28,6 +28,10 @@ public sealed record DotnetService(string Service, string Project, string Assemb
     /// marked Don't start, which its run refuses only when a start of it is asked later; null when it can run.</summary>
     public string? Unfit { get; init; }
 
+    /// <summary>The build configuration its project builds in under the folder's choice, as its evaluation says: what its
+    /// image built as deployed is given for a Dockerfile's BUILD_CONFIGURATION; null where the evaluation named none.</summary>
+    public string? Configuration { get; init; }
+
     string IRunService.Name => Service;
 }
 
@@ -39,14 +43,19 @@ public sealed record ContainerPlan(string Name, string Folder, string ProjectNam
     IReadOnlyList<DotnetService> Dotnet, IReadOnlyList<string> Backing, IReadOnlyList<string> Watched, ContainerMode Mode, bool KeepBacking,
     string? BrowserUrl, string? LaunchService, int? LaunchPort, ContainerPaths Paths)
 {
-    /// <summary>The projects Run builds first: each .NET service's that starts, once, in fast mode (images mode builds its
+    /// <summary>The workspace it was worked out in, whose build configuration its builds are given, its configuration's own
+    /// where it names one (<see cref="ProjectSession.WorkspaceOfAsync"/>); null for the folder's.</summary>
+    public WorkspaceModel? Workspace { get; init; }
+
+    /// <summary>The projects Run builds first: each one's of <see cref="Running"/>, once, in fast mode (images mode builds its
     /// images as Compose says, from their Dockerfiles).</summary>
     public IReadOnlyList<string> Builds => Mode == ContainerMode.Fast
-        ? [.. Dotnet.Where(d => d.Starts).Select(d => d.Project).Distinct(StringComparer.Ordinal)]
+        ? [.. Running.Select(d => d.Project).Distinct(StringComparer.Ordinal)]
         : [];
 
-    /// <summary>The services Rerun may restart, those Passenger builds.</summary>
-    public IEnumerable<DotnetService> Restartable => Dotnet.Where(d => d.Starts);
+    /// <summary>The .NET services <c>up</c> brings up (<see cref="Touched"/>), those marked Don't start aside: those fast mode
+    /// runs from Passenger's build, and Rerun may restart.</summary>
+    public IEnumerable<DotnetService> Running => Dotnet.Where(d => d.Starts && Touched.Contains(d.Service));
 
     /// <summary>Writes Passenger's override into the state, which <see cref="Compose"/> names: after the host's build, with the
     /// services held at their start (for the debugger or the profiler), and those of them whose code the debugger may change
@@ -127,6 +136,9 @@ public static class ContainerPlans
     /// <summary>Where fast mode mounts Passenger's build of a service's project inside its container.</summary>
     public const string AppFolder = "/passenger/app";
 
+    /// <summary>The argument a Dockerfile Visual Studio writes builds its project's configuration by.</summary>
+    public const string BuildConfigurationArgument = "BUILD_CONFIGURATION";
+
     public static async Task<ContainerPlan> ResolveAsync(RunConfiguration configuration, IReadOnlyList<ProjectModel> projects, WorkspaceModel? workspace,
         string stateFolder, ContainerEngine engine, IReadOnlyList<string> labels, CancellationToken cancel)
     {
@@ -164,6 +176,7 @@ public static class ContainerPlans
                     CarriedProperties.TargetPath, MSBuildNames.TargetDir, MSBuildNames.AssemblyName, CarriedProperties.DockerfileContext, CarriedProperties.DockerfileFile,
                     CarriedProperties.DockerfileFastModeStage, CarriedProperties.ContainerDevelopmentMode, MSBuildNames.DockerfileBuildArguments, MSBuildNames.DockerfileRunArguments,
                     MSBuildNames.DockerfileTag, CarriedProperties.ContainerBaseImage, MSBuildNames.ContainerPort, MSBuildNames.RuntimeIdentifier, MSBuildNames.SelfContained,
+                    MSBuildNames.Configuration,
                 ],
                 workspace, cancel, configuration.Kind == RunKind.SdkContainer ? MSBuildNames.ComputeContainerBaseImage : null);
             if (configuration.Kind == RunKind.Dockerfile && string.Equals(properties.GetValueOrDefault(CarriedProperties.ContainerDevelopmentMode), "Regular", StringComparison.OrdinalIgnoreCase))
@@ -175,8 +188,9 @@ public static class ContainerPlans
             {
                 string repository = $"passenger-{Slug(configuration.Name)}-{ContainerLabels.FolderValue(workspace.Folder)[..8]}";
                 properties = new Dictionary<string, string>(properties, StringComparer.OrdinalIgnoreCase) { ["PassengerImage"] = $"{repository}:{SdkImageTag}" };
-                publish = ["publish", single.Path, $"-t:{MSBuildNames.PublishContainer}", "-c", "Debug", $"-p:{CarriedProperties.ContainerRepository}={repository}",
-                    $"-p:{MSBuildNames.ContainerImageTag}={SdkImageTag}", "-nologo"];
+                IReadOnlyList<string> configured = workspace.PublishArgumentsFor(single.Path, properties.GetValueOrDefault(MSBuildNames.Configuration));
+                publish = ["publish", single.Path, $"-t:{MSBuildNames.PublishContainer}", .. configured, PropertySwitch.Of(CarriedProperties.ContainerRepository, repository),
+                    PropertySwitch.Of(MSBuildNames.ContainerImageTag, SdkImageTag), "-nologo"];
             }
             string service = DockerFiles.ServiceName(single.Name.Split(' ')[0]);
             fixedProjects[service] = single.Path;
@@ -186,7 +200,9 @@ public static class ContainerPlans
             files = [composed];
             runsIn = single.Folder;
         }
-        List<string> compose = Words(files, configuration, runsIn);
+        // A .dcproj's name is given before Compose reads the files, so its model takes that name over the files' own.
+        string? ownName = ContainerConfigurations.ProjectNameOf(configuration);
+        List<string> compose = Words(files, configuration, runsIn, ownName);
         ComposeModel model;
         try
         {
@@ -196,8 +212,11 @@ public static class ContainerPlans
         {
             throw new ComposeModelException(configuration.Name, said.Message);
         }
-        string projectName = model.Name.Length > 0 ? model.Name : Slug(Path.GetFileName(runsIn));
-        compose.InsertRange(1, ["-p", projectName]);
+        string projectName = ownName ?? (model.Name.Length > 0 ? model.Name : Slug(Path.GetFileName(runsIn)));
+        if (ownName is null)
+        {
+            compose.InsertRange(1, ["-p", projectName]);
+        }
 
         List<DotnetService> dotnet = [];
         foreach (ComposeService service in model.Services)
@@ -210,7 +229,7 @@ public static class ContainerPlans
                 : await LaunchPlan.EvaluateAsync(project, LaunchPlan.FrameworkOf(string.Empty, project),
                     [
                         CarriedProperties.TargetPath, MSBuildNames.TargetDir, MSBuildNames.AssemblyName, CarriedProperties.DockerfileFastModeStage,
-                        MSBuildNames.RuntimeIdentifier, MSBuildNames.SelfContained,
+                        MSBuildNames.RuntimeIdentifier, MSBuildNames.SelfContained, MSBuildNames.Configuration,
                     ],
                     workspace, cancel);
             string output = its.GetValueOrDefault(MSBuildNames.TargetDir) is { Length: > 0 } dir ? Path.TrimEndingDirectorySeparator(dir)
@@ -240,7 +259,11 @@ public static class ContainerPlans
                 }
             }
             ContainerPaths paths = stages is not null && service.Context is { } context ? ContainerPaths.For(stages, context) : ContainerPaths.None;
-            dotnet.Add(new DotnetService(service.Name, project.Path, assembly, output, action, stage, paths) { Unfit = unfit });
+            dotnet.Add(new DotnetService(service.Name, project.Path, assembly, output, action, stage, paths)
+            {
+                Unfit = unfit,
+                Configuration = its.GetValueOrDefault(MSBuildNames.Configuration) is { Length: > 0 } built ? built : null,
+            });
         }
         HashSet<string> dotnetNames = [.. dotnet.Select(d => d.Service)];
         bool dontStarts = configuration.ServiceActions.Values.Any(a => a == ServiceStart.DontStart);
@@ -261,6 +284,12 @@ public static class ContainerPlans
             notes.Add($"{configuration.Name} runs without {string.Join(", ", uncarried)} of its docker run arguments, which its container's compose service has no place for");
         }
         EngineState engineState = await engine.StateAsync(cancel: cancel);
+        // An image this engine cannot run would only stop as its container starts, and stop again at each restart.
+        if (engineState.Amd64 is Amd64Runs.Emulated or Amd64Runs.Never
+            && touched.Select(s => (Service: s, Is: BackingService.OfImage(model[s]?.Image)?.X64Only)).FirstOrDefault(s => s.Is is not null) is ({ } unrunnable, { } what))
+        {
+            throw new LaunchException($"{configuration.Name} cannot run {unrunnable}: {Refusals.X64OnlyUnrunnable(what, engineState)}");
+        }
         string? owner = OperatingSystem.IsLinux() ? DotnetProcesses.UserAndGroup : null;
         // As deployed, the image's own user could not read what is kept for the person alone (RunsAs).
         if (mode == ContainerMode.Images && RunsAs(engineState, owner) is { } user)
@@ -367,25 +396,9 @@ public static class ContainerPlans
     /// <summary>The tag of an SDK container's image Passenger has the SDK make, as deployed.</summary>
     public const string SdkImageTag = "passenger";
 
-    /// <summary>The <c>compose -f … --env-file … --profile … --project-directory …</c> words of files and a configuration.</summary>
-    private static List<string> Words(IReadOnlyList<string> files, RunConfiguration configuration, string runsIn)
-    {
-        List<string> compose = ["compose"];
-        foreach (string each in files)
-        {
-            compose.AddRange(["-f", each]);
-        }
-        foreach (string env in configuration.EnvFiles)
-        {
-            compose.AddRange(["--env-file", env]);
-        }
-        foreach (string profile in configuration.Profiles)
-        {
-            compose.AddRange(["--profile", profile]);
-        }
-        compose.AddRange(["--project-directory", runsIn]);
-        return compose;
-    }
+    /// <summary>The <c>compose [-p NAME] -f … --env-file … --profile … --project-directory …</c> words of files and a configuration.</summary>
+    private static List<string> Words(IReadOnlyList<string> files, RunConfiguration configuration, string runsIn, string? project = null) =>
+        ComposeFiles.Words(project, files, configuration.EnvFiles, configuration.Profiles, runsIn);
 
     /// <summary>A Compose configuration's services as Compose's own model has them (Edit Configurations' table), each with
     /// the project it runs as a run would find it, and whether it is built from a Dockerfile here (whose project a person
@@ -404,8 +417,9 @@ public static class ContainerPlans
         return [.. model.Services.Select(s => (s, DotnetProject(s, projects, null, configuration, chosen)?.Path, s.DockerfilePath is { } file && File.Exists(file)))];
     }
 
-    /// <summary>The project a service runs: its Dockerfile's (by ENTRYPOINT's assembly, else its dotnet publish), else the
-    /// person's choice kept in the configuration, else a project of the Docker Compose project named as the service.</summary>
+    /// <summary>The project a service runs: the person's choice kept in the configuration, else the one its compose files
+    /// label it with (<see cref="ComposeLabels.VisualStudioProject"/>), else its Dockerfile's (by ENTRYPOINT's assembly, else
+    /// its dotnet publish, the build's arguments put in), else a project of the Docker Compose project named as the service.</summary>
     private static ProjectModel? DotnetProject(ComposeService service, IReadOnlyList<ProjectModel> projects, WorkspaceModel? workspace, RunConfiguration configuration,
         IReadOnlyDictionary<string, string> chosen)
     {
@@ -413,8 +427,13 @@ public static class ContainerPlans
         {
             return named;
         }
+        if (service.Labels.GetValueOrDefault(ComposeLabels.VisualStudioProject) is { Length: > 0 } labelled
+            && projects.FirstOrDefault(p => string.Equals(Path.GetFileNameWithoutExtension(p.Path), labelled.Trim(), StringComparison.OrdinalIgnoreCase)) is { } label)
+        {
+            return label;
+        }
         if (service.DockerfilePath is { } dockerfile && File.Exists(dockerfile)
-            && Web.ComposeDeclarations.Built(TextSnapshot.From(File.ReadAllText(dockerfile)), service.Context!, projects) is { } built)
+            && Web.ComposeDeclarations.Built(TextSnapshot.From(File.ReadAllText(dockerfile)), service.Context!, projects, service.BuildArguments) is { } built)
         {
             return projects.FirstOrDefault(p => PathNames.Same(p.Path, built));
         }
@@ -517,7 +536,7 @@ public static class ContainerPlans
     /// <summary>The override Passenger lays over the files: its labels on every service, image and network it makes (an image
     /// built as deployed tagged apart from the one its files name); for each .NET service it starts, in fast mode its image's
     /// runtime stage running <c>dotnet /passenger/app/X.dll</c> as PID 1 over Passenger's build mounted read-only, in images
-    /// mode a Debug build where its Dockerfile takes BUILD_CONFIGURATION; the development certificate and user secrets where
+    /// mode its project's configuration for a Dockerfile's BUILD_CONFIGURATION; the development certificate and user secrets where
     /// they serve, read <see cref="RunsAs"/>; a service held for the debugger started held, its code open to Hot Reload.</summary>
     public static async Task<JsonObject> OverrideAsync(ComposeModel model, string project, IReadOnlyList<DotnetService> dotnet, ContainerMode mode, IReadOnlyList<string> labels,
         IReadOnlyList<ProjectModel> projects, string state, ChosenPorts? pinned, IReadOnlyCollection<string> held,
@@ -582,10 +601,11 @@ public static class ContainerPlans
                         environment[AspNetCoreVariables.StaticWebAssets] = assets.Manifest;
                     }
                 }
-                else if (service.DockerfilePath is { } dockerfile && File.Exists(dockerfile) && DockerfileStages.Read(File.ReadAllText(dockerfile)).Declares("BUILD_CONFIGURATION"))
+                else if (built.Configuration is { } configuration && service.DockerfilePath is { } dockerfile && File.Exists(dockerfile)
+                    && DockerfileStages.Read(File.ReadAllText(dockerfile)).Declares(BuildConfigurationArgument))
                 {
                     JsonObject build = (JsonObject)(entry["build"] ??= new JsonObject());
-                    build["args"] = new JsonObject { ["BUILD_CONFIGURATION"] = "Debug" };
+                    build["args"] = new JsonObject { [BuildConfigurationArgument] = configuration };
                 }
                 (string Folder, string Id)? secrets = development ? UserSecrets(projects.FirstOrDefault(p => PathNames.Same(p.Path, built.Project))) : null;
                 if (user is not null && (mode == ContainerMode.Fast || Serves(service) || secrets is not null))
@@ -874,15 +894,16 @@ public sealed class ComposeModelException(string name, string said) : LaunchExce
     public string Said { get; } = said;
 }
 
-/// <summary>The state's files that only the person may read on macOS and Linux (the development certificate's copy and its
+/// <summary>The state's files that only the person may read on macOS and Linux (the state folder itself, its logs and Local
+/// History, which keeps copies of a folder's .env and appsettings files, the development certificate's copy and its
 /// password, a run's override and single service's compose file, which name them and the configuration's environment, a
 /// file copied out of a container), so from the moment each is made: a folder made 0700, a file 0600 as it is created,
 /// never set so after its text is in.</summary>
 internal static class OwnFiles
 {
-    private const UnixFileMode OwnersFile = UnixFileMode.UserRead | UnixFileMode.UserWrite;
+    public const UnixFileMode OwnersFile = UnixFileMode.UserRead | UnixFileMode.UserWrite;
 
-    private const UnixFileMode OwnersFolder = UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute;
+    public const UnixFileMode OwnersFolder = UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute;
 
     /// <summary>Makes a folder only the person enters (one an earlier Passenger made, put right), before anything is
     /// written in it.</summary>
@@ -897,9 +918,56 @@ internal static class OwnFiles
         File.SetUnixFileMode(path, OwnersFolder);
     }
 
+    /// <summary>Makes a folder only the person enters where it is not there yet, with each folder above it made with it;
+    /// one there already is kept as it is (<see cref="Tree"/> puts one right once).</summary>
+    public static void Made(string path)
+    {
+        if (OperatingSystem.IsWindows())
+        {
+            Directory.CreateDirectory(path);
+            return;
+        }
+        Directory.CreateDirectory(path, OwnersFolder);
+    }
+
+    /// <summary>Puts a folder an earlier Passenger made right with all it holds, where its own mode is not yet 0700: each
+    /// folder below made 0700 and each file 0600, links passed over, the folder itself last, so one put right is known by
+    /// its own mode and walked no more. One not there is left so.</summary>
+    public static void Tree(string folder)
+    {
+        if (OperatingSystem.IsWindows() || !Directory.Exists(folder) || File.GetUnixFileMode(folder) == OwnersFolder)
+        {
+            return;
+        }
+        EnumerationOptions everything = new() { RecurseSubdirectories = true, AttributesToSkip = 0, IgnoreInaccessible = true };
+        foreach (FileSystemInfo entry in new DirectoryInfo(folder).EnumerateFileSystemInfos("*", everything))
+        {
+            UnixFileMode own = entry is DirectoryInfo ? OwnersFolder : OwnersFile;
+            if (!entry.Attributes.HasFlag(FileAttributes.ReparsePoint) && entry.UnixFileMode != own)
+            {
+                entry.UnixFileMode = own;
+            }
+        }
+        File.SetUnixFileMode(folder, OwnersFolder);
+    }
+
+    /// <summary>A file only the person reads, opened to append to, made where it is not there yet.</summary>
+    public static FileStream Append(string path, FileShare share)
+    {
+        FileStreamOptions options = new() { Mode = FileMode.Append, Access = FileAccess.Write, Share = share };
+        if (!OperatingSystem.IsWindows())
+        {
+            options.UnixCreateMode = OwnersFile;
+        }
+        return new FileStream(path, options);
+    }
+
     /// <summary>Writes a file only the person reads, whole (<see cref="AtomicFile"/>): one there before is replaced, never
     /// written into, since it would keep the mode it had.</summary>
-    public static void Write(string path, string text) => AtomicFile.Write(path, System.Text.Encoding.UTF8.GetBytes(text), OwnersFile);
+    public static void Write(string path, string text) => Write(path, System.Text.Encoding.UTF8.GetBytes(text));
+
+    /// <summary><see cref="Write(string, string)"/> of bytes.</summary>
+    public static void Write(string path, ReadOnlySpan<byte> bytes) => AtomicFile.Write(path, bytes, OwnersFile);
 
     /// <summary>A new file only the person reads, opened to be written (one there already refused).</summary>
     public static FileStream Create(string path)
@@ -929,7 +997,18 @@ public sealed record ServiceInContainer(ContainerReach Reach, DotnetProcess Prog
 
 /// <summary>A service's container as the engine says it stands: its service, state, health, published ports, the
 /// container's name and its last exit code.</summary>
-public sealed record ServiceState(string Service, string State, string? Health, string Ports, string? Container, int? ExitCode);
+public sealed record ServiceState(string Service, string State, string? Health, string Ports, string? Container, int? ExitCode)
+{
+    /// <summary>Whether its container runs, its health then said beside its state.</summary>
+    public bool Runs => State.Equals("running", StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>Running, and neither unhealthy nor still starting its health check where it has one.</summary>
+    public bool IsUp => Runs && !(Health is { } health
+        && (health.Equals("unhealthy", StringComparison.OrdinalIgnoreCase) || health.Equals("starting", StringComparison.OrdinalIgnoreCase)));
+
+    /// <summary>Whether its container runs no more: it exited, or is dead.</summary>
+    public bool HasEnded => State.Equals("exited", StringComparison.OrdinalIgnoreCase) || State.Equals("dead", StringComparison.OrdinalIgnoreCase);
+}
 
 /// <summary>A container configuration running, a run of services (<see cref="ServiceRun"/>) whose services run in containers:
 /// its plan, Compose's watch of the services that ask for one, and each .NET service's build as it was when started, so
@@ -974,8 +1053,32 @@ public sealed class ContainerRun(ContainerPlan plan, ContainerEngine engine, Con
     /// <summary>Where the container tools come from that are put in a service's container to reach its program: its session's.</summary>
     public required ContainerToolsSource Tools { get; init; }
 
-    /// <summary>Whether it was taken down (or is being).</summary>
+    /// <summary>Whether it was taken down (or is being), or let go of.</summary>
     public override bool IsStopped => stopping is not null;
+
+    /// <summary>Whether Detach let go of it (<see cref="LetGo"/>), its containers left running.</summary>
+    public bool IsLetGo { get; private set; }
+
+    /// <summary>Whether an <c>up</c> of it is under way, its start's or a restart's.</summary>
+    public bool IsComingUp => !UpsEnded.IsCompleted;
+
+    /// <summary>Detach: it is no longer under way, as Stop leaves it, taking nothing down: Compose's watch ended, and its
+    /// containers left running as the folder's (<see cref="FolderContainers"/>), which the folder's end takes down.</summary>
+    public void LetGo()
+    {
+        if (stopping is not null)
+        {
+            return;
+        }
+        if (watching is { } watch)
+        {
+            ChildProcesses.Kill(watch);
+            watching = null;
+        }
+        IsLetGo = true;
+        stopping = Task.CompletedTask;
+        ending.Cancel();
+    }
 
     /// <summary>Done once <see cref="StopAsync"/> has had the engine take it down.</summary>
     public Task Stopped => stopping ?? Task.CompletedTask;
@@ -1054,6 +1157,8 @@ public sealed class ContainerRun(ContainerPlan plan, ContainerEngine engine, Con
     /// its restart builds its image.</summary>
     public override bool BuildsBeforeRestart => Plan.Mode == ContainerMode.Fast;
 
+    public override WorkspaceModel? Workspace => Plan.Workspace;
+
     /// <summary>In fast mode, while its build here is the one it started on; as deployed, a restart builds its image again.</summary>
     public override bool RestartsOnItsBuild(IRunService service) => Plan.Mode == ContainerMode.Fast && Changed().All(d => d.Service != service.Name);
 
@@ -1072,6 +1177,10 @@ public sealed class ContainerRun(ContainerPlan plan, ContainerEngine engine, Con
 
     /// <summary>The run's .NET service by its name in the run.</summary>
     private DotnetService Dotnet(IRunService service) => Plan.Dotnet.First(d => d.Service == service.Name);
+
+    /// <summary>Why each service's program was not reached, by service, as last said in the run's console with its container
+    /// and that container's start: a lookup made again in the same start says it no more.</summary>
+    private readonly Dictionary<string, string> unreachedSaid = new(StringComparer.Ordinal);
 
     /// <summary>A service's program in its container once Compose has started it, reached through Passenger's tools there:
     /// the adapter run there over docker exec, its console the container's log since its start, its paths mapped back in
@@ -1094,8 +1203,13 @@ public sealed class ContainerRun(ContainerPlan plan, ContainerEngine engine, Con
         }
         if (there.Program.WhyNot is { } unreached)
         {
-            // In the run's console, which still says it once a later word has taken the status bar's place.
-            Say(service, unreached, error: false);
+            // In the run's console, which still says it once a later word has taken the status bar's place; once a start.
+            string said = $"{there.Reach.Container}\n{there.Started}\n{unreached}";
+            if (unreachedSaid.GetValueOrDefault(service.Name) != said)
+            {
+                unreachedSaid[service.Name] = said;
+                Say(service, unreached, error: false);
+            }
         }
         ContainerPaths paths = Plan.Mode == ContainerMode.Images ? dotnet.Paths : ContainerPaths.None;
         AdapterPlace place = there.Reach.Adapter(there.Program.Program, paths) with
@@ -1174,7 +1288,7 @@ public sealed class ContainerRun(ContainerPlan plan, ContainerEngine engine, Con
     /// for the debugger (or, its debugger turned off, saying why), by its assembly; given up on after a minute.</summary>
     internal static async Task<DotnetProcess> HeldProgramAsync(ContainerReach reach, DotnetService service, CancellationToken stop)
     {
-        DateTime until = DateTime.UtcNow + TimeSpan.FromMinutes(1);
+        Deadline until = Deadline.In(TimeSpan.FromMinutes(1));
         string assembly = $"{service.Assembly}.dll";
         while (true)
         {
@@ -1183,7 +1297,7 @@ public sealed class ContainerRun(ContainerPlan plan, ContainerEngine engine, Con
             {
                 return program;
             }
-            if (DateTime.UtcNow > until)
+            if (until.Passed)
             {
                 throw new ContainerToolsException($"no .NET program running {assembly} started in its container {reach.Container} within a minute");
             }
@@ -1425,7 +1539,7 @@ public sealed class ContainerRun(ContainerPlan plan, ContainerEngine engine, Con
 
     /// <summary>The .NET services whose build changed since they started (or were last restarted), Rerun's to restart.</summary>
     public IReadOnlyList<DotnetService> Changed() =>
-        [.. Plan.Restartable.Where(d => !stamps.TryGetValue(d.Service, out string? was) || was != BuiltInputs.Stamp(d.Output))];
+        [.. Plan.Running.Where(d => !stamps.TryGetValue(d.Service, out string? was) || was != BuiltInputs.Stamp(d.Output))];
 
     /// <summary>Restarts services (their containers kept, the same mount reading the new build), saying so in the console
     /// (<paramref name="why"/>, else that their build changed). A service whose container was made held, or unheld, other
@@ -1532,7 +1646,7 @@ public sealed class ContainerRun(ContainerPlan plan, ContainerEngine engine, Con
 
     private void Stamp(IEnumerable<DotnetService>? services = null)
     {
-        foreach (DotnetService service in services ?? Plan.Restartable)
+        foreach (DotnetService service in services ?? Plan.Running)
         {
             stamps[service.Service] = BuiltInputs.Stamp(service.Output);
         }
@@ -1582,16 +1696,16 @@ public sealed class ContainerRun(ContainerPlan plan, ContainerEngine engine, Con
         return chosen?.LinkOn(endpoint)?.GetLeftPart(UriPartial.Authority);
     }
 
-    /// <summary>The address the browser opens: the plan's, its <c>{Scheme}</c>, <c>{ServiceHost}</c> and
-    /// <c>{ServicePort}</c> filled from the port the engine published for the launched service, on the engine's machine
-    /// (<see cref="ContainerPort.LinkOn"/>); null without one.</summary>
+    /// <summary>The address the browser opens: the plan's, its tokens (<see cref="ServiceUrls"/>) filled from the port the
+    /// engine published for the launched service, on the engine's machine (<see cref="ContainerPort.LinkOn"/>), over HTTPS where
+    /// that port serves it this run; null without one.</summary>
     public async Task<string?> BrowserUrlAsync(CancellationToken cancel)
     {
         if (Plan.BrowserUrl is not { } url)
         {
             return null;
         }
-        if (!url.Contains('{', StringComparison.Ordinal))
+        if (!ServiceUrls.HasTokens(url))
         {
             return url;
         }
@@ -1604,12 +1718,12 @@ public sealed class ContainerRun(ContainerPlan plan, ContainerEngine engine, Con
             return null;
         }
         string on = published.ToString(CultureInfo.InvariantCulture);
-        string scheme = ContainerPlans.HttpsPort(port) || url.StartsWith("https", StringComparison.OrdinalIgnoreCase) ? "https" : "http";
+        // A .NET service that serves HTTPS serves HTTP on the same port for a run with no development certificate.
+        bool overHttp = Certificate is null && Plan.Https.Contains(service);
+        string scheme = (ContainerPlans.HttpsPort(port) && !overHttp) || url.StartsWith("https", StringComparison.OrdinalIgnoreCase) ? "https" : "http";
         string host = new ContainerPort(on, port.ToString(CultureInfo.InvariantCulture), "tcp").LinkOn((await engine.StateAsync(cancel: cancel)).Endpoint)?.Host
             ?? "localhost";
-        return url.Replace("{Scheme}", scheme, StringComparison.OrdinalIgnoreCase)
-            .Replace("{ServiceHost}", host, StringComparison.OrdinalIgnoreCase)
-            .Replace("{ServicePort}", on, StringComparison.OrdinalIgnoreCase);
+        return ServiceUrls.Filled(url, scheme, host, on);
     }
 
     /// <summary>Runs a docker command to its end, its output streamed into the console, its words first.</summary>

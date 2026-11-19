@@ -5,6 +5,9 @@
     <IsPackable>false</IsPackable>
     <IsTestProject>true</IsTestProject>
     <RootNamespace>Passenger.Tests</RootNamespace>
+    <!-- Passenger's own, so Windows takes the tests' process for what Passenger.exe is: one that makes a layered child
+         window (a reader's window over an editor), which a process not saying it runs on Windows 8 or later is refused. -->
+    <ApplicationManifest>../../src/Passenger.App/app.manifest</ApplicationManifest>
     <!-- The rig's LibraryImports (the run's nice value), and FileTests' (a Linux file's extended attributes). -->
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <!-- dotnet test's results (VSTest's folder for each run, a .trx, a hang's dump) under artifacts/ with the builds, never
@@ -32,6 +35,8 @@
     <Compile Include="../../src/Passenger.Inspector/AvaloniaHooks.cs" Link="AvaloniaHooks.cs" />
     <!-- The inspector's frame events, which a test tells as an app's inspector does. -->
     <Compile Include="../../src/Passenger.Inspector/FrameWire.cs" Link="FrameWire.cs" />
+    <!-- What Passenger's Hot Reload hook says, and the name its thread goes by in a debugged program. -->
+    <Compile Include="../../src/Passenger.UpdateHandlers/Wire.cs" Link="UpdateHandlersWire.cs" />
   </ItemGroup>
 
   <!-- Avalonia's templates, restored from nuget.org as every package is and served to the tests from the package cache
@@ -39,13 +44,17 @@
   <ItemGroup>
     <PackageDownload Include="Avalonia.Templates" Version="[$(AvaloniaTemplatesVersion)]" />
     <PackageDownload Include="CommunityToolkit.Mvvm" Version="[$(CommunityToolkitMvvmVersion)]" />
-    <PackageDownload Include="Aspire.ProjectTemplates" Version="[$(AspireTemplatesVersion)]" />
+    <PackageDownload Include="Aspire.ProjectTemplates" Version="[$(AspireTemplatesVersion)];[$(AspirePackageTemplatesVersion)]" />
     <PackageDownload Include="Aspire.AppHost.Sdk" Version="[$(AspireTemplatesVersion)]" />
     <AssemblyMetadata Include="NuGetPackageRoot" Value="$(NuGetPackageRoot)" />
     <AssemblyMetadata Include="AvaloniaTemplatesVersion" Value="$(AvaloniaTemplatesVersion)" />
     <AssemblyMetadata Include="AvaloniaOlderVersion" Value="$(AvaloniaOlderVersion)" />
+    <AssemblyMetadata Include="Avalonia120Version" Value="$(Avalonia120Version)" />
     <AssemblyMetadata Include="CommunityToolkitMvvmVersion" Value="$(CommunityToolkitMvvmVersion)" />
+    <AssemblyMetadata Include="ReactiveUiVersion" Value="$(ReactiveUiVersion)" />
+    <AssemblyMetadata Include="ReactiveUiGeneratorsVersion" Value="$(ReactiveUiGeneratorsVersion)" />
     <AssemblyMetadata Include="AspireTemplatesVersion" Value="$(AspireTemplatesVersion)" />
+    <AssemblyMetadata Include="AspirePackageTemplatesVersion" Value="$(AspirePackageTemplatesVersion)" />
   </ItemGroup>
 
   <!-- Aspire's dashboard and orchestrator (DCP) for this machine, about 900 MB in the package cache, which only a test
@@ -65,19 +74,30 @@
        (TestRun): the tests never run the person's. On Windows an AppHost and the CLI keep their record of running AppHosts in
        the person's profile whatever the environment says, so there the tests that would run one skip. -->
   <ItemGroup Condition="'$(PassengerAspireRuntime)' == 'true' and !$([MSBuild]::IsOSPlatform('Windows'))">
-    <PackageDownload Include="Aspire.Cli.$(NETCoreSdkRuntimeIdentifier)" Version="[$(AspireTemplatesVersion)]" />
+    <PackageDownload Include="Aspire.Cli.$(NETCoreSdkRuntimeIdentifier)" Version="[$(AspireTemplatesVersion)];[$(AspirePackageTemplatesVersion)]" />
     <AssemblyMetadata Include="AspireCli" Value="$(NuGetPackageRoot)aspire.cli.$(NETCoreSdkRuntimeIdentifier.ToLowerInvariant())/$(AspireTemplatesVersion)/tools/net10.0/$(NETCoreSdkRuntimeIdentifier)/aspire" />
+    <!-- The CLI of Aspire's package-only AppHosts, whose bundle (their dashboard and orchestrator) the run unpacks into a
+         folder of its own (AspirePackageApp). -->
+    <AssemblyMetadata Include="AspirePackageCli" Value="$(NuGetPackageRoot)aspire.cli.$(NETCoreSdkRuntimeIdentifier.ToLowerInvariant())/$(AspirePackageTemplatesVersion)/tools/any/$(NETCoreSdkRuntimeIdentifier)/aspire" />
   </ItemGroup>
   <ItemGroup>
     <AssemblyMetadata Include="AspireRuntime" Value="$(PassengerAspireRuntime)" />
   </ItemGroup>
 
-  <!-- The package graphs of the AppHosts, ServiceDefaults and services the Aspire tests write, in the package cache before
-       they run (tests/AspireGraphs): restored and built first, never linked. -->
+  <!-- The package graphs of the AppHosts, ServiceDefaults, services and Azure Functions app the Aspire tests write, in the
+       package cache before they run (tests/AspireGraphs): restored and built first, never linked. -->
   <ItemGroup>
     <ProjectReference Include="../AspireGraphs/AppHost/AspireGraphs.AppHost.csproj" ReferenceOutputAssembly="false" />
     <ProjectReference Include="../AspireGraphs/ServiceDefaults/AspireGraphs.ServiceDefaults.csproj" ReferenceOutputAssembly="false" />
     <ProjectReference Include="../AspireGraphs/ApiService/AspireGraphs.ApiService.csproj" ReferenceOutputAssembly="false" />
+    <ProjectReference Include="../AspireGraphs/FunctionsHost/AspireGraphs.FunctionsHost.csproj" ReferenceOutputAssembly="false" />
+    <ProjectReference Include="../AspireGraphs/Functions/AspireGraphs.Functions.csproj" ReferenceOutputAssembly="false" />
+    <ProjectReference Include="../AspireGraphs/PackageAppHost/AspireGraphs.PackageAppHost.csproj" ReferenceOutputAssembly="false" />
+    <ProjectReference Include="../AspireGraphs/PackageServiceDefaults/AspireGraphs.PackageServiceDefaults.csproj" ReferenceOutputAssembly="false" />
+    <ProjectReference Include="../AspireGraphs/PackageApiService/AspireGraphs.PackageApiService.csproj" ReferenceOutputAssembly="false" />
+    <AssemblyMetadata Include="AzureFunctionsSdkVersion" Value="$(AzureFunctionsSdkVersion)" />
+    <AssemblyMetadata Include="AzureFunctionsWorkerVersion" Value="$(AzureFunctionsWorkerVersion)" />
+    <AssemblyMetadata Include="AzureFunctionsHttpVersion" Value="$(AzureFunctionsHttpVersion)" />
   </ItemGroup>
 
   <!-- The package graph of the EF Core projects the Migrations window's tests write (tests/EfGraphs), and the dotnet-ef
@@ -118,6 +138,7 @@
   <ItemGroup>
     <AssemblyMetadata Include="TestSdkVersion" Value="@(PackageVersion->WithMetadataValue('Identity', 'Microsoft.NET.Test.Sdk')->'%(Version)')" />
     <AssemblyMetadata Include="XunitRunnerVersion" Value="@(PackageVersion->WithMetadataValue('Identity', 'xunit.runner.visualstudio')->'%(Version)')" />
+    <AssemblyMetadata Include="XunitVersion" Value="@(PackageVersion->WithMetadataValue('Identity', 'xunit.v3')->'%(Version)')" />
     <!-- And what both of its projects resolve through xunit.v3 that this project's graph takes at another version. -->
     <PackageDownload Include="Microsoft.Bcl.AsyncInterfaces" Version="[$(XunitAsyncInterfacesVersion)]" />
     <!-- OpenTelemetry's, which the AspireGraphs' ServiceDefaults restore puts in the package cache, for ContainerTelemetryTests' app. -->
@@ -141,6 +162,7 @@
     <AssemblyMetadata Include="NUnitFourAdapterVersion" Value="$(NUnitFourAdapterVersion)" />
     <AssemblyMetadata Include="MSTestRunnerVersion" Value="$(MSTestRunnerVersion)" />
     <AssemblyMetadata Include="XunitAppVersion" Value="$(XunitAppVersion)" />
+    <AssemblyMetadata Include="ReqnrollVersion" Value="$(ReqnrollVersion)" />
   </ItemGroup>
 
   <!-- WPF's reference pack, likewise, for the WPF app WpfXamlTests make (WpfApp.Feed), with the target they make it for
@@ -148,6 +170,7 @@
   <ItemGroup>
     <PackageDownload Include="Microsoft.WindowsDesktop.App.Ref" Version="[$(WindowsDesktopRefVersion)]" />
     <AssemblyMetadata Include="WindowsDesktopRefVersion" Value="$(WindowsDesktopRefVersion)" />
+    <AssemblyMetadata Include="MauiVersion" Value="$(MauiVersion)" />
     <AssemblyMetadata Include="TargetFramework" Value="$(TargetFramework)" />
   </ItemGroup>
   <!-- This machine's .NET runtime pack at the SDK's own version, for the self-contained app PublishTests publish for this
@@ -216,6 +239,14 @@
     </ItemGroup>
   </Target>
 
+  <!-- Passenger's themes repository as the tests read it, in its place (TestRun names it through PASSENGER_THEMES): the
+       themes and the code colour scheme that left the app, held to the window's rules (UiRulesTests). -->
+  <ItemGroup>
+    <None Include="Themes/*.json" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="Themes/pictures/*.webp" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="VsCodeThemes/*.json" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
   <!-- A test drives the IDE whole or a real process through its real boundary: the entry points a unit test would call
        instead are banned (BannedSymbols.txt), as is hearing a child past ChildProcesses.Hear, which warnings as errors
        make a failed build. -->
@@ -234,6 +265,7 @@
     <ProjectReference Include="../Debuggees/DebuggableConsoleApp/DebuggableConsoleApp.csproj" ReferenceOutputAssembly="false" />
     <ProjectReference Include="../Debuggees/LoopingConsoleApp/LoopingConsoleApp.csproj" ReferenceOutputAssembly="false" />
     <ProjectReference Include="../Debuggees/LoopingConsoleAppOptimized/LoopingConsoleAppOptimized.csproj" ReferenceOutputAssembly="false" />
+    <ProjectReference Include="../Debuggees/MinimalApiApp/MinimalApiApp.csproj" ReferenceOutputAssembly="false" />
     <ProjectReference Include="../Debuggees/PassengerCases/PassengerCases.csproj" ReferenceOutputAssembly="false" />
     <ProjectReference Include="../Debuggees/ReadsInputConsoleApp/ReadsInputConsoleApp.csproj" ReferenceOutputAssembly="false" />
     <ProjectReference Include="../Debuggees/ReadsInputConsoleAppNoCet/ReadsInputConsoleAppNoCet.csproj" ReferenceOutputAssembly="false" />

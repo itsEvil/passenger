@@ -7,6 +7,7 @@ using Passenger.Core;
 using Passenger.Lsp;
 using Passenger.Text;
 using Passenger.Workspace;
+using Passenger.Workspace.GDScript;
 using Passenger.Xaml.Features;
 
 namespace Passenger.App.CSharp;
@@ -41,7 +42,7 @@ internal sealed partial class WebAssist(AssistContext context, PopupPlacement po
             OpenDocument? shown = context.Editors.Active;
             string? markup = shown is null ? null : ScopedCss.MarkupOf(shown.Path);
             Func<TextSnapshot, int, CancellationToken, Task<CodeCompletion.OwnItems?>>? own = markup is not null ? (asked, caret, cancel) => ScopedItemsAsync(markup, asked, caret, cancel)
-                : shown is not null && GodotScriptTypes.IsScript(shown.Path) ? (asked, caret, _) => CSharpItemsAsync(shown, asked, caret)
+                : shown is not null && GodotScriptTypes.IsScript(shown.Path) ? (asked, caret, _) => CSharpItemsAsync(web, shown, asked, caret)
                 : null;
             await completion.ServerListAsync(lsp, trigger, incomplete, web, own);
         }
@@ -50,9 +51,9 @@ internal sealed partial class WebAssist(AssistContext context, PopupPlacement po
 
     /// <summary>What Godot's server cannot list after a node's dot in a GDScript (<c>$Player.</c>): the members of the C# script
     /// the scenes run on the node, listed first, each once beside the server's; null elsewhere.</summary>
-    private async Task<CodeCompletion.OwnItems?> CSharpItemsAsync(OpenDocument document, TextSnapshot asked, int caret)
+    private async Task<CodeCompletion.OwnItems?> CSharpItemsAsync(WebDocument web, OpenDocument document, TextSnapshot asked, int caret)
     {
-        int start = context.WordStart(caret);
+        int start = WebWordStart(web, asked, Math.Min(caret, asked.Length));
         if (start < 2 || asked[start - 1] != '.' || context.GodotScriptTypes?.Invoke() is not { } types || await types.TypedAsync(document) is not { } typed
             || document.Text.Snapshot != asked)
         {
@@ -213,22 +214,28 @@ internal sealed partial class WebAssist(AssistContext context, PopupPlacement po
 
     /// <summary>A character of a web language's name beyond an identifier's: CSS's and HTML's '-' (background-color,
     /// --accent, data-id), JavaScript's '$', a Dockerfile's flags' '-' (--from), YAML's keys' and names' '-' and '.'
-    /// (x-common, my-api), none of GDScript's, and in JSON the quotes a property's name is written in.</summary>
+    /// (x-common, my-api), GDScript's by Godot's identifier rule (a mark carrying a name on), and in JSON the quotes a
+    /// property's name is written in.</summary>
     public static bool IsWebWordChar(WebDocument web, char c) => web.Kind switch
     {
         WebServerKind.Css or WebServerKind.Html or WebServerKind.Dockerfile => c == '-',
         WebServerKind.TypeScript => c == '$',
         WebServerKind.Yaml => c is '-' or '.',
-        WebServerKind.GDScript => false,
+        WebServerKind.GDScript => GDScriptTokenizer.MayContinueIdentifier(c),
         _ => c is '"' or '-' or '.' or '@' or '/',
     };
+
+    /// <summary>A character of a web language's name: a GDScript's by Godot's identifier rule alone, another's an
+    /// identifier's (<see cref="AssistContext.IsIdentifierChar"/>) or one of its own (<see cref="IsWebWordChar"/>).</summary>
+    public static bool IsWebNameChar(WebDocument web, char c) =>
+        web.Kind == WebServerKind.GDScript ? GDScriptTokenizer.MayContinueIdentifier(c) : AssistContext.IsIdentifierChar(c) || IsWebWordChar(web, c);
 
     private int WebWordStart(WebDocument web, int caret) => WebWordStart(web, Editor.Document.Snapshot, caret);
 
     public static int WebWordStart(WebDocument web, TextSnapshot text, int caret)
     {
         int start = caret;
-        while (start > 0 && (AssistContext.IsIdentifierChar(text[start - 1]) || (IsWebWordChar(web, text[start - 1]) && text[start - 1] != '"')))
+        while (start > 0 && IsWebNameChar(web, text[start - 1]) && text[start - 1] != '"')
         {
             start--;
         }
@@ -240,7 +247,7 @@ internal sealed partial class WebAssist(AssistContext context, PopupPlacement po
     {
         int start = WebWordStart(web, text, Math.Min(offset, text.Length));
         int end = Math.Min(offset, text.Length);
-        while (end < text.Length && (AssistContext.IsIdentifierChar(text[end]) || (IsWebWordChar(web, text[end]) && text[end] != '"')))
+        while (end < text.Length && IsWebNameChar(web, text[end]) && text[end] != '"')
         {
             end++;
         }
@@ -307,55 +314,44 @@ internal sealed partial class WebAssist(AssistContext context, PopupPlacement po
             return;
         }
         int caret = Editor.Selections.Primary.Caret;
-        // The text the outline is asked of, whose places the edit is made in and carried through what is typed since.
-        ChangeTracker asked = new(document.Text);
         IdeErrors.Observe(popups.Carried("Rename", async () =>
         {
-            bool shown = false;
-            try
+            // The text the outline is asked of, whose places are carried through what is typed since.
+            using ChangeTracker asked = new(document.Text);
+            IReadOnlyList<DocumentSymbol> outline = await lsp.OutlineAsync();
+            if (context.Editors.Active != document || web.Lsp != lsp)
             {
-                IReadOnlyList<DocumentSymbol> outline = await lsp.OutlineAsync();
-                if (context.Editors.Active != document || web.Lsp != lsp)
-                {
-                    return;
-                }
-                ServerLines lines = ServerLines.Of(asked.Snapshot);
-                if (JsonPropertyAt(outline, lines, caret) is not { } at)
-                {
-                    context.Say("Nothing to rename here: put the caret on a property's name");
-                    return;
-                }
-                DocumentSymbol property = at.Path[^1];
-                RenameBox box = new(property.Name);
-                shown = true;
-                popups.ShowModal(box, asked.MapOffset(at.Key.Start), name =>
-                {
-                    if (name is null || name == property.Name || context.Editors.Active != document)
-                    {
-                        return Task.CompletedTask;
-                    }
-                    IReadOnlyList<TextEdit> edits = JsonRenameEdits(at.Path, at.Key, lines, name, IsPackageJson(document));
-                    if (asked.Map(edits) is not { } placed)
-                    {
-                        context.Say("Rename was not applied: the property was edited meanwhile");
-                        return Task.CompletedTask;
-                    }
-                    Editor.ApplyEdits(placed);
-                    int runs = placed.Count - 1;
-                    context.Say(runs == 0 ? "Renamed" : $"Renamed, and in {Plural.Of(runs, "script")} that {Plural.Agreeing(runs, "runs", "run")} it");
-                    return Task.CompletedTask;
-                });
-                // Let go as the box closes, however it closes; what was typed until then is still carried.
-                popups.WhenClosed(asked.Dispose);
+                return;
             }
-            finally
+            if (JsonPropertyAt(outline, ServerLines.Of(asked.Snapshot), caret) is not { } at)
             {
-                if (!shown)
-                {
-                    asked.Dispose();
-                }
+                context.Say("Nothing to rename here: put the caret on a property's name");
+                return;
             }
+            string old = at.Path[^1].Name;
+            actions.AskRename(document, asked.MapOffset(at.Key.Start), old, (held, name, _) => RenameJsonAsync(lsp, document, held.Offset, old, name));
         }, closeModal: false));
+    }
+
+    /// <summary>A JSON property renamed from its name at an offset, worked out again on the text as it stands: its name, quotes
+    /// kept, and in a package.json's scripts every <c>npm run</c> of a script renamed with it, as one undoable edit; refused
+    /// where the place no longer names <paramref name="old"/> or the text moved on under the edit.</summary>
+    private async Task<RefactorOutcome> RenameJsonAsync(LspDocument lsp, OpenDocument document, int offset, string old, string name)
+    {
+        // The text the outline is asked of, whose places the edit is made in and carried through what is typed since.
+        using ChangeTracker asked = new(document.Text);
+        IReadOnlyList<DocumentSymbol> outline = await lsp.OutlineAsync();
+        ServerLines lines = ServerLines.Of(asked.Snapshot);
+        if (JsonPropertyAt(outline, lines, offset) is not { } at || at.Path[^1].Name != old
+            || asked.Map(JsonRenameEdits(at.Path, at.Key, lines, name, IsPackageJson(document))) is not { } placed)
+        {
+            return RefactorOutcome.Refused("Rename was not applied: the property was edited meanwhile");
+        }
+        TextSnapshot was = document.Text.Snapshot;
+        WorkspaceEdits.ApplyTo(context.Editors, document, placed);
+        int runs = placed.Count - 1;
+        return new RefactorOutcome(runs == 0 ? "Renamed" : $"Renamed, and in {Plural.Of(runs, "script")} that {Plural.Agreeing(runs, "runs", "run")} it", null,
+            [new RefactoredFile(document.Path, RefactoredChange.Changed, [.. placed.Select(e => was.GetLineFromOffset(e.Start) + 1).Distinct()])], []);
     }
 
     /// <summary>The JSON property whose name is at an offset of the text the outline is of: its path from the top, and its
@@ -407,15 +403,17 @@ internal sealed partial class WebAssist(AssistContext context, PopupPlacement po
     internal static bool IsPackageJson(OpenDocument document) => Path.GetFileName(document.Path).Equals("package.json", StringComparison.OrdinalIgnoreCase);
 
     /// <summary>The installed package's package.json, found as Node.js resolves a package: node_modules beside the
-    /// package.json, then in each folder above it.</summary>
+    /// package.json, then in each folder above it of the person's (<see cref="Passenger.Core.FoldersUp"/>).</summary>
     private static string? Installed(string packageJson, string name)
     {
-        for (string? folder = Path.GetDirectoryName(packageJson); folder is not null; folder = Path.GetDirectoryName(folder))
+        foreach (string folder in Path.GetDirectoryName(packageJson) is { } start ? Passenger.Core.FoldersUp.From(start) : [])
         {
+            // A name rooted on a share or a device (as package.json's text may write one) is no package of these folders'.
             string candidate = Path.Combine(folder, "node_modules", name, "package.json");
-            if (File.Exists(candidate))
+            if (Passenger.Core.FoundPaths.Askable(candidate) && Passenger.Core.FoldersUp.Found(folder, Path.Combine("node_modules", name, "package.json")) is { } found
+                && File.Exists(found))
             {
-                return Passenger.Core.PathNames.Canonical(candidate);
+                return Passenger.Core.PathNames.Canonical(found);
             }
         }
         return null;

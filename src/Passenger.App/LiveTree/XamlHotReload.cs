@@ -21,10 +21,11 @@ public sealed class XamlHotReload(LiveApp app, Func<string, TextSnapshot?> texts
     /// <summary>The files edited since the app last took them, each with how many edits it has had.</summary>
     private readonly Dictionary<string, int> edited = new(PathNames.Comparer);
 
-    /// <summary>Whether it is a file of the app's framework: an Avalonia app's .axaml (or .xaml), a WPF app's .xaml.</summary>
+    /// <summary>Whether it is a file of the app's framework: an Avalonia app's .axaml (or .xaml), a WPF app's .xaml; none of a
+    /// MAUI app's, which XAML Hot Reload does not reach yet.</summary>
     public bool Takes(string path) => Path.GetExtension(path).ToLowerInvariant() switch
     {
-        ".xaml" => true,
+        ".xaml" => app.Kind != LiveAppKind.Maui,
         ".axaml" or ".paml" => app.Kind == LiveAppKind.Avalonia,
         _ => false,
     };
@@ -126,12 +127,12 @@ public sealed class XamlHotReload(LiveApp app, Func<string, TextSnapshot?> texts
             edited.Remove(file);
             return null;
         }
-        if (await projects(file) is not { } project)
+        if (await projects(file) is not { } project || project.UriOf(file) is not { } uri)
         {
             return (file, new XamlReloaded([], $"{Path.GetFileName(file)} is in no project whose XAML Passenger reads", []), text);
         }
         string shown = text.ToString();
-        XamlChange change = new(file, shown, held.GetValueOrDefault(file), project.AssemblyName, UriOf(project, file))
+        XamlChange change = new(file, shown, held.GetValueOrDefault(file), project.AssemblyName, uri)
         {
             CompiledBindings = app.Kind == LiveAppKind.Avalonia ? project.CompilesBindings : null,
         };
@@ -154,15 +155,6 @@ public sealed class XamlHotReload(LiveApp app, Func<string, TextSnapshot?> texts
             }
         }
         return (file, reloaded, text);
-    }
-
-    /// <summary>The URI the build gave a file in its assembly: avares:// for Avalonia's, a pack URI for WPF's.</summary>
-    private string UriOf(XamlProject project, string file)
-    {
-        string inside = Path.GetRelativePath(project.Folder, file).Replace('\\', '/');
-        return app.Kind == LiveAppKind.Wpf
-            ? $"pack://application:,,,/{project.AssemblyName};component/{inside}"
-            : $"avares://{project.AssemblyName}/{inside}";
     }
 
     /// <summary>What the files came to, said as one: refused (with an error the XAML's own, else a change only a build makes),

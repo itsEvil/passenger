@@ -1,3 +1,4 @@
+using Passenger.Core;
 using Passenger.Dap;
 
 namespace Passenger.DebugAdapter;
@@ -6,6 +7,10 @@ namespace Passenger.DebugAdapter;
 /// disconnects or goes away. Takes netcoredbg's flags, so a client written for it runs this.</summary>
 public static class AdapterProgram
 {
+    /// <summary>How long the let-go after the client's end may take beyond an evaluation's limit: the engine's lock waited
+    /// for (10 s at most), then the let-go itself.</summary>
+    private static readonly TimeSpan AbortLimit = TimeSpan.FromSeconds(20);
+
     /// <summary>Runs the adapter on the flags given; a flag it does not know is fatal (exit code 2), so a typo never runs
     /// something other than what was asked. <paramref name="usage"/> is how the help names the command.</summary>
     public static async Task<int> RunAsync(string[] args, string usage)
@@ -64,6 +69,8 @@ public static class AdapterProgram
         try
         {
             Passenger.Debugger.Extensions.EvaluationTimeout = AdapterEnvironment.EvaluationTimeout;
+            Passenger.Debugger.ManagedDebugger.LateYield = AdapterEnvironment.LateYield;
+            Passenger.Debugger.ManagedDebugger.FailAtModule = AdapterEnvironment.FailAtModule;
             _ = Passenger.Core.Waits.Scale;
         }
         catch (FormatException error)
@@ -107,7 +114,14 @@ public static class AdapterProgram
         // Ends at a disconnect, or as standard input ends, which a client gone without disconnecting leaves.
         await Task.WhenAny(disconnected.Task, connection.Completion);
         // A client that closed its end without disconnecting leaves the debuggee to be let go here.
-        await adapter.AbortAsync();
+        Task aborted = adapter.AbortAsync();
+        // Within a bound: nothing else ends the adapter (docker exec's end ends no process it started in a container).
+        TimeSpan limit = Passenger.Core.Waits.Of(AbortLimit + Passenger.Debugger.Extensions.EvaluationTimeout);
+        if (await Task.WhenAny(aborted, Task.Delay(limit)) != aborted)
+        {
+            Console.Error.WriteLine($"The program was not let go within {Durations.Said(limit)} of the client's end: the adapter exits without it");
+            Log("Abort: not done in time; exiting without it");
+        }
         Log("Exiting");
         logWriter?.Dispose();
         // A read of standard input cannot be cancelled, and the client may hold its end open: exit rather than wait.

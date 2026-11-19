@@ -9,8 +9,8 @@ using A = Passenger.App.AppActions;
 
 namespace Passenger.App;
 
-/// <summary>The XAML previewer beside the editor: View, XAML Preview shows each editor group's XAML file of an Avalonia
-/// or WPF project with its design view to its right, drawn from the project's last build by its framework's previewer
+/// <summary>The XAML previewer beside the editor: View, XAML Preview shows each editor group's XAML file of an Avalonia,
+/// WPF or .NET MAUI project with its design view to its right, drawn from the project's last build by its framework's previewer
 /// and following the text as typing pauses. Where the previewer places the file's elements, a click on one
 /// selects its start tag in the editor and the element at the caret is outlined. A file's preview is kept while the file
 /// is open and the preview on, and ends as either goes; its previewer runs while the preview is shown, or was the last
@@ -27,6 +27,9 @@ public partial class MainWindow
     private readonly Dictionary<OpenDocument, ShownPreview> previews = [];
     private bool previewing;
 
+    /// <summary>What the last MAUI page's preview was chosen to be drawn as, which each MAUI preview opened since starts as.</summary>
+    private MauiLook mauiLook = MauiLook.AsBuilt;
+
     /// <summary>Counts the times the previews shown were followed, which says the preview shown last.</summary>
     private long previewsFollowed;
 
@@ -41,14 +44,14 @@ public partial class MainWindow
         actions!.Add(new IdeAction(A.XamlPreview, "XAML Preview", "Editor", _ => TogglePreview())
         {
             WhyNot = context => context.File is null ? Refusals.NoFile
-                : session.Xaml.For(context.File) is null ? "The previewer is for the XAML of an Avalonia or WPF project" : null,
+                : session.Xaml.For(context.File) is null ? "The previewer is for the XAML of an Avalonia, WPF or .NET MAUI project" : null,
             IsChecked = _ => previewing,
             Menus = [new MenuPlace("View", 4, 0)],
         });
         actions.Add(new IdeAction(A.BuildForPreview, XamlPreviewPane.BuildForPreviewTitle, "Editor", context => IdeErrors.Observe(BuildForPreviewAsync(context.File!)))
         {
             WhyNot = context => context.File is null ? Refusals.NoFile
-                : session.Xaml.For(context.File) is null || ProjectModel.Owning(session.Projects, context.File.Path) is null ? "The previewer is for the XAML of an Avalonia or WPF project"
+                : session.Xaml.For(context.File) is null || ProjectModel.Owning(session.Projects, context.File.Path) is null ? "The previewer is for the XAML of an Avalonia, WPF or .NET MAUI project"
                 : null,
             Words = ["preview", "build", "framework"],
         });
@@ -158,14 +161,26 @@ public partial class MainWindow
     /// <summary>Whether an editor group shows a preview's pane beside its file.</summary>
     private bool Shows(XamlPreviewPane pane) => Editors.Groups.Any(g => g.Side == pane);
 
+    /// <summary>The programs on this machine that run a library project's code, in the folder's order: a desktop app's, not
+    /// one of a device or the browser; none for a project that runs itself.</summary>
+    private IReadOnlyList<ProjectModel> ProgramsOf(ProjectModel library) =>
+        library.IsRunnable ? [] : [.. library.ProgramsRunning(session.Projects).Where(p => Run.Devices.DeviceTargets.PlatformsOf(p.TargetFrameworks).Count == 0 && !p.RunsInBrowser)];
+
+    /// <summary>The programs running a library project's code (<see cref="ProgramsOf"/>), each by the assembly its build makes.</summary>
+    private IReadOnlyList<string> ProgramsRunning(string project) =>
+        session.Projects.FirstOrDefault(p => Passenger.Core.PathNames.Same(p.Path, project)) is { } library
+            ? [.. ProgramsOf(library).Select(p => p.Property(Passenger.Host.CarriedProperties.TargetPath)).OfType<string>()]
+            : [];
+
     private XamlPreviewPane PaneFor(OpenDocument shown, XamlDocument document)
     {
         if (previews.TryGetValue(shown, out ShownPreview? kept))
         {
             return kept.Pane;
         }
-        XamlPreview preview = new(document);
+        XamlPreview preview = new(document) { ProgramsRunning = ProgramsRunning, Look = mauiLook };
         XamlPreviewPane pane = new(preview);
+        pane.LookChosen += (_, look) => mauiLook = look;
         pane.ElementChosen += (_, element) => ChooseInEditor(pane, element);
         pane.ActionRequested += (_, action) => Request(action);
         preview.Changed += (_, _) => OutlineAtCaret(pane, preview);
@@ -212,13 +227,32 @@ public partial class MainWindow
     }
 
     /// <summary>Build for XAML Preview: a XAML file's project built for what its preview draws alone, a multi-targeted one's
-    /// framework chosen, so no other framework's build holds the preview up; each preview then draws the build it made.</summary>
+    /// framework chosen, so no other framework's build holds the preview up, a MAUI project of platforms alone for none
+    /// (<see cref="MauiPreviewHost.PlainBuild"/>); each preview then draws the build it made.</summary>
     private async Task BuildForPreviewAsync(OpenDocument document)
     {
-        if (ProjectModel.Owning(session.Projects, document.Path) is not { } project)
+        if (ProjectModel.Owning(session.Projects, document.Path) is not { } owning)
         {
             return;
         }
+        // A MAUI project of platforms alone is built for none, which its preview draws and no platform's SDK is needed for.
+        if (session.Xaml.For(document)?.Loading.Builder is { IsCompletedSuccessfully: true } loaded && loaded.Result?.Dialect is Passenger.Xaml.Dialects.MauiDialect
+            && MauiPreviewHost.PlainBuild(owning) is { } plain)
+        {
+            if (work.Begin(A.BuildForPreview, $"Building {owning.Name} for no platform, which its preview draws…") is not { } plainWork)
+            {
+                Say(ActionWork.Busy(work.Of(A.BuildForPreview)!));
+                return;
+            }
+            using (plainWork)
+            {
+                BuildOutcome built = await buildRun.BuildForAsync(new BuildStep(owning.Path, null) { Properties = plain }, plainWork);
+                plainWork.Tell(built.Succeeded, built.Message);
+            }
+            return;
+        }
+        // A library's views are drawn in a program that runs them, whose build builds the library too.
+        ProjectModel project = owning.IsRunnable ? owning : ProgramsOf(owning).FirstOrDefault() ?? owning;
         string? framework = session.Frameworks.Of(project);
         if (work.Begin(A.BuildForPreview, framework is null ? $"Building {project.Name} for its preview…" : $"Building {project.Name} for {framework}, which its preview draws…")
             is not { } working)

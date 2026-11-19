@@ -1,0 +1,27 @@
+{
+  "format": 1,
+  "name": "Nocturne",
+  "description": "A violet night of hot pink keywords, lemon strings and mint calls, its colours those of Dracula Theme by the Dracula Theme team (dracula-theme.theme-dracula on Open VSX, MIT), under pill shapes, a crescent moon and stars across the Welcome screen, the frame and the tool windows, and the Explorer on the right.",
+  "vscode": {"id": "dracula-theme.theme-dracula", "theme": "Dracula Theme", "version": "2.25.1"},
+  "tokens": {
+    "ControlRadius": 6,
+    "ToolRadius": 8,
+    "PopupRadius": 10,
+    "CardRadius": 10,
+    "BadgeRadius": 6,
+    "ChipRadius": 10,
+    "TabStripHeight": 38,
+    "TabMargin": [2, 5, 2, 5],
+    "TabPadding": [10, 0, 6, 0],
+    "TabRadius": 7,
+    "TabShadow": "0 1 2 0 #1F000000",
+    "PopupEdge": [1, 3, 1, 1],
+    "EditorTextPadding": 6,
+    "ToolHeaderHeight": 38,
+    "ToolTitleMargin": [14, 0, 0, 0],
+    "DialogFooterPadding": [16, 10, 16, 10]
+  },
+  "fonts": {"code": {"family": "Fira Code"}},
+  "layout": {"places": {"rightTop": ["explorer", "commit"]}, "open": ["explorer"], "sizes": {"right": 270}},
+  "background": {"image": "pictures/nocturne.webp", "opacity": 0.24, "places": ["welcome", "frame", "toolWindows"], "fit": "cover"}
+}

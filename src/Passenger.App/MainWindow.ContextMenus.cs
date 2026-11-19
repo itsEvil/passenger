@@ -5,6 +5,7 @@ using Avalonia.LogicalTree;
 using Avalonia.Threading;
 using Avalonia.VisualTree;
 using Passenger.App.Debugging;
+using Passenger.Core;
 using Passenger.Editor;
 using E = Passenger.Editor.EditorActions;
 using A = Passenger.App.AppActions;
@@ -63,7 +64,7 @@ public partial class MainWindow
         }
         if (TestAt(active, editor.CaretPosition.Line) is { } test)
         {
-            string name = test.Method ?? test.Type[(test.Type.LastIndexOfAny(['.', '+']) + 1)..];
+            string name = test.Method ?? TypeNames.Short(test.Type);
             items.Add(new Separator());
             items.Add(Command($"Run '{name}'", () => RunTestsAt(test, active.Path, debug: false)));
             items.Add(Command($"Debug '{name}'", () => RunTestsAt(test, active.Path, debug: true)));
@@ -120,12 +121,13 @@ public partial class MainWindow
 
     /// <summary>Opens a context menu, remembering it while it is open, the keys kept in it (<see cref="KeepKeys"/>). A
     /// widget's (the project's, the branch's, the run configuration's) drops from under it, where one at the pointer
-    /// covered the widget.</summary>
+    /// covered the widget; a status bar widget's (the file's encoding, the branch's) rises from over it, its right edge
+    /// with the widget's.</summary>
     private void Open(ContextMenu menu, Control target)
     {
         if (target is Button && !menu.IsSet(ContextMenu.PlacementProperty))
         {
-            menu.Placement = PlacementMode.BottomEdgeAlignedLeft;
+            menu.Placement = StatusBarFrame.IsVisualAncestorOf(target) ? PlacementMode.TopEdgeAlignedRight : PlacementMode.BottomEdgeAlignedLeft;
         }
         OpenContextMenu?.Close();
         OpenContextMenu = menu;

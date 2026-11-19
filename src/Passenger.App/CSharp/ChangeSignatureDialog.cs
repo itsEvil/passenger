@@ -3,9 +3,7 @@ using Avalonia.Controls;
 using Avalonia.Input;
 using Avalonia.Layout;
 using Avalonia.Media;
-using Microsoft.CodeAnalysis.CSharp;
 using Passenger.Editor;
-using Passenger.Languages.CSharp;
 using Passenger.Roslyn.Extension;
 
 namespace Passenger.App.CSharp;
@@ -65,7 +63,7 @@ public sealed class ChangeSignatureDialog : RefactoringDialog
             },
         };
 
-        Border previewFrame = new() { Classes = { StyleClasses.Framed }, Padding = new Thickness(10, 8), Child = preview };
+        Border previewFrame = new() { Classes = { StyleClasses.Framed }, Padding = new Thickness(Gaps.Wide, Gaps.Normal), Child = preview };
         previewFrame.Bind(Border.BackgroundProperty, previewFrame.GetResourceObservable(TokenKeys.Editor_Background));
 
         for (int i = 0; i < signature.Parameters.Count; i++)
@@ -75,7 +73,7 @@ public sealed class ChangeSignatureDialog : RefactoringDialog
         }
         Options = new StackPanel
         {
-            Spacing = 10,
+            Spacing = FormRows.Between,
             Children =
             {
                 Row("Name:", NameBox),
@@ -85,7 +83,7 @@ public sealed class ChangeSignatureDialog : RefactoringDialog
                     Children =
                     {
                         Docked(new TextBlock { Text = "Parameters:", VerticalAlignment = VerticalAlignment.Center }, Dock.Left),
-                        new StackPanel { Orientation = Orientation.Horizontal, Spacing = 2, HorizontalAlignment = HorizontalAlignment.Right, Children = { AddButton, RemoveButton, UpButton, DownButton } },
+                        new StackPanel { Orientation = Orientation.Horizontal, Spacing = Gaps.Hair, HorizontalAlignment = HorizontalAlignment.Right, Children = { AddButton, RemoveButton, UpButton, DownButton } },
                     },
                 },
                 tableFrame,
@@ -125,34 +123,30 @@ public sealed class ChangeSignatureDialog : RefactoringDialog
         chosen = row;
         foreach (ParameterRow each in rows)
         {
-            if (each == row)
-            {
-                each.View.Bind(Border.BackgroundProperty, each.View.GetResourceObservable(TokenKeys.RowSelected));
-            }
-            else
-            {
-                each.View.Background = Brushes.Transparent;
-            }
+            each.View.Classes.Set(StyleClasses.Chosen, each == row);
         }
         Update();
     }
 
     protected override string? Check()
     {
-        bool method = signature.Kind is "method" or GDScriptKind or GDScriptSignalKind;
-        if (method && !IsName(NameBox.Text))
+        if (!GDScript)
+        {
+            return RefactoringChecks.WhyNotSignature(signature, Written(NameBox), Written(ReturnTypeBox), Asked());
+        }
+        if (!IsGDScriptName(NameBox.Text))
         {
             return string.IsNullOrWhiteSpace(NameBox.Text) ? "Method name can not be empty" : $"'{NameBox.Text}' is not a valid method name";
         }
-        if (method && ReturnTypeBox.Text?.Trim() != "void" && !IsType(ReturnTypeBox.Text) && !(GDScript && string.IsNullOrWhiteSpace(ReturnTypeBox.Text)))
+        if (Written(ReturnTypeBox) != "void" && !IsGDScriptType(ReturnTypeBox.Text) && !string.IsNullOrWhiteSpace(ReturnTypeBox.Text))
         {
             return "The return type is invalid";
         }
         HashSet<string> names = new(StringComparer.Ordinal);
         foreach (ParameterRow row in rows)
         {
-            string name = row.NameBox.Text?.Trim() ?? string.Empty;
-            if (!IsType(row.TypeBox.Text) && !(GDScript && string.IsNullOrWhiteSpace(row.TypeBox.Text)))
+            string name = Written(row.NameBox);
+            if (!IsGDScriptType(row.TypeBox.Text) && !string.IsNullOrWhiteSpace(row.TypeBox.Text))
             {
                 return "A parameter has an invalid type";
             }
@@ -160,7 +154,7 @@ public sealed class ChangeSignatureDialog : RefactoringDialog
             {
                 return "Parameter name can not be empty";
             }
-            if (!IsName(name))
+            if (!IsGDScriptName(name))
             {
                 return "A parameter has an invalid name";
             }
@@ -172,18 +166,20 @@ public sealed class ChangeSignatureDialog : RefactoringDialog
         return null;
     }
 
-    protected override Task<string?> MakeAsync() => make(NameBox.Text?.Trim() ?? string.Empty, ReturnTypeBox.Text?.Trim() ?? string.Empty,
-        [.. rows.Select(r => new ParameterChange(r.From, r.Modifier, r.TypeBox.Text?.Trim() ?? string.Empty, r.NameBox.Text?.Trim() ?? string.Empty,
-            r.From >= 0 ? r.DefaultBox.Text?.Trim() ?? string.Empty : string.Empty,
-            r.From < 0 ? r.DefaultBox.Text?.Trim() ?? string.Empty : string.Empty))]);
+    protected override Task<string?> MakeAsync() => make(Written(NameBox), Written(ReturnTypeBox), Asked());
 
     private bool GDScript => signature.Kind is GDScriptKind or GDScriptSignalKind;
 
-    private bool IsName(string? text) => text is { } name && (GDScript ? Passenger.Workspace.GDScript.GDScriptRefactorings.WhyNotName(name.Trim()) is null
-        : SyntaxFacts.IsValidIdentifier(name.Trim()) && SyntaxFacts.GetKeywordKind(name.Trim()) == SyntaxKind.None);
+    /// <summary>The parameters as the table asks for them: a kept one's value its declaration's default, a new one's what
+    /// every call passes.</summary>
+    private IReadOnlyList<ParameterChange> Asked() => [.. rows.Select(r => new ParameterChange(r.From, r.Modifier, Written(r.TypeBox), Written(r.NameBox),
+        r.From >= 0 ? Written(r.DefaultBox) : string.Empty, r.From < 0 ? Written(r.DefaultBox) : string.Empty))];
 
-    private bool IsType(string? text) => !string.IsNullOrWhiteSpace(text) && (GDScript ? Passenger.Workspace.GDScript.GDScriptRefactorings.IsType(text.Trim())
-        : CSharpParsing.ReadsAsType(text.Trim()));
+    private static string Written(TextBox box) => box.Text?.Trim() ?? string.Empty;
+
+    private static bool IsGDScriptName(string? text) => text is { } name && Passenger.Workspace.GDScript.GDScriptRefactorings.WhyNotName(name.Trim()) is null;
+
+    private static bool IsGDScriptType(string? text) => !string.IsNullOrWhiteSpace(text) && Passenger.Workspace.GDScript.GDScriptRefactorings.IsType(text.Trim());
 
     /// <summary>A new parameter after the chosen one, its type to type first.</summary>
     private void Add()
@@ -286,7 +282,8 @@ public sealed class ChangeSignatureDialog : RefactoringDialog
             Grid.SetColumn(parts[i], i);
             cells.Children.Add(parts[i]);
         }
-        Border view = new() { Child = cells };
+        Border view = new();
+        ChosenMark.Hold(view, cells);
         ParameterRow row = new(from, modifiers, typeBox, nameBox, defaultBox, view);
         view.AddHandler(GotFocusEvent, (_, _) =>
         {

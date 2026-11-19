@@ -327,10 +327,19 @@ public sealed record ProjectModel(
     /// references a test SDK, an adapter or a Testing Platform test framework.</summary>
     public bool IsTestProject => DeclaredTest || Packages.Any(p => TestPackages.Contains(p.Name));
 
-    /// <summary>Whether it builds something that runs: an executable, not a library, a test or a Blazor Web App's client
-    /// (<see cref="IsBrowserClient"/>).</summary>
+    /// <summary>Whether it builds something that runs: an executable or an Android app (<see cref="IsAndroidApp"/>), not a
+    /// library, a test or a Blazor Web App's client (<see cref="IsBrowserClient"/>).</summary>
     public bool IsRunnable => (string.Equals(OutputType, "Exe", StringComparison.OrdinalIgnoreCase)
-        || string.Equals(OutputType, "WinExe", StringComparison.OrdinalIgnoreCase)) && !IsTestProject && !IsBrowserClient;
+        || string.Equals(OutputType, "WinExe", StringComparison.OrdinalIgnoreCase)
+        || IsAndroidApp) && !IsTestProject && !IsBrowserClient;
+
+    /// <summary>Whether .NET for Android builds an app of it, as evaluated (<see cref="CarriedProperties.AndroidApplication"/>):
+    /// its <see cref="OutputType"/> is then Library, turned from the Exe the project gives.</summary>
+    public bool IsAndroidApp => string.Equals(Property(CarriedProperties.AndroidApplication), "true", StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>Whether it is an Azure Functions app (.NET isolated worker), as its evaluation says
+    /// (<see cref="CarriedProperties.AzureFunctionsVersion"/>): a program Azure Functions Core Tools' func runs, never alone.</summary>
+    public bool IsFunctionsApp => IsRunnable && Property(CarriedProperties.AzureFunctionsVersion) is { Length: > 0 };
 
     /// <summary>Whether its code runs in the browser on .NET's WebAssembly runtime: it references Blazor's WebAssembly host.</summary>
     public bool RunsInBrowser => Packages.Any(p => p.Name.Equals(BlazorWebAssembly, StringComparison.OrdinalIgnoreCase));
@@ -346,6 +355,20 @@ public sealed record ProjectModel(
     {
         "Microsoft.AspNetCore.Components.WebAssembly.DevServer", "Microsoft.AspNetCore.Components.Gateway",
     };
+
+    /// <summary>The package it references that draws a program's output for a terminal (colours, tables, live progress,
+    /// prompts, a full-screen UI), by its id; null where it references none. Such a package reads whether its output and
+    /// input are a terminal's, so through a pipe it writes plain text or refuses to prompt.</summary>
+    public string? DrawsWith => Packages.Select(p => p.Name).FirstOrDefault(DrawsOnTerminal);
+
+    /// <summary>Whether a package is one of those that draw for a terminal (<see cref="TerminalPackages"/>), or of their
+    /// family (Spectre.Console.Cli).</summary>
+    public static bool DrawsOnTerminal(string package) => TerminalPackages.Any(family => package.Equals(family, StringComparison.OrdinalIgnoreCase)
+        || (package.Length > family.Length && package[family.Length] == '.' && package.StartsWith(family, StringComparison.OrdinalIgnoreCase)));
+
+    /// <summary>The packages, each with its family, that draw a program's output for the terminal it runs in.</summary>
+    private static readonly string[] TerminalPackages =
+        ["Spectre.Console", "Terminal.Gui", "XenoAtom.Terminal", "Sharprompt", "PrettyPrompt", "Consolonia", "ShellProgressBar", "Kurukuru", "RazorConsole"];
 
     /// <summary>Itself, then the projects it references among <paramref name="projects"/>, and those they reference, each once.</summary>
     public IReadOnlyList<ProjectModel> WithReferenced(IReadOnlyList<ProjectModel> projects)
@@ -501,6 +524,70 @@ public sealed record ProjectModel(
                 if (found.Add(referrer.Path))
                 {
                     next.Enqueue(referrer.Path);
+                }
+            }
+        }
+        return found;
+    }
+
+    /// <summary>Whether its code runs with a configuration of its own: a program Run starts (<see cref="IsRunnable"/>), or a
+    /// test project, whose tests build theirs.</summary>
+    public bool OwnsConfiguration => IsRunnable || IsTestProject;
+
+    /// <summary>The projects among <paramref name="projects"/> whose configuration its code runs with: itself where it owns
+    /// one (<see cref="OwnsConfiguration"/>), else each program referencing it, directly or through projects that own none,
+    /// in their order; none where no program runs it. A test's configuration is its own, so a test project runs none of it.</summary>
+    public IReadOnlyList<ProjectModel> ProgramsRunning(IReadOnlyList<ProjectModel> projects)
+    {
+        if (OwnsConfiguration)
+        {
+            return [this];
+        }
+        ILookup<string, ProjectModel> referrers = projects.SelectMany(p => p.ProjectReferences.Select(r => (Reference: r, Referrer: p)))
+            .ToLookup(r => r.Reference, r => r.Referrer, PathNames.Comparer);
+        HashSet<string> seen = new(PathNames.Comparer) { Path };
+        HashSet<string> running = new(PathNames.Comparer);
+        Queue<string> next = new([Path]);
+        while (next.TryDequeue(out string? at))
+        {
+            foreach (ProjectModel referrer in referrers[at].Where(p => seen.Add(p.Path)))
+            {
+                if (referrer.IsRunnable)
+                {
+                    running.Add(referrer.Path);
+                }
+                else if (!referrer.OwnsConfiguration)
+                {
+                    next.Enqueue(referrer.Path);
+                }
+            }
+        }
+        return [.. projects.Where(p => running.Contains(p.Path)).DistinctBy(p => p.Path, PathNames.Comparer)];
+    }
+
+    /// <summary>The projects among <paramref name="projects"/> whose code runs with its configuration, as
+    /// <see cref="ProgramsRunning"/> has it the other way: itself, then for a program those it references, directly or
+    /// through others, that own no configuration; none for a project that owns none.</summary>
+    public IReadOnlyList<ProjectModel> CodeItRuns(IReadOnlyList<ProjectModel> projects)
+    {
+        if (!OwnsConfiguration)
+        {
+            return [];
+        }
+        Dictionary<string, ProjectModel> byPath = new(PathNames.Comparer);
+        foreach (ProjectModel project in projects)
+        {
+            byPath.TryAdd(project.Path, project);
+        }
+        HashSet<string> seen = new(PathNames.Comparer) { Path };
+        List<ProjectModel> found = [this];
+        for (int i = 0; i < found.Count && IsRunnable; i++)
+        {
+            foreach (string reference in found[i].ProjectReferences)
+            {
+                if (byPath.TryGetValue(reference, out ProjectModel? referenced) && !referenced.OwnsConfiguration && seen.Add(referenced.Path))
+                {
+                    found.Add(referenced);
                 }
             }
         }

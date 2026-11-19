@@ -10,9 +10,10 @@ namespace Passenger.Editor;
 
 /// <summary>Passenger's own font collection, through which every family it draws code or words in is named (<see cref="Carry"/>,
 /// <see cref="Of"/>): a character the family lacks is drawn in the face the platform's own fallback names for it (DirectWrite,
-/// CoreText, fontconfig: <see cref="Platform"/>), in the run's culture or else the UI's, as the system's own apps draw it, never
-/// in whichever face the process happened to load first. An answer is kept for its <see cref="Bucket"/>, culture, family and
-/// style, the platform asked again only for a character that face lacks; a face that lacks the character or can't shape its
+/// CoreText, fontconfig: <see cref="Platform"/>), in the run's culture or else the UI's (an emoji's in emoji presentation's,
+/// <see cref="LanguageOf"/>), as the system's own apps draw it, never in whichever face the process happened to load first.
+/// An answer is kept for its <see cref="Bucket"/>, language, family and style, the platform asked again only for a character
+/// that face lacks; a face that lacks the character or can't shape its
 /// script, or none, leaves the character to Avalonia's own search. The faces it finds are served by a collection of their own
 /// (<see cref="Found"/>), so none takes a family's name. Avalonia asks a collection for a character only through
 /// <see cref="IFontCollection"/> where the collection doesn't derive from <see cref="FontCollectionBase"/>.</summary>
@@ -27,6 +28,7 @@ public sealed class FallbackFonts : IFontCollection
     private static FontManager? installedIn;
 
     private readonly Platform platform;
+    private readonly Action<GlyphTypeface> made;
     private readonly Found found = new();
 
     /// <summary>Each family's face at each style, as its own collection gives it: null for none.</summary>
@@ -36,15 +38,20 @@ public sealed class FallbackFonts : IFontCollection
     /// bucket's face lacks; null where the platform named no face that serves.</summary>
     private readonly ConcurrentDictionary<Asked, Answer?> answers = new();
 
-    private FallbackFonts(Platform platform) => this.platform = platform;
+    private FallbackFonts(Platform platform, Action<GlyphTypeface> made) => (this.platform, this.made) = (platform, made);
 
-    /// <summary>The platform's own fallback: the installed face it names for a character in a culture, asked by a family at a
-    /// style, as the system's collection gives that face; null for none.</summary>
-    public delegate GlyphTypeface? Platform(int codepoint, FontCollectionKey style, string? familyName, CultureInfo culture);
+    /// <summary>The platform's own fallback: the installed face it names for a character in a language (a BCP 47 tag), asked
+    /// by a family at a style, as the system's collection gives that face; null for none.</summary>
+    public delegate GlyphTypeface? Platform(int codepoint, FontCollectionKey style, string? familyName, string language);
+
+    /// <summary>BCP 47's tag for text in emoji presentation (the script Zsye), which fontconfig answers with a colour emoji
+    /// face where one is installed (<c>fc-match :lang=und-zsye</c>).</summary>
+    public const string EmojiLanguage = "und-Zsye";
 
     /// <summary>Puts the collection in the font manager in force, asking the platform's fallback through
-    /// <paramref name="platform"/>: once for each font manager, before anything draws in a family it names.</summary>
-    public static void Install(Platform platform)
+    /// <paramref name="platform"/> and handing each face it gives to <paramref name="made"/> before giving it, a family's or a
+    /// fallback's: once for each font manager, before anything draws in a family it names.</summary>
+    public static void Install(Platform platform, Action<GlyphTypeface> made)
     {
         FontManager manager = FontManager.Current;
         lock (Installing)
@@ -53,7 +60,7 @@ public sealed class FallbackFonts : IFontCollection
             {
                 return;
             }
-            FallbackFonts fonts = new(platform);
+            FallbackFonts fonts = new(platform, made);
             manager.AddFontCollection(fonts);
             manager.AddFontCollection(fonts.found);
             installedIn = manager;
@@ -71,6 +78,12 @@ public sealed class FallbackFonts : IFontCollection
     /// or a '#') is the plain family, left to Avalonia's own fallback.</summary>
     public static FontFamily Of(string name) =>
         name.AsSpan().IndexOfAny(',', '#') >= 0 ? new FontFamily(name) : new FontFamily($"{Scheme}#{name}");
+
+    /// <summary>The language a character's fallback is asked in: emoji presentation's for one presented as an emoji by
+    /// default, so the face named has the colour glyphs and the modifiers, joiners and flags an emoji's cluster goes on with,
+    /// where a culture's may name a text face with its first code point alone; else the culture's.</summary>
+    public static string LanguageOf(int codepoint, CultureInfo culture) =>
+        new Codepoint((uint)codepoint).HasEmojiPresentation ? EmojiLanguage : culture.Name;
 
     /// <summary>What a character's fallback is kept under with others': its script, or for one common to scripts or of none
     /// (symbols, emoji, a script's punctuation), its page of 256 characters.</summary>
@@ -98,7 +111,7 @@ public sealed class FallbackFonts : IFontCollection
         {
             // A carried family from Passenger's own files, else the installed one as its plain name gives it.
             Typeface typeface = new(Carried.TryGetValue(familyName, out FontFamily? embedded) ? embedded : new FontFamily(familyName), style, weight, stretch);
-            glyphTypeface = named.GetOrAdd(key, FontManager.Current.TryGetGlyphTypeface(typeface, out GlyphTypeface? face) ? face : null);
+            glyphTypeface = named.GetOrAdd(key, FontManager.Current.TryGetGlyphTypeface(typeface, out GlyphTypeface? face) ? Made(face) : null);
         }
         return glyphTypeface is not null;
     }
@@ -124,8 +137,8 @@ public sealed class FallbackFonts : IFontCollection
     public bool TryMatchCharacter(int codepoint, FontStyle fontStyle, FontWeight fontWeight, FontStretch fontStretch, string? familyName,
         CultureInfo? culture, out Typeface typeface)
     {
-        culture ??= CultureInfo.CurrentUICulture;
-        Asked bucket = new(Bucket(codepoint), -1, culture.Name, familyName, new FontCollectionKey(fontStyle, fontWeight, fontStretch));
+        string language = LanguageOf(codepoint, culture ?? CultureInfo.CurrentUICulture);
+        Asked bucket = new(Bucket(codepoint), -1, language, familyName, new FontCollectionKey(fontStyle, fontWeight, fontStretch));
         if (answers.TryGetValue(bucket, out Answer? kept) && kept is not null && kept.Covers(codepoint))
         {
             typeface = kept.Typeface;
@@ -134,7 +147,7 @@ public sealed class FallbackFonts : IFontCollection
         Asked alone = bucket with { Codepoint = codepoint };
         if (!answers.TryGetValue(alone, out Answer? answer))
         {
-            answer = Ask(codepoint, bucket.Style, familyName, culture);
+            answer = Ask(codepoint, bucket.Style, familyName, language);
             // The bucket keeps the first face that serves it; a character that face lacks keeps its own answer.
             if (answer is null || kept is not null || !answers.TryAdd(bucket, answer))
             {
@@ -151,14 +164,21 @@ public sealed class FallbackFonts : IFontCollection
     }
 
     /// <summary>The face the platform's fallback names for a character, where it has the character and can shape its script.</summary>
-    private Answer? Ask(int codepoint, FontCollectionKey style, string? familyName, CultureInfo culture)
+    private Answer? Ask(int codepoint, FontCollectionKey style, string? familyName, string language)
     {
-        if (platform(codepoint, style, familyName, culture) is not { } glyphs || !glyphs.CharacterToGlyphMap.TryGetGlyph(codepoint, out _)
+        if (platform(codepoint, style, familyName, language) is not { } glyphs || !glyphs.CharacterToGlyphMap.TryGetGlyph(codepoint, out _)
             || !Shapes(glyphs, new Codepoint((uint)codepoint).Script))
         {
             return null;
         }
-        return new Answer(glyphs, new Typeface(found.Serve(glyphs), style.Style, style.Weight, style.Stretch));
+        return new Answer(Made(glyphs), new Typeface(found.Serve(glyphs), style.Style, style.Weight, style.Stretch));
+    }
+
+    /// <summary>A face about to be given, handed first to what the installer sets on each.</summary>
+    private GlyphTypeface Made(GlyphTypeface face)
+    {
+        made(face);
+        return face;
     }
 
     /// <summary>Whether a face can shape a script: by its OpenType tables' word, or by Apple's own shaping table, 'morx', which
@@ -166,9 +186,9 @@ public sealed class FallbackFonts : IFontCollection
     private static bool Shapes(GlyphTypeface glyphs, Script script) =>
         glyphs.CanShapeScript(script) || glyphs.PlatformTypeface.TryGetTable(Morx, out ReadOnlyMemory<byte> table) && table.Length > 0;
 
-    /// <summary>A fallback asked for: its bucket, the one character where it is that character's own, the culture, the family
-    /// asking and its style.</summary>
-    private readonly record struct Asked(int Bucket, int Codepoint, string Culture, string? Family, FontCollectionKey Style);
+    /// <summary>A fallback asked for: its bucket, the one character where it is that character's own, the language, the
+    /// family asking and its style.</summary>
+    private readonly record struct Asked(int Bucket, int Codepoint, string Language, string? Family, FontCollectionKey Style);
 
     /// <summary>A face the platform named and the typeface that draws it.</summary>
     private sealed record Answer(GlyphTypeface Glyphs, Typeface Typeface)

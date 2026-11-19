@@ -17,19 +17,27 @@
     <!-- Paths compared, Razor files named and names listed in words as the rest of Passenger does, compiled in since
          Passenger.Core's net11.0 is past the server's. -->
     <Compile Include="../Passenger.Core/PathNames.cs" Link="PathNames.cs" />
+    <!-- The Windows calls PathNames makes, declared once. -->
+    <Compile Include="../Passenger.Core/Kernel32.cs" Link="Kernel32.cs" />
     <Compile Include="../Passenger.Core/PathComparer.cs" Link="PathComparer.cs" />
     <Compile Include="../Passenger.Core/RazorFiles.cs" Link="RazorFiles.cs" />
     <Compile Include="../Passenger.Core/Plural.cs" Link="Plural.cs" />
     <!-- A file nested past what a parser is given, left out of its project, read as the rest of Passenger reads it. -->
     <Compile Include="../Passenger.Core/DeepText.cs" Link="DeepText.cs" />
     <Compile Include="../Passenger.Core/Brackets.Code.cs" Link="Brackets.Code.cs" />
+    <Compile Include="../Passenger.Core/CSharpNames.cs" Link="CSharpNames.cs" />
     <Compile Include="../Passenger.Languages/CSharp/CodeBrackets.cs" Link="CodeBrackets.cs" />
-    <!-- Godot's Variant types by name and number, as the rest of Passenger reads them. -->
+    <!-- Godot's Variant types by name and number, and its paths' schemes, as the rest of Passenger reads them. -->
     <Compile Include="../Passenger.Workspace/GodotTypes.cs" Link="GodotTypes.cs" />
+    <Compile Include="../Passenger.Workspace/GodotSchemes.cs" Link="GodotSchemes.cs" />
     <!-- The names GodotSharp's engine classes give their members, read from its IL as the rest of Passenger reads them. -->
     <Compile Include="../Passenger.Workspace/GodotSharpIl.cs" Link="GodotSharpIl.cs" />
     <!-- The names the MVVM Toolkit's generators give, as Passenger's XAML reads them. -->
     <Compile Include="../Passenger.Xaml/Metadata/ToolkitNames.cs" Link="ToolkitNames.cs" />
+    <!-- MAUI's expressions in XAML read as its source generator reads them, as Passenger's XAML reads them. -->
+    <Compile Include="../Passenger.Xaml/Dialects/MauiExpressionCode.cs" Link="MauiExpressionCode.cs" />
+    <Compile Include="../Passenger.Core/Sorted.cs" Link="Sorted.cs" />
+    <Compile Include="../Passenger.Text/XmlEntities.cs" Link="XmlEntities.cs" />
   </ItemGroup>
 
   <PropertyGroup>

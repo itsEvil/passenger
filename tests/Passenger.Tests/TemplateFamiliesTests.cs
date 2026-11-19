@@ -19,6 +19,7 @@ public sealed class TemplateFamiliesTests : IDisposable
 {
     private const string TestRunner = "Test runner";
     private const string Platform = "Microsoft.Testing.Platform";
+    private const string MauiServiceDefaults = "probe-maui-aspire-servicedefaults";
 
     private readonly string settings = TestFolders.Create("settings-");
     private readonly string place = TestFolders.Create("families-");
@@ -39,11 +40,9 @@ public sealed class TemplateFamiliesTests : IDisposable
         Ui.WaitFor(() => ProjectTemplates.Ready(place) is not null, "the templates to be read ahead of New Solution", TimeSpan.FromMinutes(2));
         Assert.True(window.Perform(AppActions.NewSolution));
         NewProjectDialog dialog = Assert.Single(window.OwnedWindows.OfType<NewProjectDialog>());
-        // Rider's types first, in its order (Desktop where WPF builds, MAUI with its workload's templates), then the rest by name.
+        // Rider's types first, in its order (Desktop where WPF builds, MAUI installed or offered with its workload), then the rest by name.
         string[] atOnce = [.. dialog.Families.Select(f => f.Name)];
-        bool maui = Lists("MAUI");
-        string[] riders = ["Console", "Class Library", "Desktop", "Web", "AI Extensions",
-            "Services", "Unit Test", "Aspire", "Azure Functions", .. maui ? ["MAUI"] : Array.Empty<string>()];
+        string[] riders = ["Console", "Class Library", "Desktop", "Web", "AI Extensions", "Services", "Unit Test", "Aspire", "Azure Functions", "MAUI"];
         Assert.Equal(riders, atOnce.Take(riders.Length));
         string[] others = atOnce[riders.Length..];
         Assert.Contains("Avalonia", others);
@@ -58,7 +57,8 @@ public sealed class TemplateFamiliesTests : IDisposable
 
         Assert.All(dialog.Templates.Where(t => t.Classifications.Contains("Test") && !t.Classifications.Contains("Aspire")),
             t => Assert.True(t.Family == "Unit Test", $"{t.Name}, a test template, is in {t.Family}"));
-        Assert.All(dialog.Templates.Where(t => t.Classifications.Contains("MAUI") && !t.Classifications.Contains("Aspire")),
+        // MAUI's own Aspire service defaults among them, where its workload has it.
+        Assert.All(dialog.Templates.Where(t => t.Classifications.Contains("MAUI")),
             t => Assert.True(t.Family == "MAUI", $"{t.Name}, a MAUI template, is in {t.Family}"));
         Assert.Equal(["xUnit", "NUnit", "MSTest"], Family(dialog, "Unit Test").Types.Take(3).Select(t => t.TypeName));
         Assert.Equal(["Web App (Razor Pages)", "Web App (Model-View-Controller)", "Web API", "Empty"], Family(dialog, "Web").Types.Take(4).Select(t => t.TypeName));
@@ -68,12 +68,18 @@ public sealed class TemplateFamiliesTests : IDisposable
         // Desktop's WPF and Windows Forms apps are listed everywhere, marked off Windows, where they build but do not run.
         string[] desktopMarks = [.. dialog.FamilyRow("Desktop")!.GetVisualDescendants().OfType<TextBlock>().Where(t => t.IsVisible).Select(t => t.Text ?? string.Empty)];
         Assert.True(desktopMarks.Contains("Windows only") != OperatingSystem.IsWindows(), $"Desktop's row reads [{string.Join(", ", desktopMarks)}] here");
-        // Not installed unless a workload brought one of its templates (MAUI 10's Aspire service defaults).
-        bool aspire = Lists("Aspire");
+        // Not installed unless dotnet new has Aspire's own templates, whatever another workload's it has tagged Aspire.
+        bool aspire = Lists(["aspire-apphost"]);
         Assert.True(Family(dialog, "Aspire").NotInstalled != aspire, aspire
-            ? "Aspire's family is marked not installed though dotnet new has some of it"
-            : "Aspire's family is not marked not installed though dotnet new has none of it");
+            ? "Aspire's family is marked not installed though dotnet new has its AppHost"
+            : "Aspire's family is not marked not installed though dotnet new has none of its templates");
         Assert.Equal(["App", "MVVM App", "Cross Platform Application"], Family(dialog, "Avalonia").Types.Select(t => t.TypeName));
+        // MAUI's templates are listed whether or not its workload is, which Install installs where it is not.
+        bool maui = Lists(["--tag", "MAUI"]);
+        TemplateFamily mauis = Family(dialog, "MAUI");
+        Assert.True(mauis.NotInstalled != maui && mauis.Types.Any(t => t.ShortName == "maui"),
+            $"MAUI's family, {(maui ? "installed" : "not installed")}, lists {string.Join(", ", mauis.Types.Select(t => t.ShortName))}, not installed: {mauis.NotInstalled}");
+        Assert.True(maui || mauis.Types.All(t => t.Pack is { IsWorkload: true }), "A MAUI template not installed is offered as no workload's");
 
         Ui.Click(dialog.SearchBox);
         Type(dialog, "nunit");
@@ -217,6 +223,49 @@ public sealed class TemplateFamiliesTests : IDisposable
         }
     }
 
+    /// <summary>MAUI's Aspire service defaults, which MAUI's workload carries tagged MAUI, then Aspire (a stand-in of the
+    /// tests' own with its metadata, in a template home of the test's own, which has none of Aspire's), is a Type of MAUI's
+    /// family; Aspire's stays Aspire's own templates, not installed, opening on its starter with Install; and a search for
+    /// Aspire service defaults finds both.</summary>
+    [AvaloniaFact]
+    public void MAUIs_Aspire_service_defaults_is_a_MAUI_Type_and_Aspire_stays_its_own_templates_offered_to_install()
+    {
+        using IDisposable theme = TestsTheme();
+        string? hive = ProjectTemplates.Hive;
+        ProjectTemplates.Hive = Directory.CreateDirectory(Path.Combine(place, "hive")).FullName;
+        ProjectTemplates.Forget();
+        try
+        {
+            DotnetNew(["install", WriteMauiServiceDefaults()]);
+            MainWindow window = Started();
+            Ui.Click(window.Welcome.NewSolutionButton);
+            NewProjectDialog dialog = Opened(window);
+            ProjectTemplate defaults = Assert.Single(dialog.Templates, t => t.ShortName == MauiServiceDefaults);
+            Assert.True(defaults is { Family: "MAUI", TypeName: "Aspire Service Defaults" }, $"MAUI's Aspire service defaults is {defaults.TypeName} in {defaults.Family}");
+
+            TemplateFamily aspire = Family(dialog, "Aspire");
+            Assert.True(aspire.NotInstalled && aspire.Types.All(t => t.Pack?.Id == "Aspire.ProjectTemplates"),
+                $"Aspire's family, its templates not installed, holds {string.Join(", ", aspire.Types.Select(t => $"{t.Name} ({t.Pack?.Id ?? "installed"})"))}");
+            Ui.Click(dialog.FamilyRow("Aspire")!);
+            Assert.Equal("aspire-starter", dialog.Chosen?.ShortName);
+            Assert.True(dialog.InstallButton.IsEffectivelyVisible && dialog.Offer?.Contains("dotnet new install Aspire.ProjectTemplates", StringComparison.Ordinal) == true,
+                $"Aspire's starter, not installed, offers no install of Aspire's templates: {dialog.Offer}");
+
+            Search(dialog, "aspire service defaults");
+            Assert.Equal(["Aspire", "MAUI"], dialog.Listed.Select(f => f.Name));
+            Ui.Click(dialog.FamilyRow("MAUI")!);
+            Assert.True(dialog.Chosen is { Family: "MAUI", TypeName: "Aspire Service Defaults", Pack: null } && dialog.Offer is null,
+                $"MAUI, found by aspire service defaults, opened on {dialog.Chosen?.Name}, offering {dialog.Offer}");
+            dialog.Cancel();
+            window.Close();
+        }
+        finally
+        {
+            ProjectTemplates.Hive = hive;
+            ProjectTemplates.Forget();
+        }
+    }
+
     [AvaloniaFact]
     public void A_template_installed_while_the_dialog_is_open_fills_in_its_family_the_family_Type_and_values_chosen_kept()
     {
@@ -249,6 +298,48 @@ public sealed class TemplateFamiliesTests : IDisposable
         }
         finally
         {
+            if (installed)
+            {
+                DotnetNew(["uninstall", probe]);
+            }
+        }
+        dialog.Cancel();
+        window.Close();
+    }
+
+    /// <summary>A template installed while the watcher of dotnet new's packages.json heard nothing, as a change the system
+    /// dropped without a word, fills in its family once the open dialog comes in front, as it does when a person comes back
+    /// to it from a terminal; one uninstalled so leaves it once the main window does. The watcher stops hearing while dotnet
+    /// new writes, so each change is lost as a dropped event loses it.</summary>
+    [AvaloniaFact]
+    public void A_template_installed_while_its_watcher_heard_nothing_fills_in_its_family_once_a_window_comes_in_front()
+    {
+        using IDisposable theme = TestsTheme();
+        string probe = WriteProbeTemplate();
+        MainWindow window = Started();
+        Assert.True(window.Perform(AppActions.NewSolution));
+        NewProjectDialog dialog = Opened(window);
+        Ui.Click(dialog.FamilyRow("Unit Test")!);
+        FileSystemWatcher watcher = ProjectTemplates.PackagesWatch?.Watcher ?? throw new InvalidOperationException("dotnet new's packages.json is not watched");
+        bool installed = false;
+        try
+        {
+            watcher.EnableRaisingEvents = false;
+            DotnetNew(["install", probe]);
+            installed = true;
+            dialog.Activate();
+            Ui.WaitFor(() => dialog.Family?.Types.Any(t => t.ShortName == "probetest") == true,
+                () => $"the template installed unheard to join Unit Test once the dialog came in front (it lists {string.Join(", ", dialog.TypeNames)})", TimeSpan.FromSeconds(60));
+
+            DotnetNew(["uninstall", probe]);
+            installed = false;
+            window.Activate();
+            Ui.WaitFor(() => dialog.Family?.Types.All(t => t.ShortName != "probetest") == true,
+                () => $"the template uninstalled unheard to leave Unit Test once the main window came in front (it lists {string.Join(", ", dialog.TypeNames)})", TimeSpan.FromSeconds(60));
+        }
+        finally
+        {
+            watcher.EnableRaisingEvents = true;
             if (installed)
             {
                 DotnetNew(["uninstall", probe]);
@@ -368,6 +459,29 @@ public sealed class TemplateFamiliesTests : IDisposable
         return PathNames.Canonical(folder);
     }
 
+    /// <summary>A stand-in of MAUI's Aspire service defaults, in the test's folder: the classifications and name MAUI's
+    /// workload gives its template, under a short name of its own.</summary>
+    private string WriteMauiServiceDefaults()
+    {
+        string folder = Directory.CreateDirectory(Path.Combine(place, "MauiServiceDefaults", ".template.config")).Parent!.FullName;
+        File.WriteAllText(Path.Combine(folder, ".template.config", "template.json"), $$"""
+            {
+              "$schema": "http://json.schemastore.org/template",
+              "author": "Passenger's tests",
+              "classifications": [ "MAUI", "Aspire", "Cloud", "Web", "Web API", "API", "Service" ],
+              "identity": "Passenger.Tests.MauiAspire.ServiceDefaults.CSharp",
+              "groupIdentity": "Passenger.Tests.MauiAspire.ServiceDefaults",
+              "name": ".NET MAUI for Aspire Service Defaults",
+              "shortName": "{{MauiServiceDefaults}}",
+              "sourceName": "MauiAspire.1.ServiceDefaults",
+              "preferNameDirectory": true,
+              "tags": { "language": "C#", "type": "project" }
+            }
+            """);
+        File.WriteAllText(Path.Combine(folder, "MauiAspire.1.ServiceDefaults.csproj"), TestProjects.Library());
+        return PathNames.Canonical(folder);
+    }
+
     /// <summary>A test project template of the tests' own, in the test's folder: Probe Test Project (probetest), classified
     /// as a test.</summary>
     private string WriteProbeTemplate()
@@ -399,13 +513,14 @@ public sealed class TemplateFamiliesTests : IDisposable
         Assert.True(ran.Succeeded, $"dotnet new {string.Join(' ', arguments)} failed:\n{ran.Output}{ran.Error}");
     }
 
-    /// <summary>Whether dotnet new, in the run's own template home, lists a project template of this classification (its
-    /// tag), asked apart from Passenger's reading: it exits 103 when none matches.</summary>
-    private bool Lists(string classification)
+    /// <summary>Whether dotnet new, in the run's own template home, lists a project template this filter finds (a name, or
+    /// --tag and a classification), asked apart from Passenger's reading: it exits 103 when none matches.</summary>
+    private bool Lists(string[] filter)
     {
-        ChildResult ran = Ui.Await(Waiting.Apart(() => ChildProcesses.RunAsync(ProjectTemplates.NewCommand(["list", "--tag", classification, "--type", "project"], place),
-            limit: TimeSpan.FromMinutes(2))), $"dotnet new list --tag {classification}", TimeSpan.FromMinutes(2) + TestFolders.Spare);
-        Assert.True(ran.Succeeded || ran.ExitCode == 103, $"dotnet new list --tag {classification} failed:\n{ran.Output}{ran.Error}");
+        string asked = $"dotnet new list {string.Join(' ', filter)}";
+        ChildResult ran = Ui.Await(Waiting.Apart(() => ChildProcesses.RunAsync(ProjectTemplates.NewCommand(["list", .. filter, "--type", "project"], place),
+            limit: TimeSpan.FromMinutes(2))), asked, TimeSpan.FromMinutes(2) + TestFolders.Spare);
+        Assert.True(ran.Succeeded || ran.ExitCode == 103, $"{asked} failed:\n{ran.Output}{ran.Error}");
         return ran.Succeeded;
     }
 

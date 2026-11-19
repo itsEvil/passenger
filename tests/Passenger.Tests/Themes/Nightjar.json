@@ -1,0 +1,27 @@
+{
+  "format": 1,
+  "name": "Nightjar",
+  "description": "A navy night sky of violet keywords, apricot strings and seafoam members, its colours those of Night Owl by Sarah Drasner (sdras.night-owl on Open VSX, MIT), under card shapes, a nightjar crossing the moon on the Welcome screen and behind the tool windows, and the editor's tabs down its side.",
+  "vscode": {"id": "sdras.night-owl", "theme": "Night Owl", "version": "2.1.1"},
+  "tokens": {
+    "ControlRadius": 8,
+    "ToolRadius": 8,
+    "PopupRadius": 12,
+    "CardRadius": 14,
+    "BadgeRadius": 99,
+    "ChipRadius": 99,
+    "TabStripHeight": 40,
+    "TabMargin": [1, 6, 1, 0],
+    "TabPadding": [14, 0, 8, 0],
+    "TabRadius": [10, 10, 0, 0],
+    "TabShadow": "0 0 0 0 #00000000",
+    "PopupEdge": 1,
+    "EditorTextPadding": 6,
+    "ToolHeaderHeight": 38,
+    "ToolTitleMargin": [14, 0, 0, 0],
+    "DialogFooterPadding": [16, 10, 16, 10]
+  },
+  "fonts": {"code": {"family": "Victor Mono"}},
+  "layout": {"open": ["explorer"], "editorTabs": "left", "sizes": {"left": 250}},
+  "background": {"image": "pictures/nightjar.webp", "opacity": 0.16, "places": ["welcome", "toolWindows"], "fit": "cover", "align": "top right"}
+}

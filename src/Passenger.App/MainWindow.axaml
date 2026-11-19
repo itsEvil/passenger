@@ -23,15 +23,18 @@
         </ControlTheme>
     </Window.Resources>
     <Panel Name="Root" Background="{DynamicResource Passenger.Editor.Background}">
-    <Grid RowDefinitions="Auto,*,Auto">
+    <!-- The title bar, the tool windows round the editors, and the status bar; the first start's question lies over the
+         last two (MainWindow.FirstStart.cs). -->
+    <Grid Name="Rows" RowDefinitions="Auto,*,Auto">
 
         <!-- The toolbar, which is the window's title bar too (MainWindow.TitleBar.cs): its empty space moves the window and
              a double click on it maximizes, while what is on it takes its own clicks (the role User, where Windows asks). -->
         <Border Name="Toolbar" Classes="titleBar" Grid.Row="0" Height="40" PointerPressed="OnToolbarPressed">
-            <app:ToolbarRow Name="ToolbarContent" Margin="8,0">
+            <Panel>
+            <app:ToolbarRow Name="ToolbarContent">
                 <!-- The window's buttons at the bar's right on Windows and Linux; macOS's own stand at its left. Their
                      roles make Windows treat them as its caption buttons (its snap layouts on the maximize one). -->
-                <StackPanel Name="WindowButtons" DockPanel.Dock="Right" Orientation="Horizontal" Margin="10,0,0,0" IsVisible="False">
+                <StackPanel Name="WindowButtons" DockPanel.Dock="Right" Orientation="Horizontal" Classes="windowButtons" IsVisible="False">
                     <Button Name="MinimizeButton" Classes="windowButton" ToolTip.Tip="Minimize" AutomationProperties.Name="Minimize"
                             WindowDecorationProperties.ElementRole="MinimizeButton" Click="OnMinimizeClicked">
                         <Path Data="M0,5.5 H10" />
@@ -48,17 +51,38 @@
 
                 <!-- The run widget and the icons at the right keep their room as the window narrows: the branch's and
                      project's names give way first, then the run configuration's, each ending in an ellipsis
-                     (ToolbarRow). -->
-                <app:ShrinkingRow Name="ToolbarEnd" DockPanel.Dock="Right" Spacing="2" VerticalAlignment="Center"
+                     (ToolbarRow); where even that leaves too little, the run target's widget goes, then the build
+                     configuration's, their choices still in the Run and Build menus (ShrinkingRow.GoesWhole). -->
+                <app:ShrinkingRow Name="ToolbarEnd" DockPanel.Dock="Right" Spacing="{x:Static app:Gaps.Hair}" VerticalAlignment="Center"
                             WindowDecorationProperties.ElementRole="User">
                     <Button Name="BuildButton" Classes="tool" ToolTip.Tip="Build solution">
                         <PathIcon Data="{StaticResource Icon.Build}" />
                     </Button>
+                    <!-- The build configuration every build takes, shown once the folder offers any
+                         (MainWindow.BuildConfigurations.cs). -->
+                    <Button Name="BuildConfigButton" Classes="widget" MinWidth="52" ToolTip.Tip="Build configuration" IsVisible="False" Click="OnBuildConfigClicked"
+                            app:ShrinkingRow.GoesWhole="True">
+                        <DockPanel>
+                            <PathIcon DockPanel.Dock="Right" Classes="chevron" Data="{StaticResource Icon.ChevronDown}" />
+                            <TextBlock Name="BuildConfigName" Text="Debug" VerticalAlignment="Center"
+                                       MaxWidth="160" TextTrimming="CharacterEllipsis" />
+                        </DockPanel>
+                    </Button>
                     <Button Name="RunConfigButton" Classes="widget" MinWidth="52" ToolTip.Tip="Run configuration" Click="OnRunConfigClicked">
                         <DockPanel>
-                            <PathIcon DockPanel.Dock="Right" Margin="6,0,0,0" Classes="chevron" Data="{StaticResource Icon.ChevronDown}" />
+                            <PathIcon DockPanel.Dock="Right" Classes="chevron" Data="{StaticResource Icon.ChevronDown}" />
                             <TextBlock Name="RunConfigName" Text="No configurations" VerticalAlignment="Center"
                                        MaxWidth="200" TextTrimming="CharacterEllipsis" />
+                        </DockPanel>
+                    </Button>
+                    <!-- Where the chosen configuration's app runs, shown for a project of devices, emulators or simulators
+                         (MainWindow.RunTargets.cs). -->
+                    <Button Name="RunTargetButton" Classes="widget" MinWidth="52" ToolTip.Tip="Where it runs" IsVisible="False" Click="OnRunTargetClicked"
+                            app:ShrinkingRow.GoesWhole="True">
+                        <DockPanel>
+                            <PathIcon DockPanel.Dock="Right" Classes="chevron" Data="{StaticResource Icon.ChevronDown}" />
+                            <TextBlock Name="RunTargetName" Text="Choose a device" VerticalAlignment="Center"
+                                       MaxWidth="180" TextTrimming="CharacterEllipsis" />
                         </DockPanel>
                     </Button>
                     <Button Name="RunButton" Classes="tool" ToolTip.Tip="Run">
@@ -85,41 +109,47 @@
                     </Button>
                 </app:ShrinkingRow>
 
-                <app:ShrinkingRow Name="ToolbarStart" DockPanel.Dock="Left" HorizontalAlignment="Left" VerticalAlignment="Center"
+                <app:ShrinkingRow Name="ToolbarStart" DockPanel.Dock="Left" HorizontalAlignment="Left" VerticalAlignment="Center" Spacing="{x:Static app:Gaps.Hair}"
                            WindowDecorationProperties.ElementRole="User">
                     <!-- The main menu, where the system has no menu bar of its own: behind a button, or as a bar of its
                          menus' titles (Settings' Show main menu as a menu bar), those the toolbar has no room for
                          behind the button after them. The titles are added after the button as Settings asks for
                          them. -->
-                    <app:MainMenuPlace Name="MainMenuPlace" Margin="0,0,2,0">
+                    <app:MainMenuPlace Name="MainMenuPlace">
                         <Button Name="MenuButton" Classes="tool" ToolTip.Tip="Main menu" AutomationProperties.Name="Main menu" Click="OnMenuClicked">
                             <PathIcon Data="{StaticResource Icon.Menu}" />
                         </Button>
                     </app:MainMenuPlace>
-                    <Button Name="ProjectButton" Classes="widget" Margin="0,0,2,0" MinWidth="80" ToolTip.Tip="Open a solution, project or folder" Click="OnProjectClicked">
+                    <Button Name="ProjectButton" Classes="widget" MinWidth="80" ToolTip.Tip="Open a solution, project or folder" Click="OnProjectClicked">
                         <DockPanel>
-                            <Border Name="ProjectBadge" Classes="projectBadge" DockPanel.Dock="Left" Margin="0,0,7,0" IsVisible="False" Width="20" Height="20">
+                            <Border Name="ProjectBadge" Classes="projectBadge" DockPanel.Dock="Left" IsVisible="False" Width="20" Height="20">
                                 <TextBlock Name="ProjectBadgeText" Classes="projectBadgeText" HorizontalAlignment="Center" VerticalAlignment="Center" />
                             </Border>
-                            <PathIcon DockPanel.Dock="Right" Margin="7,0,0,0" Classes="chevron" Data="{StaticResource Icon.ChevronDown}" />
+                            <PathIcon DockPanel.Dock="Right" Classes="chevron" Data="{StaticResource Icon.ChevronDown}" />
                             <TextBlock Name="ProjectName" Classes="projectName" Text="No solution" VerticalAlignment="Center"
                                        MaxWidth="240" TextTrimming="CharacterEllipsis" />
                         </DockPanel>
                     </Button>
                     <Button Name="BranchButton" Classes="widget" MinWidth="76" ToolTip.Tip="Version control" Click="OnBranchClicked">
                         <DockPanel>
-                            <PathIcon DockPanel.Dock="Left" Margin="0,0,6,0" Data="{StaticResource Icon.Branch}" />
-                            <PathIcon DockPanel.Dock="Right" Margin="6,0,0,0" Classes="chevron" Data="{StaticResource Icon.ChevronDown}" />
+                            <PathIcon DockPanel.Dock="Left" Classes="lead" Data="{StaticResource Icon.Branch}" />
+                            <PathIcon DockPanel.Dock="Right" Classes="chevron" Data="{StaticResource Icon.ChevronDown}" />
                             <TextBlock Name="BranchName" Text="Version control" VerticalAlignment="Center" TextTrimming="CharacterEllipsis" />
                         </DockPanel>
                     </Button>
                 </app:ShrinkingRow>
             </app:ToolbarRow>
+            <app:ThemeBackdrop Place="Frame" />
+            </Panel>
         </Border>
 
         <DockPanel Grid.Row="1">
+            <!-- The open folder is not trusted, so none of its code runs, with Trust Folder (MainWindow.Trust.cs). -->
+            <app:Banner Name="TrustBanner" />
             <!-- What .NET the machine or the folder lacks, with its fix (MainWindow.Dotnet.cs). -->
             <app:Banner Name="DotnetBanner" />
+            <!-- What the folder's mobile projects need that the machine lacks, with how to get it (MainWindow.Mobile.cs). -->
+            <app:Banner Name="MobileBanner" />
             <!-- A Godot project's offer of Passenger as Godot's script editor, made once (MainWindow.GodotEditor.cs). -->
             <app:Banner Name="GodotBanner" />
             <!-- Tool windows round the editor: stripes of their buttons down both edges. -->
@@ -131,26 +161,59 @@
         </DockPanel>
 
         <!-- The status bar: where the caret is and how the file is stored. -->
-        <Border Classes="statusBar" Grid.Row="2">
-            <DockPanel Margin="12,0">
-                <StackPanel DockPanel.Dock="Right" Orientation="Horizontal" Spacing="18" VerticalAlignment="Center">
+        <Border Name="StatusBarFrame" Classes="statusBar" Grid.Row="2">
+            <Panel>
+            <!-- The line keeps a sentence's room before the widgets are laid (StatusLine.LeastWidth), so the branch's name
+                 gives way to it, then goes whole, its menu still the toolbar's Git widget's; the others keep their width. -->
+            <app:ToolbarRow Classes="statusRow">
+                <app:ShrinkingRow Classes="statusWidgets" DockPanel.Dock="Right" Spacing="{x:Static app:Gaps.Group}" VerticalAlignment="Center">
+                    <!-- Git, in a working tree: the branch checked out, a click opening the branches as the toolbar's Git
+                         widget does; the commits the branch's upstream has that it lacks and those it has that the
+                         upstream lacks, as last fetched (while it tracks one), a click comparing the two in the Git window;
+                         and the files changed since the last commit, a click opening the Commit window. -->
+                    <Button Name="GitBranchButton" Classes="statusItem" IsVisible="False" MinWidth="96" Click="OnGitBranchClicked"
+                            app:ShrinkingRow.GoesWhole="True" app:ShrinkingRow.KeepsWidth="False">
+                        <DockPanel HorizontalSpacing="{x:Static app:Gaps.Tight}">
+                            <PathIcon DockPanel.Dock="Left" Data="{StaticResource Icon.Branch}" Foreground="{DynamicResource Passenger.TextMuted}" Width="12" Height="12" />
+                            <TextBlock Name="GitBranchText" Classes="status" MaxWidth="200" TextTrimming="CharacterEllipsis" />
+                        </DockPanel>
+                    </Button>
+                    <Button Name="GitSyncButton" Classes="statusItem" IsVisible="False" Click="OnGitSyncClicked">
+                        <StackPanel Orientation="Horizontal" Spacing="{x:Static app:Gaps.Normal}">
+                            <StackPanel Orientation="Horizontal" Spacing="{x:Static app:Gaps.Tight}">
+                                <PathIcon Data="{StaticResource Icon.ArrowDown}" Foreground="{DynamicResource Passenger.TextMuted}" Width="11" Height="11" />
+                                <TextBlock Name="GitIncomingText" Classes="status" />
+                            </StackPanel>
+                            <StackPanel Orientation="Horizontal" Spacing="{x:Static app:Gaps.Tight}">
+                                <PathIcon Data="{StaticResource Icon.ArrowUp}" Foreground="{DynamicResource Passenger.TextMuted}" Width="11" Height="11" />
+                                <TextBlock Name="GitOutgoingText" Classes="status" />
+                            </StackPanel>
+                        </StackPanel>
+                    </Button>
+                    <Button Name="GitChangesButton" Classes="statusItem" IsVisible="False" Click="OnGitChangesClicked">
+                        <StackPanel Orientation="Horizontal" Spacing="{x:Static app:Gaps.Tight}">
+                            <PathIcon Data="{StaticResource Icon.Edit}" Foreground="{DynamicResource Passenger.TextMuted}" Width="12" Height="12" />
+                            <TextBlock Name="GitChangesText" Classes="status" />
+                        </StackPanel>
+                    </Button>
                     <!-- A newer release: its download under way, Restart to Update once it is ready, or (for a copy that
                          cannot update itself) a link to this system's download or the release page, once per version. -->
                     <Button Name="UpdateButton" Classes="statusItem" IsVisible="False" Click="OnUpdateClicked">
-                        <StackPanel Orientation="Horizontal" Spacing="4">
+                        <StackPanel Orientation="Horizontal" Spacing="{x:Static app:Gaps.Tight}">
                             <PathIcon Name="UpdateIcon" Data="{StaticResource Icon.ArrowDown}" Foreground="{DynamicResource Passenger.Link}" Width="12" Height="12" />
                             <TextBlock Name="UpdateText" Classes="status" Foreground="{DynamicResource Passenger.Link}" />
                         </StackPanel>
                     </Button>
                     <Button Name="AnalysisButton" Classes="statusItem" Click="OnAnalysisClicked">
-                        <StackPanel Orientation="Horizontal" Spacing="4">
+                        <StackPanel Orientation="Horizontal" Spacing="{x:Static app:Gaps.Tight}">
                             <PathIcon Name="AnalysisIcon" Width="14" Height="14" />
+                            <app:WorkingRing Name="AnalysisWorking" Width="14" Height="14" IsVisible="False" VerticalAlignment="Center" />
                             <TextBlock Name="AnalysisText" Classes="status" />
                         </StackPanel>
                     </Button>
                     <Button Name="ErrorsButton" Classes="statusItem" IsVisible="False" Click="OnErrorsClicked"
                             ToolTip.Tip="IDE Internal Errors: Passenger caught these and kept running">
-                        <StackPanel Orientation="Horizontal" Spacing="4">
+                        <StackPanel Orientation="Horizontal" Spacing="{x:Static app:Gaps.Tight}">
                             <PathIcon Data="{DynamicResource Icon.Error}" Foreground="{DynamicResource Passenger.Error}" Width="14" Height="14" />
                             <TextBlock Name="ErrorsCount" Classes="status" Foreground="{DynamicResource Passenger.Error}" />
                         </StackPanel>
@@ -159,7 +222,7 @@
                          accent's pill with a bell) and a click brings forward, since the person may not have seen it. -->
                     <Button Name="AgentButton" Classes="statusItem" Focusable="False" IsVisible="False" Click="OnAgentClicked"
                             ToolTip.Tip="An agent is using this window through Passenger's MCP server">
-                        <StackPanel Orientation="Horizontal" Spacing="4">
+                        <StackPanel Orientation="Horizontal" Spacing="{x:Static app:Gaps.Tight}">
                             <PathIcon Name="AgentIcon" Data="{StaticResource Icon.Notifications}" Width="12" Height="12" IsVisible="False" />
                             <TextBlock Name="AgentText" Classes="status" />
                         </StackPanel>
@@ -167,42 +230,45 @@
                     <!-- The file's widgets: a click on the caret's place goes to a line, on the line separator, encoding or
                          indent offers the others. Their frames reach into the spacing, so their words stand where the
                          other items' do. -->
-                    <Button Name="CaretButton" Classes="statusItem" Margin="-6,0" Focusable="False" IsVisible="False" Click="OnCaretClicked">
+                    <TextBlock Name="VimModeText" Classes="status" IsVisible="False" ToolTip.Tip="Vim mode's mode, and a command typed so far (Settings › Editor › Vim mode)" />
+                    <Button Name="CaretButton" Classes="statusItem reaching" Focusable="False" IsVisible="False" Click="OnCaretClicked">
                         <TextBlock Name="CaretText" Classes="status" />
                     </Button>
-                    <Button Name="LineSeparatorButton" Classes="statusItem" Margin="-6,0" Focusable="False" IsVisible="False" Click="OnLineSeparatorClicked">
+                    <Button Name="LineSeparatorButton" Classes="statusItem reaching" Focusable="False" IsVisible="False" Click="OnLineSeparatorClicked">
                         <TextBlock Name="LineEndingText" Classes="status" />
                     </Button>
-                    <Button Name="EncodingButton" Classes="statusItem" Margin="-6,0" Focusable="False" IsVisible="False" Click="OnEncodingClicked">
+                    <Button Name="EncodingButton" Classes="statusItem reaching" Focusable="False" IsVisible="False" Click="OnEncodingClicked">
                         <TextBlock Name="EncodingText" Classes="status" />
                     </Button>
-                    <Button Name="IndentButton" Classes="statusItem" Margin="-6,0" Focusable="False" IsVisible="False" Click="OnIndentClicked">
+                    <Button Name="IndentButton" Classes="statusItem reaching" Focusable="False" IsVisible="False" Click="OnIndentClicked">
                         <TextBlock Name="IndentText" Classes="status" />
                     </Button>
                     <TextBlock Name="LanguageText" Classes="status" />
-                </StackPanel>
+                </app:ShrinkingRow>
                 <!-- A gap before the widgets, as between them, so neither a deep file's path nor what the bar says runs on
                      against them. -->
-                <app:StatusLine Margin="0,0,18,0">
+                <app:StatusLine>
                     <!-- Cut where its line ends, and where what the bar says begins. -->
                     <Panel Name="BreadcrumbHost" VerticalAlignment="Center" ClipToBounds="True" />
                     <!-- What the status bar says, with whether it is an error or a warning (a project's load) while it says it;
                          a link to where it has more to see while it has a place (StatusBar.Say), its whole text on hover. -->
                     <Button Name="StatusMessage" Classes="statusMessage">
                         <DockPanel>
-                            <PathIcon Name="StatusIcon" DockPanel.Dock="Left" Width="14" Height="14" Margin="0,0,6,0" IsVisible="False" VerticalAlignment="Center" />
-                            <app:WorkingRing Name="StatusWorking" DockPanel.Dock="Left" Width="14" Height="14" Margin="0,0,6,0" IsVisible="False" VerticalAlignment="Center" />
-                            <TextBlock Name="StatusText" Classes="status" Text="No solution" VerticalAlignment="Center" TextTrimming="CharacterEllipsis" />
+                            <PathIcon Name="StatusIcon" DockPanel.Dock="Left" Classes="lead" Width="14" Height="14" IsVisible="False" VerticalAlignment="Center" />
+                            <app:WorkingRing Name="StatusWorking" DockPanel.Dock="Left" Classes="lead" Width="14" Height="14" IsVisible="False" VerticalAlignment="Center" />
+                            <app:LiveText Name="StatusText" Classes="status" Text="No solution" VerticalAlignment="Center" TextTrimming="CharacterEllipsis" />
                         </DockPanel>
                     </Button>
                 </app:StatusLine>
-            </DockPanel>
+            </app:ToolbarRow>
+            <app:ThemeBackdrop Place="Frame" />
+            </Panel>
         </Border>
     </Grid>
 
     <!-- Popups (Go to File, Go to Line) over everything; a click outside one dismisses it. -->
     <Panel Name="Overlay" IsVisible="False" Background="Transparent">
-        <ContentControl Name="OverlayHost" HorizontalAlignment="Center" VerticalAlignment="Top" Margin="0,84,0,0" />
+        <ContentControl Name="OverlayHost" HorizontalAlignment="Center" VerticalAlignment="Top" />
     </Panel>
     </Panel>
 </Window>

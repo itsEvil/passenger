@@ -1,4 +1,5 @@
 using Passenger.App.Godot;
+using Passenger.Dap;
 using Passenger.Workspace;
 
 namespace Passenger.UnitTests.Godot;
@@ -111,6 +112,21 @@ public class GodotScriptStopsTests
         Assert.True(GodotScriptValues.HasInside(new GodotObjectId(7)), "An object read as holding nothing");
     }
 
+    /// <summary>A tracepoint's value shows as every debugger shows one to its specifiers: a String, StringName or NodePath
+    /// quoted as Variables writes it unless nq, an int, 64 bits, in hexadecimal under h, anything else as Variables shows it.</summary>
+    [Fact]
+    public void A_tracepoints_string_is_quoted_unless_nq_and_its_int_is_64_bits_under_h()
+    {
+        Assert.Equal(("\"Ada\"", "Ada"), (DisplayFormat.Shown(GodotScriptValues.Displayed("Ada"), []), DisplayFormat.Shown(GodotScriptValues.Displayed("Ada"), ["nq"])));
+        Assert.Equal(("&\"walk\"", "walk"),
+            (DisplayFormat.Shown(GodotScriptValues.Displayed(new GodotName("walk")), []), DisplayFormat.Shown(GodotScriptValues.Displayed(new GodotName("walk")), ["nq"])));
+        Assert.Equal(("14", "0x000000000000000e", "0xffffffffffffffff"),
+            (DisplayFormat.Shown(GodotScriptValues.Displayed(14L), []), DisplayFormat.Shown(GodotScriptValues.Displayed(14L), ["h"]), DisplayFormat.Shown(GodotScriptValues.Displayed(-1L), ["h"])));
+        Assert.Equal(("2.5", "true", "<Object#7>"),
+            (DisplayFormat.Shown(GodotScriptValues.Displayed(2.5), ["h"]), DisplayFormat.Shown(GodotScriptValues.Displayed(true), ["h", "nq"]),
+                DisplayFormat.Shown(GodotScriptValues.Displayed(new GodotObjectId(7)), ["nq"])));
+    }
+
     /// <summary>Godot sends a vector's numbers as singles, which Variables writes as the numbers they read back as, as the
     /// scene's inspector does, never the double each widens to, its components as singles too; a float is a double, written
     /// with a double's digits.</summary>
@@ -145,13 +161,5 @@ public class GodotScriptStopsTests
     {
         Assert.Equal("not not (items)", GodotScriptBreakpoints.Truth("items"));
         Assert.Equal("not not (a or b)", GodotScriptBreakpoints.Truth("a or b"));
-    }
-
-    [Fact]
-    public void A_tracepoints_message_parts_its_words_from_the_expressions_read_where_it_stops()
-    {
-        Assert.Equal([("count is ", false), ("counter", true), (" of {all}", false)], GodotScriptBreakpoints.Pieces("count is {counter} of {{all}}"));
-        Assert.Equal([("name", true)], GodotScriptBreakpoints.Pieces("{name,nq}"));
-        Assert.Equal([("open { never closed", false)], GodotScriptBreakpoints.Pieces("open { never closed"));
     }
 }

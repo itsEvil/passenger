@@ -6,6 +6,7 @@ using Avalonia.Controls;
 using Avalonia.Headless;
 using Avalonia.Headless.XUnit;
 using Avalonia.Input;
+using Avalonia.Input.Raw;
 using Avalonia.Threading;
 using Avalonia.VisualTree;
 using Passenger.App.State;
@@ -20,14 +21,16 @@ using Xunit.v3;
 
 namespace Passenger.Tests;
 
-/// <summary>The real app on the headless platform, drawing with Skia so text measures as it does on
-/// a desktop.</summary>
+/// <summary>The real app on the headless platform a Passenger nobody sees draws on (<see cref="Passenger.App.HeadlessPlatform"/>):
+/// drawing with Skia so text measures as it does on a desktop, with the system's hotkeys.</summary>
 public static class TestApp
 {
-    public static AppBuilder BuildAvaloniaApp() => AppBuilder.Configure<Passenger.App.App>()
-        .UseSkia()
-        .UseHarfBuzz()
-        .UseHeadless(new AvaloniaHeadlessPlatformOptions { UseHeadlessDrawing = false });
+    /// <summary>The application's menu as the test's app ended its setup, where macOS's platform takes it before any
+    /// window is made, showing Avalonia's own About in place of none.</summary>
+    public static NativeMenu? ApplicationMenuAtSetup { get; private set; }
+
+    public static AppBuilder BuildAvaloniaApp() => Passenger.App.HeadlessPlatform.UseHeadlessPlatform(AppBuilder.Configure<Passenger.App.App>())
+        .AfterSetup(built => ApplicationMenuAtSetup = NativeMenu.GetMenu(built.Instance!));
 }
 
 /// <summary>What the whole run shares, set before anything reads it and never changed: a folder of the run's own in the
@@ -100,6 +103,8 @@ public sealed class TestRun : IAsyncDisposable
         Nice.Normal();
         // What the IDE has in flight is recorded from the first window on, for the quiet wait (Ui.Settle) to wait out.
         Passenger.Core.InFlight.Watched = true;
+        // Every folder a test opens is trusted, but one it holds to the person's answer (WorkspaceTrust.Ask).
+        Passenger.Core.WorkspaceTrust.TrustEverything();
         foreach (string left in Directory.EnumerateDirectories(Path.GetTempPath(), Prefix + "*"))
         {
             // A run still going has its process; one killed has none, and only an id reused since keeps its folder.
@@ -118,9 +123,10 @@ public sealed class TestRun : IAsyncDisposable
         Environment.SetEnvironmentVariable(StateStore.Variable, Settings);
         Environment.SetEnvironmentVariable("GIT_CONFIG_GLOBAL", gitConfig);
         Environment.SetEnvironmentVariable("GIT_CONFIG_NOSYSTEM", "1");
-        // Configuration given on git's command line through the environment, which would come before the file's.
-        OwnEnvironment.Set("GIT_CONFIG_PARAMETERS", null);
-        OwnEnvironment.Set("GIT_CONFIG_COUNT", null);
+        // Configuration git takes from the environment, over the files' or (git config's) in place of them.
+        OwnEnvironment.Set(GitVariables.ConfigParameters, null);
+        OwnEnvironment.Set(GitVariables.Config, null);
+        OwnEnvironment.Set(GitVariables.ConfigCount, null);
         // Nor the person's ssh-agent, which ssh-keygen asks first for the key a commit is signed with.
         OwnEnvironment.Set("SSH_AUTH_SOCK", null);
         // Nor the person's GnuPG keyring and agent: gpg keeps a signing test's keys in the run's.
@@ -140,7 +146,7 @@ public sealed class TestRun : IAsyncDisposable
         File.WriteAllText(Path.Combine(Root, "zsh", ".zshrc"), string.Empty);
         NuGetHome();
         // No test reaches GitHub: a Passenger that checks for updates without a stand-in asks where nothing listens.
-        Environment.SetEnvironmentVariable(Passenger.App.Updates.ReleaseFeed.Variable, "http://127.0.0.1:9/repos/Zaneris/passenger/releases/latest");
+        Environment.SetEnvironmentVariable(Passenger.App.Updates.ReleaseFeed.Variable, "http://127.0.0.1:9/repos/Zaneris/passenger/releases");
         // Nor any host a browser Passenger starts asks of its own accord (its updates, its services): they go where nothing listens.
         Environment.SetEnvironmentVariable(Passenger.App.Debugging.BrowserRun.ProxyVariable, "127.0.0.1:9");
         // Nor Microsoft's .NET release metadata: Install .NET SDK without a stand-in asks where nothing listens.
@@ -149,10 +155,16 @@ public sealed class TestRun : IAsyncDisposable
         Environment.SetEnvironmentVariable(Passenger.App.Xaml.SourceLink.Variable, "http://127.0.0.1:9/");
         // Nor the web for a JSON schema a file names: those Passenger does not carry are asked of where nothing listens.
         Environment.SetEnvironmentVariable(Passenger.App.Web.JsonSchemas.Variable, "http://127.0.0.1:9/");
+        // Nor Open VSX for VS Code themes: the explorer and a theme's base without a stand-in of the test's ask where nothing listens.
+        Environment.SetEnvironmentVariable(Passenger.App.OpenVsx.Variable, "http://127.0.0.1:9/");
+        // Nor GitHub for Passenger's themes repository: it is read from the copy the tests carry.
+        Environment.SetEnvironmentVariable(Passenger.App.ThemeSource.Variable, Path.Combine(AppContext.BaseDirectory, "Themes"));
         // Nor Docker Hub for an image's tags: a Dockerfile server without a stand-in asks where nothing listens.
         Environment.SetEnvironmentVariable(Passenger.App.Web.DockerHubTags.Variable, "http://127.0.0.1:9/");
         // Nor a registry for a Dockerfile's base images: BuildKit's checks are off but in the one test that turns them on.
         Environment.SetEnvironmentVariable(Passenger.App.Containers.BuildKitChecks.Variable, "off");
+        // Nor the person's motion and caret settings: carets blink at Passenger's own rate but where a test stands in.
+        Environment.SetEnvironmentVariable(Passenger.App.SystemMotion.Variable, "full,blink=530");
         // Nor the person's user secrets: a container run mounts a project's from the run's own folder, which a test writes.
         Environment.SetEnvironmentVariable(Passenger.App.Containers.ContainerPlans.UserSecretsVariable, UserSecrets);
         // Nor the person's Passenger: an agent's call with no window to join starts this build headless, in the run's state.
@@ -161,16 +173,19 @@ public sealed class TestRun : IAsyncDisposable
         Environment.SetEnvironmentVariable(Passenger.App.Discord.DiscordIpc.Variable, DiscordNowhere);
         // Nor npm's registry: an npm install the IDE runs takes only what the run's own empty cache has.
         string npmConfig = Path.Combine(Root, "npmrc");
+        string npmGlobalConfig = Path.Combine(Root, "npmrc-global");
         File.WriteAllText(npmConfig, string.Empty);
+        // A file of its own, as npm 11 ends at once on one file read as both.
+        File.WriteAllText(npmGlobalConfig, string.Empty);
         Environment.SetEnvironmentVariable("npm_config_userconfig", npmConfig);
-        Environment.SetEnvironmentVariable("npm_config_globalconfig", npmConfig);
+        Environment.SetEnvironmentVariable("npm_config_globalconfig", npmGlobalConfig);
         Environment.SetEnvironmentVariable("npm_config_cache", Path.Combine(Root, "npm-cache"));
         Environment.SetEnvironmentVariable("npm_config_offline", "true");
         Environment.SetEnvironmentVariable("npm_config_update_notifier", "false");
         Environment.SetEnvironmentVariable("npm_config_audit", "false");
         Environment.SetEnvironmentVariable("npm_config_fund", "false");
         // Nor the person's colour choices: what a test runs writes in colour on a terminal alone, as with none of them set.
-        foreach (string colour in (string[])["NO_COLOR", "FORCE_COLOR", "CLICOLOR_FORCE", "DOTNET_SYSTEM_CONSOLE_ALLOW_ANSI_COLOR_REDIRECTION"])
+        foreach (string colour in (string[])["NO_COLOR", "FORCE_COLOR", "CLICOLOR_FORCE", RuntimeVariables.AnsiColorRedirection])
         {
             OwnEnvironment.Set(colour, null);
         }
@@ -339,8 +354,9 @@ public sealed class TestRun : IAsyncDisposable
     /// tries each once.</summary>
     private static void End(bool waiting)
     {
-        // The windows' agent sockets are in a folder named for the run's state, outside it.
-        foreach (string folder in (string[])[Root, Passenger.App.Mcp.McpHost.SocketFolder, AspireCli.Home])
+        // The windows' agent sockets and the language servers' temporary folders are in folders named for the run's state, outside it.
+        foreach (string folder in (string[])[Root, Passenger.App.Mcp.McpHost.SocketFolder, AspireCli.Home,
+            .. UserTemporary.Of(Passenger.App.CSharp.CSharpService.ServerCache, Passenger.Lsp.RoslynServerFolder.TemporariesKind) is var servers && Directory.Exists(servers) ? [servers] : (string[])[]])
         {
             try
             {
@@ -360,6 +376,13 @@ public sealed class TestRun : IAsyncDisposable
 public static class Limits
 {
     public static TimeSpan Scaled(this TimeSpan limit) => limit == Timeout.InfiniteTimeSpan ? limit : limit * TestRun.TimeScale;
+}
+
+/// <summary>A while as the IDE says one (<see cref="Durations.Said"/>), as a regular expression: its number to a tenth and its
+/// unit, for words that say how long something took.</summary>
+public static class SaidWhile
+{
+    public const string Pattern = @"[\d,]+(\.\d)? (ms|s|minutes?|hours?)";
 }
 
 /// <summary>The run's nice value on macOS and Linux. MSBuild keeps no idle node for the next build at any nice value but 0,
@@ -471,8 +494,9 @@ public static class OpenWindows
 {
     private static readonly List<Window> Open = [];
 
-    /// <summary>The IDE's windows closed since the test began, what each started perhaps still ending.</summary>
-    private static readonly List<Passenger.App.MainWindow> Closed = [];
+    /// <summary>What the IDE's windows closed since the test began started, perhaps still ending: their ends, never the
+    /// windows, so a test may see a window it closed let go.</summary>
+    private static readonly List<Task> Ending = [];
     private static bool watching;
 
     /// <summary>The longest the work of windows closed after a test may take to land, past the end their own limit gives
@@ -490,12 +514,29 @@ public static class OpenWindows
                 Open.Remove(window);
                 if (window is Passenger.App.MainWindow closed)
                 {
-                    Closed.Add(closed);
+                    KeepEnd(closed);
                 }
             });
         }
         Open.Clear();
-        Closed.Clear();
+        Ending.Clear();
+    }
+
+    /// <summary>Keeps what a closed window started ending, which its own Closed sets, if it has not yet.</summary>
+    private static void KeepEnd(Passenger.App.MainWindow closed)
+    {
+        if (closed.Ended is { } ended)
+        {
+            Ending.Add(ended);
+            return;
+        }
+        closed.Closed += (_, _) =>
+        {
+            if (closed.Ended is { } now)
+            {
+                Ending.Add(now);
+            }
+        };
     }
 
     /// <summary>Closes every window still open, the last opened first, waits for what each started to end, and what each
@@ -509,7 +550,7 @@ public static class OpenWindows
         {
             throw new InvalidOperationException("Windows left open can only be closed on their own thread");
         }
-        List<Task> ending = [.. Closed.Select(window => window.Ended).OfType<Task>().Where(ended => !ended.IsCompleted)];
+        List<Task> ending = [.. Ending.Where(ended => !ended.IsCompleted)];
         while (Open.Count > 0)
         {
             Window last = Open[^1];
@@ -523,7 +564,7 @@ public static class OpenWindows
                 }
             }
         }
-        Closed.Clear();
+        Ending.Clear();
         if (ending.Count == 0 && BackgroundWork.Pending == 0)
         {
             return true;
@@ -721,6 +762,19 @@ public static class TestFolders
         return path;
     }
 
+    /// <summary>A stand-in program in a test's folder running one command, <paramref name="cmd"/> as a Windows .cmd (as npm
+    /// writes a package's command), else <paramref name="sh"/> as a shell script; its path.</summary>
+    public static string StandIn(string folder, string name, string cmd, string sh)
+    {
+        if (OperatingSystem.IsWindows())
+        {
+            return Write(folder, $"{name}.cmd", $"@echo off\r\n{cmd}\r\n");
+        }
+        string program = Write(folder, name, $"#!/bin/sh\n{sh}\n");
+        File.SetUnixFileMode(program, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+        return program;
+    }
+
     /// <summary>Many files of a test's folder written as <see cref="Write"/> writes each, several at once: Windows scans a
     /// file as it is made, which a test of a thousand files written one after another waits out a thousand times.</summary>
     public static void WriteAll(string folder, IEnumerable<(string Relative, string Text)> files) =>
@@ -878,6 +932,10 @@ public static class Ui
         }
     }
 
+    /// <summary>A key held with the system's command key (<see cref="Keystroke.Command"/>: Cmd on a Mac, Ctrl elsewhere), as
+    /// <see cref="Press"/> takes it: a text box's Select All is <c>Command("A")</c>, on the headless platform as on the screen.</summary>
+    public static string Command(string key) => new Keystroke(Keystroke.Parse(key).Key, Keystroke.Command).Notation();
+
     private static void Stroke(TopLevel window, Keystroke stroke)
     {
         RawInputModifiers modifiers = Raw(stroke.Modifiers);
@@ -892,8 +950,9 @@ public static class Ui
 
     /// <summary>A key that types, pressed as a keyboard presses it: the key, carrying the character the layout gives it
     /// ("ł" for a Polish AltGr+L, which Windows sends as Ctrl+Alt+L), then that character as text unless the key was taken
-    /// as a shortcut, which keeps the platform from typing it.</summary>
-    public static void Type(TopLevel window, string keys, string text)
+    /// as a shortcut, which keeps the platform from typing it; what it ran let land unless <paramref name="settle"/> is
+    /// false, as for a key typed right after it.</summary>
+    public static void Type(TopLevel window, string keys, string text, bool settle = true)
     {
         Keystroke stroke = Keystroke.Parse(keys.Replace('+', ' '));
         RawInputModifiers modifiers = Raw(stroke.Modifiers);
@@ -907,7 +966,10 @@ public static class Ui
             window.KeyTextInput(text);
         }
         window.KeyRelease(stroke.Key, modifiers, PhysicalKey.None, text);
-        Settle();
+        if (settle)
+        {
+            Settle();
+        }
     }
 
     /// <summary>Long enough for the language server to start and load a small project, on a developer's machine.</summary>
@@ -929,20 +991,25 @@ public static class Ui
         TimeSpan limit = SettleLimit.Scaled();
         if (!Settled(Deadline.In(limit)))
         {
-            throw new TimeoutException($"The IDE was not quiet within {limit.TotalSeconds} s. Still busy:\n{Busy()}{ServerConversations()}{IdeLogTail()}{ServerLogTail()}");
+            throw new TimeoutException($"The IDE was not quiet within {limit.TotalSeconds} s. Still busy:\n{Busy()}{ServerConversations()}{ProgramsRunning()}{IdeLogTail()}{ServerLogTail()}");
         }
     }
 
+    /// <summary>Whether the IDE went quiet within the limit (scaled), as <see cref="Settle"/> waits for it, for a test that
+    /// holds back work the IDE is never to wait for.</summary>
+    public static bool Quiet(TimeSpan limit) => Settled(Deadline.In(limit.Scaled()));
+
     /// <summary>Waits until nothing holds what <paramref name="weak"/> names, collecting fully at each of the window's
     /// frames, so work its close left on the window's loop ends first; fails saying what then stays alive and why it
-    /// matters. Takes no strong reference itself: the caller makes the object in a method of its own, not inlined.</summary>
-    public static void Collected<T>(WeakReference<T> weak, string what) where T : class => WaitFor(() =>
+    /// matters, past <paramref name="limit"/> (scaled) where one is given. Takes no strong reference itself: the caller makes
+    /// the object in a method of its own, not inlined.</summary>
+    public static void Collected<T>(WeakReference<T> weak, string what, TimeSpan? limit = null) where T : class => WaitFor(() =>
     {
         GC.Collect();
         GC.WaitForPendingFinalizers();
         GC.Collect();
         return !weak.TryGetTarget(out _);
-    }, what);
+    }, what, limit);
 
     /// <summary>What a blink of the caret allocates on the UI thread with the IDE at rest, the least of three: its frame of
     /// the editor, about 25 KB, which a wait draws whatever the IDE did whenever it outlasts the blink's 530 ms, so a measure
@@ -1012,9 +1079,9 @@ public static class Ui
     /// piece of work in flight, with how long it had been under way.</summary>
     public static string Busy()
     {
-        DateTime now = DateTime.UtcNow;
-        IReadOnlyList<(string What, DateTime Since)> held = BackgroundWork.Held();
-        IReadOnlyList<(string What, DateTime Since)> flying = Passenger.Core.InFlight.Now();
+        long now = Stopwatch.GetTimestamp();
+        IReadOnlyList<(string What, long Since)> held = BackgroundWork.Held();
+        IReadOnlyList<(string What, long Since)> flying = Passenger.Core.InFlight.Now();
         int unnamed = BackgroundWork.Pending - held.Count;
         string busy = Passenger.Core.InFlight.Describe(held.Concat(flying).OrderBy(b => b.Since), now);
         return (busy.Length == 0 && unnamed <= 0 ? "  nothing named" : busy)
@@ -1027,6 +1094,18 @@ public static class Ui
     {
         string conversations = Passenger.Lsp.LanguageServer.Conversations();
         return conversations.Length == 0 ? string.Empty : $"\nThe language servers' conversations:\n{conversations}";
+    }
+
+    /// <summary>The programs still running under the tests' process, with their command lines, which say where work waiting
+    /// on a program stopped: a git, a helper it started, or a stand-in's server.</summary>
+    private static string ProgramsRunning()
+    {
+        IReadOnlyList<int> running = Processes.Descendants(Environment.ProcessId);
+        return running.Count == 0
+            ? string.Empty
+            : $"\nPrograms running under the tests:\n{string.Join('\n', running.Take(40).Select(id => $"  {Cut(Processes.Describe(id))}"))}";
+
+        static string Cut(string line) => line.Length <= 300 ? line : $"{line[..300]}…";
     }
 
     /// <summary>The end of the IDE's own log, which names an exception that left background work waiting for good.</summary>
@@ -1128,6 +1207,38 @@ public static class Ui
             ?? throw new InvalidOperationException($"Avalonia's headless window no longer tells its window it was left through Deactivated ({shown.GetType().Name})");
         ((Action?)deactivated.GetValue(shown))?.Invoke();
         Settle();
+    }
+
+    /// <summary>A finger's fling: put down on the window at <paramref name="from"/>, drawn to <paramref name="to"/> in
+    /// <paramref name="moves"/> moves and let go there, given through the window's own way in as its platform gives touch,
+    /// each stamped a frame after the last with no frame drawn between, as Avalonia's velocity tracker takes a finger at
+    /// rest from a move stamped over 40 ms after the last or a release over 40 ms after it, which a slow machine's frames
+    /// between headless moves make of every fling.</summary>
+    public static void Fling(Window window, Point from, Point to, int moves)
+    {
+        object shown = window.PlatformImpl ?? throw new InvalidOperationException($"{window.Title} has no window of the platform's to touch");
+        Assembly avalonia = typeof(RawInputModifiers).Assembly;
+        Type touch = avalonia.GetType("Avalonia.Input.Raw.RawTouchEventArgs") ?? throw Unreachable("RawTouchEventArgs");
+        Type finger = avalonia.GetType("Avalonia.Input.TouchDevice") ?? throw Unreachable("TouchDevice");
+        object root = shown.GetType().GetProperty("InputRoot")?.GetValue(shown) ?? throw Unreachable("its window's InputRoot");
+        Delegate input = shown.GetType().GetProperty("Input")?.GetValue(shown) as Delegate ?? throw Unreachable("its window's Input");
+        using IDisposable device = (IDisposable)(Activator.CreateInstance(finger) ?? throw Unreachable("a TouchDevice made"));
+        ulong stamp = 0;
+        void Give(RawPointerEventType type, Point at)
+        {
+            stamp += 16;
+            input.DynamicInvoke(Activator.CreateInstance(touch, device, stamp, root, type, at, RawInputModifiers.None, 1L));
+        }
+        Give(RawPointerEventType.TouchBegin, from);
+        for (int move = 1; move <= moves; move++)
+        {
+            Give(RawPointerEventType.TouchUpdate, from + (to - from) * move / moves);
+        }
+        Give(RawPointerEventType.TouchEnd, to);
+        Draw();
+
+        static InvalidOperationException Unreachable(string what) =>
+            new($"Avalonia's touch input is no longer reachable as a platform gives it: {what} is gone");
     }
 
     /// <summary>Closes a window as the application's shutdown does (the application menu's Quit on macOS): its owned windows
@@ -1305,6 +1416,29 @@ public static class Ui
     public static void Click(Control control, Point? at = null, RawInputModifiers modifiers = RawInputModifiers.None, bool settle = true) =>
         Click(control, at, MouseButton.Left, modifiers, settle);
 
+    /// <summary>A click as <see cref="Click(Control, Point?, RawInputModifiers, bool)"/> makes one, its button held down while
+    /// <paramref name="meanwhile"/> runs (work landing between a person's press and release), then let go where it went down.</summary>
+    public static void ClickAcross(Control control, Action meanwhile)
+    {
+        (TopLevel top, Point point) = Aim(control, null);
+        Apart(top, point);
+        top.MouseDown(point, MouseButton.Left);
+        meanwhile();
+        top.MouseUp(point, MouseButton.Left);
+        Clicked(top, point);
+        Settle();
+    }
+
+    /// <summary>The pointer brought to rest over a control (its centre, or a point in it) as a person's mouse brings it, with
+    /// modifiers held when given, once the control is drawn and is what the pointer finds there, as
+    /// <see cref="Click(Control, Point?, RawInputModifiers, bool)"/> aims; then lets what it ran land.</summary>
+    public static void Hover(Control control, Point? at = null, RawInputModifiers modifiers = RawInputModifiers.None)
+    {
+        (TopLevel top, Point point) = Aim(control, at);
+        top.MouseMove(point, modifiers);
+        Settle();
+    }
+
     /// <summary>A right click as <see cref="Click(Control, Point?, RawInputModifiers, bool)"/> makes a click, which opens
     /// the menu of what is there.</summary>
     public static void RightClick(Control control, Point? at = null) => Click(control, at, MouseButton.Right, RawInputModifiers.None, settle: true);
@@ -1383,7 +1517,16 @@ public static class Ui
         Dragged(window, from, to, button, modifiers);
     }
 
-    private static void Dragged(TopLevel window, Point from, Point to, MouseButton button, RawInputModifiers modifiers)
+    /// <summary>A drag with the left button as <see cref="Drag(TopLevel, Point, Point)"/> makes one, a frame drawn after the
+    /// press and after each move, as the screen follows a person's hand: each frame draws what the moves so far changed
+    /// over what the frame before it drew.</summary>
+    public static void DragDrawn(TopLevel window, Point from, Point to)
+    {
+        Apart(window, from);
+        Dragged(window, from, to, MouseButton.Left, RawInputModifiers.None, drawn: true);
+    }
+
+    private static void Dragged(TopLevel window, Point from, Point to, MouseButton button, RawInputModifiers modifiers, bool drawn = false)
     {
         RawInputModifiers held = modifiers | button switch
         {
@@ -1395,7 +1538,15 @@ public static class Ui
         window.MouseDown(from, button, modifiers);
         for (int step = 1; step <= 10; step++)
         {
+            if (drawn)
+            {
+                Draw();
+            }
             window.MouseMove(from + ((to - from) * (step / 10.0)), held);
+        }
+        if (drawn)
+        {
+            Draw();
         }
         window.MouseUp(to, button, modifiers);
         Clicked(window, from);
@@ -1510,12 +1661,27 @@ public static class Ui
     private static string Covering(Control control) => control.TemplatedParent is Control owner ? $"{Named(control)} of {Covering(owner)}"
         : string.Join(" in ", control.GetVisualAncestors().OfType<Control>().Take(6).Prepend(control).Select(Named));
 
+    /// <summary>Every tool window serving the window's folder whatever it holds, for a test of the dock or of a window's own
+    /// parts, whose subject is not which windows a folder's projects bring (ToolWindowServesTests is).</summary>
+    public static void ServeEveryWindow(Passenger.App.MainWindow window)
+    {
+        window.DockHost.WhyUnserved = _ => null;
+        window.DockHost.Serve();
+        Settle();
+    }
+
     /// <summary>A person's window shown on a folder, once the folder's opening work has landed; without the C# language
     /// server for a test that asks nothing of C# (<see cref="Passenger.App.MainWindow.StartsLanguageServer"/>), which then
-    /// waits for no server's start, load or restore; saving only when asked for a test that reads what it left unsaved.</summary>
-    public static Passenger.App.MainWindow OpenFolder(string folder, double width = 1200, double height = 800, bool languageServer = true, bool autosaves = true)
+    /// waits for no server's start, load or restore; saving only when asked for a test that reads what it left unsaved; on
+    /// <paramref name="engine"/> in place of the machine's container engine where given.</summary>
+    public static Passenger.App.MainWindow OpenFolder(string folder, double width = 1200, double height = 800, bool languageServer = true, bool autosaves = true,
+        Passenger.App.Containers.ContainerEngine? engine = null)
     {
-        Passenger.App.MainWindow window = new() { Width = width, Height = height, StartsLanguageServer = languageServer, Autosaves = autosaves };
+        Passenger.App.MainWindow window = new()
+        {
+            Width = width, Height = height, StartsLanguageServer = languageServer, Autosaves = autosaves,
+            Engine = engine ?? Passenger.App.Containers.ContainerEngine.Shared,
+        };
         window.Show();
         window.OpenFolder(folder);
         Settle();
@@ -1549,6 +1715,15 @@ public static class Ui
             ?? throw new Xunit.Sdk.XunitException($"No button says {words}: [{string.Join(", ", buttons.Select(b => b.Content).OfType<string>())}]"));
     }
 
+    /// <summary>A line's links as a console or the terminal draws them once the disk has answered for every path they name,
+    /// which it is asked off the window's thread.</summary>
+    public static Passenger.App.ToolWindows.FoundLink[] LinksIn(Passenger.App.ToolWindows.ConsoleLinks links, string line)
+    {
+        links.In(line);
+        WaitFor(() => !links.Looking, () => $"the disk's answers for the paths in: {line}");
+        return links.In(line);
+    }
+
     /// <summary>A click on a console line's link to a file, at its first character, as a person clicks it: the pointer
     /// rested there first, failing unless that underlines the link.</summary>
     public static void ClickLink(Passenger.App.ToolWindows.OutputView console, string line) =>
@@ -1560,7 +1735,7 @@ public static class Ui
     public static void ClickLink(Passenger.App.ToolWindows.OutputView console, string line, Func<Passenger.App.ToolWindows.FoundLink, bool> which)
     {
         CodeEditor editor = console.Editor;
-        Passenger.App.ToolWindows.FoundLink link = console.Links.In(line).Single(which);
+        Passenger.App.ToolWindows.FoundLink link = LinksIn(console.Links, line).Single(which);
         int offset = editor.Document.Snapshot.ToString().IndexOf(line, StringComparison.Ordinal) + link.Start;
         editor.GoTo(editor.Document.Snapshot.GetPosition(offset));
         Settle();
@@ -1587,6 +1762,18 @@ public static class Ui
         window.BottomPanel.Debug.ShowTab(console: true);
         Settle();
         TypeLine(window.BottomPanel.Debug.Console, line);
+    }
+
+    /// <summary>Find in Files searching for some text now, waited for until its matches are shown, failing saying what the
+    /// popup says. The box tells of its new text after the frame, which puts a search begun before it off until a pause
+    /// and drops its matches, even those shown: told first.</summary>
+    public static void Search(Passenger.App.Navigation.FindInFilesPopup popup, string text)
+    {
+        popup.Text = text;
+        Dispatcher.UIThread.RunJobs();
+        Task searching = popup.SearchAsync();
+        WaitFor(() => searching.IsCompleted && popup.Searching.IsCompleted && popup.Status != "Searching…",
+            () => $"the search for {text}; the popup says '{popup.Status}'");
     }
 
     /// <summary>A control as a failure message names it: by its name, words or tip.</summary>
@@ -1704,7 +1891,7 @@ public static class Ui
         for (int i = 0; i < path.Length; i++)
         {
             string step = path[i];
-            MenuItem item = items.FirstOrDefault(m => (string?)m.Header == step)
+            MenuItem item = items.FirstOrDefault(m => m.Header as string == step)
                 ?? throw new InvalidOperationException($"{where} has no {step}: [{string.Join(", ", items.Select(m => $"{m.Header}{(m.IsEnabled ? "" : " (disabled)")}"))}]");
             if (!item.IsEffectivelyEnabled)
             {
@@ -1921,6 +2108,54 @@ public static class Ui
     }
 }
 
+/// <summary>A window's diffs wherever Settings' Open diffs in shows them, in a tab of the editors
+/// (<see cref="Passenger.App.Vcs.DiffTab"/>) or in a window of their own (<see cref="Passenger.App.Vcs.DiffWindow"/>): a test
+/// finds, reads and works a diff through these, never taking it to be either, so what it checks holds of both.</summary>
+public static class OpenDiffs
+{
+    /// <summary>The diffs open: the editors' tabs, then the windows over the IDE's.</summary>
+    public static IReadOnlyList<Passenger.App.Vcs.IDiffHost> In(Passenger.App.MainWindow window) =>
+        [.. window.EditorArea.Diffs.Select(d => d.Diff!), .. window.OwnedWindows.OfType<Passenger.App.Vcs.DiffWindow>().Where(w => w.IsVisible)];
+
+    /// <summary>The diff the person sees: the diff window over the others, else the diff tab the editors show; null for none.</summary>
+    public static Passenger.App.Vcs.IDiffHost? Shown(Passenger.App.MainWindow window) =>
+        window.OwnedWindows.OfType<Passenger.App.Vcs.DiffWindow>().LastOrDefault(w => w.IsVisible) ?? (Passenger.App.Vcs.IDiffHost?)window.EditorArea.Active?.Diff;
+
+    /// <summary>The diff an action opened (a key, a double click, a menu's choice), once the window's work has landed;
+    /// fails saying <paramref name="what"/> never showed.</summary>
+    public static Passenger.App.Vcs.IDiffHost Landed(Passenger.App.MainWindow window, string what)
+    {
+        Ui.Landed(() => Shown(window) is not null, $"{what}, where the status bar says \"{window.Status}\"");
+        return Shown(window)!;
+    }
+
+    /// <summary>Its view, as its window or the group showing its tab has it; fails where none shows it.</summary>
+    public static Passenger.App.Vcs.DiffView ViewOf(Passenger.App.Vcs.IDiffHost diff) => diff.View
+        ?? throw new Xunit.Sdk.XunitException($"The diff \"{diff.Shown.Title}\" is in a tab no group shows in front, so nothing in it can be seen or worked");
+
+    /// <summary>Where its keys go: its own window, or the window whose editors show its tab.</summary>
+    public static TopLevel KeysOf(Passenger.App.Vcs.IDiffHost diff) => TopLevel.GetTopLevel(ViewOf(diff))
+        ?? throw new Xunit.Sdk.XunitException($"The diff \"{diff.Shown.Title}\" is in no window, so no key can reach it");
+
+    /// <summary>Its title as the person reads it: its window's, or its tab's.</summary>
+    public static string TitleOf(Passenger.App.Vcs.IDiffHost diff) => diff switch
+    {
+        Passenger.App.Vcs.DiffWindow shown => shown.Title ?? string.Empty,
+        Passenger.App.Vcs.DiffTab tab => tab.Document.Title,
+        _ => throw new ArgumentException($"A diff is shown in a window or a tab, not in a {diff.GetType().Name}", nameof(diff)),
+    };
+
+    /// <summary>Whether it is still open.</summary>
+    public static bool IsOpen(Passenger.App.MainWindow window, Passenger.App.Vcs.IDiffHost diff) => In(window).Contains(diff);
+
+    /// <summary>Fails where a diff is open, naming each, as <paramref name="why"/> says it should not be.</summary>
+    public static void None(Passenger.App.MainWindow window, string why)
+    {
+        IReadOnlyList<Passenger.App.Vcs.IDiffHost> open = In(window);
+        Assert.True(open.Count == 0, $"{why}: {string.Join(", ", open.Select(TitleOf))} open");
+    }
+}
+
 /// <summary>The project files tests write, as short as dotnet new's: each targets <see cref="Framework"/>, so moving the tests
 /// to the next .NET changes one line.</summary>
 public static class TestProjects
@@ -1977,6 +2212,9 @@ public static class TestPackages
 
     /// <summary>xunit v3 on the Testing Platform alone, its second line (the tests' own xunit v3 is on its first).</summary>
     public static string XunitApp { get; } = AvaloniaApp.Metadata("XunitAppVersion");
+
+    /// <summary>Reqnroll on xunit v3 (Reqnroll.xunit.v3), beside the tests' own xunit v3, adapter and test SDK.</summary>
+    public static string Reqnroll { get; } = AvaloniaApp.Metadata("ReqnrollVersion");
 }
 
 public static class ExplorerRows
@@ -2309,6 +2547,9 @@ public static class TestGit
 
     public static Task<string> RunAsync(string folder, params string[] arguments) => RunAsync(folder, arguments, null);
 
+    /// <summary><see cref="RunAsync(string, string[])"/> with what git reads given it, off the UI thread.</summary>
+    public static Task<string> FeedAsync(string folder, string input, params string[] arguments) => RunAsync(folder, arguments, input);
+
     private static async Task<string> RunAsync(string folder, string[] arguments, string? input)
     {
         Passenger.Core.ChildResult result;
@@ -2455,16 +2696,17 @@ public static class TestGpgKeys
     /// <summary>Why a test that signs with GPG cannot run here, or null.</summary>
     public static string? WhyNot => Gpg is null ? "gpg is not on the PATH, so no commit can be signed with a GPG key here" : null;
 
-    /// <summary>A new key for tests@passenger.invalid guarded by <paramref name="passphrase"/>, given gpg on its input,
-    /// never its command line; its id, the agent ended after so the passphrase is asked for again.</summary>
-    public static async Task<string> MakeAsync(string passphrase, string? gpg = null)
+    /// <summary>A new key for <paramref name="user"/> (tests@passenger.invalid's where none is given) guarded by
+    /// <paramref name="passphrase"/>, given gpg on its input, never its command line; its id, the agent ended after so the
+    /// passphrase is asked for again.</summary>
+    public static async Task<string> MakeAsync(string passphrase, string? gpg = null, string user = "Passenger Tests <tests@passenger.invalid>")
     {
         gpg ??= Gpg!;
         Passenger.Core.ChildResult made = await Passenger.Core.ChildProcesses.RunAsync(Of(gpg,
-            ["--batch", "--pinentry-mode", "loopback", "--passphrase-fd", "0", "--quick-gen-key", "Passenger Tests <tests@passenger.invalid>", "ed25519", "sign", "never"]),
+            ["--batch", "--pinentry-mode", "loopback", "--passphrase-fd", "0", "--quick-gen-key", user, "ed25519", "sign", "never"]),
             passphrase + "\n", Limit.Scaled());
         Assert.True(made.Succeeded, $"gpg made no key to sign with, exiting {made.ExitCode}: {made.Error}");
-        Passenger.Core.ChildResult listed = await Passenger.Core.ChildProcesses.RunAsync(Of(gpg, ["--list-secret-keys", "--with-colons", "tests@passenger.invalid"]),
+        Passenger.Core.ChildResult listed = await Passenger.Core.ChildProcesses.RunAsync(Of(gpg, ["--list-secret-keys", "--with-colons", $"={user}"]),
             limit: Limit.Scaled());
         string id = listed.Output.Split('\n').Select(l => l.Split(':')).First(f => f[0] == "sec")[4];
         await EndAgentAsync(gpg);
@@ -2557,9 +2799,7 @@ public sealed class EndingAsTheyStart : IDisposable
                 }
                 ended.Add(child.ProcessId);
             }
-            using Process ending = Process.GetProcessById(child.ProcessId);
-            ending.Kill();
-            ending.WaitForExit();
+            OwnProcess.Of(child.ProcessId).Kill(alone: true, waited: true);
         };
         ChildProcesses.Started += started;
     }
@@ -2791,7 +3031,8 @@ public static partial class Processes
     }
 
     /// <summary>The folder a process works in on Windows, which Windows lets nobody delete while it does, read from its
-    /// parameters in its memory (CurrentDirectory at 0x38); null elsewhere, or where its memory does not read.</summary>
+    /// parameters in its memory (CurrentDirectory at 0x38), a 32-bit program's from its own 32-bit ones (at 0x24, as adb's
+    /// is); null elsewhere, or where its memory does not read.</summary>
     public static string? WindowsWorkingFolder(int id)
     {
         if (!OperatingSystem.IsWindows())
@@ -2802,6 +3043,12 @@ public static partial class Processes
         {
             using System.Diagnostics.Process process = System.Diagnostics.Process.GetProcessById(id);
             IntPtr handle = process.Handle;
+            long[] wow64 = new long[1];
+            if (NtQueryInformationProcess(handle, 26, wow64, sizeof(long), out _) == 0 && wow64[0] != 0)
+            {
+                return ReadMemory(handle, wow64[0] + 0x10, 4) is { } at32 && ReadMemory(handle, BitConverter.ToUInt32(at32) + 0x24, 8) is { } folder32
+                    && ReadMemory(handle, BitConverter.ToUInt32(folder32, 4), BitConverter.ToUInt16(folder32, 0)) is { } name32 ? System.Text.Encoding.Unicode.GetString(name32) : null;
+            }
             long[] basic = new long[6];
             if (NtQueryInformationProcess(handle, 0, basic, basic.Length * sizeof(long), out _) != 0 || ReadMemory(handle, basic[1] + 0x20, 8) is not { } at
                 || ReadMemory(handle, BitConverter.ToInt64(at) + 0x38, 16) is not { } folder)
@@ -2946,44 +3193,228 @@ public static partial class Processes
     /// the time given.</summary>
     public static bool Gone(int id, TimeSpan? within = null) =>
         Waiting.Until(() => !IsRunning(id), within ?? TimeSpan.FromSeconds(15), every: TimeSpan.FromMilliseconds(100));
+}
 
-    /// <summary>Ends what a failed test left running, its children with it.</summary>
-    public static void Kill(int id)
+/// <summary>A process as a test came to know it for its own (one it started, one whose id a program it ran wrote as it ran,
+/// one a session of the IDE's names while it runs): its id and when it began. Once it has ended the system may give its id to
+/// any program, which begins later, so it is ended, stopped or signalled only while it is still the process the test knew:
+/// every end of a process found by its id goes through here (BannedSymbols.txt). Nothing for an id of 0, or one none had.</summary>
+public readonly struct OwnProcess
+{
+    /// <summary>When it began, as <see cref="BeganNow"/> reads it; 0 for none.</summary>
+    private readonly long began;
+
+    private OwnProcess(int id, long began)
+    {
+        Id = id;
+        this.began = began;
+    }
+
+    public int Id { get; }
+
+    /// <summary>The process with this id now, which the test knows for its own at this moment.</summary>
+    public static OwnProcess Of(int id) => id > 0 ? new(id, BeganNow(id)) : default;
+
+    /// <summary>A process the test holds, as it began.</summary>
+    public static OwnProcess Of(Process process)
     {
         try
         {
-            if (IsRunning(id))
-            {
-                using System.Diagnostics.Process left = System.Diagnostics.Process.GetProcessById(id);
-                left.Kill(entireProcessTree: true);
-            }
+            return DotnetProcesses.Runs(process) ? Of(process.Id) : default;
         }
-        catch (Exception gone) when (gone is ArgumentException or InvalidOperationException or AggregateException or System.ComponentModel.Win32Exception)
+        catch (InvalidOperationException)
         {
-            // Gone, or ending: Windows refuses to end a process of the tree that is.
+            // No process was ever associated with it.
+            return default;
         }
     }
 
-    /// <summary>Stops a process where it stands, answering nothing, as a deadlocked one would: SIGSTOP on macOS and
-    /// Linux, and on Windows every thread suspended (NtSuspendProcess), which a kill ends as surely. Signalled, not by
-    /// running kill: on macOS a child ending while another is stopped sets .NET reaping in a spin that holds Process's lock.</summary>
-    public static void Suspend(int id, string what)
+    /// <summary>Ends it and what it started, or it alone as a crash ends it, while it is still the process the test knew,
+    /// passing over one that has ended; <paramref name="waited"/>, once it has gone (what it started is not waited for).</summary>
+    public void Kill(bool alone = false, bool waited = false)
     {
         if (OperatingSystem.IsWindows())
         {
-            using System.Diagnostics.Process process = System.Diagnostics.Process.GetProcessById(id);
+            using Process? held = Held();
+            if (held is not null)
+            {
+                End(held, alone);
+                if (waited)
+                {
+                    held.WaitForExit();
+                }
+            }
+            return;
+        }
+        if (!Runs())
+        {
+            return;
+        }
+        if (alone)
+        {
+            Libc.Signal(Id, SigKill);
+        }
+        else
+        {
+            try
+            {
+                using Process found = Process.GetProcessById(Id);
+                End(found, alone: false);
+            }
+            catch (ArgumentException)
+            {
+                // Gone meanwhile.
+            }
+        }
+        if (waited)
+        {
+            OwnProcess ended = this;
+            Waiting.Until(() => !ended.Runs(), TimeSpan.FromMinutes(1), every: TimeSpan.FromMilliseconds(50));
+        }
+    }
+
+    /// <summary>Stops it where it stands, answering nothing, as a deadlocked one would: SIGSTOP on macOS and Linux, and on
+    /// Windows every thread suspended (NtSuspendProcess), which a kill ends as surely. Signalled, not by running kill: on
+    /// macOS a child ending while another is stopped sets .NET reaping in a spin that holds Process's lock.</summary>
+    public void Suspend(string what)
+    {
+        if (OperatingSystem.IsWindows())
+        {
+            Process? held = Held();
+            Assert.True(held is not null, $"{what} (process {Id}) had ended before it could be suspended");
+            using Process process = held;
             int status = NtSuspendProcess(process.Handle);
             Assert.True(status == 0, $"{what} could not be suspended (NTSTATUS 0x{status:X8})");
             return;
         }
-        Assert.True(Signal(id, OperatingSystem.IsMacOS() ? 17 : 19) == 0, $"{what} could not be stopped (errno {System.Runtime.InteropServices.Marshal.GetLastPInvokeError()})");
+        Assert.True(Runs(), $"{what} (process {Id}) had ended before it could be stopped");
+        Assert.True(Libc.Signal(Id, OperatingSystem.IsMacOS() ? 17 : 19) == 0, $"{what} could not be stopped (errno {System.Runtime.InteropServices.Marshal.GetLastPInvokeError()})");
     }
+
+    /// <summary>Asks it to end (SIGTERM), as the system asks a program, while it is still the process the test knew: on
+    /// macOS and Linux, which have the signal. One that ends meanwhile is as good.</summary>
+    public void Terminate()
+    {
+        if (Runs() && Libc.Signal(Id, SigTerm) != 0)
+        {
+            int error = System.Runtime.InteropServices.Marshal.GetLastPInvokeError();
+            Assert.True(error == NoSuchProcess, $"Process {Id} could not be asked to end (errno {error})");
+        }
+    }
+
+    /// <summary>Whether it still runs as the process the test knew: a process now given its id began later.</summary>
+    private bool Runs() => began != 0 && BeganNow(Id) == began;
+
+    /// <summary>Its process on Windows, held by its handle (its id then its own until let go), while it still runs as the
+    /// process the test knew; null once it has ended.</summary>
+    private Process? Held()
+    {
+        if (began == 0)
+        {
+            return null;
+        }
+        Process? found = null;
+        try
+        {
+            found = Process.GetProcessById(Id);
+            _ = found.SafeHandle;
+            if (!DotnetProcesses.Runs(found) || found.StartTime.ToUniversalTime().Ticks != began)
+            {
+                return null;
+            }
+            Process held = found;
+            found = null;
+            return held;
+        }
+        catch (Exception gone) when (gone is ArgumentException or InvalidOperationException or System.ComponentModel.Win32Exception)
+        {
+            return null;
+        }
+        finally
+        {
+            found?.Dispose();
+        }
+    }
+
+    private static void End(Process process, bool alone)
+    {
+        try
+        {
+#pragma warning disable RS0030 // The one end of a process found by its id, once it is shown to be the one the test knew.
+            if (alone)
+            {
+                process.Kill();
+            }
+            else
+            {
+                process.Kill(entireProcessTree: true);
+            }
+#pragma warning restore RS0030
+        }
+        catch (Exception ending) when (ending is InvalidOperationException or AggregateException or System.ComponentModel.Win32Exception)
+        {
+            // Ending already: Windows refuses to end a process of the tree that is.
+        }
+    }
+
+    /// <summary>When the process with this id began, as the system marks it (Windows' creation time in ticks, macOS's start
+    /// in microseconds, Linux's in clock ticks from boot); 0 when none runs by it. Read on macOS and Linux without .NET's
+    /// Process, whose calls there wait on the lock its reaping holds while a child of the test's process is stopped.</summary>
+    private static unsafe long BeganNow(int id)
+    {
+        if (OperatingSystem.IsWindows())
+        {
+            try
+            {
+                using Process process = Process.GetProcessById(id);
+                return DotnetProcesses.Runs(process) ? process.StartTime.ToUniversalTime().Ticks : 0;
+            }
+            catch (Exception gone) when (gone is ArgumentException or InvalidOperationException or System.ComponentModel.Win32Exception)
+            {
+                return 0;
+            }
+        }
+        if (OperatingSystem.IsMacOS())
+        {
+            byte* info = stackalloc byte[BsdInfoSize];
+            return ProcPidInfo(id, ProcPidTbsdInfo, 0, info, BsdInfoSize) == BsdInfoSize && *(uint*)(info + BsdStatusOffset) != ZombieStatus
+                ? *(long*)(info + BsdStartOffset) * 1_000_000 + *(long*)(info + BsdStartOffset + 8)
+                : 0;
+        }
+        try
+        {
+            // The fields after the name, which may hold spaces and parentheses itself: the state is the 3rd, the start the 22nd.
+            string stat = File.ReadAllText($"/proc/{id}/stat");
+            string[] fields = stat[(stat.LastIndexOf(')') + 2)..].Split(' ');
+            return fields.Length > 19 && fields[0] is not ("Z" or "X")
+                && long.TryParse(fields[19], System.Globalization.CultureInfo.InvariantCulture, out long ticks) ? ticks : 0;
+        }
+        catch (Exception gone) when (gone is IOException or UnauthorizedAccessException)
+        {
+            return 0;
+        }
+    }
+
+    private const int SigKill = 9;
+    private const int SigTerm = 15;
+
+    /// <summary>ESRCH, on macOS and Linux alike.</summary>
+    private const int NoSuchProcess = 3;
+
+    // macOS: proc_pidinfo's BSD side (struct proc_bsdinfo), its status and its start's seconds and microseconds.
+    private const int ProcPidTbsdInfo = 3;
+    private const int BsdInfoSize = 136;
+    private const int BsdStatusOffset = 4;
+    private const int BsdStartOffset = 120;
+
+    /// <summary>The BSD side's status of a process that has ended and waits for its parent (SZOMB).</summary>
+    private const uint ZombieStatus = 5;
+
+    [System.Runtime.InteropServices.DllImport("libc", EntryPoint = "proc_pidinfo")]
+    private static extern unsafe int ProcPidInfo(int pid, int flavor, ulong argument, byte* buffer, int size);
 
     [System.Runtime.InteropServices.DllImport("ntdll.dll")]
     private static extern int NtSuspendProcess(IntPtr process);
-
-    [System.Runtime.InteropServices.DllImport("libc", EntryPoint = "kill", SetLastError = true)]
-    private static extern int Signal(int process, int signal);
 }
 
 /// <summary>Where a process's threads wait, as macOS's sample sees them (it may read any of the user's processes): each
@@ -3015,7 +3446,7 @@ public static partial class NativeStacks
             Passenger.App.IdeErrors.Observe(heard);
             if (!sample.WaitForExit(TimeSpan.FromMinutes(1)))
             {
-                sample.Kill();
+                ChildProcesses.Kill(sample);
                 return $"\n{what}: sample did not finish in a minute";
             }
             // Once it has ended, until the last of what it wrote has been heard.

@@ -43,13 +43,15 @@ public sealed class PrettierService : IAsyncDisposable
     /// <summary>The runner carried beside the app.</summary>
     public static string Script => Path.Combine(WebLanguages.Carried, "passenger", "prettier.cjs");
 
-    /// <summary>The Prettier package that formats a file as Settings configure it, null for none (Disabled, or no package
-    /// found). The glob is not asked: Reformat with Prettier formats any file Prettier reads.</summary>
+    /// <summary>The Prettier package that formats a file as Settings configure it, null for none (Disabled, no package
+    /// found, or a file of a folder not trusted). The glob is not asked: Reformat with Prettier formats any file Prettier reads.</summary>
     public string? PackageFor(string path)
     {
         AppSettings now = settings();
         return now.Prettier switch
         {
+            // A folder not trusted runs no Prettier: its configuration may be code.
+            _ when !WorkspaceTrust.Trusts(path) => null,
             ToolConfiguration.Disabled => null,
             ToolConfiguration.Manual => ProjectPackages.Named(now.PrettierPackage, folder),
             _ => ProjectPackages.Installed(path, "prettier"),
@@ -66,7 +68,7 @@ public sealed class PrettierService : IAsyncDisposable
     /// <summary>The package.json that lists prettier for a file the glob covers but it is not installed for, under
     /// Automatic configuration.</summary>
     public string? Missing(string path) =>
-        settings().Prettier == ToolConfiguration.Automatic && Covers(path) ? ProjectPackages.Missing(path, "prettier") : null;
+        settings().Prettier == ToolConfiguration.Automatic && Covers(path) && WorkspaceTrust.Trusts(path) ? ProjectPackages.Missing(path, "prettier") : null;
 
     /// <summary>Whether Reformat Code formats the file with Prettier ("Run on 'Reformat Code' action").</summary>
     public bool OnReformat(string path) => settings().PrettierOnReformat && Covers(path) && PackageFor(path) is not null;
@@ -74,13 +76,13 @@ public sealed class PrettierService : IAsyncDisposable
     /// <summary>Whether a save formats the file with Prettier first ("Run on save").</summary>
     public bool OnSave(string path) => settings().PrettierOnSave && Covers(path) && PackageFor(path) is not null;
 
-    /// <summary>The nearest .prettierignore from the file's folder up, for when Settings names none.</summary>
+    /// <summary>The nearest .prettierignore from the file's folder up, in the person's folders (<see cref="FoldersUp"/>),
+    /// for when Settings names none.</summary>
     public static string? IgnoreFile(string path)
     {
-        for (string? at = Path.GetDirectoryName(path); at is not null; at = Path.GetDirectoryName(at))
+        foreach (string at in Path.GetDirectoryName(path) is { } start ? FoldersUp.From(start) : [])
         {
-            string ignore = Path.Combine(at, ".prettierignore");
-            if (File.Exists(ignore))
+            if (FoldersUp.Found(at, ".prettierignore") is { } ignore && File.Exists(ignore))
             {
                 return ignore;
             }
@@ -163,7 +165,7 @@ public sealed class PrettierService : IAsyncDisposable
                     throw;
                 }
                 return new PrettierAnswer(Error: disposed ? "the folder was closed"
-                    : error is TimeoutException ? $"Prettier did not answer in {Limit.TotalSeconds:0} s" : $"Prettier's runner ended: {error.Message}");
+                    : error is TimeoutException ? $"Prettier did not answer in {Durations.Said(Limit)}" : $"Prettier's runner ended: {error.Message}");
             }
             if (line is null)
             {
@@ -181,7 +183,7 @@ public sealed class PrettierService : IAsyncDisposable
             if (!running.Timed)
             {
                 running.Timed = true;
-                IdeErrors.Write($"Prettier {answer.Version} formatted {Path.GetFileName(path)} for {folder} in {Stopwatch.GetElapsedTime(began).TotalMilliseconds:0} ms, its runner started on Node.js {runtime.Version}");
+                IdeErrors.Write($"Prettier {answer.Version} formatted {Path.GetFileName(path)} for {folder} in {Durations.Said(Stopwatch.GetElapsedTime(began))}, its runner started on Node.js {runtime.Version}");
             }
             return answer;
         }

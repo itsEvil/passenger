@@ -9,13 +9,14 @@ namespace Passenger.App.CSharp;
 
 /// <summary>The card when the pointer rests, or Quick Documentation at the caret: the problems there, then a paused
 /// program's value (its rows to open, the card taking the pointer and the keys) or what the file's language says of the
-/// symbol; an inlay hint's own words over a hint.</summary>
+/// symbol; an inlay hint's own words over a hint. A card a key shows is read to a screen reader, one the pointer brings
+/// never.</summary>
 internal sealed class QuickInfo
 {
     private readonly AssistContext context;
     private readonly PopupPlacement popups;
     private readonly Func<bool> completing;
-    private readonly InfoCard hoverCard = new();
+    private readonly InfoCard hoverCard = new("Quick Documentation");
     private CancellationTokenSource? hovering;
 
     /// <summary>The pause after the pointer leaves a card of a paused program's value (its word, or the card itself) before
@@ -28,6 +29,9 @@ internal sealed class QuickInfo
     /// <summary>Where a card of a value was placed: the line's top it hangs from, in the layer, and whether it stands over
     /// the line, so a card that grows as its rows open stays beside the line and inside the editor.</summary>
     private (Point Line, bool Above)? valuesPlace;
+
+    /// <summary>The diff's side the card was last asked for, while it is one (<see cref="ShowIn"/>); null for the active editor.</summary>
+    private DiffSide? side;
 
     /// <summary>The hover card on the layer, which never shows over an open completion list (<paramref name="completing"/>).</summary>
     public QuickInfo(AssistContext context, PopupPlacement popups, Func<bool> completing)
@@ -117,25 +121,52 @@ internal sealed class QuickInfo
             values.FocusRow();
             return;
         }
-        IdeErrors.Observe(Show(context.Caret, Editor.PointOf(context.Caret)));
+        IdeErrors.Observe(Show(context.Caret, Editor.PointOf(context.Caret), byKey: true));
     }
 
-    public async Task Show(int offset, Point point)
+    /// <summary>The card for an offset, hung at a point's left; told to a screen reader where a key asked for it.</summary>
+    public async Task Show(int offset, Point point, bool byKey = false)
     {
         using (BackgroundWork.Scope())
         {
-            await ShowCore(offset, point);
+            await ShowCore(offset, point, byKey, null);
         }
     }
 
-    private async Task ShowCore(int offset, Point point)
+    /// <summary>The card for an offset of a diff's side that is an open file's own text, hung at a point's left in that
+    /// side, on <paramref name="layer"/> (over the diff's own window), else over the editors: what the file's markers and
+    /// its language say there, as in its editor, with no paused program's value.</summary>
+    public async Task ShowIn(CodeEditor editor, Workspace.OpenDocument file, Avalonia.Controls.Canvas? layer, int offset, Point point)
+    {
+        using (BackgroundWork.Scope())
+        {
+            await ShowCore(offset, point, byKey: false, new DiffSide(editor, file, layer));
+        }
+    }
+
+    /// <summary>The card goes with the diff's side it shows for (typed in, or gone from its window), and off the layer over
+    /// the side's own window (<paramref name="layer"/>), which it would hold once that window has closed.</summary>
+    public void LetGo(CodeEditor editor, Avalonia.Controls.Canvas? layer)
+    {
+        if (side?.Editor == editor)
+        {
+            Hide();
+        }
+        if (layer is not null && hoverCard.Parent == layer)
+        {
+            popups.OnLayer(hoverCard);
+        }
+    }
+
+    private async Task ShowCore(int offset, Point point, bool byKey, DiffSide? over)
     {
         hovering?.Cancel();
         CancellationTokenSource cancel = new();
         hovering = cancel;
         ForgetValues();
         hoverCard.Clear();
-        foreach (Marker marker in Editor.MarkersAt(offset))
+        side = over;
+        foreach (Marker marker in (over?.Editor ?? Editor).MarkersAt(offset))
         {
             hoverCard.AddText(marker.Message, marker.Kind switch
             {
@@ -144,7 +175,7 @@ internal sealed class QuickInfo
                 _ => null,
             });
         }
-        DebuggerHover? debuggerValue = DebuggerValue is { } value ? await value(offset, cancel.Token) : null;
+        DebuggerHover? debuggerValue = over is null && DebuggerValue is { } value ? await value(offset, cancel.Token) : null;
         if (cancel.IsCancellationRequested)
         {
             return;
@@ -161,7 +192,7 @@ internal sealed class QuickInfo
         {
             try
             {
-                if (context.Editors.Active is { } shown)
+                if ((over?.File ?? context.Editors.Active) is { } shown)
                 {
                     await context.Languages.HoverAsync(hoverCard, shown, offset, cancel.Token);
                 }
@@ -176,8 +207,15 @@ internal sealed class QuickInfo
             hoverCard.IsVisible = false;
             return;
         }
-        Place(offset, point, values, debuggerValue);
+        Place(offset, point, values, debuggerValue, over);
+        if (byKey)
+        {
+            Said();
+        }
     }
+
+    /// <summary>The card shown, its words told to a screen reader.</summary>
+    private void Said() => popups.Tell(hoverCard.Text, Urgency.Polite, hoverCard);
 
     /// <summary>Quick Evaluate Expression's card: a value read for an offset, shown as a hovered one is under its line, its
     /// row taking the keys at once, as Quick Documentation pressed again gives them.</summary>
@@ -191,7 +229,8 @@ internal sealed class QuickInfo
         {
             return;
         }
-        Place(offset, Editor.PointOf(Math.Min(offset, Editor.Document.Snapshot.Length)), values, value);
+        Place(offset, Editor.PointOf(Math.Min(offset, Editor.Document.Snapshot.Length)), values, value, null);
+        Said();
         // Once laid out, so the row itself has a container to take them.
         Avalonia.Threading.Dispatcher.UIThread.Post(() =>
         {
@@ -235,17 +274,24 @@ internal sealed class QuickInfo
         return true;
     }
 
-    /// <summary>The card shown under the line of an offset, at a point's left: a value's rows as they fit
-    /// (<see cref="PlaceValues"/>), gone with the stop a debugger's value was read at.</summary>
-    private void Place(int offset, Point point, Debugging.VariablesList? values, DebuggerHover? debuggerValue)
+    /// <summary>The card shown under the line of an offset, at a point's left, in the active editor or a diff's side
+    /// (<paramref name="over"/>): a value's rows as they fit (<see cref="PlaceValues"/>), gone with the stop a debugger's
+    /// value was read at.</summary>
+    private void Place(int offset, Point point, Debugging.VariablesList? values, DebuggerHover? debuggerValue, DiffSide? over)
     {
         hoverCard.IsVisible = true;
-        TextSnapshot text = Editor.Document.Snapshot;
+        CodeEditor editor = over?.Editor ?? Editor;
+        TextSnapshot text = editor.Document.Snapshot;
         int lineStart = text.GetLineStart(text.GetLineFromOffset(Math.Min(offset, text.Length)));
-        Point anchor = Editor.PointOf(lineStart);
+        Point anchor = editor.PointOf(lineStart);
         if (values is not null)
         {
+            popups.OnLayer(hoverCard);
             PlaceValues(values, new Point(point.X, anchor.Y));
+        }
+        else if (over is not null)
+        {
+            popups.Place(hoverCard, over.Editor, over.Layer, new Point(point.X, anchor.Y), above: false);
         }
         else
         {
@@ -259,20 +305,21 @@ internal sealed class QuickInfo
     }
 
     /// <summary>Puts a card of a value's rows under the line at <paramref name="at"/> (its top), or over it when the room
-    /// below holds fewer rows than the room above, its rows scrolling past what that room holds.</summary>
+    /// below holds fewer rows than the room above, its rows scrolling past what that room holds; held to the editor's
+    /// width, where its rows give way (<see cref="PopupPlacement.Widest"/>).</summary>
     private void PlaceValues(Debugging.VariablesList values, Point at)
     {
         at = popups.InLayer(at);
-        double lineHeight = Editor.LineHeight;
-        double below = popups.Room.Height - (at.Y + lineHeight + 2) - 8;
+        double below = popups.Room.Height - (at.Y + Editor.LineHeight + 2) - 8;
         double over = at.Y - 2 - 8;
         bool above = below < ListRow.Height * 8 && over > below;
         hoverCard.AddValues(values, above ? over : below);
+        hoverCard.Within(popups.Widest);
         valuesPlace = (at, above);
         hoverCard.Measure(Size.Infinity);
         Size size = hoverCard.DesiredSize;
         Avalonia.Controls.Canvas.SetLeft(hoverCard, Math.Clamp(at.X - 4, 0, Math.Max(0, popups.Room.Width - size.Width - 8)));
-        Avalonia.Controls.Canvas.SetTop(hoverCard, above ? Math.Max(0, at.Y - size.Height - 2) : at.Y + lineHeight + 2);
+        Avalonia.Controls.Canvas.SetTop(hoverCard, ValuesTop(at, above, size.Height));
     }
 
     /// <summary>A card of a value that grew as its rows opened stays inside the editor, and over its line when it stands over it.</summary>
@@ -288,12 +335,18 @@ internal sealed class QuickInfo
         {
             Avalonia.Controls.Canvas.SetLeft(hoverCard, x);
         }
-        double y = Math.Max(0, place.Line.Y - size.Height - 2);
-        if (place.Above && y != Avalonia.Controls.Canvas.GetTop(hoverCard))
+        double y = ValuesTop(place.Line, place.Above, size.Height);
+        if (y != Avalonia.Controls.Canvas.GetTop(hoverCard))
         {
             Avalonia.Controls.Canvas.SetTop(hoverCard, y);
         }
     }
+
+    /// <summary>Where a card of a value's rows stands, over or under the line whose top is <paramref name="line"/>: in an
+    /// editor too short for its least rows, moved in to end at its edge, over some of the line.</summary>
+    private double ValuesTop(Point line, bool above, double height) => above
+        ? Math.Max(0, line.Y - height - 2)
+        : Math.Max(0, Math.Min(line.Y + Editor.LineHeight + 2, popups.Room.Height - height));
 
     /// <summary>The pointer left a card of a value, or its word, or the keys left the card: it goes after a pause unless
     /// the pointer comes back to it or it is in use.</summary>
@@ -305,9 +358,11 @@ internal sealed class QuickInfo
         }
     }
 
-    /// <summary>Lets go of the value the card showed: its pause before going, its stop, its place.</summary>
+    /// <summary>Lets go of the value the card showed: its pause before going, its stop, its place, and the diff's side
+    /// it showed over.</summary>
     private void ForgetValues()
     {
+        side = null;
         leaving.Stop();
         hoverGone.Dispose();
         hoverGone = default;
@@ -411,6 +466,10 @@ internal sealed class QuickInfo
             Editor.Focus();
         }
     }
+
+    /// <summary>A diff's side that is an open file's own text, the card shown over it: the side, its file, and the layer
+    /// over the diff's own window (null for a diff among the editors).</summary>
+    private sealed record DiffSide(CodeEditor Editor, Workspace.OpenDocument File, Avalonia.Controls.Canvas? Layer);
 
     /// <summary>The card for what a language server says of an offset (its symbol's description), added to the card;
     /// none where the server fails, the card then saying what the markers there say.</summary>

@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Diagnostics;
 using Passenger.Core;
 
@@ -18,6 +19,10 @@ public sealed record PackageOutcome(bool Done, IReadOnlyList<string> Changed, IR
 
     /// <summary>The files of a change that failed that were saved while it ran, which it left as saved rather than put back.</summary>
     public IReadOnlyList<string> Meanwhile { get; init; } = [];
+
+    /// <summary>Under central package management, the packages whose central versions Passenger's own writes moved, those
+    /// sharing a property set among them; null without it.</summary>
+    public IReadOnlyCollection<string>? Moved { get; init; }
 
     /// <summary>For a change that failed having written files, what became of them: put back as before, those the disk
     /// would not take back left changed, and those saved meanwhile left as saved; else null.</summary>
@@ -54,7 +59,8 @@ public sealed record PackageOutcome(bool Done, IReadOnlyList<string> Changed, IR
 }
 
 /// <summary>Adds, updates and removes a project's packages through dotnet add and remove package, so the SDK checks the
-/// package fits and writes a central version where it belongs. What the command says goes to the log.</summary>
+/// package fits and writes a central version where it belongs, none in a folder not trusted. What the command says goes
+/// to the log.</summary>
 public sealed class PackageManager
 {
     /// <summary>How many times a command is run that found its project file in another program's hands.</summary>
@@ -66,7 +72,8 @@ public sealed class PackageManager
     private Process? running;
     private bool stopped;
 
-    /// <summary>A line the command printed, for the NuGet window's log; raised on the UI thread.</summary>
+    /// <summary>A line the command printed, for the NuGet window's log; raised on the UI thread in the order heard, each
+    /// before the command's run returns.</summary>
     public event EventHandler<string>? Line;
 
     /// <summary>Adds a package at a version, or moves it to that version when the project has it.</summary>
@@ -77,7 +84,7 @@ public sealed class PackageManager
 
     /// <summary>Moves several packages to their versions together (EF Core's packages and a provider): each written without a
     /// restore, so none is refused for a downgrade the others take back, then one restore of the project.</summary>
-    public async Task<bool> InstallSetAsync(string project, IReadOnlyList<(string Id, string Version)> packages)
+    public async Task<bool> InstallSetAsync(string project, IReadOnlyList<(string Id, string Version)> packages, CancellationToken cancel = default)
     {
         if (packages.Any(p => Refused(p.Id, p.Version)))
         {
@@ -85,12 +92,12 @@ public sealed class PackageManager
         }
         foreach ((string id, string version) in packages)
         {
-            if (!await RunAsync(["add", project, "package", id, "--version", version, "--no-restore"]))
+            if (cancel.IsCancellationRequested || !await RunAsync(["add", project, "package", id, "--version", version, "--no-restore"]))
             {
                 return false;
             }
         }
-        return await RestoreAsync(project);
+        return !cancel.IsCancellationRequested && await RestoreAsync(project);
     }
 
     /// <summary>Restores the project as it is.</summary>
@@ -128,6 +135,12 @@ public sealed class PackageManager
         // A folder left stops the change under way; the next folder's changes run, retried as ever.
         stopped = false;
         string folder = Path.GetDirectoryName(arguments[1]) ?? Environment.CurrentDirectory;
+        // dotnet's restore runs the project's MSBuild and its packages' build targets.
+        if (!WorkspaceTrust.Trusts(folder))
+        {
+            Line?.Invoke(this, Refusals.Untrusted);
+            return false;
+        }
         for (int attempt = 1; ; attempt++)
         {
             // Each run its own start: a child's is its own once it has started.
@@ -175,11 +188,14 @@ public sealed class PackageManager
             ChildProcesses.Kill(process);
         }
         bool fileInUse = false;
+        ConcurrentQueue<string> untold = new();
         try
         {
             Task heard = ChildProcesses.Hear(process, Heard, Heard);
             await process.WaitForExitAsync();
             await heard;
+            // Lines the window has yet to run are told now: the caller reads what the command said once this returns.
+            Tell();
             return (process.ExitCode == 0, fileInUse);
         }
         finally
@@ -194,7 +210,16 @@ public sealed class PackageManager
             {
                 fileInUse = true;
             }
-            UiThread.Post(() => Line?.Invoke(this, line));
+            untold.Enqueue(line);
+            UiThread.Post(Tell);
+        }
+
+        void Tell()
+        {
+            while (untold.TryDequeue(out string? line))
+            {
+                Line?.Invoke(this, line);
+            }
         }
     }
 }

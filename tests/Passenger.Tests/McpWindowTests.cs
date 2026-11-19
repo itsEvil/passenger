@@ -1,4 +1,5 @@
 using System.Text.Json;
+using System.Text.RegularExpressions;
 using Avalonia.Headless;
 using Avalonia.Headless.XUnit;
 using Avalonia.VisualTree;
@@ -8,6 +9,7 @@ using Passenger.App.Debugging;
 using Passenger.App.Editors;
 using Passenger.App;
 using Passenger.App.Mcp;
+using Passenger.App.Mobile;
 using Passenger.App.Run;
 using Passenger.App.Settings;
 using Passenger.Core;
@@ -102,7 +104,7 @@ public sealed class McpWindowTests : McpRig, IClassFixture<RestoredFolders>
         try
         {
             Task<JsonElement> installing = Waiting.Apart(() => Call(client, McpTools.NugetInstall, new() { ["project"] = "Lib", ["id"] = "Passenger.Sample" }));
-            Press(Question(window, "the question for the agent's install"), "Allow");
+            Press(Question(window, "the question for the agent's install"), AgentToolDialog.AllowForSession);
             JsonElement installed = Await(installing, "the agent's install");
             Assert.Equal(["Lib.csproj"], installed.GetProperty("changed").EnumerateArray().Select(f => f.GetString()!));
             Assert.True(worked.Contains("Installing Passenger.Sample 1.0.0 in Lib…"), $"The agent's install did not show as the NuGet window's work; it showed: {string.Join(" | ", worked)}");
@@ -152,9 +154,9 @@ public sealed class McpWindowTests : McpRig, IClassFixture<RestoredFolders>
             Task held = window.EditorArea.Commands.HoldNextWrite(release.Task);
             Task<JsonElement> replacing = Waiting.Apart(() => Call(client, McpTools.ReplaceInFiles,
                 new() { ["text"] = "tally", ["replacement"] = "count", ["wholeWords"] = true, ["scope"] = "directory", ["directory"] = "." }));
-            ConfirmDialog asked = Question(window, "the question for the agent's replace");
+            Avalonia.Controls.Window asked = Question(window, "the question for the agent's replace");
             // Pumped, not settled: the replace holds the window's background work while its write of Notes.txt is held.
-            Ui.Click(Avalonia.VisualTree.VisualExtensions.GetVisualDescendants(asked).OfType<Avalonia.Controls.Button>().First(b => (string?)b.Content == "Allow"), settle: false);
+            Ui.Click(Avalonia.VisualTree.VisualExtensions.GetVisualDescendants(asked).OfType<Avalonia.Controls.Button>().First(b => (string?)b.Content == AgentToolDialog.AllowForSession), settle: false);
             Ui.PumpUntil(() => held.IsCompleted, "the agent's write of Notes.txt to be held", AgentLimit);
             window.EditorArea.CodeEditor.Focus();
             window.KeyTextInput("// saved meanwhile ");
@@ -199,7 +201,7 @@ public sealed class McpWindowTests : McpRig, IClassFixture<RestoredFolders>
             JsonElement found = Assert.Single(Await(Waiting.Apart(() => Call(client, McpTools.NugetSearch, new() { ["query"] = "sample", ["feed"] = "local" })), "the agent's search").EnumerateArray());
             Assert.Equal("Passenger.Sample", found.GetProperty("id").GetString());
             Task<JsonElement> installing = Waiting.Apart(() => Call(client, McpTools.NugetInstall, new() { ["project"] = "Lib", ["id"] = "Passenger.Sample" }));
-            Press(Question(window, "the question for the agent's install"), "Allow");
+            Press(Question(window, "the question for the agent's install"), AgentToolDialog.AllowForSession);
             JsonElement installed = Await(installing, "the agent's install");
             Assert.Equal(["Lib.csproj"], installed.GetProperty("changed").EnumerateArray().Select(f => f.GetString()!));
             Assert.False(window.DockHost[ToolWindowIds.NuGet].IsBuilt, "The agent's package search or install built the hidden NuGet window's view");
@@ -240,7 +242,7 @@ public sealed class McpWindowTests : McpRig, IClassFixture<RestoredFolders>
             try
             {
                 Task<JsonElement> committing = Waiting.Apart(() => Call(client, McpTools.VcsCommit, new() { ["message"] = "Two as a number", ["push"] = true }));
-                Press(Question(window, "the question for the agent's commit"), "Allow");
+                Press(Question(window, "the question for the agent's commit"), AgentToolDialog.AllowForSession);
                 string answer = Await(committing, "the agent's commit and push").GetString()!;
                 Assert.Equal("Nothing to run: no executable project", pressed);
                 Assert.True(answer.EndsWith(" Two as a number; Pushed main", StringComparison.Ordinal),
@@ -267,7 +269,7 @@ public sealed class McpWindowTests : McpRig, IClassFixture<RestoredFolders>
         try
         {
             Task<CallToolResult> misspelt = Waiting.Apart(() => Result(client, McpTools.IdeAction, new() { ["action"] = "app.biuld" }));
-            Press(Question(window, "the question for the agent's action"), "Allow");
+            Press(Question(window, "the question for the agent's action"), AgentToolDialog.AllowForSession);
             CallToolResult unknown = Await(misspelt, "the misspelt action");
             string said = Text(unknown);
             Assert.True(unknown.IsError == true, $"An action no action has was answered as run: {said}");
@@ -278,6 +280,308 @@ public sealed class McpWindowTests : McpRig, IClassFixture<RestoredFolders>
             Assert.True(commit.IsError == true, $"Commit in a folder with no repository was answered as run: {said}");
             Assert.Contains(Refusals.NoRepository, said, StringComparison.Ordinal);
             Assert.False(window.DockHost.IsShown(ToolWindowIds.Commit), "Commit, refused for want of a repository, opened the Commit window anyway");
+        }
+        finally
+        {
+            Gone(client);
+            window.Close();
+        }
+    }
+
+    /// <summary>An agent in a person's window whose folder they opened without trusting is refused at once the tools that
+    /// would run its code, in the words the window greys its actions with, and a search of the feeds its nuget.config names,
+    /// asking the person nothing; workspace says why, and the agent cannot trust the folder itself.</summary>
+    [AvaloniaFact]
+    public void An_agent_in_a_window_whose_folder_is_not_trusted_is_refused_what_would_run_its_code_and_cannot_trust_it()
+    {
+        string folder = PathNames.Canonical(TestFolders.Create("mcp-untrusted-"));
+        File.WriteAllText(Path.Combine(folder, "App.csproj"), TestProjects.Console());
+        File.WriteAllText(Path.Combine(folder, "Program.cs"), "System.Console.WriteLine(\"App\");\n");
+        using IDisposable asked = WorkspaceTrust.Ask(folder);
+        MainWindow window = AgentsWindow(folder, languageServer: false);
+        Ui.WaitFor(() => window.AskingTrust is { IsVisible: true }, "the trust question");
+        Ui.ClickButton(window.AskingTrust!, WorkspaceTrustDialog.Untrusted);
+        McpClient client = Await(Waiting.Apart(() => Start(["--mcp-attach", ProcessId, folder])), "the agent attaching");
+        try
+        {
+            foreach (string tool in (string[])[McpTools.Build, McpTools.Run, McpTools.DebugStart, McpTools.TestsRun])
+            {
+                CallToolResult refused = Await(Waiting.Apart(() => Result(client, tool)), tool);
+                Assert.True(refused.IsError == true && Text(refused).Contains(Refusals.Untrusted, StringComparison.Ordinal),
+                    $"{tool} in a window whose folder is not trusted answered: {Text(refused)}");
+            }
+            CallToolResult search = Await(Waiting.Apart(() => Result(client, McpTools.NugetSearch, new() { ["query"] = "Serilog" })), McpTools.NugetSearch);
+            Assert.True(search.IsError == true && Text(search).Contains(Refusals.UntrustedFeeds, StringComparison.Ordinal),
+                $"{McpTools.NugetSearch} in a window whose folder is not trusted answered: {Text(search)}");
+            JsonElement workspace = Await(Waiting.Apart(() => Call(client, McpTools.Workspace)), "the workspace");
+            Assert.Equal(Refusals.Untrusted, workspace.GetProperty("trust").GetString());
+
+            Task<CallToolResult> trusting = Waiting.Apart(() => Result(client, McpTools.IdeAction, new() { ["action"] = AppActions.TrustFolder }));
+            Press(Question(window, "the question for the agent's action"), AgentToolDialog.AllowForSession);
+            CallToolResult trust = Await(trusting, "the agent's Trust Folder");
+            Assert.True(trust.IsError == true && Text(trust).Contains(Refusals.TrustIsThePersons, StringComparison.Ordinal),
+                $"An agent's Trust Folder answered: {Text(trust)}");
+            Assert.False(window.Session.Trusted, "An agent trusted the person's folder");
+        }
+        finally
+        {
+            Gone(client);
+            window.Close();
+            TestFolders.Delete(folder);
+        }
+    }
+
+    /// <summary>An agent's input into the person's window never trusts its folder: its click on the trust question's Trust
+    /// never reaches the question, and its click at the point of the banner's Trust Folder, where the person's click trusts
+    /// the folder, leaves it untrusted; the agent is told why each time, the status bar saying it too, and the person's
+    /// own click then trusts it.</summary>
+    [AvaloniaFact]
+    public void An_agents_input_into_the_persons_window_never_trusts_its_folder_and_is_told_why()
+    {
+        string folder = PathNames.Canonical(TestFolders.Create("mcp-input-trust-"));
+        File.WriteAllText(Path.Combine(folder, "Notes.txt"), "notes\n");
+        using IDisposable asked = WorkspaceTrust.Ask(folder);
+        MainWindow window = AgentsWindow(folder, languageServer: false);
+        Ui.WaitFor(() => window.AskingTrust is { IsVisible: true }, "the trust question");
+        WorkspaceTrustDialog question = window.AskingTrust!;
+        McpClient client = Await(Waiting.Apart(() => Start(["--mcp-attach", ProcessId, folder])), "the agent attaching");
+        try
+        {
+            Task<CallToolResult> answering = Waiting.Apart(() => Result(client, McpTools.AppClick,
+                new() { ["app"] = "ide", ["window"] = nameof(WorkspaceTrustDialog), ["control"] = $"Button \"{WorkspaceTrustDialog.Trust}\"" }));
+            Press(Question(window, "the question for the agent's click in Passenger's windows"), AgentToolDialog.AllowForSession);
+            CallToolResult answered = Await(answering, "the agent's click on the trust question's Trust");
+            Assert.True(answered.IsError == true && Text(answered).Contains(Refusals.TrustAnsweredByThePerson, StringComparison.Ordinal),
+                $"The agent's click on the trust question's Trust was answered: {Text(answered)}{Said()}");
+            Assert.True(question.IsVisible && !window.Session.Trusted, "The agent's click answered the trust question the person is asked");
+
+            Ui.ClickButton(question, WorkspaceTrustDialog.Untrusted);
+            Ui.WaitFor(() => window.TrustSaid == Refusals.UntrustedSaid, "the banner over the folder opened without trusting it");
+            string title = window.Actions[AppActions.TrustFolder]!.Title;
+            Avalonia.Controls.Button link = window.GetVisualDescendants().OfType<Avalonia.Controls.Button>().Single(b => (b.Content as string) == title && b.IsEffectivelyVisible);
+            Avalonia.Point at = Avalonia.VisualExtensions.TranslatePoint(link, new Avalonia.Point(link.Bounds.Width / 2, link.Bounds.Height / 2), window)
+                ?? throw new InvalidOperationException("The banner's Trust Folder is not in the window");
+            CallToolResult clicked = Await(Waiting.Apart(() => Result(client, McpTools.AppClick,
+                new() { ["app"] = "ide", ["window"] = nameof(MainWindow), ["x"] = at.X, ["y"] = at.Y })), "the agent's click on the banner's Trust Folder");
+            Assert.True(clicked.IsError == true && Text(clicked).Contains(Refusals.TrustIsThePersons, StringComparison.Ordinal),
+                $"The agent's click on the banner's Trust Folder was answered: {Text(clicked)}{Said()}");
+            Ui.Settle();
+            Assert.False(window.Session.Trusted || WorkspaceTrust.Trusts(folder), "The agent's click on the banner trusted the person's folder");
+            Assert.Equal((Refusals.UntrustedSaid, Refusals.TrustIsThePersons), (window.TrustSaid, window.Status));
+
+            Ui.Click(link);
+            Ui.WaitFor(() => window.Session.Trusted && window.TrustSaid is null, "the person's own click on Trust Folder to trust the folder");
+        }
+        finally
+        {
+            Gone(client);
+            window.Close();
+            TestFolders.Delete(folder);
+        }
+    }
+
+    /// <summary>An agent's commit in a window whose folder is not trusted is refused a file Git stores through a filter,
+    /// which does not run there, saying why before anything is committed; a commit of every changed file leaves that one
+    /// out, saying which and why, and commits the file beside it.</summary>
+    [AvaloniaFact]
+    public void An_agents_commit_in_a_folder_not_trusted_leaves_out_a_file_stored_through_a_git_filter_saying_why()
+    {
+        string folder = PathNames.Canonical(TestFolders.Create("mcp-untrusted-filter-"));
+        DeleteAtEnd(folder);
+        File.WriteAllText(Path.Combine(folder, "Notes.txt"), "one\n");
+        File.WriteAllText(Path.Combine(folder, "Picture.bin"), "one\n");
+        File.WriteAllText(Path.Combine(folder, ".gitattributes"), "*.bin filter=keep\n");
+        TestGit.Init(folder);
+        TestGit.Run(folder, "config", "filter.keep.clean", "cat");
+        File.WriteAllText(Path.Combine(folder, "Notes.txt"), "two\n");
+        File.WriteAllText(Path.Combine(folder, "Picture.bin"), "two\n");
+        const string Why = "The folder is not trusted: Picture.bin is stored through Git's keep filter, which runs only once the folder is trusted";
+        using IDisposable asked = WorkspaceTrust.Ask(folder);
+        MainWindow window = AgentsWindow(folder, languageServer: false);
+        Ui.WaitFor(() => window.AskingTrust is { IsVisible: true }, "the trust question");
+        Ui.ClickButton(window.AskingTrust!, WorkspaceTrustDialog.Untrusted);
+        McpClient client = Await(Waiting.Apart(() => Start(["--mcp-attach", ProcessId, folder])), "the agent attaching");
+        try
+        {
+            Task<CallToolResult> naming = Waiting.Apart(() => Result(client, McpTools.VcsCommit, new() { ["message"] = "The picture", ["paths"] = new[] { "Picture.bin" } }));
+            Press(Question(window, "the question for the agent's vcs_commit"), AgentToolDialog.AllowForSession);
+            CallToolResult refused = Await(naming, "the agent's commit of Picture.bin");
+            Assert.True(refused.IsError == true && Text(refused).Contains(Why, StringComparison.Ordinal), $"An agent's commit of Picture.bin in a folder not trusted answered: {Text(refused)}");
+            string made = Await(Waiting.Apart(() => Call(client, McpTools.VcsCommit, new() { ["message"] = "The notes" })), "the agent's commit").GetString()!;
+            Assert.EndsWith($" The notes; left uncommitted: Picture.bin ({Why})", made, StringComparison.Ordinal);
+            Assert.Equal("two\n", TestGit.Run(folder, "show", "HEAD:Notes.txt"));
+            Assert.Equal("one\n", TestGit.Run(folder, "show", "HEAD:Picture.bin"));
+        }
+        finally
+        {
+            Gone(client);
+            window.Close();
+        }
+    }
+
+    /// <summary>An agent's stash and checkout in a window whose folder is not trusted are refused, saying why, before
+    /// anything is saved or written, where git would store or write out a file it stores through a filter, which does not
+    /// run there: the file's bytes, the branch and the stashes stay as they were.</summary>
+    [AvaloniaFact]
+    public void An_agents_stash_and_checkout_in_a_folder_not_trusted_are_refused_where_git_would_write_out_a_file_stored_through_a_filter()
+    {
+        string folder = PathNames.Canonical(TestFolders.Create("mcp-untrusted-filter-writes-"));
+        DeleteAtEnd(folder);
+        string picture = Path.Combine(folder, "Picture.bin");
+        File.WriteAllText(Path.Combine(folder, "Notes.txt"), "one\n");
+        File.WriteAllText(picture, "one\n");
+        File.WriteAllText(Path.Combine(folder, ".gitattributes"), "*.bin filter=keep\n");
+        TestGit.Init(folder);
+        TestGit.Run(folder, "config", "filter.keep.clean", "cat");
+        TestGit.Run(folder, "config", "filter.keep.smudge", "cat");
+        TestGit.Run(folder, "switch", "-q", "-c", "pictured");
+        File.WriteAllText(picture, "pictured\n");
+        TestGit.Run(folder, "commit", "-q", "-a", "-m", "The picture changed");
+        TestGit.Run(folder, "switch", "-q", "main");
+        File.WriteAllText(picture, "two\n");
+        const string Why = "The folder is not trusted: Picture.bin is stored through Git's keep filter, which runs only once the folder is trusted";
+        using IDisposable asked = WorkspaceTrust.Ask(folder);
+        MainWindow window = AgentsWindow(folder, languageServer: false);
+        Ui.WaitFor(() => window.AskingTrust is { IsVisible: true }, "the trust question");
+        Ui.ClickButton(window.AskingTrust!, WorkspaceTrustDialog.Untrusted);
+        McpClient client = Await(Waiting.Apart(() => Start(["--mcp-attach", ProcessId, folder])), "the agent attaching");
+        try
+        {
+            Task<CallToolResult> stashing = Waiting.Apart(() => Result(client, McpTools.VcsStash, new() { ["action"] = "push", ["message"] = "Set aside" }));
+            Press(Question(window, "the question for the agent's vcs_stash"), AgentToolDialog.AllowForSession);
+            CallToolResult stash = Await(stashing, "the agent's stash");
+            Assert.True(stash.IsError == true && Text(stash).Contains(Why, StringComparison.Ordinal), $"An agent's stash of Picture.bin in a folder not trusted answered: {Text(stash)}");
+            Task<CallToolResult> checking = Waiting.Apart(() => Result(client, McpTools.VcsCheckout, new() { ["branch"] = "pictured" }));
+            Press(Question(window, "the question for the agent's vcs_checkout"), AgentToolDialog.AllowForSession);
+            CallToolResult checkout = Await(checking, "the agent's checkout");
+            Assert.True(checkout.IsError == true && Text(checkout).Contains(Why, StringComparison.Ordinal), $"An agent's checkout of pictured in a folder not trusted answered: {Text(checkout)}");
+            Assert.Equal(("main\n", string.Empty, "two\n"), (TestGit.Run(folder, "branch", "--show-current"), TestGit.Run(folder, "stash", "list"), File.ReadAllText(picture)));
+        }
+        finally
+        {
+            Gone(client);
+            window.Close();
+        }
+    }
+
+    /// <summary>An agent's input into the person's window never installs what a project needs: its click on the banner's
+    /// Install Workloads… installs nothing and asks the person nothing, and its click on Install in the question the
+    /// person's own click asked never answers it; the agent is told why each time, the status bar saying it too, and the
+    /// question waits for the person, whose Cancel installs nothing.</summary>
+    [AvaloniaFact]
+    public void An_agents_input_into_the_persons_window_never_installs_what_a_project_needs_and_is_told_why()
+    {
+        string folder = PathNames.Canonical(TestFolders.Create("mcp-input-install-"));
+        DeleteAtEnd(folder);
+        (string name, string platform) = OperatingSystem.IsMacOS() ? ("Tv", "tvos") : ("Droid", "android");
+        File.WriteAllText(Path.Combine(folder, $"{name}.csproj"), $"""
+            <Project Sdk="Microsoft.NET.Sdk">
+              <PropertyGroup>
+                <TargetFramework>net{MobilePlatforms.FirstOnCoreClr}.0-{platform}</TargetFramework>
+                <OutputType>Exe</OutputType>
+              </PropertyGroup>
+            </Project>
+            """);
+        MainWindow window = AgentsWindow(folder, languageServer: false);
+        WaitFor(() => window.Projects.Any(p => p.IsEvaluated), "the project to evaluate", TimeSpan.FromMinutes(3));
+        Ui.Await(window.MobileAsked(), "what the project needs to be asked", TimeSpan.FromMinutes(3));
+        if (window.MobileWant.Workloads.Count == 0)
+        {
+            window.Close();
+            Assert.Skip($"This .NET has the {platform} workload, so nothing is lacking to install");
+        }
+        List<IReadOnlyList<string>> installed = [];
+        MainWindow.WorkloadStandIn = new WorkloadStandIn(folder, arguments =>
+        {
+            installed.Add(arguments);
+            return ChildProcesses.DotnetCommand(["--version"]);
+        });
+        McpClient client = Await(Waiting.Apart(() => Start(["--mcp-attach", ProcessId, folder])), "the agent attaching");
+        try
+        {
+            string title = window.Actions[AppActions.InstallWorkloads]!.Title;
+            Avalonia.Controls.Button link = window.GetVisualDescendants().OfType<Avalonia.Controls.Button>().Single(b => (b.Content as string) == title && b.IsEffectivelyVisible);
+            Avalonia.Point at = Avalonia.VisualExtensions.TranslatePoint(link, new Avalonia.Point(link.Bounds.Width / 2, link.Bounds.Height / 2), window)
+                ?? throw new InvalidOperationException("The banner's Install Workloads… is not in the window");
+            Task<CallToolResult> clicking = Waiting.Apart(() => Result(client, McpTools.AppClick,
+                new() { ["app"] = "ide", ["window"] = nameof(MainWindow), ["x"] = at.X, ["y"] = at.Y }));
+            Press(Question(window, "the question for the agent's click in Passenger's windows"), AgentToolDialog.AllowForSession);
+            CallToolResult clicked = Await(clicking, "the agent's click on the banner's Install Workloads…");
+            Assert.True(clicked.IsError == true && Text(clicked).Contains(Refusals.AgentInstallsMobile, StringComparison.Ordinal),
+                $"The agent's click on the banner's Install Workloads… was answered: {Text(clicked)}");
+            Ui.Settle();
+            Assert.True(window.Actions.Work.Of(AppActions.InstallWorkloads) is null && !window.OwnedWindows.OfType<ConfirmDialog>().Any() && installed.Count == 0,
+                $"The agent's click on Install Workloads… began an install ({window.Actions.Work.Of(AppActions.InstallWorkloads)?.Stage}; {installed.Count} run)");
+            Assert.Equal(Refusals.AgentInstallsMobile, window.Status);
+
+            Ui.Click(link);
+            WaitFor(() => window.OwnedWindows.OfType<ConfirmDialog>().Any(d => d.IsVisible), "the person's own click on Install Workloads… to ask them");
+            ConfirmDialog question = window.OwnedWindows.OfType<ConfirmDialog>().Single();
+            CallToolResult answered = Await(Waiting.Apart(() => Result(client, McpTools.AppClick,
+                new() { ["app"] = "ide", ["window"] = nameof(ConfirmDialog), ["control"] = "Button \"Install\"" })), "the agent's click on the question's Install");
+            Assert.True(answered.IsError == true && Text(answered).Contains(Refusals.AgentInstallsMobile, StringComparison.Ordinal),
+                $"The agent's click on the install question's Install was answered: {Text(answered)}");
+            Ui.Settle();
+            Assert.True(question.IsVisible && question.Answered is null && installed.Count == 0, "The agent's click answered the install question the person is asked");
+
+            Press(question, "Cancel");
+            WaitFor(() => window.Actions.Work.Of(AppActions.InstallWorkloads) is null, "the install the person turned down to end");
+            Assert.Equal(($"The .NET workload {platform} was not installed", 0), (window.Status, installed.Count));
+        }
+        finally
+        {
+            MainWindow.WorkloadStandIn = null;
+            Gone(client);
+            window.Close();
+        }
+    }
+
+    /// <summary>An attached agent never quits the person's Passenger: its ide_action of Exit is refused, so is Exit chosen
+    /// in Find Action by its keys, and, where the window draws its own buttons, its click on Close of the last window; the
+    /// agent is told why each time, the status bar saying it too, and the window stays open.</summary>
+    [AvaloniaFact]
+    public void An_attached_agent_never_quits_the_persons_passenger_and_is_told_why()
+    {
+        string folder = PathNames.Canonical(Plain("mcp-quit-"));
+        MainWindow window = AgentsWindow(folder, languageServer: false);
+        // The person works in a file, which has the keys the agent's then reach.
+        window.OpenFile(Path.Combine(folder, "Notes.txt"));
+        Ui.Settle();
+        McpClient client = Await(Waiting.Apart(() => Start(["--mcp-attach", ProcessId, folder])), "the agent attaching");
+        // Each tool asks the person once, allowed for the session.
+        CallToolResult Allowed(string tool, Dictionary<string, object?> arguments, string what)
+        {
+            Task<CallToolResult> calling = Waiting.Apart(() => Result(client, tool, arguments));
+            WaitFor(() => calling.IsCompleted || Questions(window).Any(), what);
+            if (Questions(window).FirstOrDefault() is { } asked)
+            {
+                Press(asked, AgentToolDialog.AllowForSession);
+            }
+            return Await(calling, what);
+        }
+        try
+        {
+            CallToolResult exited = Allowed(McpTools.IdeAction, new() { ["action"] = AppActions.Exit }, "the agent's Exit");
+            Assert.True(exited.IsError == true && Text(exited).Contains(Refusals.QuitIsThePersons, StringComparison.Ordinal), $"The agent's Exit answered: {Text(exited)}");
+            Assert.True(window.IsVisible, "The agent's Exit closed the person's window");
+
+            CallToolResult found = Allowed(McpTools.AppKey, new() { ["app"] = "ide", ["keys"] = "primary+shift+A" }, "the agent's keys for Find Action");
+            CallToolResult typed = Allowed(McpTools.AppType, new() { ["app"] = "ide", ["text"] = "Exit" }, "the agent's typing in Find Action");
+            CallToolResult entered = Allowed(McpTools.AppKey, new() { ["app"] = "ide", ["keys"] = "Enter" }, "the agent's Enter on Find Action's Exit");
+            Assert.True(entered.IsError == true && Text(entered).Contains(Refusals.QuitIsThePersons, StringComparison.Ordinal),
+                $"The agent's Enter on Find Action's Exit answered: {Text(entered)} (Find Action's keys: {Text(found)}; the typing: {Text(typed)})");
+            Ui.Settle();
+            Assert.True(window.IsVisible, "The agent's Exit from Find Action closed the person's window");
+            Assert.Equal(Refusals.QuitIsThePersons, window.Status);
+
+            if (Avalonia.Controls.ControlExtensions.FindControl<Avalonia.Controls.Button>(window, "CloseButton") is { IsEffectivelyVisible: true })
+            {
+                CallToolResult closed = Allowed(McpTools.AppClick, new() { ["app"] = "ide", ["control"] = "#CloseButton" }, "the agent's click on the window's Close");
+                Assert.True(closed.IsError == true && Text(closed).Contains(Refusals.QuitIsThePersons, StringComparison.Ordinal),
+                    $"The agent's click on the last window's Close answered: {Text(closed)}");
+                Ui.Settle();
+                Assert.True(window.IsVisible, "The agent's click on Close closed the person's last window");
+            }
         }
         finally
         {
@@ -311,7 +615,7 @@ public sealed class McpWindowTests : McpRig, IClassFixture<RestoredFolders>
 
             client = Await(Waiting.Apart(() => Start(["--mcp-attach", ProcessId])), "the agent attaching");
             Task<CallToolResult> converting = Waiting.Apart(() => Result(client, McpTools.IdeAction, new() { ["action"] = AppActions.ConvertIndentationToTabs }));
-            Press(Question(window, "the question for the agent's action"), "Allow");
+            Press(Question(window, "the question for the agent's action"), AgentToolDialog.AllowForSession);
             CallToolResult refused = Await(converting, "Convert Indentation on tool.py");
             string said = Text(refused);
             Assert.True(refused.IsError == true && said.Contains(Refusals.GrammarFailed("tool.py", "Python", grammar.Failure.Message), StringComparison.Ordinal),
@@ -345,7 +649,7 @@ public sealed class McpWindowTests : McpRig, IClassFixture<RestoredFolders>
         try
         {
             Task<JsonElement> saving = Waiting.Apart(() => Call(client, McpTools.IdeAction, new() { ["action"] = AppActions.SaveAsLaunchProfile, ["input"] = "Twice" }));
-            Press(Question(window, "the question for the agent's action"), "Allow");
+            Press(Question(window, "the question for the agent's action"), AgentToolDialog.AllowForSession);
             Assert.Equal("Saved as the launch profile Twice in Sum's Properties/launchSettings.json, made for it: it is now Sum: Twice, generated from that profile",
                 Await(saving, "the agent's Save as Launch Profile").GetString());
             Assert.True(window.Configurations.SingleOrDefault(c => c.Name == "Sum: Twice") is { Generated: true, Arguments: "--twice" },
@@ -359,6 +663,450 @@ public sealed class McpWindowTests : McpRig, IClassFixture<RestoredFolders>
         }
         finally
         {
+            Gone(client);
+            window.Close();
+        }
+    }
+
+    /// <summary>A file come into a project the language server met an error loading, asked about while the server's load of
+    /// the project again for it is held (its design-time builds not yet given), is in none of the server's projects, and no
+    /// load of the project can take it in until the project is mended: an agent's outline of it says at once that the
+    /// project did not load and why, never that the file is not loaded yet once the wait for it has run out.</summary>
+    [AvaloniaFact]
+    public void An_agent_asking_of_a_file_come_into_a_project_that_did_not_load_hears_why_while_the_project_loads_again()
+    {
+        string folder = PathNames.Canonical(TestFolders.Create("mcp-unloaded-came-"));
+        DeleteAtEnd(folder);
+        TestFolders.Write(folder, "Good/Good.csproj", TestProjects.Library());
+        TestFolders.Write(folder, "Good/Fine.cs", "namespace Good;\n\npublic class Fine\n{\n}\n");
+        string bad = TestFolders.Write(folder, "Bad/Bad.csproj", TestProjects.Library().Replace("</Project>", string.Empty, StringComparison.Ordinal));
+        TestFolders.Write(folder, "Bad/Greeter.cs", "namespace Lib;\n\npublic class Greeter\n{\n}\n");
+        MainWindow window = AgentsWindow(folder);
+        Ui.WaitFor(() => window.CSharpService is { IsReady: true } csharp && csharp.ProjectProblems.Any(p => PathNames.Same(p.Project, bad)),
+            () => $"the language server to load the projects, Bad with an error ({window.CSharpService?.State})", TimeSpan.FromMinutes(3));
+        McpClient client = Await(Waiting.Apart(() => Start(["--mcp-attach", ProcessId])), "the agent attaching");
+        TaskCompletionSource building = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        try
+        {
+            Task held = window.Session.DesignTimeBuilds.HoldNextAsked(bad, building.Task);
+            TestFolders.Write(folder, "Bad/Welcome.cs", "namespace Lib;\n\npublic static class Welcome\n{\n    public static string Say() => \"Welcome\";\n}\n");
+            // Pumped, not settled: the server's load held waits on the window.
+            Ui.PumpUntil(() => held.IsCompleted, "the server's load of Bad again, for the file come into it, to be held", AgentLimit);
+            CallToolResult answer = Ui.AwaitPumped(Waiting.Apart(() => Result(client, McpTools.Outline, new() { ["path"] = "Bad/Welcome.cs" })),
+                "the agent's outline of Welcome.cs", AgentLimit);
+            string said = Text(answer);
+            Assert.True(answer.IsError == true && said.Contains("Bad did not load into the C# language server, which holds none of its code to answer from: The project file could not be loaded.",
+                StringComparison.Ordinal), $"outline of a file come into a project that did not load, while the project loads again, answered: {said}");
+        }
+        finally
+        {
+            building.TrySetResult();
+            Gone(client);
+            window.Close();
+        }
+    }
+
+    /// <summary>A MAUI page's code-behind asked of as its folder first loads: the server's restore brings MAUI's generator,
+    /// its load after queues the generator's run, and the server's word that its diagnostics moved, sent of changes made
+    /// before that load, is heard just after it ends (held to then). An agent's definition of the InitializeComponent the
+    /// generator declares, asked before the first load, goes to that declaration once the generator has run, never
+    /// answering nothing because the word came first.</summary>
+    [AvaloniaFact]
+    public void An_agents_definition_of_what_a_restored_generator_declares_waits_for_its_run_though_the_server_says_its_diagnostics_moved_first()
+    {
+        string folder = McpNavigationTests.MauiPage("mcp-maui-refreshed-");
+        DeleteAtEnd(folder);
+        string project = Path.Combine(folder, "MauiApp1.csproj");
+        MainWindow window = new() { Width = 1200, Height = 800 };
+        window.Show();
+        TaskCompletionSource loading = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        TaskCompletionSource reloading = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        McpClient? client = null;
+        try
+        {
+            // Pumped, not settled throughout: the server's loads held wait on the window.
+            Task opening = window.OpenFolder(folder);
+            Ui.PumpUntil(() => opening.IsCompleted && window.CSharpService is not null, "the folder to open with a language server", AgentLimit);
+            Task refreshHeld = window.CSharpService!.HoldRefreshesPastRestore();
+            Task loadHeld = window.Session.DesignTimeBuilds.HoldNextAsked(project, loading.Task);
+            window.ApplySettings(window.Settings with { McpServer = true });
+            Assert.True(window.AgentSocket is not null, $"The window does not listen for agents: {window.Status}");
+            client = Ui.AwaitPumped(Waiting.Apart(() => Start(["--mcp-attach", ProcessId])), "the agent attaching", AgentLimit);
+            Heard heard = new();
+            Task<CallToolResult> asked = Waiting.Apart(() => Result(client, McpTools.Definition, new() { ["path"] = "MainPage.xaml.cs", ["line"] = 9, ["column"] = 9 }, heard: heard));
+            Ui.PumpUntil(() => loadHeld.IsCompleted && (heard.Told.Count > 0 || asked.IsCompleted), "the server's first load of MauiApp1 to be held while the agent's definition waits", AgentLimit);
+            Task reloadHeld = window.Session.DesignTimeBuilds.HoldNextAsked(project, reloading.Task);
+            loading.SetResult();
+            Ui.PumpUntil(() => reloadHeld.IsCompleted && refreshHeld.IsCompleted, "the server's load of MauiApp1 after its restore to be held, its word that its diagnostics moved heard", AgentLimit);
+            reloading.SetResult();
+            CallToolResult answer = Ui.AwaitPumped(asked, "the agent's definition of InitializeComponent", AgentLimit);
+            string said = Text(answer);
+            Assert.True(answer.IsError != true && said.Contains("MainPage.xaml.sg.cs", StringComparison.Ordinal)
+                && said.Contains("private partial void InitializeComponent();", StringComparison.Ordinal),
+                $"definition of a MAUI page's InitializeComponent, asked as the restore bringing its generator loaded, answered: {said}");
+        }
+        finally
+        {
+            loading.TrySetResult();
+            reloading.TrySetResult();
+            if (client is not null)
+            {
+                Gone(client);
+            }
+            window.Close();
+        }
+    }
+
+    /// <summary>A MAUI page's folder whose first load restores MAUI: the design-time build the load after the restore takes
+    /// writes again the settings MAUI's generator reads of the page and the global usings, and the server keeps the texts it
+    /// read of them until it hears of them, held back here past the generators' run. An agent's definition of the
+    /// InitializeComponent the generator declares waits, saying so, until the server has read them, never answering nothing
+    /// because the generator ran on the settings of the load before the restore.</summary>
+    [AvaloniaFact]
+    public void An_agents_definition_of_what_a_restored_generator_declares_waits_for_the_server_to_read_what_its_build_wrote_again()
+    {
+        string folder = McpNavigationTests.MauiPage("mcp-maui-unread-");
+        DeleteAtEnd(folder);
+        string project = Path.Combine(folder, "MauiApp1.csproj");
+        MainWindow window = new() { Width = 1200, Height = 800 };
+        window.Show();
+        TaskCompletionSource loading = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        TaskCompletionSource telling = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        McpClient? client = null;
+        try
+        {
+            // Pumped, not settled throughout: the server's load held waits on the window.
+            Task opening = window.OpenFolder(folder);
+            Ui.PumpUntil(() => opening.IsCompleted && window.CSharpService is not null, "the folder to open with a language server", AgentLimit);
+            Task loadHeld = window.Session.DesignTimeBuilds.HoldNextAsked(project, loading.Task);
+            window.ApplySettings(window.Settings with { McpServer = true });
+            Assert.True(window.AgentSocket is not null, $"The window does not listen for agents: {window.Status}");
+            client = Ui.AwaitPumped(Waiting.Apart(() => Start(["--mcp-attach", ProcessId])), "the agent attaching", AgentLimit);
+            Heard heard = new();
+            Task<CallToolResult> asked = Waiting.Apart(() => Result(client, McpTools.Definition, new() { ["path"] = "MainPage.xaml.cs", ["line"] = 9, ["column"] = 9 }, heard: heard));
+            Ui.PumpUntil(() => loadHeld.IsCompleted && window.CSharpService!.Session is not null && (heard.Told.Count > 0 || asked.IsCompleted),
+                "the server's first load of MauiApp1 to be held while the agent's definition waits", AgentLimit);
+            window.CSharpService!.Session!.Server.WatchedFiles.HoldTelling(
+                path => path.EndsWith(".GeneratedMSBuildEditorConfig.editorconfig", StringComparison.Ordinal) || path.EndsWith(".GlobalUsings.g.cs", StringComparison.Ordinal), telling.Task);
+            loading.SetResult();
+            Ui.PumpUntil(() => asked.IsCompleted || heard.Told.Any(t => t.Message?.Contains("which a design-time build wrote again", StringComparison.Ordinal) == true),
+                "the agent's definition to wait for the server to read what the build after the restore wrote again", AgentLimit);
+            telling.SetResult();
+            CallToolResult answer = Ui.AwaitPumped(asked, "the agent's definition of InitializeComponent", AgentLimit);
+            string said = Text(answer);
+            Assert.True(answer.IsError != true && said.Contains("MainPage.xaml.sg.cs", StringComparison.Ordinal)
+                && said.Contains("private partial void InitializeComponent();", StringComparison.Ordinal),
+                $"definition of a MAUI page's InitializeComponent, asked before the server read what the build after the restore wrote again, answered: {said}");
+        }
+        finally
+        {
+            loading.TrySetResult();
+            telling.TrySetResult();
+            if (client is not null)
+            {
+                Gone(client);
+            }
+            window.Close();
+        }
+    }
+
+    /// <summary>A MAUI page's folder whose first load restores MAUI, the server's report that it loaded the project again
+    /// with what the restore brought heard before the end of the batch it loaded in (held back here, as a server that loads
+    /// the project once more in that batch keeps its end): an agent's definition of the InitializeComponent MAUI's generator
+    /// declares, asked as the folder opens, waits through the batch's end and the generators' run it queues, saying so,
+    /// and goes to that declaration, never answering nothing as of the code before the generator ran.</summary>
+    [AvaloniaFact]
+    public void An_agents_definition_of_what_a_restored_generator_declares_waits_for_the_end_of_the_batch_its_project_loaded_again_in()
+    {
+        string folder = McpNavigationTests.MauiPage("mcp-maui-batch-");
+        DeleteAtEnd(folder);
+        string project = Path.Combine(folder, "MauiApp1.csproj");
+        MainWindow window = new() { Width = 1200, Height = 800 };
+        window.Show();
+        TaskCompletionSource loading = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        TaskCompletionSource reloading = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        TaskCompletionSource ending = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        McpClient? client = null;
+        try
+        {
+            // Pumped, not settled throughout: the server's loads and the batch's end held wait on the window.
+            Task opening = window.OpenFolder(folder);
+            Ui.PumpUntil(() => opening.IsCompleted && window.CSharpService is not null, "the folder to open with a language server", AgentLimit);
+            Task loadHeld = window.Session.DesignTimeBuilds.HoldNextAsked(project, loading.Task);
+            Task batchHeld = window.CSharpService!.HoldBatchEndPastRestore(ending.Task);
+            // The window's own load again after the restore, which an agent's question would wait for too, comes after.
+            window.CSharpService.HoldReloads(project, ending.Task);
+            window.ApplySettings(window.Settings with { McpServer = true });
+            Assert.True(window.AgentSocket is not null, $"The window does not listen for agents: {window.Status}");
+            client = Ui.AwaitPumped(Waiting.Apart(() => Start(["--mcp-attach", ProcessId])), "the agent attaching", AgentLimit);
+            Heard heard = new();
+            Task<CallToolResult> asked = Waiting.Apart(() => Result(client, McpTools.Definition, new() { ["path"] = "MainPage.xaml.cs", ["line"] = 9, ["column"] = 9 }, heard: heard));
+            Ui.PumpUntil(() => loadHeld.IsCompleted && window.CSharpService.Session is not null && (heard.Told.Count > 0 || asked.IsCompleted),
+                "the server's first load of MauiApp1 to be held while the agent's definition waits", AgentLimit);
+            Task reloadHeld = window.Session.DesignTimeBuilds.HoldNextAsked(project, reloading.Task);
+            loading.SetResult();
+            Ui.PumpUntil(() => asked.IsCompleted || reloadHeld.IsCompleted, "the server's load after the restore to ask for MauiApp1's builds", AgentLimit);
+            Ui.Hold(TimeSpan.FromSeconds(2), "the generators' run the first load queued, 1.5 s after it, to go before the load after the restore");
+            reloading.SetResult();
+            Ui.PumpUntil(() => asked.IsCompleted || (batchHeld.IsCompleted
+                && heard.Told.Any(t => t.Message?.Contains("to load again the projects its restore brought packages to", StringComparison.Ordinal) == true)),
+                "the agent's definition to wait for the end of the batch the server loaded MauiApp1 again in after its restore", AgentLimit);
+            ending.SetResult();
+            CallToolResult answer = Ui.AwaitPumped(asked, "the agent's definition of InitializeComponent", AgentLimit);
+            string said = Text(answer);
+            Assert.True(answer.IsError != true && said.Contains("MainPage.xaml.sg.cs", StringComparison.Ordinal)
+                && said.Contains("private partial void InitializeComponent();", StringComparison.Ordinal),
+                $"definition of a MAUI page's InitializeComponent, asked as the server's batch loading MauiApp1 again after its restore had still to end, answered: {said}");
+        }
+        finally
+        {
+            loading.TrySetResult();
+            reloading.TrySetResult();
+            ending.TrySetResult();
+            if (client is not null)
+            {
+                Gone(client);
+            }
+            window.Close();
+        }
+    }
+
+    /// <summary>An agent renames the type a MAUI page's C# expression names, which moves its file (Helper.cs to Speaker.cs),
+    /// then at once renames the method the expression calls from the expression, the server's load taking in the moved file
+    /// held back until then: the rename waits, saying so, until the server has the file in its project, then renames the
+    /// method there and in the expression, never refusing the expression as naming nothing.</summary>
+    [AvaloniaFact]
+    public void An_agents_rename_in_a_maui_expression_asked_as_a_type_rename_moved_its_file_waits_for_the_server_to_take_the_file_in()
+    {
+        (string folder, string page) = McpNavigationTests.MauiPageCallingHelper("mcp-maui-moved-");
+        DeleteAtEnd(folder);
+        string project = Path.Combine(folder, "MauiApp1.csproj");
+        MainWindow window = AgentsWindow(folder);
+        McpClient client = Await(Waiting.Apart(() => Start(["--mcp-attach", ProcessId])), "the agent attaching");
+        TaskCompletionSource loading = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        try
+        {
+            // The first waits through the server's restore of MAUI and the load after it, so the load held next is the move's.
+            Task<JsonElement> yelled = Waiting.Apart(() => Call(client, McpTools.Rename, new() { ["path"] = "Helper.cs", ["line"] = 5, ["column"] = 26, ["newName"] = "Yell" }));
+            Press(Question(window, "the question for the agent's rename"), AgentToolDialog.AllowForSession);
+            Await(yelled, "the agent's rename of Shout to Yell");
+            // Pumped, not settled, from here: the server's load held waits on the window.
+            Task loadHeld = window.Session.DesignTimeBuilds.HoldNextAsked(project, loading.Task);
+            Ui.AwaitPumped(Waiting.Apart(() => Call(client, McpTools.Rename, new() { ["path"] = "Helper.cs", ["line"] = 3, ["column"] = 21, ["newName"] = "Speaker" })),
+                "the agent's rename of Helper to Speaker", AgentLimit);
+            string speaker = Path.Combine(folder, "Speaker.cs");
+            Assert.True(File.Exists(speaker) && !File.Exists(Path.Combine(folder, "Helper.cs")), "renaming Helper to Speaker did not rename its file Speaker.cs");
+            Ui.PumpUntil(() => loadHeld.IsCompleted, "the server's load of MauiApp1 taking in Speaker.cs to be held", AgentLimit);
+            string renamed = File.ReadAllText(Path.Combine(folder, "MainPage.xaml"));
+            int at = renamed.IndexOf("Yell(", StringComparison.Ordinal);
+            Heard heard = new();
+            Task<CallToolResult> asked = Waiting.Apart(() => Result(client, McpTools.Rename, new()
+            {
+                ["path"] = "MainPage.xaml", ["line"] = renamed[..at].Count(c => c == '\n') + 1, ["column"] = at - renamed.LastIndexOf('\n', at) + 1, ["newName"] = "Cheer",
+            }, heard: heard));
+            Ui.PumpUntil(() => asked.IsCompleted || heard.Told.Any(t => t.Message?.Contains("Speaker.cs", StringComparison.Ordinal) == true),
+                "the agent's rename from the expression to wait for the server to take Speaker.cs into MauiApp1", AgentLimit);
+            if (asked.IsCompleted)
+            {
+                Assert.Fail($"the agent's rename from the expression answered while the server's load taking in Speaker.cs was held: {Text(Ui.AwaitPumped(asked, "the agent's rename", AgentLimit))}");
+            }
+            loading.SetResult();
+            CallToolResult answer = Ui.AwaitPumped(asked, "the agent's rename of Yell to Cheer from the expression", AgentLimit);
+            Assert.True(answer.IsError != true, $"the agent's rename from the expression, asked as the server's load taking in Speaker.cs was held, answered: {Text(answer)}");
+            Assert.Contains("public static string Cheer(string text)", File.ReadAllText(speaker), StringComparison.Ordinal);
+            string again = File.ReadAllText(Path.Combine(folder, "MainPage.xaml"));
+            Assert.True(again == page.Replace("{local:Helper.Shout(", "{local:Speaker.Cheer(", StringComparison.Ordinal),
+                $"renaming Yell to Cheer from the expression left it naming Yell, or changed more: {again}");
+        }
+        finally
+        {
+            loading.TrySetResult();
+            Gone(client);
+            window.Close();
+        }
+    }
+
+    /// <summary>A MAUI page's folder whose load after its first restore waits for its design-time builds (held back here)
+    /// longer than an agent's code tools wait for the C# language server, given this window a little past the time the
+    /// server may say nothing of a load under way: the agent's definition of the InitializeComponent MAUI's generator
+    /// declares, asked as the folder opens, is refused as the server still loading once the wait is over, never answered as
+    /// nothing from the load before the restore.</summary>
+    [AvaloniaFact]
+    public void An_agents_definition_asked_while_the_server_loads_again_past_the_wait_is_refused_as_still_loading()
+    {
+        string? limitWas = Environment.GetEnvironmentVariable(PassengerTools.ServerLimitVariable);
+        TimeSpan limit = Waits.Of(TimeSpan.FromSeconds(15)) + TimeSpan.FromSeconds(10).Scaled();
+        string folder = McpNavigationTests.MauiPage("mcp-maui-slow-");
+        DeleteAtEnd(folder);
+        string project = Path.Combine(folder, "MauiApp1.csproj");
+        MainWindow window = new() { Width = 1200, Height = 800 };
+        window.Show();
+        TaskCompletionSource loading = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        TaskCompletionSource reloading = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        McpClient? client = null;
+        Environment.SetEnvironmentVariable(PassengerTools.ServerLimitVariable, ((int)limit.TotalMilliseconds).ToString(System.Globalization.CultureInfo.InvariantCulture));
+        try
+        {
+            // Pumped, not settled throughout: the server's load held waits on the window.
+            Task opening = window.OpenFolder(folder);
+            Ui.PumpUntil(() => opening.IsCompleted && window.CSharpService is not null, "the folder to open with a language server", AgentLimit);
+            Task loadHeld = window.Session.DesignTimeBuilds.HoldNextAsked(project, loading.Task);
+            window.ApplySettings(window.Settings with { McpServer = true });
+            Assert.True(window.AgentSocket is not null, $"The window does not listen for agents: {window.Status}");
+            client = Ui.AwaitPumped(Waiting.Apart(() => Start(["--mcp-attach", ProcessId])), "the agent attaching", AgentLimit);
+            Heard heard = new();
+            Task<CallToolResult> asked = Waiting.Apart(() => Result(client, McpTools.Definition, new() { ["path"] = "MainPage.xaml.cs", ["line"] = 9, ["column"] = 9 }, heard: heard));
+            Ui.PumpUntil(() => loadHeld.IsCompleted && window.CSharpService!.Session is not null && (heard.Told.Count > 0 || asked.IsCompleted),
+                "the server's first load of MauiApp1 to be held while the agent's definition waits", AgentLimit);
+            Task reloadHeld = window.Session.DesignTimeBuilds.HoldNextAsked(project, reloading.Task);
+            loading.SetResult();
+            Ui.PumpUntil(() => asked.IsCompleted || reloadHeld.IsCompleted, "the server's load after the restore to ask for MauiApp1's design-time builds", AgentLimit);
+            CallToolResult answer = Ui.AwaitPumped(asked, "the agent's definition, asked as the server's load after the restore waits", AgentLimit);
+            string said = Text(answer);
+            Assert.True(answer.IsError == true && (said.Contains("is still loading the folder's projects", StringComparison.Ordinal)
+                || said.Contains("load MauiApp1 again with what its restore brought, which has not come", StringComparison.Ordinal)),
+                $"definition of a MAUI page's InitializeComponent, asked while the server's load after the restore waited past the agent's wait, answered: {said}");
+        }
+        finally
+        {
+            loading.TrySetResult();
+            reloading.TrySetResult();
+            if (client is not null)
+            {
+                Gone(client);
+            }
+            window.Close();
+            Environment.SetEnvironmentVariable(PassengerTools.ServerLimitVariable, limitWas);
+        }
+    }
+
+    /// <summary>Two projects each given a package once loaded, the first's change loaded and restored as the second's waits:
+    /// the server's next batch loads the second alone, before it hears of the first's restore (held back here), then
+    /// restores the second, which fails, no feed holding its package. An agent's definition of the class the first's
+    /// restore brought waits, saying so, for the first project's load again after its restore, never answering as of its
+    /// load before it because another project's load ended in between.</summary>
+    [AvaloniaFact]
+    public void An_agents_definition_of_what_a_restore_brought_waits_for_its_projects_load_again_though_another_projects_load_ends_first()
+    {
+        string folder = PathNames.Canonical(TestFolders.Create("mcp-restored-apart-"));
+        DeleteAtEnd(folder);
+        using StandInFeed feed = new();
+        feed.Add("Passenger.Sample", "1.0.0", new Dictionary<string, string>
+        {
+            ["build/Passenger.Sample.targets"] = "<Project>\n  <ItemGroup>\n    <Compile Include=\"$(MSBuildThisFileDirectory)Brought.cs\" />\n  </ItemGroup>\n</Project>\n",
+            ["build/Brought.cs"] = "namespace Sample;\n\npublic static class Brought\n{\n    public static string Say() => \"brought\";\n}\n",
+        });
+        TestFolders.Write(folder, "nuget.config", $"<configuration>\n  <packageSources>\n    <clear />\n    <add key=\"stand-in\" value=\"{feed.Index}\" protocolVersion=\"3\" allowInsecureConnections=\"true\" />\n"
+            + "  </packageSources>\n  <config>\n    <add key=\"globalPackagesFolder\" value=\"packages\" />\n  </config>\n</configuration>\n");
+        string uses = TestFolders.Write(folder, "Uses/Uses.csproj", TestProjects.Library());
+        TestFolders.Write(folder, "Uses/Caller.cs", "namespace Uses;\n\npublic static class Caller\n{\n    public static string Call() => Sample.Brought.Say();\n}\n");
+        string lacks = TestFolders.Write(folder, "Lacks/Lacks.csproj", TestProjects.Library());
+        MainWindow window = AgentsWindow(folder);
+        Ui.WaitFor(() => window.CSharpService is { IsReady: true }, () => $"the language server to load Uses and Lacks ({window.CSharpService?.State})", TimeSpan.FromMinutes(3));
+        McpClient client = Await(Waiting.Apart(() => Start(["--mcp-attach", ProcessId])), "the agent attaching");
+        TaskCompletionSource sampling = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        TaskCompletionSource answering = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        TaskCompletionSource telling = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        TaskCompletionSource reloading = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        global::Passenger.App.CSharp.CSharpService csharp = window.CSharpService!;
+        try
+        {
+            // The server hears of Uses's files, and the window asks it to load Uses again, only once the definition waits.
+            string usesFolder = Path.GetDirectoryName(uses)!;
+            csharp.Session!.Server.WatchedFiles.HoldTelling(path => PathNames.IsUnder(path, usesFolder), telling.Task);
+            feed.Hold("Passenger.Sample", sampling.Task);
+            TestFolders.Write(folder, "Uses/Uses.csproj", TestProjects.Library().With("  <ItemGroup>\n    <PackageReference Include=\"Passenger.Sample\" Version=\"1.0.0\" />\n  </ItemGroup>\n"));
+            Ui.PumpUntil(() => feed.Requests.Any(r => r.Path.StartsWith("/flat/passenger.sample/", StringComparison.Ordinal)), "Uses's restore to ask the feed for its package", AgentLimit);
+            csharp.HoldReloads(uses, reloading.Task);
+            // Lacks's change waits in the server's queue as Uses's restore runs, so it loads in a batch of its own after it.
+            TestFolders.Write(folder, "Lacks/Lacks.csproj", TestProjects.Library().With("  <ItemGroup>\n    <PackageReference Include=\"Passenger.Missing\" Version=\"1.0.0\" />\n  </ItemGroup>\n"));
+            Ui.PumpUntil(() => csharp.Session.Server.WatchedFiles.ToldAt(lacks) is not null, "the server to be told Lacks.csproj changed as Uses's restore runs", AgentLimit);
+            feed.Hold("Passenger.Missing", answering.Task);
+            sampling.SetResult();
+            Ui.PumpUntil(() => feed.Requests.Any(r => r.Path.StartsWith("/flat/passenger.missing/", StringComparison.Ordinal)), "Lacks's restore to ask the feed for its package", AgentLimit);
+            Heard heard = new();
+            Task<CallToolResult> asked = Waiting.Apart(() => Result(client, McpTools.Definition, new() { ["path"] = "Uses/Caller.cs", ["line"] = 5, ["column"] = 43 }, heard: heard));
+            Ui.PumpUntil(() => heard.Told.Count > 0 || asked.IsCompleted, "the agent's definition to be under way", AgentLimit);
+            answering.SetResult();
+            Ui.PumpUntil(() => asked.IsCompleted || heard.Told.Any(t => t.Message?.Contains("to load Uses again with what its restore brought", StringComparison.Ordinal) == true),
+                "the agent's definition to wait for Uses to load again after its restore", AgentLimit);
+            telling.SetResult();
+            reloading.SetResult();
+            string said = Text(Ui.AwaitPumped(asked, "the agent's definition of Brought", AgentLimit));
+            Assert.True(said.Contains("/Brought.cs", StringComparison.Ordinal) || said.Contains($"{Path.DirectorySeparatorChar}Brought.cs", StringComparison.Ordinal),
+                $"definition of a class a restore brought, asked as another project's load ended between that restore and its project's load again, answered: {said}");
+        }
+        finally
+        {
+            sampling.TrySetResult();
+            answering.TrySetResult();
+            telling.TrySetResult();
+            reloading.TrySetResult();
+            Gone(client);
+            window.Close();
+        }
+    }
+
+    /// <summary>A project's package written again as the same version range in other words: the server restores it, the
+    /// restore leaving its assets file as it was, and (the window's own load again held back) never loads it again. Once the
+    /// server has said nothing of its loads for its quiet time that wait is let go for good, so a later load of another
+    /// project, its design-time build held here, keeps no agent's question waiting for a load that will never come:
+    /// definition of what the first restore brought answers while that build is held.</summary>
+    [AvaloniaFact]
+    public void An_agents_question_after_a_restore_that_left_its_assets_as_they_were_waits_for_no_later_load()
+    {
+        string folder = PathNames.Canonical(TestFolders.Create("mcp-restored-same-"));
+        DeleteAtEnd(folder);
+        using StandInFeed feed = new();
+        feed.Add("Passenger.Sample", "1.0.0", new Dictionary<string, string>
+        {
+            ["build/Passenger.Sample.targets"] = "<Project>\n  <ItemGroup>\n    <Compile Include=\"$(MSBuildThisFileDirectory)Brought.cs\" />\n  </ItemGroup>\n</Project>\n",
+            ["build/Brought.cs"] = "namespace Sample;\n\npublic static class Brought\n{\n    public static string Say() => \"brought\";\n}\n",
+        });
+        TestFolders.Write(folder, "nuget.config", $"<configuration>\n  <packageSources>\n    <clear />\n    <add key=\"stand-in\" value=\"{feed.Index}\" protocolVersion=\"3\" allowInsecureConnections=\"true\" />\n"
+            + "  </packageSources>\n  <config>\n    <add key=\"globalPackagesFolder\" value=\"packages\" />\n  </config>\n</configuration>\n");
+        string sample = "  <ItemGroup>\n    <PackageReference Include=\"Passenger.Sample\" Version=\"1.0.0\" />\n  </ItemGroup>\n";
+        string uses = TestFolders.Write(folder, "Uses/Uses.csproj", TestProjects.Library().With(sample));
+        string caller = TestFolders.Write(folder, "Uses/Caller.cs", "namespace Uses;\n\npublic static class Caller\n{\n    public static string Call() => Sample.Brought.Say();\n}\n");
+        string other = TestFolders.Write(folder, "Other/Other.csproj", TestProjects.Library());
+        string assets = Path.Combine(folder, "Uses", "obj", "project.assets.json");
+        MainWindow window = AgentsWindow(folder);
+        Ui.WaitFor(() => window.CSharpService is { IsReady: true }, () => $"the language server to load Uses and Other ({window.CSharpService?.State})", TimeSpan.FromMinutes(3));
+        McpClient client = Await(Waiting.Apart(() => Start(["--mcp-attach", ProcessId])), "the agent attaching");
+        TaskCompletionSource building = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        TaskCompletionSource keeping = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        global::Passenger.App.CSharp.CSharpService csharp = window.CSharpService!;
+        Dictionary<string, object?> brought = new() { ["path"] = "Uses/Caller.cs", ["line"] = 5, ["column"] = 43 };
+        try
+        {
+            // Asked first, so the server's first restore of Uses and its load after it are over.
+            string first = Text(Ui.AwaitPumped(Waiting.Apart(() => Result(client, McpTools.Definition, brought)), "the agent's first definition of Brought", AgentLimit));
+            Assert.True(first.Contains("Brought.cs", StringComparison.Ordinal), $"definition of a class Uses's first restore brought answered: {first}");
+            DateTime written = File.GetLastWriteTimeUtc(assets);
+
+            // The window's own load again of Uses, which its evaluation of the change asks for, held: only the server's comes.
+            csharp.HoldReloads(uses, keeping.Task);
+            TestFolders.Write(folder, "Uses/Uses.csproj", TestProjects.Library().With(sample.Replace("Version=\"1.0.0\"", "Version=\"[1.0.0, )\"", StringComparison.Ordinal)));
+            Ui.PumpUntil(() => csharp.ReloadingWhat(caller)?.Contains("to load Uses again with what its restore brought", StringComparison.Ordinal) == true,
+                "the server to restore Uses once its package was written again", AgentLimit);
+            Assert.True(File.GetLastWriteTimeUtc(assets) == written, "The restore of the same package written again wrote Uses's assets file again, so the server loads Uses again after all");
+            Ui.PumpUntil(() => csharp.ReloadingWhat(caller) is null, "the wait for a load of Uses to be let go once the server said nothing of its loads for its quiet time", AgentLimit);
+
+            Task held = window.Session.DesignTimeBuilds.HoldNextAsked(other, building.Task);
+            TestFolders.Write(folder, "Other/Other.csproj", TestProjects.Library().With("  <PropertyGroup>\n    <Description>Changed</Description>\n  </PropertyGroup>\n"));
+            Ui.PumpUntil(() => held.IsCompleted, "the server's load of Other to ask for its design-time build, held", AgentLimit);
+            Heard heard = new();
+            Task<CallToolResult> asked = Waiting.Apart(() => Result(client, McpTools.Definition, brought, heard: heard));
+            string said = Text(Ui.AwaitPumped(asked, "the agent's definition of Brought, asked while Other's design-time build is held", AgentLimit));
+            Assert.True(said.Contains("Brought.cs", StringComparison.Ordinal) && !building.Task.IsCompleted,
+                $"definition of a class a restore brought, asked once the wait for Uses's load had been let go and while another project's build was held, answered: {said}"
+                + $" (last told: {heard.Told.LastOrDefault()?.Message})");
+            Assert.DoesNotContain(heard.Told, t => t.Message?.Contains("to load Uses again", StringComparison.Ordinal) == true);
+        }
+        finally
+        {
+            building.TrySetResult();
+            keeping.TrySetResult();
             Gone(client);
             window.Close();
         }
@@ -424,7 +1172,7 @@ public sealed class McpWindowTests : McpRig, IClassFixture<RestoredFolders>
         try
         {
             Task<CallToolResult> asking = Waiting.Apart(() => Result(client, McpTools.IdeAction, new() { ["action"] = "tests.fault" }));
-            Press(Question(window, "the question for the agent's action"), "Allow");
+            Press(Question(window, "the question for the agent's action"), AgentToolDialog.AllowForSession);
             CallToolResult faulted = Await(asking, "the action that fails");
             string said = Text(faulted);
             Assert.True(faulted.IsError == true && said.Contains("NullReferenceException: The fault's own words", StringComparison.Ordinal),
@@ -442,6 +1190,39 @@ public sealed class McpWindowTests : McpRig, IClassFixture<RestoredFolders>
         }
     }
 
+    /// <summary>An agent's call that fails as a file can (an action whose file another program holds), which the agent hears
+    /// in the failure's own words alone, leaves the failure in passenger.log whole: the tool, the exception and the frames it
+    /// was thrown through.</summary>
+    [AvaloniaFact]
+    public void An_agents_call_that_fails_leaves_its_exception_and_stack_in_the_log()
+    {
+        MainWindow window = AgentsWindow(Folder, languageServer: false);
+        window.Actions.Add(new IdeAction("tests.held", "Held", "Tests", _ => ThrowAsHeld()));
+        McpClient client = Await(Waiting.Apart(() => Start(["--mcp-attach", ProcessId])), "the agent attaching");
+        try
+        {
+            Task<CallToolResult> asking = Waiting.Apart(() => Result(client, McpTools.IdeAction, new() { ["action"] = "tests.held" }));
+            Press(Question(window, "the question for the agent's action"), AgentToolDialog.AllowForSession);
+            CallToolResult failed = Await(asking, "the action that fails");
+            Assert.True(failed.IsError == true && Text(failed).Contains("The file is held by another program", StringComparison.Ordinal),
+                $"An agent's call that failed was answered without the failure's words: {Text(failed)}");
+            IdeErrors.Flush();
+            string log = Ui.Shared(IdeErrors.LogPath);
+            int at = log.LastIndexOf($"An agent's {McpTools.IdeAction} failed: ", StringComparison.Ordinal);
+            string logged = at < 0 ? string.Empty : log[at..];
+            Assert.True(logged.Contains("System.IO.IOException: The file is held by another program", StringComparison.Ordinal)
+                && logged.Contains(nameof(ThrowAsHeld), StringComparison.Ordinal),
+                $"An agent's call that failed left no exception with its stack in passenger.log: {(at < 0 ? "no line names the call" : logged)}");
+        }
+        finally
+        {
+            Gone(client);
+            window.Close();
+        }
+
+        static void ThrowAsHeld() => throw new IOException("The file is held by another program");
+    }
+
     /// <summary>An agent's remove of "Any exception", the row every folder keeps, turns it off: its answer and the
     /// Breakpoints window show it off, so the program no longer breaks on every exception.</summary>
     [AvaloniaFact]
@@ -454,7 +1235,7 @@ public sealed class McpWindowTests : McpRig, IClassFixture<RestoredFolders>
         try
         {
             Task<JsonElement> removing = Waiting.Apart(() => Call(client, McpTools.BreakpointSet, new() { ["exception"] = ExceptionBreakpoint.AnyException, ["remove"] = true }));
-            Press(Question(window, "the question for the agent's breakpoint"), "Allow");
+            Press(Question(window, "the question for the agent's breakpoint"), AgentToolDialog.AllowForSession);
             JsonElement answer = Await(removing, "the agent's remove of Any exception");
             JsonElement listed = answer.EnumerateArray().Single(b => b.TryGetProperty("exception", out JsonElement type) && type.GetString() == ExceptionBreakpoint.AnyException);
             Assert.False(listed.GetProperty("enabled").GetBoolean(), $"The agent's remove answered Any exception still on: {listed}");
@@ -497,7 +1278,7 @@ public sealed class McpWindowTests : McpRig, IClassFixture<RestoredFolders>
         WaitFor(() => window.Agents == 1 || agent.IsCompleted, "the window to show the agent", AgentLimit);
         int shown = window.Agents;
         // A breakpoint is asked about first: its condition or log message runs in the person's later sessions too.
-        Press(Question(window, "the question for the agent's breakpoint"), "Allow");
+        Press(Question(window, "the question for the agent's breakpoint"), AgentToolDialog.AllowForSession);
         looked.TrySetResult();
         WaitFor(() => agent.IsCompleted, "the agent's calls", AgentLimit);
         Assert.Equal(1, shown);
@@ -580,7 +1361,7 @@ public sealed class McpWindowTests : McpRig, IClassFixture<RestoredFolders>
         try
         {
             Task<CallToolResult> denied = Waiting.Apart(() => Result(client, McpTools.Run, run));
-            ConfirmDialog asked = Question(window, "the question for the agent's run");
+            Avalonia.Controls.Window asked = Question(window, "the question for the agent's run");
             string[] said = Texts(asked);
             Assert.Contains("Allow run?", said);
             Assert.Contains(said, t => t.Contains("wants to run a configuration", StringComparison.Ordinal));
@@ -593,7 +1374,7 @@ public sealed class McpWindowTests : McpRig, IClassFixture<RestoredFolders>
 
             using CancellationTokenSource giveUp = CancellationTokenSource.CreateLinkedTokenSource(Cancel);
             Task<CallToolResult> allowed = Waiting.Apart(() => CallGivingUp(client, McpTools.Run, run, giveUp.Token));
-            Press(Question(window, "the question asked again"), "Allow");
+            Press(Question(window, "the question asked again"), AgentToolDialog.AllowForSession);
             WaitFor(() => window.Runner.IsRunning && window.AgentStatus == "Agent: Run a configuration", "the agent's run in the status bar");
 
             giveUp.Cancel();
@@ -604,8 +1385,8 @@ public sealed class McpWindowTests : McpRig, IClassFixture<RestoredFolders>
             WaitFor(() => !window.Runner.IsRunning, "the program stopped");
 
             Task<CallToolResult> again = Waiting.Apart(() => Result(client, McpTools.Run, run));
-            WaitFor(() => window.Runner.IsRunning || window.OwnedWindows.OfType<ConfirmDialog>().Any(), "the run allowed before");
-            Assert.Empty(window.OwnedWindows.OfType<ConfirmDialog>());
+            WaitFor(() => window.Runner.IsRunning || Questions(window).Any(), "the run allowed before");
+            Assert.Empty(Questions(window));
             WaitFor(() => window.AgentStatus == "Agent: Run a configuration", "the second run in the status bar");
             Gone(client);
             WaitFor(() => window.AgentStatus is null, "the window to stop waiting on the run of the agent that went");
@@ -721,7 +1502,7 @@ public sealed class McpWindowTests : McpRig, IClassFixture<RestoredFolders>
         try
         {
             Task<JsonElement> committing = Waiting.Apart(() => Call(client, McpTools.VcsCommit, new() { ["message"] = "Two", ["push"] = true }));
-            Press(Question(window, "the question for the agent's vcs_commit"), "Allow");
+            Press(Question(window, "the question for the agent's vcs_commit"), AgentToolDialog.AllowForSession);
             WaitFor(() => window.GitQuestion is { IsVisible: true }, "the window to ask the person for the login the push needs");
             Passenger.App.Vcs.GitQuestionDialog asked = window.GitQuestion!;
             Assert.Equal($"Sign in to {remote.Place}", asked.Title);
@@ -773,7 +1554,7 @@ public sealed class McpWindowTests : McpRig, IClassFixture<RestoredFolders>
         try
         {
             Task<JsonElement> running = Waiting.Apart(() => Call(client, McpTools.TerminalRun, new() { ["command"] = "echo agent-shell", ["waitSeconds"] = 5 }));
-            Press(Question(window, "the question for the agent's terminal command"), "Allow");
+            Press(Question(window, "the question for the agent's terminal command"), AgentToolDialog.AllowForSession);
             string answer = Await(running, "the agent's terminal command").GetString()!;
             Assert.Contains("agent-shell", answer, StringComparison.Ordinal);
             Ui.Settle();
@@ -819,7 +1600,7 @@ public sealed class McpWindowTests : McpRig, IClassFixture<RestoredFolders>
         try
         {
             Task<JsonElement> first = Waiting.Apart(() => Call(client, McpTools.TerminalRun, new() { ["command"] = "echo agent-one", ["waitSeconds"] = 5 }));
-            Press(Question(window, "the question for the agent's terminal command"), "Allow");
+            Press(Question(window, "the question for the agent's terminal command"), AgentToolDialog.AllowForSession);
             WaitFor(() => terminal.AgentShell is not null || first.IsCompleted, "the Agent Shell to start for the agent's first command");
             Assert.True(terminal.AgentShell is not null, $"The agent's command ran in no Agent Shell, the person's program's screen:\n{TerminalTests.Screen(persons.Session)}");
             Heard heard = new();
@@ -911,11 +1692,11 @@ public sealed class McpWindowDebuggingTests : McpRig, IClassFixture<RestoredFold
         File.WriteAllText(Path.Combine(Folder, "slow"), string.Empty);
         MainWindow window = AgentsWindow(Folder, languageServer: false);
         McpClient client = Await(Waiting.Apart(() => Start(["--mcp-attach", ProcessId])), "the agent attaching");
-        int step = 0;
+        OwnProcess step = default;
         try
         {
             Assert.True(window.Perform(AppActions.Build));
-            step = Processes.WrittenId(Path.Combine(Folder, "slow.pid"), "the build's slow step to start");
+            step = OwnProcess.Of(Processes.WrittenId(Path.Combine(Folder, "slow.pid"), "the build's slow step to start"));
 
             window.OpenFile(Path.Combine(Folder, "Sum.csproj"));
             window.EditorArea.CodeEditor.GoTo(new Passenger.Text.TextPosition(6, 0));
@@ -930,7 +1711,7 @@ public sealed class McpWindowDebuggingTests : McpRig, IClassFixture<RestoredFold
         finally
         {
             window.Perform(AppActions.Stop);
-            Processes.Kill(step);
+            step.Kill();
             Ui.PumpUntil(() => !window.IsBuilding, "the build to stop", TimeSpan.FromMinutes(1));
             Gone(client);
             window.Close();
@@ -996,7 +1777,8 @@ public sealed class McpWindowDebuggingTests : McpRig, IClassFixture<RestoredFold
     }
 
     /// <summary>While an attached agent's ten thousand usages are found, each with its line read from its closed file, the
-    /// window takes every key typed.</summary>
+    /// window takes every key typed; the files the answer only counted are read through within, and from where one file's
+    /// places run past the limit, to every place.</summary>
     [AvaloniaFact]
     public void The_window_takes_keys_while_an_attached_agent_finds_ten_thousand_usages_each_with_its_line()
     {
@@ -1032,13 +1814,36 @@ public sealed class McpWindowDebuggingTests : McpRig, IClassFixture<RestoredFold
                 typed++;
                 Ui.Hold(TimeSpan.FromMilliseconds(50), "a pause between keys, as a person types");
             }
-            IReadOnlyList<(string Path, int Line, int Column, string Text)> found = Used(Ui.AwaitPumped(usages, "the usages"));
+            JsonElement answered = Ui.AwaitPumped(usages, "the usages");
             Ui.Settle();
+            Assert.Equal(new string('x', typed), window.EditorArea.Active!.Text.Snapshot.ToString());
 
+            List<(string Path, int Line, int Column, string Text)> found = [.. Used(answered)];
+            foreach (string counted in answered.GetProperty("files").EnumerateArray().Where(f => f.TryGetProperty("count", out _)).Select(f => f.GetProperty("path").GetString()!))
+            {
+                for (int? from = null; ;)
+                {
+                    Dictionary<string, object?> asked = new() { ["path"] = "Helper.cs", ["line"] = 3, ["column"] = 23, ["within"] = counted };
+                    if (from is int line)
+                    {
+                        asked["from"] = line;
+                    }
+                    JsonElement part = Await(Waiting.Apart(() => Call(client, McpTools.Usages, asked)), $"the usages within {counted} from {from}");
+                    found.AddRange(Used(part));
+                    if (!part.TryGetProperty("more", out JsonElement more))
+                    {
+                        break;
+                    }
+                    int next = int.Parse(Regex.Match(more.GetString()!, @"from (\d+) with within").Groups[1].Value, System.Globalization.CultureInfo.InvariantCulture);
+                    Assert.True(next > (from ?? 0), $"usages within {counted} from {from} said to read on from {next}: {more}");
+                    from = next;
+                }
+            }
+
+            Assert.Equal(10_002, found.Distinct().Count());
             Assert.Equal(10_002, found.Count);
             Assert.All(found, place => Assert.Contains("Twice(", place.Text, StringComparison.Ordinal));
             Assert.Contains(found, place => place.Path == "Uses3.cs" && place.Line == 5005 && place.Text == "total += Helper.Twice(2499);");
-            Assert.Equal(new string('x', typed), window.EditorArea.Active!.Text.Snapshot.ToString());
 
             JsonElement callers = Await(Waiting.Apart(() => Call(client, McpTools.Hierarchy, new() { ["path"] = "Helper.cs", ["line"] = 3, ["column"] = 23 })), "the callers");
             Assert.Equal(["Uses0.cs:7 total += Helper.Twice(0);", "Uses1.cs:7 total += Helper.Twice(0);", "Uses2.cs:7 total += Helper.Twice(0);", "Uses3.cs:7 total += Helper.Twice(0);"],

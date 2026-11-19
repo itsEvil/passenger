@@ -18,13 +18,27 @@ public enum ConsoleKind
 
 /// <summary>What a run configuration launches: a .NET project on this machine, a Compose application, one project's
 /// Dockerfile, or a project as the .NET SDK makes its container (<c>EnableSdkContainerSupport</c>), each container kind
-/// run by the person's engine from Passenger's own build of its .NET services (<see cref="Containers.ContainerRun"/>).</summary>
+/// run by the person's engine from Passenger's own build of its .NET services (<see cref="Containers.ContainerRun"/>); or
+/// several of the solution's projects on this machine together, as a multi-project launch profile beside the solution
+/// says (<see cref="SolutionLaunch"/>); or a Node package's script, run with its package manager (<see cref="NodeProjects"/>).</summary>
 public enum RunKind
 {
     Project,
     Compose,
     Dockerfile,
     SdkContainer,
+    Projects,
+    Script,
+}
+
+/// <summary>One project a multi-project configuration starts: its file (canonical), what Run and Debug do with it (null for
+/// an action Passenger does not know, which keeps the configuration from starting), and the launch profile of its own it
+/// starts in (empty for its default).</summary>
+public sealed record ProjectStart(string Project, ProjectLaunchAction? Action, string LaunchProfile)
+{
+    /// <summary>It as its file held it when read, which a change is written over; null for one not written yet.</summary>
+    [JsonIgnore]
+    public SolutionLaunchProject? Launch { get; init; }
 }
 
 /// <summary>What a Compose configuration does with one .NET service: run it, debug it, or leave it unstarted.</summary>
@@ -56,8 +70,12 @@ public sealed record RunConfiguration
     /// <summary>What it launches: a project here, or containers.</summary>
     public RunKind Kind { get; init; }
 
-    /// <summary>The project's file: a canonical path in the window, relative to the open folder in the store.</summary>
+    /// <summary>The project's file: a canonical path in the window, relative to the open folder in the store. A script's
+    /// is its package's package.json.</summary>
     public string Project { get; init; } = string.Empty;
+
+    /// <summary>For a Node package's, the script of its package.json it runs.</summary>
+    public string Script { get; init; } = string.Empty;
 
     /// <summary>Whether Passenger coordinates this AppHost and its project resources.</summary>
     public bool Aspire { get; init; }
@@ -119,6 +137,11 @@ public sealed record RunConfiguration
 
     public bool BuildBeforeLaunch { get; init; } = true;
 
+    /// <summary>The build configuration and platform its run builds, evaluates and starts as, by its key (Release|Any CPU,
+    /// <see cref="Passenger.Workspace.BuildConfiguration.Key"/>), in place of the folder's choice; empty for the folder's
+    /// (<see cref="ProjectSession.WorkspaceOfAsync"/>).</summary>
+    public string BuildConfiguration { get; init; } = string.Empty;
+
     public ConsoleKind Console { get; init; }
 
     /// <summary>Whether the browser opens at <see cref="BrowserUrl"/> once the program listens there, as a launch profile's
@@ -128,6 +151,11 @@ public sealed record RunConfiguration
     /// <summary>Where the browser opens: a profile's <c>launchUrl</c> against its first <c>applicationUrl</c>; for containers
     /// Visual Studio's <c>{Scheme}://{ServiceHost}:{ServicePort}</c> filled from the published port.</summary>
     public string BrowserUrl { get; init; } = string.Empty;
+
+    /// <summary>The browser its page opens in, and Debug drives to debug a Blazor app's WebAssembly half, as a command line
+    /// naming a program and its arguments, in place of Settings' (<see cref="PageBrowsers"/>): the person's alone, kept with
+    /// the folder and never written to a launch profile; empty for Settings'.</summary>
+    public string Browser { get; init; } = string.Empty;
 
     /// <summary>A Compose configuration's files, the first the base and the rest its overrides, as <c>-f</c> gives them:
     /// canonical paths in the window, relative to the open folder in the store.</summary>
@@ -180,9 +208,30 @@ public sealed record RunConfiguration
     /// <c>-v</c>), as a launch profile's DockerfileRunArguments or containerRunArguments give them.</summary>
     public string RunArguments { get; init; } = string.Empty;
 
-    /// <summary>Whether it runs containers rather than a program on this machine.</summary>
+    /// <summary>A multi-project configuration's projects in the order they start, each with what Run and Debug do with it
+    /// and the launch profile it starts in.</summary>
+    public List<ProjectStart> Starts { get; init; } = [];
+
+    /// <summary>For a multi-project configuration, whether the team shares it in the solution's <c>.slnLaunch</c>, rather
+    /// than keeping it in the person's own <c>.slnLaunch.user</c>.</summary>
+    public bool Shared { get; init; } = true;
+
+    /// <summary>For a multi-project configuration, the profile as its file held it when read, which a change is written over;
+    /// null for one not written yet.</summary>
     [JsonIgnore]
-    public bool IsContainer => Kind != RunKind.Project;
+    public SolutionLaunchProfile? Launch { get; init; }
+
+    /// <summary>Whether it runs containers rather than programs on this machine.</summary>
+    [JsonIgnore]
+    public bool IsContainer => Kind is RunKind.Compose or RunKind.Dockerfile or RunKind.SdkContainer;
+
+    /// <summary>Whether it runs a Node package's script, which Run alone starts: nothing is built, debugged or profiled.</summary>
+    [JsonIgnore]
+    public bool IsScript => Kind == RunKind.Script;
+
+    /// <summary>Whether it starts several of the solution's projects together, as a multi-project launch profile says.</summary>
+    [JsonIgnore]
+    public bool IsMultiple => Kind == RunKind.Projects;
 
     /// <summary>Made from the folder's projects and container files rather than by the person: changed in place, its
     /// changes kept with the folder over what its source makes (<see cref="Source"/>), or copied to be the person's own.</summary>
@@ -198,6 +247,11 @@ public sealed record RunConfiguration
     [JsonIgnore]
     public string? Origin { get; init; }
 
+    /// <summary>For a generated one, the package its program draws for a terminal with (<see cref="DrawingPackage"/>), which
+    /// runs it in the terminal unless the person says otherwise; null for one that draws none.</summary>
+    [JsonIgnore]
+    public string? DrawsWith { get; init; }
+
     /// <summary>Why it cannot launch here (a launch profile of a kind Passenger does not run), or null.</summary>
     [JsonIgnore]
     public string? Unsupported { get; init; }
@@ -206,7 +260,12 @@ public sealed record RunConfiguration
     /// one of a project Godot.NET.Sdk builds that names no program of its own, or names Godot as a launch profile does
     /// (<see cref="NamesGodot"/>).</summary>
     public bool RunsGodot(IEnumerable<ProjectModel> projects) =>
-        !IsContainer && (Program.Length == 0 || NamesGodot) && (RunsScriptGame || projects.FirstOrDefault(p => Core.PathNames.Same(p.Path, Project))?.GodotFolder is not null);
+        Kind == RunKind.Project && (Program.Length == 0 || NamesGodot) && (RunsScriptGame || projects.FirstOrDefault(p => Core.PathNames.Same(p.Path, Project))?.GodotFolder is not null);
+
+    /// <summary>Whether it runs an Azure Functions app among these projects, which func runs (<see cref="Aspire.FunctionsHost"/>):
+    /// one of a Functions project that names no program of its own.</summary>
+    public bool RunsFunctions(IEnumerable<ProjectModel> projects) =>
+        Kind == RunKind.Project && Program.Length == 0 && projects.FirstOrDefault(p => Core.PathNames.Same(p.Path, Project))?.IsFunctionsApp == true;
 
     /// <summary>Whether the program it names is Godot (%GODOT%, a path to a Godot executable: <see cref="GodotExecutables.NamesGodot"/>),
     /// which for a Godot project's runs its game as one naming no program does, on the Godot Settings names or the one found.</summary>
@@ -219,22 +278,53 @@ public sealed record RunConfiguration
     /// <summary>Whether it runs a Godot project of GDScript alone, its project.godot its project (<see cref="ProjectModel.IsScriptGame"/>):
     /// no C# project is built or debugged for it.</summary>
     [JsonIgnore]
-    public bool RunsScriptGame => !IsContainer && Path.GetFileName(Project) == GodotProject.FileName;
+    public bool RunsScriptGame => Kind == RunKind.Project && Path.GetFileName(Project) == GodotProject.FileName;
 
     /// <summary>Why it cannot launch here among these projects: its launch profile's kind, or, when it runs its project's
     /// own program, a project that runs only on Windows (WPF, Windows Forms) elsewhere; null when it can.</summary>
     public string? WhyNotHere(IEnumerable<ProjectModel> projects) => Unsupported
+        ?? (IsMultiple ? WhyNotStarted(projects) : null)
+        ?? (IsScript && Script.Length == 0 ? "it names no script of its package.json to run" : null)
         ?? (!IsContainer && Aspire && Path.GetExtension(Project).Equals(".cs", StringComparison.OrdinalIgnoreCase)
             ? AspireAppHosts.SingleFileWhyNot(Project, projects.Select(project => project.Path)) : null)
         ?? (!IsContainer && Program.Length == 0 && projects.FirstOrDefault(p => Core.PathNames.Same(p.Path, Project)) is { } project ? project.RunsOnlyOnWindows(Framework) : null);
 
+    /// <summary>Why a multi-project configuration cannot start here among these projects: it starts none, or one it starts is
+    /// not loaded, runs only on Windows, or takes an action Passenger does not know; null when it can.</summary>
+    private string? WhyNotStarted(IEnumerable<ProjectModel> projects)
+    {
+        List<ProjectStart> starting = [.. Starts.Where(s => s.Action != ProjectLaunchAction.None)];
+        if (starting.Count == 0)
+        {
+            return "it starts no project: each is set to None";
+        }
+        List<ProjectModel> loaded = [.. projects];
+        foreach (ProjectStart start in starting)
+        {
+            string name = Path.GetFileNameWithoutExtension(start.Project);
+            if (start.Action is null)
+            {
+                return $"its action for {name} is one Passenger does not know";
+            }
+            if (loaded.FirstOrDefault(p => p.Exists && Core.PathNames.Same(p.Path, start.Project)) is not { } project)
+            {
+                return $"{name} is not loaded";
+            }
+            if (project.RunsOnlyOnWindows(string.Empty) is { } windows)
+            {
+                return $"{name}: {windows}";
+            }
+        }
+        return null;
+    }
+
     /// <summary>The configurations the folder's executable projects make: one per launch profile, named "Project: profile",
     /// and the project itself when none of its profiles runs it here (a Godot project's game), with a Godot project's editor
     /// beside it ("Project: Godot Editor"), the workspace's Godot projects of GDScript alone among them (<see cref="WorkspaceModel.ScriptGames"/>);
-    /// then single-file AppHosts and the container ones the workspace's compose files, Dockerfiles, SDK container projects
-    /// and Docker Compose projects (.dcproj) make (<see cref="Containers.ContainerConfigurations"/>).</summary>
+    /// then single-file AppHosts, the container ones (<see cref="Containers.ContainerConfigurations"/>), and each Node
+    /// package's scripts, "package: script" (<see cref="OfScript"/>).</summary>
     public static IReadOnlyList<RunConfiguration> Generate(IEnumerable<ProjectModel> projects, WorkspaceModel? workspace = null,
-        IEnumerable<string>? singleFileAppHosts = null)
+        IEnumerable<string>? singleFileAppHosts = null, IEnumerable<NodePackage>? packages = null)
     {
         List<RunConfiguration> generated = [];
         List<ProjectModel> all = [.. projects];
@@ -246,7 +336,10 @@ public sealed record RunConfiguration
                 continue;
             }
             string name = NameOf(project);
-            IReadOnlyList<LaunchProfile> profiles = project.IsScriptGame ? [] : Run.LaunchProfile.Read(project);
+            // A profile tied to a platform its apps run on makes none: the project's own takes it where that platform is the target.
+            IReadOnlyList<LaunchProfile> profiles = project.IsScriptGame ? [] : Devices.DeviceTargets.OwnProfiles(project.TargetFrameworks, Run.LaunchProfile.Read(project));
+            string? drawing = DrawingPackage(project, all);
+            ConsoleKind console = drawing is null ? ConsoleKind.Internal : ConsoleKind.Terminal;
             if (!profiles.Any(p => p.Unsupported is null && !p.RunsInContainer))
             {
                 generated.Add(new RunConfiguration
@@ -257,9 +350,15 @@ public sealed record RunConfiguration
                     Generated = true,
                     // A program runs beside its C# file, as dotnet run there runs it: what it builds lies out of sight.
                     WorkingDirectory = project.IsProgram ? DotnetRunFolder : string.Empty,
+                    Console = console,
+                    DrawsWith = drawing,
                 });
             }
-            generated.AddRange(profiles.Select(p => From(project, p) with { Name = NameOf(project, p.Name), Generated = true }));
+            foreach (LaunchProfile profile in profiles)
+            {
+                RunConfiguration made = From(project, profile) with { Name = NameOf(project, profile.Name), Generated = true };
+                generated.Add(made.Kind == RunKind.Project ? made with { Console = console, DrawsWith = drawing } : made);
+            }
             if (godot)
             {
                 generated.Add(new RunConfiguration { Name = NameOf(project, GodotEditorName), Project = project.Path, GodotEditor = true, Generated = true });
@@ -293,7 +392,59 @@ public sealed record RunConfiguration
                 }
             }
         }
+        HashSet<string> used = new(generated.Select(g => g.Name), StringComparer.OrdinalIgnoreCase);
+        foreach (NodePackage package in packages ?? [])
+        {
+            foreach (NodeScript script in package.Runnable)
+            {
+                string name = UniqueName(OfScript(package, script.Name).Name, used);
+                used.Add(name);
+                generated.Add(OfScript(package, script.Name) with { Name = name, Generated = true });
+            }
+        }
         return generated;
+    }
+
+    /// <summary>The package a project's program draws for a terminal with, its own or a referenced project's
+    /// (<see cref="ProjectModel.DrawsWith"/>): its generated configurations run in the Terminal window, the one place what
+    /// it draws shows; null for a program that draws none, and for one Passenger starts its own way (Godot's game, an
+    /// AppHost, a Functions app, an Android or browser app).</summary>
+    public static string? DrawingPackage(ProjectModel project, IReadOnlyList<ProjectModel> projects) =>
+        project.GodotFolder is not null || project.IsAspireHost || project.IsFunctionsApp || project.IsAndroidApp || project.RunsInBrowser
+            ? null
+            : project.WithReferenced(projects).Select(p => p.DrawsWith).FirstOrDefault(p => p is not null);
+
+    /// <summary>The configuration running a Node package's script, named "package: script".</summary>
+    public static RunConfiguration OfScript(NodePackage package, string script) => new()
+    {
+        Name = $"{package.Name}: {script}",
+        Kind = RunKind.Script,
+        Project = package.Manifest,
+        Script = script,
+        BuildBeforeLaunch = false,
+        Origin = $"Generated from the script {script} in {package.Name}'s package.json, run with {NodeProjects.ProgramOf(package.Manager)}",
+    };
+
+    /// <summary>It with a launch profile's values where it gives none of its own, as it runs on the platform the profile is
+    /// tied to: the profile's arguments, working folder and browser where it names none, the profile's variables under its
+    /// own, and the profile's name, which dotnet run names it by.</summary>
+    public RunConfiguration TakingProfile(ProjectModel project, LaunchProfile profile)
+    {
+        RunConfiguration made = From(project, profile);
+        Dictionary<string, string> environment = new(made.Environment);
+        foreach ((string name, string value) in Environment)
+        {
+            environment[name] = value;
+        }
+        return this with
+        {
+            LaunchProfile = profile.Name,
+            Arguments = Arguments.Length > 0 ? Arguments : made.Arguments,
+            WorkingDirectory = WorkingDirectory.Length > 0 ? WorkingDirectory : made.WorkingDirectory,
+            Environment = environment,
+            LaunchBrowser = LaunchBrowser || made.LaunchBrowser,
+            BrowserUrl = BrowserUrl.Length > 0 ? BrowserUrl : made.BrowserUrl,
+        };
     }
 
     /// <summary>What a Godot project's configuration that starts Godot's editor on it is called after the project's name.</summary>
@@ -356,12 +507,15 @@ public sealed record RunConfiguration
         Framework = Framework ?? string.Empty,
         LaunchProfile = LaunchProfile ?? string.Empty,
         Program = Program ?? string.Empty,
+        Script = Script ?? string.Empty,
         Arguments = Arguments ?? string.Empty,
         GodotCopies = Math.Clamp(GodotCopies, 1, GameCopies.Most),
         CopyArguments = [.. (CopyArguments ?? []).Select(a => a ?? string.Empty).Take(GameCopies.Most)],
         Environment = (Environment ?? []).Where(v => !string.IsNullOrEmpty(v.Key)).ToDictionary(v => v.Key, v => v.Value ?? string.Empty),
         WorkingDirectory = WorkingDirectory ?? string.Empty,
+        BuildConfiguration = BuildConfiguration ?? string.Empty,
         BrowserUrl = BrowserUrl ?? string.Empty,
+        Browser = Browser?.Trim() ?? string.Empty,
         Console = Enum.IsDefined(Console) ? Console : ConsoleKind.Internal,
         ComposeFiles = [.. (ComposeFiles ?? []).Where(f => !string.IsNullOrWhiteSpace(f))],
         EnvFiles = [.. (EnvFiles ?? []).Where(f => !string.IsNullOrWhiteSpace(f))],
@@ -377,11 +531,13 @@ public sealed record RunConfiguration
         Context = Context ?? string.Empty,
         BuildArguments = BuildArguments ?? string.Empty,
         RunArguments = RunArguments ?? string.Empty,
+        Starts = [.. (Starts ?? []).Where(s => s is not null && !string.IsNullOrWhiteSpace(s.Project)).Select(s => s with { LaunchProfile = s.LaunchProfile ?? string.Empty })],
     };
 
     /// <summary>A deep enough copy to edit in Edit Configurations without touching the one it came from.</summary>
     public RunConfiguration Copied() => this with
     {
+        Starts = [.. Starts],
         Environment = new Dictionary<string, string>(Environment),
         LinkedAppHosts = [.. LinkedAppHosts],
         ComposeFiles = [.. ComposeFiles],

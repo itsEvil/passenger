@@ -55,7 +55,7 @@ public static partial class BindingErrors
     /// <summary>The framework's message, and the nearest members when the path named one its source's type does not have.</summary>
     public static string Message(BindingFailure failure) => failure.Nearest.Count == 0
         ? failure.Message
-        : $"{failure.Message.TrimEnd()} Did you mean {string.Join(" or ", failure.Nearest)}?";
+        : $"{failure.Message.TrimEnd()} Did you mean {Plural.Either(failure.Nearest)}?";
 
     /// <summary>A failure the debugger stopped at (Avalonia Binding Errors), as the Debug console says it, its place first so
     /// the console links it: "MainWindow.axaml(10,26): paused on a binding error: TextBlock#Caption.Text to Nmae (DataContext
@@ -83,7 +83,7 @@ public static partial class BindingErrors
     /// <summary>A XAML file's text as the editor has it, else as it is on disk, else none.</summary>
     public static TextSnapshot? TextOf(string file, IEnumerable<OpenDocument> documents)
     {
-        if (!File.Exists(file))
+        if (!FoundPaths.Askable(file) || !File.Exists(file))
         {
             return null;
         }
@@ -102,8 +102,9 @@ public static partial class BindingErrors
         }
     }
 
-    /// <summary>A XAML file's path as the editor knows it, when it is there.</summary>
-    private static string Canonical(string file) => File.Exists(file) ? PathNames.Canonical(file) : file;
+    /// <summary>A XAML file's path as the editor knows it, when it is there; a share's or a device's as the app named it,
+    /// never asked.</summary>
+    private static string Canonical(string file) => FoundPaths.Askable(file) && File.Exists(file) ? PathNames.Canonical(file) : file;
 
     /// <summary>The problem a failure is in Problems: at its misspelt member in <paramref name="text"/> (its file's text,
     /// when there is one to read), else at its control's element, in the editor's lines (<see cref="AppPlaces"/>).</summary>
@@ -206,7 +207,7 @@ public static partial class BindingErrors
     }
 
     /// <summary>A type as Avalonia names it, without its namespace.</summary>
-    private static string Short(string? type) => type is null ? "its source" : type[(type.LastIndexOfAny(['.', '+']) + 1)..];
+    private static string Short(string? type) => type is null ? "its source" : TypeNames.Short(type);
 
     /// <summary>An attribute of a start tag and its value, in either quotes.</summary>
     [GeneratedRegex(@"(?<name>[\w:.]+)\s*=\s*(?:""(?<value>[^""]*)""|'(?<value>[^']*)')")]

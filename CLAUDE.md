@@ -14,6 +14,10 @@ Avalonia 12 UI, for Windows, macOS and Linux. v0.3.0 shipped; the Backlog
 and close or tick it when it lands. A new feature is the best Passenger can make it, never a copy of another IDE's; only
 its keys follow Rider's keymaps (their files are in the jars of `~/Applications/Rider.app`).
 
+**Consistency is key.** Each thing is done one way, IDE-wide: what several places share is one mechanism, declared
+once and applied the same everywhere (a shared helper, base style, token or declaration, held by a rule test), never
+written again per place.
+
 ## Commands
 
 ```sh
@@ -24,10 +28,15 @@ just test [filter] [N] [--gate|--report]  # tests whose name matches (one lane, 
                            # Alone classes (tools/test-run.py); results and logs in artifacts/test-results/local;
                            # --plan shows the deal
 just test-times RUN...     # rewrite tests/Passenger.Tests/TestTimes.json from CI runs (it deals CI's shards)
-just publish RID           # self-contained Release build: osx-arm64, win-x64, win-arm64, linux-x64, linux-arm64
-just package-mac [RID]     # the .dmg (Apple Silicon), signed by PASSENGER_SIGN_IDENTITY and notarized by
-                           # PASSENGER_NOTARY_PROFILE when set, else ad hoc (--dry-run needs an identity)
+just publish RID           # self-contained Release build: osx-arm64, osx-x64, win-x64, win-arm64, linux-x64, linux-arm64
+just package-mac [RID]     # the .dmg (osx-arm64, or osx-x64 checked under Rosetta with DOTNET_ROOT_X64's Intel SDK),
+                           # signed by PASSENGER_SIGN_IDENTITY and notarized by PASSENGER_NOTARY_PROFILE when set,
+                           # else ad hoc (--dry-run needs an identity)
 just package-win [RID]     # Velopack's per-user installer; just package-linux [RID]: the .tar.gz with install.sh
+just first-start-shots     # the first start's pictures of each carried theme, retaken in a version bump's commit
+                           # (FirstStartPicturesTests fails until then)
+just debug-relay [android] [apple]  # the debugger's relay into artifacts/debug-relay/<rid>/ (macOS: clang, the Android
+                           # workload's linker, Xcode's SDKs); the app carries Android's under debugger/relay/<rid>/
 just container-tools [RID] [--archive]  # the in-container tools (linux[-musl]-x64/arm64) into artifacts/container-tools
 just notices               # fail naming any carried package the notices miss
 just mcp [FOLDER]          # Passenger as an MCP server over a folder, from a clone of the last build
@@ -35,7 +44,7 @@ just mcp-call FOLDER TOOL [JSON]  # one MCP tool over a folder (a worktree) from
 just site-shots [SCENE...] # site/images/<scene>-<dark|light>.webp retaken (macOS, cwebp)
 just godot-sweep [NAME...] # tools/godot-projects.json's Godot projects swept by a headless Passenger (report.md),
                            # cloned outside any repository, whose Directory.*.props MSBuild would take in
-just icons | file-icons | themes | unicode-widths | aspire-protocol | app-icon  # regenerate
+just icons | file-icons | themes | unicode-widths | unicode-identifiers | aspire-protocol | app-icon  # regenerate
 just godot-shader-types | godot-theme                                          # regenerate
 ```
 
@@ -56,11 +65,11 @@ artifacts/bin/Passenger.App/debug/Passenger . --file src/Passenger.App/App.axaml
     --screenshot out.png --size 1400x880 --scale 2 --crop 320,76,900,500 --theme light
 ```
 
-Steps: `--key`, `--type` (one input, so completion opens only on a trigger typed alone), `--click`, `--right-click`,
-`--hover X,Y` (logical units), `--click-name NAME` (exit 2 if none), `--drag[-hold]`, `--wait MS`, `--window-buttons`,
+Steps: `--key` (as a US keyboard types it: `shift+4` is `$`), `--type` (one input, so completion opens only on a trigger typed alone), `--click`, `--right-click`,
+`--hover X,Y` (logical units), `--click-name NAME` (exit 2 if none), `--drag[-hold]`, `--wait MS`, `--window-buttons`, `--untrusted` (the folder held to the person's answer),
 `--agent COMMAND` (an agent in the Terminal's Agent tab, every tool allowed); a step after one that opens a dialog goes
-to the dialog. State is kept only where PASSENGER_SETTINGS names a folder (short on macOS: a socket path holds 103
-bytes). Headless, dispatcher timers fire only inside a running frame (`Screenshot.Pump`, `Ui.WaitFor`).
+to the dialog. State is kept only where PASSENGER_SETTINGS names a folder, whose settings.json a screenshot or `--mcp`
+Passenger opens on, keeping no change (short on macOS: a socket path holds 103 bytes). Headless, dispatcher timers fire only inside a running frame (`Screenshot.Pump`, `Ui.WaitFor`).
 
 **Build facts.** Everything builds under `artifacts/`. Package versions live only in `Directory.Packages.props` (each
 kept pin saying why), shared properties only in `Directory.Build.props` (the version too). Packages come from nuget.org
@@ -82,33 +91,43 @@ tests run with a 4 MB `System.GC.Gen0MaxBudget`, so a young collection fits a 14
   `tools/Passenger.Notices/Licenses`, a package inside Roslyn's server in its table. MIT first. The owner's exceptions:
   Visual Studio Telemetry and Utilities.Internal inside Roslyn's server (Razor needs them), and the TextMate bundle
   licence.
-- **Every program Passenger starts goes through `ChildProcesses`**, so none outlives the IDE (`Lifeline`): `Command`,
+- **Every program Passenger starts goes through `ChildProcesses`**, so none outlives the IDE (`Lifeline`, its watchdog outside Passenger's process tree, so a tree kill leaves it to end what the system started for Passenger, a Catalyst or simulator app adopted once found, and runs each key's end command, `ChildProcesses.AtIdeEnd`; `ChildProcesses.WatchdogOf`): `Command`,
   `DotnetCommand`, `HelperCommand` (Passenger's helpers on Passenger's runtime, never the machine's), `ConservingMemory`
   for Roslyn's server and the project host but never the debug adapter, whose program would inherit it, `DotnetQuestion`
-  for the .NET CLI's questions (no telemetry, so it lets go of its folder), `Kill` for it and all it started. Give each
-  its folder as the disk names it, PWD too. On Windows every child shares the IDE's UTF-8 console (`SharedConsole`).
+  for the .NET CLI's questions (no telemetry, so it lets go of its folder), `Kill` for it and all it started (a group killed again until empty: a kill passes over a process forked as it kills); a .cmd or .bat runs through cmd.exe there and in the Terminal (`WindowsCommandLine.ThroughCmd`), never a cmd.exe line of a caller's own. Give each
+  its folder as the disk names it, PWD too; an SDK command for a folder not trusted, or under a global.json in one not trusted (`Dotnet.TakesOnlyTrusted`), works outside it (`DotnetFolder`, as the muxer runs the SDK a global.json's `sdk.paths` names), so its arguments name the folder (`--output`). On Windows every child shares the IDE's UTF-8 console (`SharedConsole`).
   Read a child through `ChildProcesses.Output`/`Errors`/`Hear`, never `Begin*ReadLine` (banned: its disposal faults a
-  read under it). Started elsewhere: the terminal's shell (Porta.Pty), vstest.console, Velopack's Update.exe, an agent's
+  read under it). Started elsewhere: the terminal's shell (Porta.Pty; on macOS `MacPseudoTerminal`, held until its reader reads, through dash to take its terminal), vstest.console, Velopack's Update.exe, an agent's
   `--mcp-attach` Passenger (`StartApart`), the system web view's helpers; a program run in the terminal is `Adopt`ed.
-  Passenger's own standard input is taken at its start (`StandardInput`), so nothing it starts reads it.
+  Passenger's own standard input is taken at its start (`StandardInput`), so nothing it starts reads it. It works in the person's home once its command line is read (`Program.LeaveStartingFolder`; `--mcp-attach` keeps its folder), so no program it starts by name is taken from a repository.
+- **A folder's code runs only once it is trusted** (`WorkspaceTrust.Trusts`, Core; a parent covers its children, kept in `StateStore.Trust`): the project host refuses an untrusted folder, git runs there without the repository's programs, nor any hook a configuration declares, nor any filter in any scope (git-lfs's included), a file git stores through a filter committed, stashed or written out by git only once trusted (`Git.UnfilteredAsync`, `FileChange.Filter`), an inherited GIT_CONFIG_PARAMETERS or GIT_CONFIG never reaching its git (`UntrustedGit.Give`), reaching no remote, on the folder's own files (`UntrustedGit.FitAsync`: settings through GIT_CONFIG_COUNT, never `-c`, which splits a key at '='; each checked-out submodule's own config too; the working tree by GIT_WORK_TREE, never GIT_DIR, which skips safe.directory, as git takes `core.worktree` only from the repository's file; a clone or init fitted to none), and TypeScript, ESLint, Prettier, headless Godot, previewers, a global.json's dotnet, BuildKit checks and restores ask first; an action that would run its code greys with `Refusals.Untrusted`, an attached agent's tool through `McpTools.Untrusted` (each tool an untrusted folder refuses, with why); trusting starts what was held back (`ProjectSession.Trust`), never a restart, a folder in a Git repository trusting the repository's top (`WorkspaceTrust.FolderToTrust`, a walk of Passenger's own, never git; what Passenger makes, New Solution or Clone, trusted as made only where `TrustsAlone`; a kept trust below a repository's top forgotten as a window takes it in), trust given only by the person, never by an agent's input into the window (`AgentAsks.PersonsAlone`, `KeptFromAgents`; as every action only the person does, an install, a change of their shell, Restart to Update, Quit and the last window's Close, and the question for each, `ConfirmDialog.PersonsAlone`: refused to an agent's input through `MainWindow.RefusedToAgentsInput` and in an agent's own Passenger through `AskedByAgent`, never `ByAgent` alone, as an agent's own Passenger's ide_action runs unmarked), trust taken back only through `WorkspaceTrust.TakeBack` (Settings › Trusted Folders), each window following it through `ProjectSession.Untrust` (`ProjectHosts.EndServingAsync` ends a folder's hosts), a trusted solution's outside projects through `WorkspaceTrust.Lend` (never a disk's root, the home folder or a folder above the open one, `Lends`; a solution an agent's call wrote never widening it, `AgentReach.WroteFor`); every MSBuild question and target run passes `WorkspaceTrust.Check`. A Passenger nobody sees and a test run trust every folder; a test holds one to the person's answer with `WorkspaceTrust.Ask`, a screenshot with `--untrusted`.
 - **No secret on a command line** (any process can read it): give it through the environment, or don't make it. Secrets
-  are masked everywhere (Details, logs, consoles, hints, agents' answers, `ChildProcesses.Shown`) by one rule,
+  are masked everywhere (Details, logs, consoles, hints, agents' answers, `ChildProcesses.Shown`, an agent's answer carrying a program's, terminal's, build's or container's words through `PassengerTools.Masked`) by one rule,
   `ContainerSecrets`.
-- **Containers are ended by label** (`ContainerLabels`), never by `down` or `--remove-orphans`, which take the person's
+- **Containers are ended by label** (`ContainerLabels`; what this process made of a Compose project only through `ContainerLabels.Ours(project, folder)`), never by `down` or `--remove-orphans`, which take the person's
   own; Aspire's unlabelled DCP containers and network through `AspireContainerOwnership`; persistent containers and the
   person's own never.
-- **Colours are tokens** (`Passenger.*` in `Theme/Tokens.axaml`), given in every theme (dark and light, `Harbour.axaml`
-  and each look `just themes` writes); Fluent's keys are mapped once in `Theme/FluentKeys.axaml`. The window's typeface
+- **Colours are tokens** (`Passenger.*` in `Theme/Tokens.axaml`, the default theme every other is laid over), given in
+  every theme (dark and light; the others live in Zaneris/passenger-themes, the tests' copy in
+  `tests/Passenger.Tests/Themes`, Harbour's and Reef by hand, the rest by `just themes FOLDER`; Cubicle, carried in `Theme/BuiltIn`, by
+  `tools/themes.py`'s `BUILT_IN`, the themes' pictures by `tools/theme-pictures.py`, `ThemeSource.Carried` naming what is carried); a theme file is read
+  only through `ThemeFiles` (format 1, `docs/themes.md`; its JSON `ThemeJson.Read`; one kept over a VS Code theme through `KeptThemes.KeepOver`, its base, by id or by file, kept under `vscode/` (`KeptThemes.BaseBeside`), its name `ThemeFiles.NameOf`) and laid through `ThemeResources`, so a token added to
+  Tokens.axaml is one a theme may give. A theme is a `SourcedTheme`; a source is read only through `ThemeSourceReads` and
+  `ThemeListing`, never at a start whose themes are kept (`KeptThemes`); `PASSENGER_THEMES` names the repository's place; a theme's picture is drawn only through `ThemeBackdrop`
+  (`ThemeBackdrops`), its colours by language reach an editor only through `ThemeLanguages.Follow`; a VS Code colour theme is read as data only (`VsCodeThemes`, a `.vsix` as a zip, nothing of it run), mapped by `VsCodeColours`, a theme's base by `VsCodeBases`, and Open VSX reached only through `OpenVsx` while the explorer is open or a theme is picked, never Microsoft's Marketplace; a token a theme may leave out is in `ThemeFiles.Optional`; the code's size in force
+  is `AppSettings.CodeSize()`, never `EditorFontSize`, the person's own and null until set;
+  Fluent's keys are mapped once in `Theme/FluentKeys.axaml`. The window's typeface
   is the resource `WindowFonts.Key` (macOS tracking `WindowTracking`), the code's `CodeFonts.Key`; a control drawing its
   own words takes `TextElement.GetFontFamily`, never a named family. UiRulesTests fails on a colour or non-zero
-  CornerRadius written outside `Theme/` (but the content's own) and on an unmapped Fluent key. No access keys:
+  CornerRadius written outside `Theme/` (but the content's own) and on an unmapped Fluent key, and holds every colour to WCAG AA by what Tokens.axaml declares it is read on (`read:Text`, `Mark`, `Edge`, `None`), as `tools/themes.py` writes by. No access keys:
   `Shell.axaml`'s ContentPresenter style shows words as written, a native menu item's through `MainWindow.NativeWords`.
 - **An identifier is named from its home** (`[IdentifierHome]`: action and tool window ids, DAP and LSP names,
-  `McpTools`, each `PASSENGER_` variable, `TokenKeys`, `IconKeys`, `StyleClasses`): PSG0001 (`Rules.cs`) fails its text
+  `McpTools`, each `PASSENGER_` variable, `TokenKeys`, `IconKeys`, `StyleClasses`, `VimKeys`): PSG0001 (`Rules.cs`) fails its text
   written anywhere else, a plain word only where a member marked `[IdentifierOf]` its home takes it.
 - **Async is awaited**: no async void (PSG0002), no async lambda given to a void delegate (PSG0003), no blocking wait on
-  a task (PSG0004; a read where the task has certainly ended passes); a caller that must stay synchronous goes through
-  `Synchronously.Run`, saying why.
+  a task (PSG0004, through `AsyncWaitHandle` too; a read where the task has certainly ended passes); a caller that must
+  stay synchronous goes through `Synchronously.Run` (the App) or, in a library, Core's `Blocking.Until` for a task no thread
+  it holds ends, saying why.
 - **Thread-pool work goes through `BackgroundWork`** (`Run`; `Debounce`, not a `DispatcherTimer`), so screenshots and
   tests wait for it; `Unheld`/`UnheldThread` for work that mustn't hold them, saying why (PSG0006; a test's own through
   `Waiting.Apart`).
@@ -124,9 +143,10 @@ tests run with a 4 MB `System.GC.Gen0MaxBudget`, so a young collection fits a 14
   to the UI thread (`UiThread.Check()` in entry points). Text, Vcs, Workspace, Packages, Lsp, Dap, Debugger and Profiler
   never reference Avalonia and raise events on any thread; Editor, Languages and Terminal on the UI thread. The App
   crosses from another thread only through `UiThread` (`Post`, `Marshal`, `InvokeAsync`).
+- **A path read out of a program's or a file's text** (a frame, a compiler's message, a link, a PDB's document) is asked of the disk only where `FoundPaths.Askable` lets it: never a share's, a device's or one under an automount root, a window's open folder held through `FoundPaths.Reach`; a file address through `FoundPaths.OfFileAddress`; `ConsoleLinks` asks off the window's thread, and a test reads a line's links through `Ui.LinksIn`.
 - **Paths are canonical** (`PathNames.Canonical`, symlinks resolved, as MSBuild and Roslyn report them); compare with
   `PathNames.Comparer`/`Same`/`IsUnder`, names in one folder with `NamesIn(folder)`, never `Comparison` for a path; walk
-  a project's folders with `FoldersUnder`, the open folder's files with `FilesUnder`; show one with `PathNames.Shown`.
+  a project's folders with `FoldersUnder`, the open folder's files with `FilesUnder`; show one with `PathNames.Shown`; a path below a folder in forward slashes is `PathNames.Relative` (out by `..` only through `Route`), never `GetRelativePath(…).Replace`.
 - **Lines differ by reader.** Roslyn ends a line at a lone '\r', U+0085, U+2028 and U+2029, an XML reader (XAML's
   compilers, BAML, XamlIl) at a lone '\r' only. Every place crossing to a server, compiler, PDB or running app goes
   through `ServerLines`/`ServerPlaces`, never `new TextPosition(line, character)`; the debugger's lines through
@@ -135,37 +155,42 @@ tests run with a 4 MB `System.GC.Gen0MaxBudget`, so a young collection fits a 14
   holds unsaved (an agent refused, `Refusals.HeldInGodot`); `TrySave` refuses a held file unless explicit or let
   through; a command writing outside its recording asks first (`Recording.ClearAsync`). A workspace file:
   `FileText.Save` (atomic, metadata kept, a hard-linked file in place, a read-only one refused, Local History given the
-  old bytes); a file the IDE makes `SaveNew` (its .editorconfig's end_of_line and charset), again `SaveOver`; one the
+  old bytes); a file the IDE makes `SaveNew` (its .editorconfig's end_of_line and charset), only where none is yet `SaveNewOnly` (`AtomicFile.MoveNew`), again `SaveOver`; one the
   window changes itself `MainWindow.ChangeFileAsync`; a file landed byte for byte (a publisher's output) `LandedFiles`;
-  any other whole file `AtomicFile.Write`, a file that may be a link (a shell's startup file) written to the file it
-  names (`AtomicFile.Target`); a state file only the person may read `OwnFiles`; never `File.WriteAll*`. An open
+  a file handed to git for one call (a commit's message, a private index, the data Passenger's gpg signs: `CommitFile.Signed`, beside the operation's socket, deleted at its end) `CommitFile`, never `GetTempFileName` and a replace; any other whole file `AtomicFile.Write`, a written file put in another's place `AtomicFile.Move`, never `File.Move(…, overwrite: true)` (PSG0009), a file that may be a link (a shell's startup file) written to the file it
+  names (`AtomicFile.Target`); a state file only the person may read `OwnFiles` (the state folder, logs and Local History the person's alone: `StateStore.Own` at start, `OwnFiles.Made`/`Append`/`Write`, an earlier one put right once by `OwnFiles.Tree`); never `File.WriteAll*`. An open
   project, solution, filter, nuget.config or Directory.Packages.props is saved before Passenger writes it and loaded
-  after (`SaveBeforeWriting`). Server edits pass `LineEndings.Fit` then `Indentation.Fit`.
+  after (`SaveBeforeWriting`). A save's final line break is `.editorconfig`'s `insert_final_newline`, else the setting's (`OpenDocument.EnsuresFinalLineBreak`), in `TextEditing.Saving`'s one plan. Server edits pass `LineEndings.Fit` then `Indentation.Fit`. A formatter of Passenger's own that writes the file's indentation passes `LineEndings.Fit` alone (`GherkinAssist.LineEdits`); a closed file with no line break yet takes its .editorconfig's end_of_line (`WorkspaceEdits.Edited`).
 - **A change of several files, or a move, is one command of global undo** (`EditorArea.Commands.Record`; `RecordWrites`
-  for one that waits between writes; moves through `Recording.Move`, never a bare `EditorArea.MoveFile`; deletes kept).
+  for one that waits between writes; moves through `Recording.Move`, never a bare `EditorArea.MoveFile`; deletes kept, each moved to the Trash as where it went through `CommandHistory.Recording.Deleted(path, Trash.Move(path))`, never its bytes, a window's delete for a command through `DeleteAsync`/`TrashAsync` with it (`within`), Git's files no commit has through `VcsController.MoveToTrash`, never deleted in Vcs; a copy through `Recording.CopiedAsync`, which Undo moves to the Trash while it is as copied and Redo brings back; a paste failing partway taken back, `Recording.PutBack` for what it replaced, two of one name refused before any goes, `MainWindow.PutAsync`).
   A closed file changes through `Recording.Change`, written off the window's thread, every write of closed files in turn
   (`CommandHistory.InTurnAsync`); Undo and Redo put them back off it, a `Part` saying why it could not be put, one the
   disk may refuse going `First`, one refused partway taking back what it did. The window follows only what a change
-  made, moved or deleted (`ProjectSession.CameOrWent`), never a whole re-read of the folder.
+  made, moved or deleted (`ProjectSession.CameOrWent`), never a whole re-read of the folder; one that may make or delete
+  a file runs in `AssistContext.ChangeFilesAsync` (`MainWindow.Following`): the watcher hears the IDE's own writes as
+  saves (`FileText.Writing`), and Roslyn's server takes a file heard changed into no project.
 - **Saves land in order.** A save Windows refuses while another program holds the file lands in the background
   (`FileText.Landed`); what hands files to another program (a build, Git, a restore, an agent) waits for it
   (`SaveAllLandedAsync`); a change writing closed files is done only once its own writes landed
   (`WorkspaceEdits.LandedAsync`, `Recording.LandedAsync`).
 - **A file shown read-only refuses every change** (`TextDocument.IsReadOnly`, set only by `OpenDocument`; every file in
-  a package folder an evaluation names, `PackageFolders`); an action on it greys with `Refusals.ReadOnly`.
+  a package folder an evaluation names, `PackageFolders`); an action on it greys with `Refusals.ReadOnly` (CodeAssist's code actions by their `writes`; an editor action changing text, `EditorActions.IsChange`, by the editor it goes to, `MainWindow.ChangeRefused`, its keys saying why, a text box with the keys taking its own, `MainWindow.TextBoxEdits`; an agent's refactor, rename and code action refused up front; every read-only `CodeEditor` gives its `ReadOnlyWhy` in `Refusals`' words, typed text refused through `CodeEditor.TypingRefusedEvent`, a console's program input taking the menu's Paste, Backspace and New Line, `OutputView.TakesEdit`).
 - **State is a `StateDocument`** in the one `StateStore` (versioned, `Clamped`, debounced, merged, a bad file set aside
-  as `.bad`), read off the UI thread, never a file of its own; per-folder state under `workspaces/<name>-<hash>/`, held
-  by each window with it open; writes hold a lock every process honours (`StateFile.Hold`); a renamed key moves in
-  `IStateDocument.Renamed`; a value of the wrong kind is passed over alone. A new setting: an `AppSettings` property,
+  as `.bad`, a change still waiting written as Passenger ends, `StateStore.LandWaiting`), read off the UI thread, never a file of its own; per-folder state under `workspaces/<name>-<hash>/`, held
+  by each window with it open; reads and writes hold a lock every process honours (`StateFile.Hold`, a read through `StateFile.ReadHeld`); a renamed key moves in
+  `IStateDocument.Renamed`; a value of the wrong kind is passed over alone. A Settings row is an `OptionRow` (its label above its editor on a narrow page), an editor narrowing by `MaxWidth` (`OptionRow.EditorWidth`, a number box `OptionRow.NumberWidth`; a note wraps where `OptionRow` lays it) and a field with what follows it (a button, a unit) through `NarrowingField`, never a fixed `Width` (UiRulesTests). A process nobody sees reads PASSENGER_SETTINGS's settings once as it starts (`SettingsStore.KeptWhereNamed`, any thread), their logs' switches in force before anything begins (`SettingsStore.LogsInForce`), and its window opens on that read. A new setting: an `AppSettings` property,
   its row and range in `Declared` (refused values `Refused`, which Settings and `settings_set` ask), `Add`ed in
-  `SettingsDialog`, a line in `MainWindow.Follow` or `SettingsStore.InForce`; a row another setting voids says so
-  (`SettingRow.When`).
+  `SettingsDialog`, a line in `MainWindow.Follow` or `SettingsStore.InForce`, a look's in `SettingsPreview.Over` and
+  `MainWindow.OnPreviewChanged` (`VisualsInForce`) instead, so Settings shows it before Apply; a row another setting
+  voids says so (`SettingRow.When`); a row a file's .editorconfig says over declares its keys (`SettingRow.Over`), from which its note's words, the live line under it (`FolderEditorConfigs`) and `settings`' `editorConfig` come, never words of its own. A setting a theme may default is a `ThemedChoiceSetting`, its `AppSettings` value
+  nullable and read through an in-force method (as `CodeSize()`).
 - **Every action is an `IdeAction`** in the window's `ActionRegistry` (ids and keymaps in `AppActions.cs`): keys, menus,
   Find Action, context menus and MCP's `ide_action` all run it; `WhyNot` greys it with why; titles come from the
   registry (`TitleWhere`), one that asks more ending in "…"; what's missing is said in `Refusals`' words (RefusalsTests
   fails a copy). Work that takes a while holds a `Working` (`ActionWork.Begin`) from its first moment to its hand-over,
   saying each stage, honouring `Stopping`, and tells what it came to (`Working.Tell`), which `ide_action` answers;
   toolbar buttons bind with `ActionButtons.Bind`.
+- **An agent's paths are the open folder's** and, trusted, its solution's projects beside it (`ProjectSession.Reached`, the one list `WorkspaceTrust.Lend` takes): every tool's path goes through `PassengerTools.Resolve` (`AgentReach`, `Refusals.OutOfReach`), a tool writing the file it names with `changes: true`, refused as read-only by where the file lies, outside them only reading what Go to Declaration leads to; only `open`'s folder or solution and the debugger's places take any path (`Named`), never a share's (`FoundPaths`), a breakpoint outside reach telling nothing of its file; a setting naming a program is the person's (`AppSettings.NamingPrograms`); the consent question shows each argument whole (`AskedArguments`).
 - **An agent never takes the person's keys or brings a window forward** (`ActionRegistry.RunForAgent`,
   `DockHost.ShowBehind`); `AgentAsks` cancels an attached agent's focus moves and refuses its popups and modal dialogs
   (`Refusals.AsksThePerson`; a popup host asks `AgentAsks.Refused`); a file it opens comes in a tab behind.
@@ -184,22 +209,31 @@ tests run with a 4 MB `System.GC.Gen0MaxBudget`, so a young collection fits a 14
 ## Where things are
 
 Projects in `src/`; `find_symbol` finds the rest from the names here. A pointer's "never" is a rule.
-- `Passenger.Core` (no UI), where each of these is the one way: a PATH search `Programs.OnPath`; .NET's folder
-  `Dotnet.Root`, never `Dotnet.Host()`'s folder; a request of a host `OutboundHttp`; a Unix socket `SocketFolders`; a C
-  call made in more than one place `Libc`; whether a process runs `DotnetProcesses.Runs`, a `Process` held too, never
+- `Passenger.Core` (no UI), where each of these is the one way: a command's program `Programs.Command`/`CommandIn` (never a Windows `.exe` or `.cmd` name spelled by hand), a file on the PATH `OnPath`; .NET's folder
+  `Dotnet.Root`, never `Dotnet.Host()`'s folder, for a folder's work `Dotnet.Root(folder)`/`Host(folder)` (the first installation holding the SDK its global.json takes, its `sdk.paths` searched as the muxer does, `Dotnet.Find(folder)`), which `DotnetCommand(args, folder)` and `NamingDotnet(start, folder)` take; a request of a host `OutboundHttp` (an answer read whole `OutboundHttp.ReadAsync`, a stream held to a limit `Streams.Bounded`); a Unix socket `SocketFolders`, the user's own temporary folder on the startup disk whatever TMPDIR says `UserTemporary` (a state's own folder in it `Of`, made the user's own `Own`); a C
+  call made in more than one place `Libc`, a Windows one `Kernel32`; whether a process runs `DotnetProcesses.Runs`, a `Process` held too, never
   `HasExited` (PSG0007): ended, one Passenger started has an `ExitCode` to read, one found by id none; a PASSENGER_*_MS
-  `EnvironmentValues.Milliseconds`; a Windows command line `WindowsCommandLine`; the version `Product`; a log below the
-  App `PassengerLog`, never `IdeLog`; an MSBuild name Passenger writes `MSBuildNames`; another program's or a person's
+  `EnvironmentValues.Milliseconds`; a wait's limit `Deadline`, a time between the IDE's own moments `Stopwatch.GetElapsedTime`, never `DateTime.UtcNow` or `Environment.TickCount64` (WallClockTests, over all of `src`; the wall clock only for a moment shown, kept, or set against a file's or another program's time); a PASSENGER_* stand-in for a host `EnvironmentValues.Address` (read in Program.Main's checks); a Windows command line `WindowsCommandLine`; git's environment variables `GitVariables`; the version `Product`, Passenger's own program `Product.Program`; a while in words `Durations.Said`, as a size `Sizes.Said`; a log below the
+  App `PassengerLog`, never `IdeLog`; an MSBuild name Passenger writes `MSBuildNames`, a property on a dotnet or MSBuild command line `PropertySwitch.Of`, never a `-p:` by hand (PropertySwitchTests); another program's or a person's
   JSON `JsonMembers` (`Value` for a member of any kind), never a bare `TryGetProperty`/`GetProperty` (PSG0008); a search
-  by halving `Sorted`, never a loop of your own; a primitive `PrimitiveTypes`; an SDK into an installation
-  `DotnetMerge`; a path in a project file `ItemPaths`; what a Mac program links `MachOFile`.
+  by halving `Sorted`, never a loop of your own; the newest of folders named by versions `VersionOrder.Newest`; a primitive `PrimitiveTypes`; a file's stamp (length, last write, through its links) `FileStamp`; an SDK into an installation
+  `DotnetMerge`; a path in a project file `ItemPaths`, which files an MSBuild value names `ItemPaths.Matches` (its parts `ItemPaths.Parts`), a project file's items `ProjectItems`; a Mac program's slices and what it links `MachOFile`; whether this process runs translated `Dotnet.Translated`, a program's processors
+  `ProgramProcessors`; work any thread asks for by
+  key (a download), begun once however many ask, an ask that stops waiting never letting it go, `SharedWork` (`unheld` where any window asks, saying why); a folder first on a PATH `Programs.FirstOnPath`; the system's command key `CommandKey` (Passenger's keymaps through `Keystroke.Command`, an agent's `primary` through `HeldModifiers.Held`, an unseen app's hotkeys), never `OperatingSystem.IsMacOS()` for it; a walk up a folder's parents `FoldersUp.From`, what it finds there only through `FoldersUp.Found` (ending at a folder another user owns or a root-owned one every user may write, passing over what another put there; a test's stand-in `HeldByAnother`), never a `GetDirectoryName` loop of its own; a shell's kind `ShellKinds.Of`; a macOS app bundle from a path `MacBundles`; requests to a peer answered by number `PendingRequests` (one asked after its end fails at once), never a table of one's own.
 - `Passenger.Text`: the rope, `TextDocument`, editing commands as pure functions to an `EditPlan`, `FileText`; an XML
   value through `XmlEntities`, never `SecurityElement.Escape` or a hand Replace; a place in the text held by an anchor
-  (`AnchorAt`), never your own `TextEditing.Map*`; an end tag typed over by hand `EndTagTyping`, never a caret jump.
+  (`AnchorAt`), never your own `TextEditing.Map*`; an end tag typed over by hand `EndTagTyping`, never a caret jump; a line's start, end and the next line's start in a string `TextNavigation.LineStart`/`LineEnd`/`NextLineStart` (its indent `IndentOf`); a range trimmed of white space `TextRange.Trimmed`.
 - `Passenger.Editor`: `CodeEditor`, `Keymap`, `EditorActions`; the code font is `CodeFonts.Key`, never a `FontFamily`
-  written elsewhere; a family code or the window's words are drawn in is named through `FallbackFonts` (`Carry`, `Of`),
-  so what it lacks takes the platform's own fallback; the editor names no debugger, test or VCS concept (`IGutterColumn`, EditorRulesTests); a file's
-  editors draw its one `DocumentDecorations`, never fed per split.
+  written elsewhere; a family code or the window's words are drawn in is named through `FallbackFonts` (`Carry`, `Of`), an emoji's fallback asked in
+  `und-Zsye` (`FallbackFonts.LanguageOf`), never the culture's, or fontconfig names a text face,
+  so what it lacks takes the platform's own fallback; a view drawing its own text takes the input method through `ViewInputMethod` (CodeEditor, TerminalView); the editor names no debugger, test or VCS concept (`IGutterColumn`, EditorRulesTests); a file's
+  editors draw its one `DocumentDecorations`, never fed per split. Vim mode: `Vim` decides a key's meaning purely over the editor's
+  `IVimView` (`Vim.Commands`, `Vim.Operators`, `VimMotions`, `VimTextObjects`) and `CodeEditor.PressVim` takes it before
+  any keymap; an insert session is one `EditKind.Joined` step, `.`'s edits one too (`FollowVim`); normal-mode carets
+  settle in `SetSelections`; registers are each window's own (`CodeEditor.VimRegisters`), `+`/`*` the clipboard; visual mode's stretches are the editor's selections, a selection made
+  otherwise entering it (`Vim.FollowSelections`); macros are pressed again by `CodeEditor.ReplayVim`; Vim's key names are `VimKeys`, J's and gq's join `Vim.JoinSpace`; mappings come from the state folder's vimrc (`VimMappings`, read through `VimMappingsFile`), `gq` wraps through `VimWrapping`, `=` lays out through `CodeActions.ReformatLinesAsync`, its Ctrl keys go to Vim or the keymap by `Declared.VimKeysToKeymap`, a read-only file refuses through `IVimView.Refuses` (`CodeEditor.ReadOnlyWhy`), a mapping's key waits `timeoutlen` through `CodeEditor.FollowVimTimeout`, and a command line of several commands (`Vim.Bars`) or one run in each file or place (`:bufdo`, `:windo`, `:argdo`, `:cdo`, `:cfdo`) runs only through `MainWindow.RunVimAsync`, one command of global undo, each file's steps joined by `TextDocument.JoinUndoSince`; whether a final line break ends the file or begins an empty last line is the file's, as Vim's 'eol' (`IVimView.KeepsFinalLineBreak`, of what was last read or saved), passed to every `LastLine`/`Settled`; a key that types on the command line goes to the platform and comes back as text input, and text the command line takes without a key of its own (an input method's, a dead key's) goes through `CodeEditor.TypeOnVimCommandLine`, the input method's window at the end the host gives (`VimCommandLineEnd`, `StatusBar.EndIn`); search and the ex command line are Vim's own (`Vim.Search`, `Vim.Ex`,
+  `VimPatterns`) over `TextSearch`, and what only the window can do comes as a `VimRequest` (`MainWindow.Vim.cs`);
+  a count cut short fails the operator but leaves the caret where it ran out (`Vim.ranOutAt`); Vim mode is written from Vim's observed behaviour and help alone, never its source; `VimTests`' expected texts are the system Vim 9.1's. A pattern made from a repository's or a person's text runs on `RegexOptions.NonBacktracking`, a person's own regex through `TextSearch.IsWrittenMatch`. A word's characters are `WordCharacters` (moves, whole words, Find's Words, Vim's motions and `\<`, `\>`, `\k`), never `char.IsLetterOrDigit` or .NET's `\w`; a character's columns `WideCharacters.Cells`, counted through `TextNavigation.ColumnAfter`/`VisualColumn` (Passenger.Text).
 - **A key costs what it changed, not the file's size**: keep it so. Wraps, rows, folds, hints and built lines move only
   where an edit reaches; a highlighter keeps colours an edit didn't reach (`KeptColours`, `ChangedWithin`); a row is a
   retained visual (`CodeEditor.Rows.cs`) drawn again only where its key changed, the caret's blink only the overlay;
@@ -213,8 +247,10 @@ Projects in `src/`; `find_symbol` finds the rest from the names here. A pointer'
   so every in-process parse goes through `CSharpParsing.Parse`/`Changed` (`DeepText`), never `ParseText`; its depth is
   read as Roslyn's lexer reads strings and comments (`Brackets.ReadCode`), a key's around what it changed
   (`TypedMayGoDeep`), and a `?[` is read ahead to its expression's end, so 11 of them at once are too deep.
-- `Passenger.Xaml`: Passenger's own XAML core (no Avalonia; WPF shares it; not Avalonia.Ide.CompletionEngine); a
-  binding's path is read once (`BindingPath`) for the check, Go to Declaration, uses and completion.
+- `Passenger.Xaml`: Passenger's own XAML core (a XAML file's URI in its assembly only `XamlProject.UriOf`/`PathIn`, never a pack:// or avares:// string built elsewhere; a theme dictionary's variant only `ThemeVariants.VariantOf`) (no Avalonia; WPF shares it; not Avalonia.Ide.CompletionEngine); a
+  binding's path is read once (`BindingPath`) for the check, Go to Declaration, uses and completion. MAUI's XAML is a
+  dialect of it (`MauiDialect`, its implied namespaces in `XamlFile`); a `{…}` a dialect reads as a C# expression is the
+  compiler's to check (`XamlDialect.IsExpression`), its places in the value and the code mapped only through `MauiExpressionCode.CodeAt`/`WrittenOver`, never halved (an attached property's read reorders them), its hover the server's own through the extension's `MauiExpressionHover`, an agent's question in one waiting through `PassengerTools.ServerSettledAsync`, the wait every C# question takes. A MAUI expression is answered through the extension's `MauiExpressionDocument`, written from the editor's text as MAUI's generator writes it, never from its `.xsg.cs`; MAUI's runtime loader reads only the namespaces a file writes and takes a merged dictionary's Source from the build, so the preview sends both written in (`MauiPreviewText`); the live check reruns the generator in a fork (`MauiXamlChecks`), asked again as the server loads projects (`XamlService.ServerLoaded`), never only as the file opens; a namespace whose `targetPlatform=` names another platform is passed over (`XamlDialect.TargetPlatformOf`, `BuildsFor`), and a framework's reference pack is the one the SDK's `KnownFrameworkReference` names (`FrameworkDependencies.TargetingPacks`), never `<framework>.Ref` built by hand.
 - `Passenger.Lsp`: the LSP client (StreamJsonRpc, whose types never leave the project), `LspDocument` (never a change
   between a "\r\n"'s halves), Roslyn's server (`RoslynServer.targets`), the web servers under `web/` (to move a pin:
   edit `WebServers/package.json`, `npm install --package-lock-only --ignore-scripts`, the notices' "Inside web/").
@@ -225,85 +261,127 @@ Projects in `src/`; `find_symbol` finds the rest from the names here. A pointer'
   decodes a directive's text once and writes it unescaped: `#:ref`'s metadata is the real file, a Compile's Include is
   read again by MSBuild.
 - `Passenger.Vcs`, `Passenger.Workspace`, `Passenger.Packages`: UI-free Git, folder and NuGet code. A revision's text
-  `Git.BytesAtAsync` in the open file's encoding, never `git show` decoded as UTF-8; every git call but a clone through
+  `Git.BytesAtAsync` in the open file's encoding, never `git show` decoded as UTF-8; a git asked for in a folder that is gone answers `Git.Gone`, never "git is not installed"; every git call but a clone through
   `Git.RunAsync<T>`; paths on git's input, never its command line; git's questions only through `GitAskPass`, GPG's
   through Passenger's own gpg (`GpgLoopback`; gpgsm's for X.509; Git for Windows' MSYS gpg given its home as MSYS reads
   one, `MsysGpg`, its agent inheriting none of Passenger's handles, `StandardHandles.NotInherited`; every gpg found by
   `GpgPrograms`); signatures read for the rows shown, never by `%G?` in a read; a git that may ask ends with its folder
-  (`GitQuestions`).
-- `Passenger.Dap`, `Passenger.Debugger`, `Passenger.DebugAdapter`: Passenger's own debugger behind its own DAP.
+  (`GitQuestions`); the status bar's Git reads `VcsController.Upstream` and `Divergence`, counted only when the branch, upstream or refs move; an agent's `vcs_commit` lines go through `PartialCommit.Touched`, a file committed in part keeping what the index staged with the commit taken in (`PartialCommit.Restaged`), never reset to the commit, and a failed whole-file commit putting the index back (`Git.PutBackAsync`); moves reach the index only through `VcsController.Moved`, batched (`Git.MoveInIndexAsync`, `IndexMoves`), never one git per file; a commit's own index is `Git.PrivateIndexAsync`, which starts from `read-tree -m -i --index-output` (without `-i` a staged file changed since is refused) (the real index's stats), never
+  a plain `read-tree`, which reads every file again.
+- `Passenger.Dap`, `Passenger.Debugger`, `Passenger.DebugAdapter`: Passenger's own debugger behind its own DAP. On a
+  device it runs through `Passenger.DebugRelay` (relay.c), loaded by the Debug app as its profiler, which knows only the
+  callbacks' argument kinds: `Passenger.Debugger/Relay` plans each interface from the interop declarations, keeps answers
+  in `RelayAnswers` keyed by the interface declaring the method (ICorDebug's interfaces reuse slot numbers), those naming a method's version only until an update (`RelayAnswers.ForTheCode`, `RelaySession.NewCode`), and answers
+  or refuses a raw pointer no plan can size on the host; the relay's answers held to what was asked (`RelayConnection.Call`, `RelaySession.Misread`), anything else ending the session (`IRelayLink.Broken`), a value's size kept per object (`RemoteObject.Size`), an in-memory module's image read only through `ModuleImages.Read`, never at the size the module claims, a generic value written only through `CorDebugValueExtensions.SetValue(ReadOnlySpan<byte>)`, refused shorter than its size, metadata from an app's memory opened only past `DeviceMetadata.Refused` (the runtime's reader widens every column under `#JTD` after checking the tables' sizes); a Hot Reload update through it first has the app's debugger make its own copy of the module's metadata (`RelaySession.AppMetadataMade`), which its ApplyChanges assumes, and an update the app took is applied to the host's copy of the module's metadata too (`DeviceModules.Updated`), one scope per module.
   `Passenger.ContainerTools` runs inside a Linux container, carried only in the release's archives.
 - `Passenger.Profiler`: EventPipe and ClrMD (its Azure packages stay carried; its DAC stays loaded once used: unloading
-  it crashed on Linux); recording in a container trusts nothing in a frame. A heap dump is Passenger's own (`DumpTool`):
+  it crashed on Linux); recording in a container trusts nothing in a frame. A TraceEvent read's failures are `TraceFailures`, a trace cut short `Snapshot.CutShort`, a trace file reaching TraceEvent only as a stream Passenger opened (`Snapshot.Opened`), never by its path, whose constructor holds the file when it throws; Profile's program is ended through `ProfiledProgram.Kill`. A heap dump is Passenger's own (`DumpTool`):
   the runtime's createdump writes into the program's stdout, and Windows' dumps only its parent.
-- `Passenger.UpdateHandlers`, `Passenger.Inspector` (+`.Wpf`; `Protocol.cs` in both ends), `Passenger.WpfPreview`,
-  `Passenger.TestFrames`, `Passenger.Terminal` (Porta.Pty); `Passenger.Analyzers` (`Rules.cs`; a rule goes on only where
+- `Passenger.UpdateHandlers`, `Passenger.Inspector` (+`.Wpf`, `.Maui`; `Protocol.cs` in every end; a MAUI app read only through MAUI's own API, `IVisualTreeElement`, Android's views only through `AndroidViews`, UIKit's through `AppleViews`, an element's place on UIKit its own, `AppleViews.InWindow`, never MAUI's frames), `Passenger.WpfPreview`,
+  `Passenger.MauiPreview` (their wire Core's `PreviewWire` and `PreviewRequests`, linked into each, a JSON-lines peer's options `PeerJson`; Avalonia.Controls.Maui, its Skia and HarfBuzz natives its own folder's, `OwnNatives`; hosts share
+  `ChildPreviewHost`; a project of platforms alone previews from `MauiPreviewHost.PlainBuild`), `Passenger.TestFrames`, `Passenger.Terminal` (Porta.Pty; a program's own link (OSC 8) read through `TerminalLine.LinkOf` and `TerminalView.LinkTo`, told from its address alone by `MainWindow.ProgramLink` (a `file://` only with no host or localhost, never a share's or device's path), the disk asked only on a click, off the window's thread; block elements drawn from `BlockElements`, never the font; a key's bytes from `TerminalKeys`, one table of function keys, `Functional`, both protocols read; Avalonia's X11 map has no KP_Begin, so the keypad's 5 with Num Lock off comes as NumPad5 with no KeySymbol, read as Begin off Windows (`TerminalKeys.Of`); a folder's shell finds its dotnet first through `FirstOnPath`, given again after the startup files, as a login shell's reorder PATH, the folder put first only through `Dotnet.PathFolder`: the installation's own where it `HoldsLayoutAlone`, else a private one holding its dotnet alone, `HostAlone`); `Passenger.Analyzers` (`Rules.cs`; a rule goes on only where
   nothing it flags is left); `tools/` (notices, the test runner, packaging, site shots).
 
 `src/Passenger.App`, by area:
-- **Shell.** Every open through `PassengerApp.OpenProject`; a `.slnf`'s left-out projects are never saved as the
-  person's; a handler acts only while its session is bound (`ProjectSession.Bind`). A Passenger nobody sees
+- **Shell.** A new state's first start asks the theme and dark or light (`MainWindow.ShowFirstStartOnce`,
+  `Welcome/FirstStartView`), never in a window nobody sees; a carried theme needs its first-start pictures.
+  `KeepWorkspace` writes `WorkspaceState` whole, so a field added to it is added there too. The person's window opens where the last stood (`MainWindow.OpenWherePlaced`, one place for every folder, `StateStore.Placement`), its normal bounds taken only once settled (`KeepPlacement`). Every open through
+  `PassengerApp.OpenProject`; a `.slnf`'s left-out projects are never saved as the
+  person's; a handler acts only while its session is bound (`ProjectSession.Bind`). An Avalonia app is one beside Avalonia.Controls (`DesktopPrograms.AvaloniaAssembly`), never Avalonia.Base, which a library's tool takes alone; the inspector's hook ends or replaces the Main of an app nobody sees only where it carries a screen platform (`AppAvaloniaContext.CarriesScreenPlatform`); the program a plan's start hands the inspector to is `LiveApp.Inspected` (`LaunchPlan.DesktopApp`), and an inspector waits for the app to set itself up through `Looking`, never a fixed sleep. A Passenger nobody sees
   (`ShowsNoWindow`) runs Godot and browsers headless, a desktop app where nobody sees it (`UnseenApps`; what a start
-  runs read by `DesktopPrograms`, never `Built` alone), and plays no sound; a Linux display is taken by `NoDisplay`,
-  never by unsetting `WAYLAND_DISPLAY`: a client named no socket connects to the session's `wayland-0`. Anything new on
-  the toolbar goes inside `ToolbarStart` or `ToolbarEnd`, or Windows takes a press for the caption's.
+  runs read by `DesktopPrograms`, never `Built` alone), and plays no sound; a start where fontconfig lists no font takes the carried Inter as Avalonia's default (`NoSystemFont.Checked`, on every AppBuilder); an exception that ends Passenger is kept in `logs/crash.log` (`CrashFile`, watched from Main's start) and said once by the person's first window and a screenshot's (`MainWindow.SaysLastCrash`); a Linux display is taken by `NoDisplay`,
+  never by unsetting `WAYLAND_DISPLAY`: a client named no socket connects to the session's `wayland-0`. A toolbar widget that may go at the narrowest takes `ShrinkingRow.GoesWhole`, its menu opening elsewhere once it has (`ShrinkingRow.HasGone`). Anything new on
+  the toolbar goes inside `ToolbarStart` or `ToolbarEnd`, or Windows takes a press for the caption's. Windows' jump list, macOS's Dock menu and freedesktop's recently used list (`LinuxRecentlyUsed`, an install.sh copy alone; GLib refuses a list with two bookmarks of one href or an unknown attribute, and GNOME Files never lists a folder) follow the recent list only through `RecentShortcuts`, a repeated name told apart by `RecentShortcut.ToldApart`, and the installer's `--aumid` (package-win.sh) stays the AppUserModelID Velopack gives the process. The display scale is
+  one `InterfaceScale` transform per window, which its popups take from it. What a window tells the person is heard only through its `Announcer` (`Tell`, `TellStage`; a refusal `MainWindow.Refuse`), live words a `LiveText`, never a control's own LiveSetting; a popup placed at a line takes its role and name through `IHeardPopup` (`PopupPlacement.Add`/`Place`) and speaks only through `PopupPlacement.Tell`, words about what changes (a list's choice) passing `about` so only the latest is heard; a control drawing its own text gives a screen reader `AccessibleText` through `AccessibleTextPeer`, which each system's bridge reads (words as readers step: a run of one kind with its white space after it, `ReadingUnits`): Windows' UI Automation text pattern only through `UiaTextElement`/`UiaTextRange` (Passenger.Editor.UiAutomation, its peer from `AccessibleTextPeer.For`, its element holding the control weakly and its window taken down once the control is collected, `UiaTextWindow.LetGo`; a reader's question of any range reads only what is on screen or asked), VoiceOver's text attributes only through `MacTextElements` (found by the peer's automation id, `AccessibleTextPeer.Find`; what a change removed `AccessibleText.ReadRemoved`). Every tree is a `TreeList`, which `TreeKeys.Attach` takes, its rows' peer saying level, place and open state (in the row's words too, as Avalonia's bridges pass a set's place only to AT-SPI and a level to none); the window's regions are `MainWindow.Regions` (Next/Previous Region), keys given as by Tab so the ring is drawn. What the system asks of motion and carets is read only through `SystemMotion` (at start and as a window comes in front; `PASSENGER_SYSTEM_MOTION` stands in, the test run's `full,blink=530`); every caret's blink and width come from `Carets`' resources, and what moves by itself stands still under `StillMotion`.
 - **Editors.** `EditorArea` (a file in two windows is one `OpenDocument`; every editor through `ForEachEditor`; the one
-  close `CloseTab`). A diff is an `OpenDocument.OfDiff` of no file, never in `Documents`, every one through
-  `MainWindow.ShowDiff`. An SVG preview is a drawing (`ZoomedPicture`), never a bitmap; an HTML preview is never made in
+  close `CloseTab`; a closed window lets go of its files, `LetGoOfFiles`). A highlighter's work lands on the thread that asked, never a context captured when it was made, holding the quiet through a Scope its `Dispose` lets go. A diff is an `OpenDocument.OfDiff` of no file, never in `Documents`, every one through
+  `MainWindow.ShowDiff`. The Commit window's diff tab follows its choice until pinned or edited in (`DiffTab.Follows`). A file Git has in conflict says so in its banner (`OpenDocument.InConflict`, followed by `MainWindow.FollowConflicts`), its Merge… through `EditorArea.MergeRequested`; a commit's refusals are `VcsController.WhyNotCommit`, which greys the Commit window's buttons. A tool window as an editor tab is an `OpenDocument.OfTool` of no file, never in `Documents`,
+  shown in one place at a time (splitting refused), opened and closed only through `DockHost.EditorTabs`; code treating
+  `Editors.Active` as a file passes over `Tool` as it passes over `Diff`. A Markdown preview follows the editor and leads it only after the person's own input in it
+  (`MarkdownPreview.Lead`), never because of a layout. An SVG preview is a drawing (`ZoomedPicture`), never a bitmap; an HTML preview's page never leaves itself (`HtmlPreview.Leaving`, its banner's Open), on Windows only its own folder served (`ServedPage.WhyNotServed`, `Git.LeftOutUnderAsync`); an HTML preview is never made in
   a window nobody sees (WebView2 refuses a non-STA thread), on Windows is served (`ServedPage`, `WebView2Pages`),
   `NavigateToString` only where WebView2 refuses, and its white is the web view's own (`DrawGround`), never CSS: a
   background on html stops a body's reaching the canvas. Convert Indentation has one refusal
   (`OpenDocument.WhyNotConverted`), a language's literals beyond its strings go in `Language.Literals`, Python's blocks
   through `Indentation.FirstBlockAtRisk`, `Language.BlockWords` and `Language.Continued`.
-- **Docking.** A kept layout records windows by `ToolWindowIds`, so a value never changes; one `Dock.Add` per window. A
+- **Docking.** A theme's default layout is the dock's default (`DockHost.UseDefault`/`Default`, `Themes.Layout`): what a
+  window with no kept layout opens on and what Restore Default Layout goes to, never laid over a kept layout. A window
+  closed off its stripe (`ToolWindow.IsClosed`, set only through `DockHost.SetOnStripe`: Close and the stripe's checklist, `DockHost.StripeMenu`; `ClosesOffStripe` governs only ×) is kept in the saved layout; the stripes and titled tabs list only
+  `OnStripes`. A stripe with no icon folds away, but not while a window of its places is off it (`ToolWindow.IsClosed`), so its checklist stays reachable, and shows while a tool window is dragged (`DockHost.Dragging`, fed by
+  `DragGesture.DraggingChanged`); drop places are measured on the editors and the open areas (`DockDrag.Target`), never the frame's quarters. A kept layout records windows by `ToolWindowIds`, so a value never changes; one `Dock.Add` per window. A
   view is built when first shown: what the IDE writes while it's hidden lives in a model, reached only through a
   property that builds the view for a person's action. A view letting go on `DetachedFromVisualTree` shows itself again
   on attach (a split rebuilds the frame).
-- **C#.** `CSharpService`, `CodeAssist`; each language's answers a `LanguageAssist` in `LanguageAssists`' one order. A
+- **C#.** `CSharpService`, `CodeAssist`; a check of Passenger's own on an open file derives from `OpenFileChecks` (an edit it keeps heard through `Edited`), a reformat ends through `CodeActions.Reformatted.Apply`/`Refused` (Reformat on save `CodeActions.ReformatOnSaveAsync`, after a language's own on-save formatter, never two on one file) (a read-only file refused through `Reformatted.ReadOnly`), a type's short name is `TypeNames.Short`; a C# name's characters are Roslyn's (`SyntaxFacts`; in the App `AssistContext.IsIdentifierChar`, `IsIdentifierStart`, `StartsName`; where Roslyn is not, Core's `CSharpNames`), never `char.IsLetterOrDigit` or a regex's `\w`, but a MAUI expression's names are MAUI's source generator's patterns (`MauiExpressionCode`); Passenger's own C# findings carry their fixes' data through `CSharpDocument.OwnOn<T>`, an app's settings files are named by `AppSettingsFiles` (Passenger.Workspace); a Rename box opens only through `CodeActions.AskRename`, a rename of edits Passenger placed itself finishes through `PlacedRename`, its refusals `Refusals.NotRenamed`; a refactoring's check of what it is asked (names, types, values, file names, namespaces, members chosen) is the extension's `RefactoringChecks`, compiled into Languages, which a dialog checks by, never a copy; completion ranks through `CompletionRanking` (how well an item fits from Roslyn's `MatchPriority` through the extension's `passenger/completion`, `CompletionPriorities` runs beside the items, ranked within a way of matching, `FuzzyMatch.LabelWay`); a C# list comes in two parts, what is in scope then the types of namespaces not imported (`CompletionParts`, `LaterCompletions`, the later part's sort texts after the first's by `CompletionOrder.Later`, a list waiting for it open with no row, `Completion.Coming`), and the popup is laid out ahead as the window opens (`CompletionPopup.LayOutAhead`) and held to the editor's width (`CompletionPopup.Within`), its rows ten places made once that it scrolls itself, never a virtualizing list, open from `Open`/`Made` whether its first rows have shown or not (a key's meaning reads `open`, never `IsVisible`), one still asked for let go by an Escape or the caret moved out of its name (`CodeCompletion.asking`, cancelling the language's `Asking()`), as every popup placed at a line is (`PopupPlacement.Place` through `IHeldToEditor.Within`: a card, the colour picker, closed from the layer it was placed in through `CodeAssist.PlaceAtLine`'s close) and a value card (`QuickInfo.PlaceValues`) (its order held equal to scoring
+  afresh by `CompletionRankingTests`) and reads an answer once (`CompletionAnswer`, list defaults by `WithDefaults`); a method chosen from completion is written at once, its brackets after the extension's `CompletionCall` answers, joined to the name's step of Undo; each language's answers a `LanguageAssist` in `LanguageAssists`' one order. A
   server's edit to a file written moments before waits for the server to read it (`WorkspaceEdits`); one written as it
   worked is refused. A generated document is never opened in the server (it would freeze its text into the compilation):
   its file (`RoslynSession.WrittenAsync`) or a read-only copy (`GeneratedCode`), asked about through
-  `RoslynSession.Unopened`. The server finds a partial member's callers only at its declaring half and callees only at
+  `RoslynSession.Unopened`; a generator's symbols reach `find_symbol` and Go to Symbol through `WorkspaceSymbols.Kept` and `NamedSymbol.Generated`, after the person's own, landing in its copy. Whether a place is in generated code is Roslyn's own check, asked through the extension
+  (`GeneratedCode.SetApartAsync`), never a file-name or comment rule of Passenger's. The server finds a partial member's callers only at its declaring half and callees only at
   its body half (`PartialHalf`). Its Go to Declaration leaves out a type's generated parts once the person wrote one
   (`GeneratedParts`); an extension's document handler refuses a file that's no C# document, a `.razor`, so a handler
   asked of any file is a workspace one. C# in XAML has one finder (`XamlService.UsesAsync`). A multi-targeted project's
-  framework is one choice (`TargetFrameworkChoices`), never a framework's output taken by its newest write. A C# file no
-  tab shows is pulled when shown or asked, never at a refresh. Edits added to a server's edit join that file's entry
-  (`TypeRename.With`): `documentChanges` apply in order. A server's own command runs through `ServerCommands`, its
-  `workspace/applyEdit` one command of Undo.
+  framework is one choice (`TargetFrameworkChoices`), never a framework's output taken by its newest write; the
+  solution-wide analysis pulls in it through the extension (`ChosenFrameworksHandler`), its reports kept by project:
+  Roslyn's own `workspace/diagnostic`, pulled only without the extension, analyses every framework and names no
+  project. A C# file no tab shows is pulled when shown or asked, never at a refresh. Edits added to a server's edit join
+  that file's entry (`TypeRename.With`): `documentChanges` apply in order. A whole-project read in the extension keeps each document's result through `DocumentReadsKept` (its text, parse options and the project's dependent semantic version), never the project's version alone, a reader binding only what its syntax and the compilation's references allow. A server's own command runs through
+  `ServerCommands`, its `workspace/applyEdit` one command of Undo; a code action's edit through
+  `CodeActions.ApplyEditAsync`, so a type it renames takes its files along as Rename's (`TypeRename.RenamedByAsync`).
 - **Godot code.** `GodotScenes`, `GodotSceneIndex` (never a walk of every file on the window's thread; an autoload by
   uid, never project.godot's text), the extension's `GodotChecks` and `GodotKinds` (the projects' strings only through
-  `GodotKinds.WritesAsync`). GDScript is Godot's parser and analyzer, ported (`GDScriptTree`, `GDScriptAnalyzer`); a
+  `GodotKinds.WritesAsync`); the open scenes', shaders' and scripts' checks are told together (`ProjectSession.GodotFilesChanged`). GDScript is Godot's parser and analyzer, ported (`GDScriptTree`, `GDScriptAnalyzer`), a name its tokenizer's rule (Unicode's XID tables as Godot reads them, `UnicodeIdentifiers.Starts`/`Continues` from `just unicode-identifiers`; a whole name `GDScriptTokenizer.IsIdentifier`; never `WordCharacters` or `char.IsLetterOrDigit`), a light read of a script's comments, strings, words and calls `GDScriptScan`; a
   newer Godot's warning or error is gated on `GodotEngineApi.Version`; an error is said only where the class is read
   whole and both types are sure (`GDScriptAnalyzer.Knows`, `Sure`); a GDScript session starts no Godot editor, its
   headless one only when asked (`WebLanguages.AskGodot`; a test of Godot's own server opens with
   `MainWindow.GodotHeadlessAtOpen`); a function's argument count only `GodotScriptDeclared.Takes`; what stands before a dot only
   `GDScriptAnalysis.ValueBefore`, never `NodeAt(dot - 1)`; `GDScriptFormatter`
   refuses unless `Differs` finds the same tokens, comments and tree, and Reformat Code never runs `OrderParts`. Godot's
-  generator assigns every field in generated code, so a field's values come from the code's own documents. Edits placed
+  generator assigns every field in generated code, so a field's values come from the code's own documents. Every move in a Godot project (the Explorer's, a rename's, a code action's) follows only through `CSharpAssist.GodotFollowAsync` in its command: texts, `.uid`/`.import`, binary scenes and resources (`GodotScenes.MovedBinary`) and Godot's uid cache (`GodotUids.CacheMoved`), as Godot loads a known uid's cached path without checking it is there. A copy in a Godot project is left as Godot's Duplicate leaves it, new uids and copies repointed (`CSharpAssist.GodotCopiedAsync`, `GodotUids.Copied`), never a second reader of .uid files; a binary scene's or resource's uid and external resources are read and written only through `GodotBinaryResource` (formats 1–6, RSCC through .NET's own Zstandard). Edits placed
   in text Passenger read carry that text (`PlacedEdits`), checked before anything is written. A GDScript refactoring
   moving code asks `GDScriptEffects`: a call's arguments run before what it is called on, and an object's script
   variable with no getter is read only as what takes it runs. Text typed for a scene is checked by `GodotVariantText`
   and `GodotVariantBounds`, never `GodotFile`, which keeps what it doesn't know; values kept together go through
   `GodotKeeping`. Shader marks are Passenger's port of Godot's front end (`GodotShaderChecker`). The person's Godot
   editor is asked through IDE messaging (`GodotIdeLink`), never Passenger's headless editors.
-- **Web languages.** `WebLanguages`: one Node.js server per kind but GDScript's (Godot's editor over TCP, one per Godot
-  project: `ServerPlace`), every per-kind switch naming each kind; `JsonSchemas` and `PageStylesheets` reach the web
+- **Web languages.** A web server's rename keeps a stylesheet name's sigil (`CodeActions.SigilOf`). `WebLanguages`: one Node.js server per kind but GDScript's (Godot's editor over TCP, one per Godot
+  project: `ServerPlace`), every per-kind switch naming each kind; a schema's file is read only through `JsonSchemas.ContentAsync` (`FoundPaths.OfFileAddress`), the JSON server fetching none itself, the YAML server's reads handed to it by Passenger's preload (`module.registerHooks`, Node.js 22.15+/23.5+, `NodeServer.PreloadNeeds`); `JsonSchemas` and `PageStylesheets` reach the web
   only while Settings allows; a page's `<base href>` says nothing of the app's mount, so a link is the browser's address
   first, `LinkedSheet.Mounted` second; in a macOS bundle the servers live under `Contents/Resources/web`. One tsserver,
-  never `useSyntaxServer` (it answers rename and usages from the open files alone); `typescript` stays on 6.x (7 carries
+  always named its tsserver.js (`WebLanguages.OwnTsserver`), never `useSyntaxServer` (it answers rename and usages from the open files alone); `typescript` stays on 6.x (7 carries
   no `tsserver`); typescript-language-server keeps a file's first `formattingOptions`, so each open file tells tsserver
   its indent. what an HTML server holds of Razor's files changes only in a send's turn (`RazorHtmlCopies`); the SDK
   writes no scoped CSS bundle once a project has no sheet left. Razor forwards `_vs_onAutoInsert` to the client's HTML
   only for `=`: its `>` is Razor's own answer, its `</` closed over its HTML.
-- **Build and run.** `BuildRunController`, every console through `ConsoleSink.PumpAsync`, `LaunchPlan` (one resolution
+- **Build and run.** The build configuration and platform are one choice (`BuildConfigurationChoices`, `WorkspaceModel.Build`):
+  an MSBuild question of a project goes through `MSBuildQuestions.AskAsync` (a target run `MSBuildQuestions.Command`) (its answer `MSBuildAnswer`, a JSON object among other lines `JsonMembers.ObjectIn`), never a `-getProperty` of one's own, and a framework's platform is `FrameworkNames.PlatformOf`;
+  command lines take it through `WorkspaceModel.BuildArgumentsFor` (a publish building as the folder builds through `PublishArgumentsFor`), evaluations through `ProjectModels.Properties`/`Each`, a project's build told what the solution maps its references to where one would take another from its referrer (`BuildChoice.ToldOf`, MSBuild's CurrentSolutionConfigurationContents), projects built together each with its own and one told list (`WorkspaceModel.BuiltTogetherWith`), and the default a choice wherever it maps a project otherwise than Debug|AnyCPU (`BuildConfigurations.MapsAsGivenNone`);
+  never a `-c` written anywhere else; a kept choice is dropped only once the workspace read has projects each evaluated (`BuildConfigurationChoices.ReadAsync`); what reads the projects right after a write takes them as written (`ProjectSession.ProjectsAsWrittenAsync`, in every MCP tool's `OnUi`, every start's `ResolvePlanAsync` and a person's Build; a solution written read again by `WorkspaceModel.ReadFrom`'s stamp), never the model as the watcher last heard it; a run configuration's own is read only through `ProjectSession.WorkspaceOfAsync`, the plan's `LaunchPlan.Workspace` carrying it to its build, dotnet watch and device install, never `session.Workspace` in a start's path. A Node package's script runs by its own package manager through `ScriptRuns` (whether it runs a script's pre and post scripts `NodeProjects.RunsHooks`) (never npm for a pnpm, Yarn or Bun package), packages read by `NodeProjects` from the files the index lists (`NodeFiles`), never a walk of their own. Godot runs only a game's Debug build (`GodotLaunch.RunsConfiguration`); a new C# game targets the newest .NET its Godot's editor builds and runs, started through Passenger and on its own (`GodotEditorDotnet.TargetsOf`, `GodotGames.Default`), never Passenger's own, and an export Godot would build none of is refused as its dialog opens (`GodotExportPlan.BuildsOf`).
+  `BuildRunController` (the Build window's builds keep MSBuild's nodes their own off Windows, `ProcessRunner`'s builds, which Stop kills with what they run, `ChildProcesses.KillLeft`), every console through `ConsoleSink.PumpAsync`, `LaunchPlan` (one resolution
   for Run, Debug, Profile, Hot Reload and a debugged test host), `UpToDate`; a Passenger it launches keeps its state in
   `sandbox/`; `PASSENGER_DOTNET_RELEASES` is dead in tests. Godot: `GodotLaunch`, `GodotGame`; the Game window is an
   owned window, never a child; a GDScript-only game is never in `Projects`; export templates only from a `.tpz` the
-  person picks. On Windows a build first lets go of the Avalonia previewers holding its output.
+  person picks. On Windows a build first lets go of the Avalonia previewers holding its output. A solution's build gives
+  each project the configuration and platform it maps it to (bin/x64/…), a project's own build neither: what reads the
+  solution build's output is evaluated with them (the host's `SolutionBuild`, `WorkspaceModel.BuiltSolution`). A
+  solution's multi-project launch profiles live only in Visual Studio's `.slnLaunch`/`.slnLaunch.user` beside it
+  (`SolutionLaunch`, written as text where each stands), each project started as its own configuration
+  (`RunConfigurations.ProjectOf`). Whether this machine builds Android apps is `AndroidHosts` (Linux on any processor but x64 builds none; an installed pack's aapt2 answers for itself); a workload install's downloads and words go through `WorkloadInstalls`, every install, Install Workloads' and New Project's, through `MainWindow.InstallWorkloadsAsync`, and New Project offers a workload only where `AndroidHosts` builds it (`TemplatePack.Unbuilt`). What a mobile project needs is asked of its own workloads (`MobileQuestions`, said by `MobileBanner`; every mobile head's edits for its SDK `MobileHeads`, made by Make the Mobile Edits, a Catalyst Debug build's trimming by Keep .NET's Assemblies Whole in Debug, offered where its run finds it, Info.plist read and written only through `AppManifests`; an Apple project's simulator runtimes of the workload's own Xcode's `simctl`), and a workload
+  installed reloads every project (`ProjectHosts.EndUnderAsync`, `ProjectModels.EvaluateAll`). An app on a device is a `LaunchPlan.Device` (`DeviceLaunches`; the inspector and relay put in `files/.passenger` by `PutInspectorAsync`/`PutRelayAsync`, never over the app's own assemblies, reached through `adb forward`, the steps after the files are in each running to its end, a stop taken between them, `DeviceLaunches.PutInAsync`; each start held from its first step there by `ProjectSession.StartsOnDevice` (`DeviceStart`), its end handed over through `DeviceStart.EndsWith`, never left to a session's end event, Stop and Passenger's end waiting for it, `EndedOnDevicesAsync`, `DeviceLaunches.EndLimit`, a signal's end too, `DeviceStart.EveryOut`; a stopped start never runs its program; every start first takes out what an earlier end left, `AndroidApp.TakeOutLeft`, and the build's environment goes back once the relay says hello, `DeviceStart.Started`), where a project runs one answer (`DeviceChoices.InForce`), an iOS simulator's app a `SimulatorApp` (`AppleSimulators`: the workload's `ComputeAvailableDevices` and `_ReadAppManifest`, its Xcode's simctl; its process found by its start's token, `AppProcess`; the relay, inspector and hook copied into its data container's `tmp/passenger` for each start and taken out at its end (`SimulatorApp.Carried`; a simulator's app can't read a folder macOS keeps private, Documents or Desktop) and named through simctl's `SIMCTL_CHILD_` variables, the relay and inspector on loopback ports; a simulator a folder booted shut down at its end, `ProjectSession.Booted`, and by the watchdog however Passenger ends, `AppleSimulators.Booting`; Simulator.app never opened; devices through `IDeviceApp`), a Mac Catalyst head this machine on a Mac (the system opens it through `MacCatalystApps.Opener`, `-g -j` where nobody sees it, skipping the windows it would reopen, `MacCatalystApps.IgnoringKeptWindows`, as an app ended while reopening them next asks, hidden, and connects no scene until answered, found by its start's own token (`AppProcess`, `PASSENGER_APP_START`, read back through `DotnetProcesses.VariableOf`) and that process kept and ended with its run, never looked up again by its program, its opener's FIFOs in `MacCatalystApp.Pipes`; its DBI and DAC load only into a Catalyst process, so a debugger reaches it only through the relay, which listens at a path, PASSENGER_DEBUG_SOCKET, in a folder of each start in its sandbox container's tmp, `MacCatalystApp.Carried`, `CarriedIn` (each level it makes 0700, as `Directory.CreateDirectory`'s mode reaches only the last), where the default diagnostic socket name is cut short; its template's Debug build trims and ReadyToRun-compiles the framework, so a startup hook can't load and Passenger, never changing a build, says so), Run with Hot Reload there attaching quietly through the relay (`DebugController.AttachForHotReloadThroughRelayAsync`), never dotnet watch; a generated run configuration runs in the terminal where its project, or one it references, draws with a terminal package (`ProjectModel.DrawsWith`, `RunConfiguration.DrawingPackage`), and a program's need of one is read from what .NET writes of its exception (`TerminalNeeds`, `BuildRunController.HearNeeds`; at a debugger's stop `TerminalNeeds.Thrown`, a profiled run's console `HearProfiled`, the Debugger tab and Profiler showing a console's offer through `OutputView.OfferChanged`), never its source, Run or Debug in the Terminal setting Use external console through `RunConfigurations.UseConsole`; a launch profile naming one platform belongs to it (`DeviceTargets.TiedTo`), taken by the project's configuration where that platform is the target, never a configuration of its own;
+  Android's only through the workload's `ComputeAvailableDevices`, `DeployToDevice` and `ComputeRunArguments`, adb through
+  `ChildProcesses`.
 - **Runs of services.** `ServiceRun` is the one model: Debug, Attach, Restart and Profile written once; one start at a
   time; Stop ends every session and recording before the programs go.
-- **Containers.** The person's `docker` CLI and context only, never the Engine API or a Docker package; a service's name
+- **Containers.** A published port takes connections from the container's start, before its program listens, so a
+  container's page opens on an HTTP answer (`BrowserLaunch.AnsweringAsync`), never a connection. A shared project (.shproj) is never evaluated or loaded: its files are its `.projitems`' items read as text (`SharedProjects`), an importer's items from it marked `EvaluatedItem.Shared`, its `.projitems` edited only through `SharedProjects` (`WithAdded`, `WithRemoved`, `WithExcluded`: a wildcard's file gets no item, a list keeps its other names) and moves in any project file through `ProjectEdits.MoveItems` (a list's name followed, one a wildcard of its type takes dropped), and the Explorer writes into it through `MainWindow.SharedProjects` (`IntoShared`, `OutOfShared`, `FollowMoved`); an importer takes or drops it through `ProjectEdits.AddSharedImport`/`RemoveSharedImport`, and a test project's code includes what it compiles from elsewhere (`TestFinder.Elsewhere`). A .dcproj written is followed by the watcher (`ComposeProjectsWritten`), never a re-read of the solution. A .dcproj is MSBuild's
+  file in the editor but never evaluated (its SDK is Visual Studio's); its properties are read as text (`ComposeProjectFile`). Its Solution-view files come from that text
+  (`ContainerConfigurations.ItemsOf`), never its folder. A compose service's project is the person's choice, else Visual
+  Studio's project-name label, else what its Dockerfile builds with the build's arguments filled in
+  (`DockerfileStages.Expanded`). A run Detach let go of (`ContainerRun.LetGo`) is the folder's: Stop
+  passes it over, and leaving the folder asks whether to stop its containers or leave them running, those left the
+  person's from then on (`containers.json`'s `Left`, written before the quit carries on, `ContainerLabels.LeaveToPersonAsync`, merged as a set, passed over by the clean-up); a Passenger nobody sees never asks.
+  The person's `docker` CLI and context only, never the Engine API or a Docker package (how it runs x86-64 images, `EngineEmulation`, reads Docker Desktop's Rosetta choice from its own settings file, the one file of Docker's Passenger reads); a service's name
   always after `--`; Compose's own model is the plan, Passenger's override in the state; downloaded tools
   SHA256-checked; Podman both ways. A container publish (`-t:PublishContainer`; several platforms need
   `RuntimeIdentifiers` too, NETSDK1047 otherwise, and containerd's image store) is judged by the SDK's "Pushed image"
@@ -311,36 +389,51 @@ Projects in `src/`; `find_symbol` finds the rest from the names here. A pointer'
   on localhost; a push takes the logins the SDK reads (`RegistryLogins`, server names only), refused only on the
   registry's own 401 (`AsksForLoginAsync`). Vulnerabilities only when
   asked: without the plugin docker answers `scout … --format` with "unknown flag", so find it by `docker scout version`.
-- **Aspire.** `AspireController` checks bearer tokens first; deploy logins are read from each tool's files, never by
+  docker exec's end ends nothing it started, only closing its standard input; a container's first process takes no
+  SIGKILL from inside it, so Stop lets one attached to go (`ManagedDebugger.Unending`).
+- **Aspire.** DCP always dials `localhost:{port}`, so the execution server holds both loopbacks; a launch's code-loading variables are judged only through `LoadingVariables`. `AspireController` checks bearer tokens first; a resource's state is read only through `AspireStates` (`HasEnded`, `IsStopped`, `IsBetween`, `IsFailed`), the protocol's run modes `AspireRunModes`; a Functions app, its own or an AppHost's, runs through `func start`, the debugger attached to the worker func starts (`FunctionsHost`; Debug through `DebugController.StartThroughAsync`, func ending with its session, `DebugTab.FollowedStarts`); func's host restarts a held worker every 60 s, so one no debugger reaches is never let go and func is started again unheld (`AspireController.UnheldFunctionsAsync`; `DebugController.RefuseNextAttach` in tests); deploy logins are read from each tool's files, never by
   running a cloud CLI; metrics only while shown. MetricsEventSource's CollectionStart and Stop reach TraceEvent as
   `Collection/Start` and `Collection/Stop`, and a histogram's count is the interval's.
 - **Web apps' data.** The Requests window reads only while someone looks; Migrations takes connection strings by
-  environment only; Endpoints sends nothing but on Test or Send, and a send taking the person's environment asks first.
+  environment only, and runs dotnet ef in the environment `MigrationsController.EnvironmentOf` decides (the window's choice per startup project, `EfEnvironmentChoices`, else the run configuration's), given as ASPNETCORE_ENVIRONMENT and DOTNET_ENVIRONMENT, never `--environment`; Endpoints sends nothing but on Test or Send, and a send taking the person's environment asks first.
   An app's OpenAPI document is asked only at its origin (`OpenApiAddresses`), and what's made from one with no app asked
   comes from `AppDocuments`, never a process-wide cache. `ResourceFiles` is the one reader and writer of `.resx` and
-  `xlf/*.xlf`, a table's change one edit of the open text.
-- **Debugging.** `DebugController`, `DebugSession`; Variables and the hover card are one list. A row's expression is the
-  debugger's `evaluateName`, never built in the window. A library's types are shown as the App tells the debugger at
-  launch (`DapTypePresentation`), never by engine code naming a library. An exception is read from what it stores, a
-  getter or `ToString` only where that can't be. An HTTPS page's dev certificate is only read, never made or trusted.
-  Every breakpoint through one pipeline (`IHitBreakpoint`).
+  `xlf/*.xlf`, a table's change one edit of the open text. A configuration read is checked against the programs running
+  its code (`ProjectSession.ConfiguredCodeOf`, `ProjectModel.ProgramsRunning`), never its own library's folder, checked again as evaluations change what configures it (`ProjectSession.OnEvaluated`).
+- **Debugging.** `DebugController`, `DebugSession`; Variables and the hover card are one list, a hover evaluating only
+  inside the stopped frame's method (`MethodBounds`). A row's expression is the debugger's `evaluateName`, never built
+  in the window. A frame is named only through `FrameNames` (a lambda or local function by the method it is written in, never the compiler's name); an exception's StackTrace as the runtime writes it. A library's types are shown as the App tells the debugger at launch (`DapTypePresentation`), never by
+  engine code naming a library. An exception is read from what it stores, a getter or `ToString` only where that can't
+  be. An HTTPS page's dev certificate is only read, never made or trusted. Every breakpoint of every debugger through one pipeline and one reconcile (`BreakpointHits`, Passenger.Dap): a hit counts only where its condition held; the in-process adapters share `InProcessAdapter`; Run to Cursor holds a breakpoint (`DapSourceBreakpoint.RunTo`), never edits it. A tracepoint's message and a [DebuggerDisplay] are read only through `DisplayFormat` (`\{` a brace; a `{{` or `}}` refused, `Misread`), each value shown by its specifiers only through `DisplayFormat.Shown`, a debugger telling what it read as a `DisplayValue`. .NET's browser debug proxy drops a breakpoint's condition as the page loads (`BreakpointRequest.Clone`), so the WebAssembly adapter sends none and reads conditions itself. A program attached to in a container maps its paths by its Compose labels' Dockerfile
+  (`ContainerReach.PathsAsync`), else back by the engine's own match (`SourcePaths.FileOf`).
+- **BDD (Reqnroll, SpecFlow).** A .feature file is read only through `FeatureReading` (Cucumber's Gherkin package, in its
+  project's language, `FeatureLanguage`, a `# language:` line through `GherkinDialects.ReqnrollProvider`, as Reqnroll's reader takes a region Gherkin lacks; a scenario is an outline wherever it has examples, whatever its keyword, as Reqnroll's parser builds it; what Reqnroll's code-behind generator refuses is `GeneratorChecks`, marked only where Gherkin's reader finds no mistake; a file the reader finds no feature in is one mistake, `FeatureError.NoFeature`, worded by `ReqnrollConfig.NoFeatureWhy`, a load problem naming a feature through `FeatureLoadProblems`, the host naming the project's own file in a design-time build's message, `DesignTimeBuilds.Placed`) and its steps matched only through `StepMatcher` (Reqnroll's own rules, ported:
+  keep them its); a run's step outcomes come only from the step trace in each test's output (`StepTrace`), an outline's row by `ExampleRows.RowOf` (pickle index first), held by `StepRuns`, the gutter and `tests_run` both through `MainWindow.FeatureRunsAsync`, an agent's feature diagnostics waiting for the bindings' read (`PassengerTools.FeatureMatchedAsync`)); a step argument converted only through `StepConversions` (Reqnroll's converter, ported, held to its 3.3.4 verdicts) in `ReqnrollConfig.BindingCultureOf` (the binding culture, else the file's `# language:` line's, else the project's feature language as written, else en-US, as Reqnroll's runtime takes it) and a table's columns through `TableColumns`, a step refused for an argument alone bound as Reqnroll binds it (`StepMatch.Refused`); the Step Library lists `StepCatalog` through `StepLibrary`, counting uses through `StepUses` only while shown, and writes a phrase through completion's own `GherkinAssist.WriteStep`; bindings come from the extension's `StepBindings` with no build, never reflection, cached in
+  `StepCatalog`, unknown (no undefined mark) until read; an open feature's marks and colours come from `FeatureChecks`,
+  its commands from `GherkinAssist`; a scenario's test is at its feature line by its code-behind's `#line`
+  (`DeclaredTest.Written`, `TestNode.Places`), never the runner's line for mapped code.
 - **Tests window.** `TestFinder`; tests are keyed by themselves (`TestItem.ById`), never a key string per test;
-  `VsTestRunner` is the only file that knows VSTest's object model (VSTest starts a debugged .NET test host itself and
+  a runner's failure stack goes through `FailureStacks.Once` (NUnit's adapter repeats each stack after its number); `VsTestRunner` is the only file that knows VSTest's object model (VSTest starts a debugged .NET test host itself and
   asks to attach: `LaunchTestHost` is never called for one); the person's `GODOT_BIN` wins; GUT's tests are chosen by
   `GutRuns.Hook`, never `-gunit_test_name` or `-ginner_class`, which take substrings; what a read depends on is taken
   inside `TestFinder.ReadFile`'s parse, never captured by a listing. A case named in place of its method is a row from
   its source (`TestItem.NamedCase`), never by `NUnit.ClassName`, the declaring type; the Testing Platform's VSTest
   bridge says no file or line unless run settings ask (`TestingPlatformRunner.SourcesAsked`); run settings reach a
-  Testing Platform host through `PlatformRunSettings`, never `--settings`.
-- **The rest.** `Packages` is every package change's one path (one command of Undo, put back when it fails; credentials
-  only to their feed's host); `SolutionEdits`/`ProjectEdits` change files as text, never `dotnet sln`/`add reference`;
-  templates drive what is offered, Passenger's config only layered on (`ProjectTemplates`); only an installed copy
-  updates itself, a package manager's left to it; What's New from `docs/release-notes/X.Y.Z.md`.
-- **MCP.** `PassengerTools` (every tool on the UI thread), `McpHost`, `McpProxy`, `AgentConnection`. A relay follows an
+  Testing Platform host through `PlatformRunSettings`, never `--settings`. VSTest ends a discovery at the first assembly
+  whose test host cannot start, so each it did not look through whole is asked again alone; an assembly a runner could
+  not look through is an `UnfoundTests`, said wherever its tests are missed.
+- **The rest.** a version's deprecation comes from its registration, read only through `FolderPackages.DeprecationsAsync` (`DeprecationsReadAsync` where the sources may be unread), only when asked; a project's transitive packages come from its assets file (`RestoredVersions.Transitive`, `FolderPackages.TransitiveAsync`), never a restore, kept for each framework not referencing the package (`NuGetView.Brought`), and no version is offered to put in while the audit is out (`FolderPackages.IsAuditing`); `Packages` is every package change's one path (one command of Undo and one Local History set named as it, over its own files alone, `LocalHistory.Over`, never `During`, as a restore writes them for a while; put back when it fails; credentials
+  only to the host they were stored for, by URL, never name, `FeedCredentialHosts`); under central package management Passenger writes each version where the evaluation keeps
+  it (`CentralWrites`), never dotnet add package, which drops a props file's blank lines and turns a property to a literal;
+  EF Core's own packages move as one set, another maker's provider only when asked (`MigrationsController.UpdateAsync`);
+  `SolutionEdits`/`ProjectEdits` change files as text, never `dotnet sln`/`add reference`;
+  templates drive what is offered, Passenger's config only layered on (`ProjectTemplates`; whether a template is offered a service's set-ups is `NewProjectDialog.NotAService`, by its tags then what its projects build, `TemplateVariant.OutputType`, never its name); updates are checked and downloaded once, by the watching window, and said in every window (`MainWindow.UpdatesOwner`); a Mac update's disk image is downloaded and opened only in `DiskImageUpdater.ImageFolder` on the startup disk, never the state folder; an update put in place as Passenger ends goes through `InPlaceUpdater.Install` (macOS, Linux; each system's own steps only, two renames where a volume can't swap folders `InTwoRenames`; Windows' Update.exe hand-off is `VelopackUpdater`'s), one held back said through `Updater.HeldBack`; a Linux install for everyone takes an update only through install.sh's `--archive FILE --sha256 SUM`, staged where only the person writes; only an installed copy
+  updates itself, a package manager's left to it; What's New from `docs/release-notes/X.Y.Z.md`, a security release's notes carrying `<!-- Security release -->`, read only through `ReleaseNotes.SecurityOf`.
+- **MCP.** `PassengerTools` (every tool on the UI thread), `McpHost`, `McpProxy`, `AgentConnection`. An agent's call after a quiet spell looks again for what the system dropped, as a window coming in front does (`MainWindow.AgentCalling`, the server's watchers too, `ServerWatches.LookAgainAsync`); a test makes a change no watcher hears through `PASSENGER_UNHEARD` (`WatchedTree.UnheardVariable`). A launching tool picks its configuration through `Choosing`, which puts the window's choice back where the launch is refused. A tool that changes files answers once its saves landed and its moves are in Git's index (`SaveLandedAsync`, `VcsController.MovesIndexed`); a theme an agent names is taken as the picker takes one (`ThemeListing.TakeAsync`). An agent's rename, refactor and code action name their Local History change set (`MainWindow.NameAgentsChange`). A relay follows an
   update or, on Windows, ends, signalling the relay alone, never its agent's process group; `godot_editor` makes each
   change one `EditorUndoRedoManager` action.
 
-Releases and the site: `ci.yml` and `release.yml` (from a `vX.Y.Z` tag, its body `docs/release-notes/X.Y.Z.md`, refused
+A security report is handled by `SECURITY.md`'s steps in its private advisory, never a public issue. Releases and the site: `ci.yml` and `release.yml` (from a `vX.Y.Z` tag, its body `docs/release-notes/X.Y.Z.md`, refused
 while it is the stand-in) call `test.yml`: the gate on every system in two shards, and for CI the report lane too.
 `site/` is passenger-ide.net, plain HTML and CSS loading only its own files (CSP 'self'), deployed by the owner by hand:
 each page has its own title, description, canonical, Open Graph tags and `sitemap.xml` entry, a changed share card takes
@@ -357,25 +450,48 @@ a new name, and `just site-shots` retakes its images.
   writes a Razor component as `X_razor.g.cs` and `X_razor.decl.g.cs` (`@code`; read both, `SymbolNames.HintsOf`),
   restores after its load batch ends (a failed restore is said as heard), takes a project's assets as seen at load (a
   given build reading what changed since loads it again, `ProjectGiven.Stale`), streams a pull's results as named
-  `$/progress`, and registers its watches as one brace of `**/` choices (`FileWatch` matches each alone).
+  `$/progress`, and registers its watches as one brace of `**/` choices (`FileWatch` matches each alone), every watch
+  under a folder it watches with subfolders folded into that folder's one (`ServerWatches` walks it for each project's
+  build output).
 - **Roslyn's server makes a C# file opened before its project loads a Miscellaneous File** (with no SDK, of no
   references), so a loading project's files open only once it loaded, a file come since once a load that read it ended
-  (`CSharpService.Arrivals`); references come from `CSharpService.ProjectsNow`, never the start-time `workspace`. A
-  reload sent while it loads is one more load to wait for: its word that a load ended names none. A server ending during
-  its start is started again, and StreamJsonRpc drops a faulted answer (`LanguageServer.IsDroppedAnswer`).
+  (`CSharpService.Arrivals`), and an agent's code tool waits for every one its file's project and references hold
+  (`SeenFrom`), and through a first restore, the load after it of each project it restored, however many batches of others end first (`RestoredStillToLoad`; a solution's restore, naming none, the batch after it), and its generators' rerun (`CSharpService.AwaitsRestore`, `ReloadingRestored`), never its own alone, the server asking for a project's builds a load under way until given (`LanguageServer.ProjectAsked`), and a wait run out refusing saying what it waited for (`Refusals.StillLoading`, `StillComing`), never answering as of the load before, a restore the server never loads again let go for good (`CSharpService.LetGoOfQuietRestores`); a project the IDE asked the server to load again (`CSharpService.Reload`, files written in the last 2 s evaluated first, `ProjectModels.ReadWrittenNowAsync`) is waited for as an arrival keyed by its project file; references come from `CSharpService.ProjectsNow`, never the start-time `workspace`.
+  A reload sent while it loads is one more load to wait for: its word that a load ended names none. A server ending
+  during its start is started again, and StreamJsonRpc drops a faulted answer (`LanguageServer.IsDroppedAnswer`).
+- **Roslyn's server loads with half the processors** (one on a three-core Mac), so a load asked for while one of the same project runs comes after it in the same batch: a restored project's load report precedes its batch's end, which alone starts the generators' wait (`CSharpService.ReloadingRestored` holds until then).
+- **Roslyn's server takes nothing of a load that met an error** ("Error while loading", `ProjectLoadProblem.FailedLoad`,
+  never a restore's, `Restoring`) and restores only what it loaded: a file come under such a project is in none until a
+  load of it succeeds, so nothing waits for it (`Arrival.Decided`) or for the project's restore (`RestoresNone`).
 - **Roslyn's server takes file watching all or nothing**: offered it, it watches nothing itself. A deleted file reaches
   it only once its projects loaded again without it (`ProjectMethods.Deleted`): told first, it reads the missing file, a
-  second each, before any answer needing the compilation (dotnet/roslyn#86236).
+  second each, before any answer needing the compilation (dotnet/roslyn#86236). A reload adds new files before it drops
+  those gone, and the solution finds a path's documents ignoring case: a file renamed in letter case alone loads first
+  without it (`Recased`), and a document found by path through `SyntaxReads.DocumentIdsOf`, which checks it with `PathNames.Same`.
+- **Roslyn's server reruns a project's generators 1.5 s after a load changes its analyzers**, answering for their code as
+  made before until then: whether the queued runs have run is asked of the extension (`RoslynSession.GeneratorsRunAsync`; a load takes a design-time build's documents by their paths, keeping what it read of one the build wrote again, the generated .editorconfig a generator reads and the global usings, until it hears of it, so that answer names those of each project's intermediate output folder it holds otherwise than the disk, waited for until none, `CSharpService.GeneratorsReadAsync`),
+  never read from a diagnostics refresh, which comes 2 s after a batch's first change and so may be of changes before the
+  load. A server taken up from the head start is ready only once what it said before then has landed on the window's
+  thread (`CSharpService.Heard`). It reruns every project's generators a second after its projects load and for each 5 s batch of
+  `.dll` changes under .NET's packs folders, which moves every project's version, then says its diagnostics may have changed (`LanguageServer.RefreshedNote` in its log, from the server's start where an `--mcp` lsp.log begins only with the window's settings), bringing no pull of a file no tab shows: solution-wide analysis drops a pull
+  under way at the server's diagnostic refresh (`CSharpService.SolutionMoved`), and its first round ends at the
+  extension's word that it analysed everything, never at the answer (so a test holding an answer holds no round: it holds the pull unsent). A change under such a `**/*.dll` watch reaches the server only for a
+  file a project references (`WatchedFiles.ReferencedAsync`, the extension's `ReferencedFiles`).
+- **`LanguageServer.Changes` moves only for what changes the server's answers**: a request that changes them counts itself (`AnswersMoved`), a read never does; and `lsp.log` is written up to 250 ms late, so a test counting its lines first waits for a later request to show there.
 - **Roslyn's server keeps what it first read of a reference**, a failed read too, and waits 5 s after a change:
   references go through `ReferencesOnDisk` (the extension), a build's end through `CSharpService.Built`, which moves
   `LanguageServer.Changes` itself (`AnswersMoved`).
+- **Roslyn's server begins a completion item's sort text with its place in four digits**: past 10,000 items the extension widens them (`CompletionOrder`), which a `.razor` list, asked through `textDocument/completion`, doesn't get.
+- **Roslyn's server cuts a completion list at 1,000 items and marks it incomplete** (`dotnet_lsp_max_completion_list_size`,
+  never asked through `workspace/configuration`): Passenger's extension sets it uncut (`WholeCompletionLists`), so a name
+  asks once and each key narrows here; without the extension every key asks again.
 - **Roslyn's server passes over an option answered empty**, so an option goes back to its default only as the default's
   value (`CSharpService.OwnScope`), never null; a running server can't take an option left out.
 - **Roslyn's server writes its MEF caches beside its DLLs**, so in a macOS bundle (a file added breaks the seal, #450)
   or a read-only folder it runs from a copy in `cache/roslyn/` (`RoslynServerFolder`); nothing a Passenger runs may
-  write inside the app.
-- **The debugger's engine.** `EngineLock` is not re-entrant; a read of the stop waits behind continue, steps, pause and
-  disconnect. Never leave `_stepper` set but inactive (async stepping reads it as a queued StepComplete). Abort an
+  write inside the app. On Linux its TMPDIR is the person's own (`RoslynServerFolder.Temporary`).
+- **The debugger's engine.** The runtime's `DebuggerError` ends a session: its process answers nothing after it, so a launched program is ended and nothing more is asked of it (`ManagedDebugger.HandleDebuggerError`, `TerminatedEvent.Failure`; `PASSENGER_ENGINE_FAIL_AT_MODULE` holds it in a test). `EngineLock` is not re-entrant; a read of the stop waits behind continue, steps, pause and
+  disconnect. Never leave `_stepper` set but inactive (async stepping reads it as a queued StepComplete). Under load the runtime may hand a stepping thread's breakpoints over only after it ran on past them, in one batch with its step's end: an async step's own breakpoint is told by the breakpoint, never by where its thread stands (`PASSENGER_ENGINE_LATE_YIELD` holds it so in a test). Abort an
   evaluation past its time only where the abort takes, never rudely (one left pending fires later inside a lock, #238).
   Before letting a program go, run it off patch and step stops (CET would fault it) and wait out abandoned evaluations.
   Never decompile under the lock. Returned partway through a statement, a frame's IL offset reads as its start: seek the
@@ -390,9 +506,18 @@ a new name, and `just site-shots` retakes its images.
   Letting threads run voids every value read before, so an evaluation left
   running returns first (`LetAbandonedReturnAsync`), holding the program at the stop shown: never Continue there. One left
   is held with the rest (`process.Stop(0)`) until the person goes on, so "still running N s later" says nothing of how
-  long it ran.
+  long it ran. ICorDebug walks code marked [DebuggerHidden] with [StackTraceHidden] (compiled code's helpers, a program's
+  own; from .NET 11 the exception dispatch and entry-point call too), which the stack leaves out on every runtime: a
+  stop's frames and top come from `EnumerateFramesForThread` and `TopFrame`, never a chain's own, and
+  `thread.ActiveFrame` may be hidden code (#1503). Without Just My Code the runtime's stepper loses a frame's return into
+  native code (a static constructor, .NET 11's CallClassConstructor): its step goes out of the hidden frame above the
+  next shown one, which guards its other steps (`AboveShownCaller`, #1511).
 - **Hot Reload**: the server's `EditAndContinueService` from the extension; update handlers through Passenger's hook
-  (`UpdateHandlerHook`), never the runtime's agent, which refuses under a debugger. CoreCLR lets no debugger go once
+  (`UpdateHandlerHook`), never the runtime's agent, which refuses under a debugger; the hook connects by the system's
+  socket calls, never .NET's Socket (whose first use starts a thread of .NET's on macOS and Linux), and makes its own
+  calls of reading and answering before Main (the program's handlers are first found and called at the first update),
+  so a stop between updates finds its thread blocked in recv: a thread caught partway through a first use may hold a
+  stop's evaluations (#1495). Hot Reload applies only to a program built as the language server reads the code, the folder's configuration (`HotReload.Builds`, `WorkspaceModel.BuiltUnlike`); a run built as another is refused, saying why. CoreCLR lets no debugger go once
   Edit and Continue changed a program, so neither does Passenger (`DebugController.LetsNoDebuggerGo`: Detach refused, a
   service restarted, leaving the folder asks). A build's edits are kept for each program it starts later; a session
   takes edits only for its loaded modules' projects; `StaleCallers` blocks an update leaving loaded code calling a
@@ -403,34 +528,37 @@ a new name, and `just site-shots` retakes its images.
   app's own stay); C#'s bookkeeping follows `HotReloadOutcome.Code`; a file of an app's source places is told by
   `XamlPlaces.FileOf`, never by name; WPF's `x:Name` fields are found through `IComponentConnector` (its
   `SuppressMessage` is compiled out); an app keeps its build's XAML, so a closed file written on disk reaches it. dotnet
-  watch replaces its app's `DOTNET_STARTUP_HOOKS`, so an Avalonia or WPF app's Run with Hot Reload is attached quietly.
-- **dotnet watch takes Ctrl+R only from a console's keys**, never redirected input: the Run window's restart under it is
+  watch replaces its app's `DOTNET_STARTUP_HOOKS`, so an Avalonia or WPF app's Run with Hot Reload is attached quietly. On a device the hook connects to an abstract socket that adb's reverse carries to a port of Passenger's own, saying its start's token first (`UpdateHandlerHook.OnDevice`).
+- **dotnet watch takes `-p` as its `--project`**, so a property goes as `--property:` (`BuildChoice.ArgumentsFor(watched)`). It **takes Ctrl+R only from a console's keys**, never redirected input: the Run window's restart under it is
   Rerun, and a wait after the program ends is said (`BuildRunController.WatchedEnd`). A save's temporary file ends in
   `.user` (`FileText.SaveSuffix`), which `DefaultItemExcludes` leaves out, or dotnet watch hears it as added, reloads
   and loses the next edit.
 - **The inspector** never touches `Dispatcher.UIThread` before the app makes it, never waits on Passenger, and readies
-  its wire's types before the app's Main (System.Text.Json's lock against a thread the debugger stopped). An app the
+  its wire's types before the app's Main (System.Text.Json's lock against a thread the debugger stopped). MAUI's, compiled against MAUI's cross-platform assemblies, reads a member typed as a head's own view (`WindowOverlay.GraphicsView`) by name, or it throws `MissingMethodException` in the head, and guards every MAUI callback it runs in (an overlay's Draw), whose throw ends the app. A library's view previews in a program that runs it (`XamlPreview.ProgramsRunning`). An app the
   previewer loads needs `BuildAvaloniaApp()`, or HostApp aborts.
-- **MCP's tool list** is paid for by every agent session (45.6 KB, held under 62 KB by McpDebuggingTests): say each
+- **MCP's tool list** is paid for by every agent session (54 KB, held under 62 KB by McpDebuggingTests): say each
   thing once (shared parameters in `McpHost.Instructions`), add no tool another covers; an answer that can run long goes
-  through `AgentAnswers` and says what it left out. `save_all` stays a tool of its own, never asked about on a person's
-  window (#278). `debug_evaluate`, `debug_input` and `breakpoint_set` are `Destructive` and ask the person the first
-  time; every question closes unanswered after 2 minutes; calls send progress every 10 s (OpenCode gives up after 60 s).
+  through `AgentAnswers` and says what it left out (`MostCharacters`, 40,000: a list through `PassengerTools.Held`, its words after it, an object's in its `more`; `within` and `from` said once in `McpHost.Instructions`; read on by `before` for vcs_log, `within` for usages, hierarchy and workspace, `from` for editor_text, outline, diagnostics, local_history and usages within a file; an answer of several lists sharing its room through `AgentAnswers.Shares`). An agent's query by a type finds what derives from it (`AppTree.Bases`, filled by the inspectors' shared serving and Godot's helper). `save_all` stays a tool of its own, never asked about on a person's
+  window (#278). `debug_evaluate`, `debug_input` and `breakpoint_set` are `Destructive`: a `Destructive` tool asks the person
+  at each call until allowed for the session (`AgentToolDialog`, `AgentConnection.AllowAsync`), or every tool at once by `request_full_access` (kept and cleared with the same allowance, its Deny holding as long; `ConnectedTool.Asks` the one rule of which tools ask), input into Passenger's
+  own windows asked apart (`PassengerTools.OwnWindows`); every question closes unanswered after 2 minutes; calls send progress every 10 s (OpenCode gives up after 60 s).
+- **An await's continuation on the window's thread runs before work `UiThread.Post` queued earlier** (Avalonia's context posts at Normal, `UiThread.Post` at Default): take in what's pending first, as `ProjectModels.Land` before `Keep`.
 - **An await of a task the window's thread completes continues on the thread pool**, even with ConfigureAwait(false):
   what must happen where the answer lands is an awaited `ContinueWith(…, ExecuteSynchronously)`; an await of work that
-  may have ended continues inline, so a view filling on its own turn awaits with `ConfigureAwaitOptions.ForceYielding`.
+  may have ended continues inline, so a view filling on its own turn awaits with `ConfigureAwaitOptions.ForceYielding`, and work begun while an object is made may have ended before it is handed over: check what it came to first (`OpenDocument.Load`).
 - **Work every window shares** (a cache of tasks, a process-wide gate) runs on the thread pool, never the asking thread:
   a headless window test's thread never runs again once its test is over.
 - **A window the IDE opens of its own accord** (a notification, an agent's question) shows with `ShowActivated` false,
   or it takes the keys from what the person types; an agent's question is not waited on as a dialog and has no default
-  button, so a stray Enter never answers it.
+  button, so a stray Enter never answers it. The File Cache Conflict question is answered only by its buttons (Enter and
+  Escape are Cancel), and a screenshot run says each file it wrote.
 - **Agents never open windows on the person's screen**: `--mcp FOLDER`, or a headless screenshot run's `--agent` step
   for attached behaviour; never a bare `--mcp-attach` (headless, it keeps no settings and asks a person who isn't
   there), never `just run`.
 - **Chrome and .NET's browser proxy**: Chrome runs a new-document script only once `Page.enable` came, so a page's
   conversation enables Page first, or nothing binds; an app-hosted `/_framework/debug/ws-proxy` binds once per app
   process to its first browser's port; with a fixed `--remote-debugging-port` Chrome writes no DevToolsActivePort; a
-  getter the proxy reads only by itself is called through `Runtime.callFunctionOn` on its object.
+  getter the proxy reads only by itself is called through `Runtime.callFunctionOn` on its object; Chrome's network service, ended as a page fetches its .NET code, fails every fetch until it restarts, so a page whose runtime never came is loaded again (`ChromiumBrowsers.NetworkServiceEnded`). Chrome wakes the machine's updater 19 s after it starts, from the person's own Library whatever HOME says, unless `--disable-updater-scheduler` (`BrowserRun.Quiet`).
 - **Aspire's CLI and AppHosts** list pipeline steps only over the CLI's backchannel
   (`--operation inspect --list-steps true`, 13.6+); a real AppHost's `--operation publish` without it runs every step,
   deploy included: never in a probe or a test. They keep running AppHosts in `$HOME/.aspire/cli/bch` whatever
@@ -450,6 +578,7 @@ a new name, and `just site-shots` retakes its images.
   macOS export of an arm64 or universal game needs `textures/vram_compression/import_etc2_astc`. A headless game's
   window is 64×64 (the helper sets `display/window/size`); it has no picture, picks no 3D mesh without a collision
   shape, and never pauses again after Next Frame (the helper's `step` ends it).
+- **Godot's editor on macOS builds with /usr/local/share/dotnet/dotnet** wherever that is, but runs on DOTNET_ROOT's .NET: lacking a release SDK of that major there, its Microsoft.Build.Locator 1.2.6 names a .NET 11 SDK's folders without their separator and no build finds Microsoft.NET.Sdk: every start of Godot's editor that builds (an editor configuration, a C# export) takes `GodotEditorDotnet.For`, never DOTNET_ROOT as it stands (#1715, #1726); a test naming the editor's .NET names `DOTNET_ROOT_<ARCH>` too, which the test process carries and Godot reads first.
 - **Godot's headless editor** writes project.godot (a plugin's `ProjectSettings.save()` writes all it holds),
   `editor_layout.cfg`, `script_editor_cache.cfg` and `ide_messaging_meta.txt` into the project, imports and exports too,
   which `GodotScripts` puts back (a Passenger save meanwhile stays the person's); from 4.5 it runs `--recovery-mode`,
@@ -472,9 +601,9 @@ a new name, and `just site-shots` retakes its images.
   scripts (GodotTools' watcher reloads the editor's own assemblies every 0.5 s); its completion kinds lack font sizes,
   so send the engine's numbers; an editor importing as it opens answers no handshake until done (`GodotIdeLink` retries
   after 10 s).
-- **Godot's game.** Stop ends a game before its debug session: wait for the session too; a session is ended once its
+- **Godot's game.** Passenger's helper comes in only once the game has run its loop (`GodotGame.LoopedAsync`): Godot reads messages between a script's lines and at each hit, while a root setting up its children adds no node; only the first busy-parent refusal after the fence's answer and before the helper's `passenger:here` is the helper's (`GodotGame.BringAsync`, `GodotAgent.Unplaced`), add_child's other refusals the game's own, and an evaluation's errors are those between its answer and its fence, sent in one write (`SendTogetherAsync`). Stop ends a game before its debug session: wait for the session too; a session is ended once its
   adapter says so or its process is gone after Exited without Terminated (`ProgramGone`). An agent's call on a game has
-  one limit (`GodotGame.Within`); app_ tools wait for the first scene, no evaluation. The frame counter runs on while
+  one limit (`GodotGame.Within`); app_ tools wait for the first scene, no evaluation; a game's picture is read only where `GodotPictures.WhyNot` lets it; an answer about a run whose app's inspector ended waits for the run's own end, heard after it; on a device the inspector's hello comes before the activity's view, so app_ tools wait for its first top level (`ViewShownAsync`). The frame counter runs on while
   paused: count the helper's frames. Node selection, once set up, takes the game's clicks until turned off; 4.8 renamed
   `runtime_node_select_set_type` to `set_node_type` and a game passes over one it lacks (`GodotPicks.TypeMessages`); the
   Live tree's follow keeps its own count and never drops a refresh's answer. Godot reads the debugger's messages between
@@ -504,14 +633,28 @@ a new name, and `just site-shots` retakes its images.
   counts as held; reload only a scene Godot has open and saved. A static function named after an Object virtual (`_set`)
   fails the whole script; `remove_child` clears owners outside the branch, so a move or undone remove sets them again.
   `PASSENGER_ADDON_TRACE` prints each scene act.
-- **Windows**: a folder a process works in can't be deleted, and MSBuild nodes start in their launcher's folder and
+- **Android**: a framework given to `msbuild -restore` reaches the projects referenced, restoring a shared library for the app's platform alone (its desktop build then fails): `AndroidDevices.ListAsync` restores with none, then lists with it. .NET for Android turns an app's OutputType Exe into Library (`AndroidApplication` true, which runnability
+  reads); its Debug host reads `files/.__override__/<abi>/environment`, where a Debug start puts the relay's variables
+  through run-as and puts the build's link back after; `am set-debug-app` (kept only in the activity manager: clear only
+  your own) keeps a long stop of the main thread from ending the app; the relay calls the DBI's `DllMain` itself, or
+  `ICorDebug::Initialize` hangs; without the workload's platform (`platforms;android-37.0`) its device listing fails with
+  XA5207. adb shell's exit status is the device command's own and its errors come apart from its output, so a put is judged by both, its staged files removed only once the status is taken (`AndroidApp.PutIn`, `DeviceLaunches.Unput`). A start Passenger couldn't end leaves its own environment file in place of fast deployment's link: the build's is the one beside what the assembly links point to (`AndroidApp.PutIn`). The installer is given its JDK folder (`AndroidFolders.Jdk`), never JAVA_HOME's, and `AndroidInstallJavaDependencies=false` where no JDK lacks; the workload's JDK installer, given no folder, puts it where the workload's search finds it again on macOS and Windows but has none on Linux. AndroidDeviceTests needs that platform, a JDK in `JAVA_HOME`, an AVD (booted `-no-window`; the tests name their device in every adb call, `ANDROID_SERIAL` first, through `MauiApp.Target` and `AndroidSerials.Of`)
+  and the relays a build carries only after `just debug-relay android`.
+- **Windows**: its watcher names a folder changed as a file in it is first read since it was written, so Local History walks only a folder that came (`FolderChanges.ComeOrGone`); a plain move over a file another program has open is refused however it shares it, so a written file is put in place through `AtomicFile.Move` (a rename with POSIX semantics, refused only by a holder sharing no deletion, a state change then landing as Passenger ends, `StateStore.LandWaiting`; a plain move where the file system has none, FAT or a share). A fresh file another program opens a moment after it is written refuses a replace over it and its deletion, so such a file is written once and its deletion never fails what was done. A folder a process works in can't be deleted, and MSBuild nodes start in their launcher's folder and
   outlive it, so hold a child whose descendants must end with it with `ChildProcesses.HoldFamily`; a write waits out a
   reader that shares no writes for up to 2 s, off the window's thread (`FileText.WhileHeldAsync`); closing a socket with
   unread input resets it, losing what was written (servers shut their side and drain first); the diagnostics library
   leaves a profiler pipe open after its listener goes (`ProfilingSession.CloseLeftListener`); a folder can't be renamed
   while any file under it is open, however it is shared, where a file opened sharing deletion can be (`DotnetMerge`
-  moves what others may read file by file); what holds a file is `FileHolders`.
-- **macOS**: a zombie gives no process info (`DotnetProcesses.Runs` counts it gone); `SystemFonts` lists the hidden
+  moves what others may read file by file); what holds a file is `FileHolders`; the shell's Recycle Bin delete (through `Trash`, told to show no UI) never says where it put an item, found by the `$I` record it wrote (`RecycleBin.Find`).
+- **macOS's Gatekeeper rejects a notarized, stapled app carrying another platform's Mach-O among its code** (an iOS
+  simulator's relay in `Contents/MacOS`: "Unnotarized Developer ID") though the notary accepts it: what the app carries
+  for others to load lives in the bundle's Resources, found through `CarriedFiles` (#1869).
+- **macOS**: `hdiutil detach` of a mount point can unmount yet leave the disk attached while a process holds its device,
+  the image's helper keeping the file locked (a convert then fails "Resource temporarily unavailable"): detach by the disk
+  until `hdiutil info` lists the image no more (`package-mac.sh`, `AttachedImages.DetachAsync`, never by its mount point); hdiutil's helper checks the disk a mount point is on before it mounts, so an image on an external drive may be refused "Permission denied" where the startup disk is not (a disk image's own volume reads as internal, so no test reaches it); a disk whose device is held refuses every detach, forced too, and Parallels Desktop attaches each image a moment at a temporary mount. `diskutil image attach` (the update's, from macOS 26) opens an image another program holds, answers one already attached with exit 0 and its existing mount point, and says its errors as "Error: …" in the Mac's language. Avalonia takes the application's menu once, as setup ends and before any window, showing its own About where none is set: App sets the one menu in `Initialize`, windows only fill it (`MainWindow.FollowApplicationMenu`). A `DispatcherTimer` or `Stopwatch` counts only time awake on macOS and Linux, so a wait of hours or days is measured on the wall clock (`MainWindow.UpdateClock`). An x64 Passenger under Rosetta loads MSBuild only from an x64 SDK (`DOTNET_ROOT_X64`,
+  `/usr/local/share/dotnet/x64`), and MSBuildLocator finds its SDK by DOTNET_ROOT, so the host is given the chosen root;
+  a zombie gives no process info (`DotnetProcesses.Runs` counts it gone); `SystemFonts` lists the hidden
   `.AppleSystemUIFont` only once loaded and `TryGetGlyphTypeface` answers an unknown name with Helvetica (`WindowFonts`
   checks the face); Chrome waits for good on a keychain where HOME has none (`--use-mock-keychain`); a hardened-runtime
   program without `get-task-allow` (Godot's release build) can't be dumped, so its snapshot comes from its GC heap dump;
@@ -519,22 +662,28 @@ a new name, and `just site-shots` retakes its images.
   `poll` never says a named pipe's writer has gone (`select`); a Unix socket path holds 104 bytes; `Screen.Scaling` is 1
   on Retina, so a pixel size goes with `RenderScaling`, and Avalonia's `PointToScreen` is in points whatever its
   `PixelPoint` says; `codesign` takes a dotted folder under `Contents/MacOS` for a bundle (so the web servers live in
-  Resources); TMPDIR goes through the /var link, so build a test's project by its real path (two spellings restored at
+  Resources); TMPDIR goes through the /var link, so build or restore a test's project by its real path (a restore by /var writes an assets file with no projectReferences) (two spellings restored at
   once collide).
 - **.NET's watcher on macOS passes over FSEvents' word that it dropped events** (dotnet/runtime#136577), so a folder is
-  watched only through `WatchedTree`, never a bare `FileSystemWatcher` (#607, #609); settings.json, watched alone, is
-  read again on its watcher's error and as a window comes in front (`SettingsStore.LookAgain`).
+  watched only through `WatchedTree`, never a bare `FileSystemWatcher` (#607, #609); a file watched alone (settings.json,
+  vimrc) only through `WatchedFile`, a folder through `WatchedTree` (WatcherRulesTests refuses a `FileSystemWatcher` named
+  elsewhere), each read again on its watcher's error and, through `LookAgain`, as a window comes in front (settings.json,
+  vimrc, `ProjectTemplates.LookAgain`, the open folder's and Git's watchers through `MainWindow.AddLookingAgain`).
 - **macOS's "damaged" dialog** comes from reading or starting a Passenger.app whose seal no longer holds: a mounted disk
   image whose file was replaced (`just package-mac` ejects one first) or a bundle written into (#450). Tests never start
   a program inside an unsigned bundle, and a run's folder ends in `.noindex`, so Spotlight reads none of it.
 - **Linux**: file systems tell letter case apart, so a test of another letter case skips there.
-- **MSBuild**: a Remove glob (by its source an Include's or Update's too) is unescaped twice, an Exclude's or Import's
+- **MSBuild**: on Windows it takes the SDK through DOTNET_ROOT's links as they stand (its packs the link folder's), where off Windows the locator resolves the link. Its locator takes DOTNET_ROOT's installation, then a process named dotnet, before DOTNET_HOST_PATH, and lists SDKs only of the first holding any: a helper loading another installation's MSBuild is given it as DOTNET_ROOT (`Dotnet.Apart`). A Remove glob (by its source an Include's or Update's too) is unescaped twice, an Exclude's or Import's
   once, and one escaped wildcard makes a whole glob a plain name fitting no file (`ItemPaths`); a build through another
   spelling of a project's path deletes what the first wrote (IncrementalClean; a shell or MSBuild takes an inherited PWD
   for its folder, #413, #537), and a reused node carries a project's earlier spelling and NuGet home into the next
   build. It keeps no idle node unless the process's nice value is 0.
+- **A state folder inside the open folder** is heard by its watcher, which names paths canonically: whatever writes state on
+  hearing a change passes over the state folder by its canonical path (`LocalHistory.Open`), or each write is heard and
+  written again.
 - **Local History's `changes.log` is shared by every Passenger on the same state**: a store takes in the others' lines
-  under `Hold` before it keeps anything, and a change logged twice lists once.
+  under `Hold` before it keeps anything, and a change logged twice lists once; nothing is written to it without the hold, however long another holds it (`LocalHistory.HoldToChange`), as a line written beside a prune's rewrite is lost with the log it replaces.
+- **.NET on iOS has no Unix sockets** (PlatformNotSupportedException), and `OperatingSystem.IsMacOS()` is false there: Darwin code takes `IsIOS()` too. simctl writes its own words only at its end unless `NSUnbufferedIO=YES`, and a killed `simctl launch --console` leaves its app running.
 - **A variable taken out of a process's own environment goes through `OwnEnvironment.Set`**: on macOS and Linux
   `SetEnvironmentVariable` never changes the process's own, from which Porta.Pty forks the shell. Porta.Pty drops an
   empty value, so a removed variable (an outer tmux's or screen's too) is unset through `env -u`
@@ -543,37 +692,64 @@ a new name, and `just site-shots` retakes its images.
 - **The carried schemas hold Passenger's patches** (`WebServers/schemas`, MSBuild's xsd), listed in the notices and each
   file's `$comment`: a fresh upstream copy loses them (CarriedSchemasTests checks defaults).
 - **The terminal reuses a line** once it leaves the screen and a full scrollback: nothing keeps a `TerminalLine` past
-  its line number; cells are written only through `TerminalLine.Writing()`. A pseudo-terminal's close on macOS waits for
-  a write in flight, and an exiting session leader waits for its output to be read: `TerminalSession` reads to the end
-  and closes off the window's thread. macOS's bash 3.2 sometimes prints "child setpgid (N to N): Operation not
+  its line number; cells are written only through `TerminalLine.Writing()`. A pseudo-terminal's last close on macOS waits at most 0.6 s for its output to be read, then drops it, so a program
+  there never runs before its reader reads (`IPseudoTerminal.LetRun`); posix_spawn opens a session leader's terminal
+  before its session (dash's redirection takes it, zsh's doesn't), and Darwin's waitid tells of a held program as ended.
+  A pseudo-terminal's close on macOS waits for
+  a write in flight, and an exiting session leader waits for its output to be read, about 0.6 s, then drops it and hangs the terminal up
+  (Linux once nothing holds it): `TerminalSession` reads to the end and closes off the window's thread, a run's end waiting
+  for the read's end where poll says hung up (`TerminalSession.HungUp`), the quiet guess only where the terminal stays open. macOS's bash 3.2 sometimes prints "child setpgid (N to N): Operation not
   permitted", so a test reading a shell's lines allows others between them.
+- **ConPTY** (Porta.Pty's OpenConsole and Windows' own) passes a program's kitty keyboard requests out and CSI u keys in
+  as written, but gives a VT-input program a win32-input-mode key (`?9001h`) as xterm's bytes, Shift+Enter a bare `\r`:
+  a key's modifiers reach a program by the kitty protocol (`TerminalKeys`).
 - **Avalonia 12's lists** re-attach, and so re-style, every recycled container and never reuse a `DataTemplate`'s
   content: rows go through `ReusedRows`, made once with their containers (UiRulesTests).
+- **Avalonia's Button lets go of its press when it greys**, and a headless `MouseUp` runs queued work before the release:
+  a list listed again greys nothing its choice enables until the choice is taken again (`BranchesPanel.listing`).
+- **Avalonia stamps headless input with when it is handled**, and its velocity tracker takes a move more than 40 ms after the last, or a release 40 ms after it, for a finger at rest: a test's touch fling goes through `Ui.Fling`, stamped a frame apart with no frame between. The inspector of Passenger's own windows answers on its UI thread's current dispatcher, as each headless test makes a new one.
+- **Avalonia's headless `KeyTextInput` and `KeyPress` run the window's queued work before the key**, so a count taken around one includes what came due before it: count from the key's change.
 - **Avalonia 12.1 counts a run of clicks per button**: a press of another button starts a new run (`ClickCount` 1); a
   control with no background is no pointer target.
+- **Windows makes a layered child window only for a program whose manifest names Windows 8 or later** (refusing it with error 0 otherwise), so every program hosting the editor carries `src/Passenger.App/app.manifest`, the tests included.
+- **Avalonia 12 has no text pattern for a screen reader**, so Passenger bridges each system over Avalonia internals, held by tests: on Windows the peer is Avalonia's internal `InteropAutomationPeer` over Passenger's child window (`UiaTextWindow`), whose element names its neighbours through Avalonia's internal `AutomationNode.GetOrCreate` (or UIA lists the window again under the top level), owns SetFocus and hands WM_SETFOCUS back (or UIA gives the child window the keys), and an exception out of OnCreateAutomationPeer ends Passenger (UiaTextTests); on macOS libAvaloniaNative's `AvnAccessibilityElement`, `initWithPeer:`, `raisePropertyChanged:` and `ValueProvider_Value` = 5 (MacTextElementsTests), whose element calls super for `accessibilityIsAttributeSettable:`, which NSAccessibilityElement lacks, so a test never sends the legacy name-based AX selectors. With the screen locked the accessibility API shows an app's windows as the application, so an AX probe needs an unlocked screen.
+- **Avalonia 12's ListBox takes Enter and Space before a bubbling `KeyDown`** on the list: a list's keys and double click go only through `ListKeys.Act` (`ListActs`, its `Enter` where a stray double click must not do it; `TreeKeys.Attach` for a tree), held by UiRulesTests.
 - **Avalonia 12's ListBox re-points its keys' row by the chosen row's new index before moving rows**, so a focused row
   loses the keys when rows come above it, and moves a Shift range's anchor only with its first chosen row: every tree
   goes through `TreeKeys.Attach`.
+- **`HashCode` is seeded anew in each process**: a table placed by it meets two keys in some runs only, so a cache of one place a hash thrashes there (`SharedNames` keeps two).
 - **`GC.GetAllocatedBytesForCurrentThread` counts the unused rest of a thread's allocation context** when a background
   collection's mark ends, up to 8 KB never allocated, so the unit tests run every collection blocking (#1355).
 - **`ArrayPool.Shared` loses a thread's arrays at a Gen 2 once load reaches 81% of memory**, so a `Rent` on a path held
-  to 0 bytes can allocate: such a path keeps a per-thread array (`FuzzyMatch`).
+  to 0 bytes can allocate: such a path keeps a per-thread array (`FuzzyMatch`), a conversation its own message buffers
+  (`ContiguousReader`).
 - **`FormattedText` lays its lines out again at every draw**: text drawn frame after frame is kept as a `TextLayout` or
   `TextLine` until what it says or its width changes. Avalonia's text formatter returns the pooled arrays of runs it
   shapes together only when finalized, so runs of one line are taken from two copies of its text in turn.
 - **Avalonia's font fallback sweeps every loaded font in name order before asking the platform** (AvaloniaUI#22464), and
   never calls a `FontCollectionBase`'s own `TryMatchCharacter`: `FallbackFonts` is an `IFontCollection`. Apple's fonts
   shape by `morx`, which `CanShapeScript` doesn't count.
-- **Svg.Skia stays at 5.1** while Avalonia's Skia is SkiaSharp 3 (5.2 needs SkiaSharp 4); its `SKSvg` disposes its
-  picture, so a picture is never let go while a frame may still draw it.
+- **SkiaSharp and HarfBuzzSharp are taken newer than Avalonia names** (Passenger.App and Passenger.MauiPreview reference
+  both and the Linux natives; the tests' Avalonia apps keep Avalonia's, `tests/AvaloniaGraphs/Avalonia12`): a move checks
+  that every member Avalonia.Skia, Avalonia.HarfBuzz and Avalonia.Controls.Maui call still resolves. Svg.Skia's `SKSvg`
+  disposes its picture, so a picture is never let go while a frame may still draw it.
+- **HarfBuzz applies a font's 'trak' itself** where the face has `STAT` too, at 12 pt whatever the size (Avalonia gives it none), a lone track too; macOS, by name, applies only a `STAT` face's normal track at the size (harfbuzz/harfbuzz#6671): each face `FallbackFonts` gives has HarfBuzz's tracking taken off its advances (`FaceTracking.Set`, the hook `FallbackFonts.Install` takes), and the window's letter spacing is the normal track alone (`FaceTracking.SpacingAt`). Avalonia 12 lets no app implement its text shaper (`ITextShaperImpl` is not client-implementable).
+- **Avalonia's Skia context of a bitmap above 96 DPI** reads its transform back with the DPI in it once a clip or layer
+  is popped (AvaloniaUI#20693), so a transform pushed after (every text run's) is scaled twice: an immediate drawing at a
+  scale goes into a 96-DPI bitmap under a scale transform (`Pictures.Take`).
 - **Avalonia renders a visual again when its Bounds, ZIndex or RenderTransform change**, and on `InvalidateArrange`:
-  retained content moves through its parent layer.
+  retained content moves through its parent layer. Two visuals invalidated in one frame draw again all that lies between
+  them: invalidate only what changed (`CodeEditor.RefreshStripe`).
 - **EventPipe from a program's start**: .NET 10's LoggingEventSource misreads its `FilterSpecs`, so a category takes no
   `:Level` there (`LiveRequests.LogsSpec`). Its sampler takes a thread only where it can stop it, so a test program's
   method that must own its samples spins in a loop that calls nothing. A program the debugger holds answers no session's
   start or stop and gives no heap, so the profiler refuses it (`Refusals.PausedInDebugger`). A session enabling a managed
   EventSource as a program before .NET 11 RC starts hangs it for good (dotnet/runtime#119014): every live session starts
   through `SessionStarts`, which waits out `ProgramStarts`.
+- **A runtime's events heard in-process**: an `EventListener`'s session holds 10 MB and drops what overflows unsaid, and
+  the GC keyword at Verbose bursts at every collection, so a test that must hear every event opens a session of its own,
+  sized and filtered by event id, and fails on TraceEvent's `EventsLost` (`FlingTests`). TraceEvent holds a thread's last
+  events of a flush until a later one the runtime marks oldest comes: a wait on the last event makes one on a new thread.
 
 ## Tests
 
@@ -589,12 +765,15 @@ all three systems, no measured time or allocation bound and no container, real-A
 flow; one that fails there for a test's reason leaves it until rewritten. Every other test is in the report lane, whose
 failures never fail a run but each become a `ci-report` issue. `BannedSymbols.txt` bans driving internals directly (the
 terminal's emulator, a hand-started Roslyn or profiling session, a lone `TextDocument`, `LineDiff`, `CommitGraph`,
-`Snippet.Parse`; `Rig.cs` excepted), raising Click events (`Ui.Click` instead) and fixed sleeps (`Thread.Sleep`,
-`Task.Delay`, `Screenshot.Pump`) outside `Waiting` and `Ui`. The long random editing session checks every key against a
-string model, soft wrap too: keep it passing, never narrow it. Performance is held by what the UI thread allocates in a
-small case against a large one, never by a time (attach the profiler to the test process to see its time,
-`ProfilingSession.AttachAsync(Environment.ProcessId, …)`). Tests that press thousands of keys draw a small window (a
-headless frame is GC pressure); a measure of a key's bytes collects first (LongTextTests).
+`Snippet.Parse`; `Rig.cs` excepted), raising Click events (`Ui.Click` instead), fixed sleeps (`Thread.Sleep`,
+`Task.Delay`, `Screenshot.Pump`) outside `Waiting` and `Ui`, and the process's heap total (`GC.GetTotalMemory`, which
+counts what classes beside let go of: what an object keeps is `HeldBytes.Of` it), and `Process.Kill` (a process the test
+started ends through `ChildProcesses.Kill`, one found by its id through `OwnProcess`, taken while it is known to be the
+test's own: a dead program's id may be another's). The long random editing session checks
+every key against a string model, soft wrap too: keep it passing, never narrow it. Performance is held by what the UI
+thread allocates in a small case against a large one, never by a time (attach the profiler to the test process to see
+its time, `ProfilingSession.AttachAsync(Environment.ProcessId, …)`). Tests that press thousands of keys draw a small
+window (a headless frame is GC pressure); a measure of a key's bytes collects first (LongTextTests).
 
 **Waits (#237).** A test waits for what it checks, however slow the machine. `Ui.Settle` (and `Press`, `Landed`,
 `WaitFor` on it) waits until the IDE is quiet: `BackgroundWork` landed, nothing in `InFlight` but Roslyn's held
@@ -611,10 +790,10 @@ machine sleeps), never the wall clock, of a developer machine's time scaled by `
 **Isolation.** A run keeps to its own folder (`TestRun`): state, logs, sockets, test folders, shells' history, an empty
 Git configuration (no ssh-agent; its own GnuPG home and keys), NuGet's home on macOS and Linux, MSBuild's node salt,
 container labels, user secrets, dotnet new's templates, Aspire's HOME and CLI, Godot's user folders
-(`PASSENGER_GODOT_HOME`); `PersonsGodot` fails a run that writes the person's Godot folders. It never reaches nuget.org
+(`PASSENGER_GODOT_HOME`); `PersonsGodot` fails a run that writes the person's Godot folders. Its themes come from the tests' copy (`PASSENGER_THEMES`). It never reaches nuget.org
 (local feeds, the run folder's feedless nuget.config `TestRun.Feedless`, the restore-only `tests/*Graphs`, which name
 every package their test apps resolve, at its version: a CI cache restored by key prefix hides one missing), GitHub
-(`PASSENGER_RELEASES` dead), registries (`PASSENGER_BUILDKIT_CHECKS=off`), Docker Hub, symbol servers, Discord, the
+(`PASSENGER_RELEASES` dead), Open VSX (`PASSENGER_OPEN_VSX` dead), registries (`PASSENGER_BUILDKIT_CHECKS=off`), Docker Hub, symbol servers, Discord, the
 person's Passenger (`PASSENGER_START=headless`), or a host a browser asks of its own accord (`PASSENGER_BROWSER_PROXY`).
 It shortens `PASSENGER_EVAL_TIMEOUT_MS`, `PASSENGER_WATCH_LATER_MS` (3 s each), `PASSENGER_MCP_PROGRESS_MS` and
 `PASSENGER_REGEX_TIMEOUT_MS` (1 s each); a test holding a server to not answering sets that server's limits, never the
@@ -624,7 +803,8 @@ session's thread (`await Task.Yield()` before throwing). `just test` keeps the M
 
 **Collections and shared projects** (`Collections.cs`). Window tests run one at a time on the session's thread; beside
 them only `DebugSession.Collection` and `Beside` classes (no window, nothing shared changed, nothing held to a time). A
-class with a test held to a time, or that debugs through the window, is `[Collection(Alone.Name)]`, run last alone. A
+class with a test held to a time, that debugs through the window, or that counts every thread's allocations
+(`GC.GetTotalAllocatedBytes`: a Beside class's are counted as its own), is `[Collection(Alone.Name)]`, run last alone (CollectionRulesTests). A
 class sharing one project derives from `SharedProject` (one warm server; a new file through `project.Write`, which ends
 the server unless `loadsAgain`; `PrepareAsync(restore: false)` where nothing reads a restore, `byRealPath: true` where
 projects name each other by real path). xunit v3 calls only `DisposeAsync` on a class with both. `RestoredFolders` hands
@@ -638,13 +818,14 @@ class taking far longer than its work needs is a bug, never held to a limit. A t
 `~/Documents/passenger-vm/vm-test.sh NAME FILTER` (no Node.js; it can't see dot folders), Ubuntu 26.04 ARM64
 `vm-test-linux.sh NAME FILTER`.
 
-**Helpers** (`Ui`, `Waiting`, `TestProjects`, `TestFolders`, `McpRig`, `Docker`): a click is `Ui.Click` (a real press on
+**Helpers** (`Ui`, `Waiting`, `TestProjects`, `TestFolders`, `McpRig`, `Docker`, `ReqnrollProjects`): a click is `Ui.Click` (a real press on
 a control shown, enabled and hit); a chord one `Ui.Press(window, "control M , control S")` (its first key forgotten
 after 2 s); multi-line edits `Typing.Replace` (`KeyTextInput` drops `\n`); a server's request or answer held
-`LanguageServer.HoldNext`/`HoldNextAnswer`, a container run's `up` `BuildRunController.HoldNextUp`; a log the IDE may be
-writing `Ui.Shared`. A dialog is held to `DialogButtonsTests.Check`, the window to UiRulesTests. A helper that runs a
+`LanguageServer.HoldNext`/`HoldNextAnswer` (the next answer to come, whatever request it answers), a container run's `up` `BuildRunController.HoldNextUp`; a log the IDE may be
+writing `Ui.Shared`; a typing pause held open `Debounce.HoldOpen`, the server's word that its diagnostics changed `CSharpService.HoldRefreshes`. A terminal test points at a line, acts on the screen or types its next command once the shell's prompt is below
+it (`WaitForPromptBelow`; a command typed ahead is echoed, then drawn again a row lower with the prompt): cmd's prompt comes in a later ConPTY frame and scrolls a full screen. A dialog is held to `DialogButtonsTests.Check`, the window to UiRulesTests. A test never assumes a setting's value: a diff is found, read and keyed through `OpenDiffs` wherever Settings opens it, `OpenDiffsIn` set only where the setting or the diff's window is the subject. A drag whose drawing a test checks goes through `Ui.DragDrawn`: `Ui.Drag` and a screenshot's `--drag` draw no frame between moves. A helper that runs a
 program waits on the UI thread with its loop running; a fixture or windowless test awaits its `…Async` form. A stand-in
-leaves files a target writes as it found them (a new one makes MSBuild skip the target). A headless click runs queued
+leaves files a target writes as it found them (a new one makes MSBuild skip the target). A stand-in's record a test reads while Passenger may run it again is written beside and moved into place (`McpTests.EnvironmentGitAsync`), never `> file`. A headless click runs queued
 work and draws after itself, so a status during a click is read from what it showed throughout; a count of a key's
 frames sets aside the caret's blinks.
 
@@ -656,7 +837,7 @@ naming the `WindowsDesktopRefVersion` to pin.
 
 **Debuggees** (`tests/Debuggees`): tests find their lines by code (`Debuggees.Line`), so changing a line's code means
 changing the tests that name it (a breakpoint binds the statement that starts first on its line, inside a lambda only
-where the line starts in one: give the lambda's column). `SelfDebuggingTests` finds its breakpoint by the code `Say(why,
+where the line starts in one: give the lambda's column). `SelfDebuggingTests` finds its breakpoint by the code `Refuse(why,
 RefusalPlace(action));` in MainWindow.Actions.cs. `StartHold` holds a launched program at its start;
 `PASSENGER_ENGINE_LOG=FILE` keeps the engine's log. A thread a debuggee starts just before a stop can hold that stop's
 evaluations: stop once it has run a round (#599). An evaluation past its time logs `WhereThreadsStand`, and a test of
@@ -683,12 +864,13 @@ to the window's tests.
   Passenger's own consistency settles a design question. The shared pieces: `DialogFooter` (`Of`, `Listed`, `Answers`,
   `Bar`, `Page`, `Default`, `Cancel`, `OkCancel`, `Headed`, `Popup`) in a `Border.footerBar`; `Border.framed`;
   `Passenger.Separator`, `Passenger.Divider`; `MenuChoice` (`Holding`); `ListMenus.PlaceForKeys`; `ToolTabs.Tab`;
-  `PopupFrame` (`Framed`), `popupTitle`; `ListRow.Height` (24); `TextBlock.emptyText`, `EmptyState`;
-  `ToolButtons.Of`/`Toggle` (never focusable), `Tip` (an icon's tip and its accessible name); `ColumnTitles.Of`/`Row`; `ToolBars.OverEditor`; `Banner`; `CheckRows`;
-  `MutedText`; `ListKeys.Move`; `Plural.Of`/`Listed`; `Border.kindBadge`/`tag`/`box` (never a literal radius);
-  `RunRows`; `DetailsTables`; `MergedLog` (`OutputView.Find`); `ZoomedPicture`; `ToolWindow.ExpandAll`/`CollapseAll`;
-  `ToolWindows.FilterBox`; `ToolFlow`; `PaneSplit`; `ToolColumn`; `ControlThemes.axaml`; `FocusRing`; `AppIcon`;
+  `PopupFrame` (`Framed`), `popupTitle`; a popup placed through `PopupPlacement.Place` (laid out first), a card beside a list narrowed by `InfoCard.Within`; `ListRow.Height` (24); `TextBlock.emptyText`, `EmptyState`;
+  `ToolButtons.Of`/`Toggle` (never focusable), `Tip` (an icon's tip and its accessible name), `Grey` (greyed, its tip saying why); `ColumnTitles.Of`/`Row`/`Ruled` (a table edited in place an `EditableTable`); a form's label rows `FormRows` (`Of`, `Scope`; a `BrowseRow`'s field is the one named); `ToolBars.OverEditor`; `Banner`; `CheckRows`;
+  `MutedText`; `ListKeys.Move`, `ListKeys.Act`; `Plural.Of`/`Listed`/`Either` (a choice); `Border.kindBadge`/`tag`/`box` (never a literal radius);
+  `RunRows`; `ShrinkingRow.KeepsWidth` (a row's version and tags kept whole, its name cut first); `ChangedFileRow` (`Show` of a `FileChange`, every list of changed files), a revision's files `ChangedFileList`; `ChosenMark` (`Rows`, `Choices`, `Template`, `Hold`: a chosen row, tab, stripe button, segment or on toolbar toggle shows the mark beside its ground, never its ground alone); `DetailsTables`; `MergedLog` (`OutputView.Find`); `ZoomedPicture`; `ToolWindow.ExpandAll`/`CollapseAll`;
+  `ToolWindows.FilterBox`; `FilterMenu` (a list's Sort and Filter, placed in its search); `DropDownSearch` (every ComboBox's search, never per control); `ToolFlow`; `PaneSplit` (a tool window's two panes and an editor's own pane, `EditorGroup.Side`); `ToolColumn`; `ControlThemes.axaml`; `FocusRing`; `AppIcon`;
   `ReusedRows` (`Use`, `Showing`); `RowIcon` and `RowGlyphs`, drawn as `PathIcon` draws for a fraction of its cost,
   never `PathIcon` (UiRulesTests). A row hears its item only while shown (`Observable.FollowWhileShown`).
-- `MainWindow.SmallestWidth` is 640: the layout works at half a 1366-wide screen; every window is an `IdeWindow`, which
-  fits its owner's screen as it shows.
+- `MainWindow.SmallestWidth` is 640: the layout works at half a 1366-wide screen, its least size that times the display
+  scale (`IdeWindow.HoldAtLeast`); every window is an `IdeWindow`, which fits its owner's screen as it shows and as it is
+  rescaled (`IdeWindow.Rescaled`).

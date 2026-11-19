@@ -158,6 +158,10 @@ public static class ComposeLabels
     public const string Service = "com.docker.compose.service";
     public const string ConfigFiles = "com.docker.compose.project.config_files";
     public const string WorkingDir = "com.docker.compose.project.working_dir";
+
+    /// <summary>The project a service runs, by name, as Visual Studio's compose files label a service whose Dockerfile is
+    /// not in its project's folder.</summary>
+    public const string VisualStudioProject = "com.microsoft.visual-studio.project-name";
 }
 
 /// <summary>A Compose project: its name, its status as <c>docker compose ls</c> words it ("running(2)", "exited(1)"), its
@@ -315,7 +319,7 @@ public sealed record ContainerSnapshot(IReadOnlyList<ComposeProject> Projects, I
 
     private static string ImageName(JsonElement image)
     {
-        // Podman's own command names an image in full ("docker.io/library/busybox:1.37"), with no repository and tag apart.
+        // Podman's own command names an image in full ("docker.io/library/busybox:1.38"), with no repository and tag apart.
         if (JsonMembers.Scalar(image, "Repository") is null && ContainerInfo.First(image, "Names") is { } named)
         {
             return named;

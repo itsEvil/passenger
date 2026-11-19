@@ -2,7 +2,8 @@ namespace Passenger.Core;
 
 /// <summary>MSBuild's names Passenger writes, each named once: what it gives the builds, servers and evaluations it starts, or
 /// keeps from them (in their environment, where a property given is one MSBuild takes as the project's, or as a global
-/// property), the properties it asks an evaluation for or writes into a project or publish profile, and the targets it runs.
+/// property), the properties and items it asks an evaluation or a question for or writes into a project or publish
+/// profile, and the targets it runs.
 /// Those an evaluation carries (Host's CarriedProperties) are named there. Framework-free, since the project host compiles
 /// it in.</summary>
 [IdentifierHome]
@@ -44,8 +45,14 @@ public static class MSBuildNames
     public const string SolutionFileName = "SolutionFileName";
     public const string SolutionExt = "SolutionExt";
 
+    /// <summary>What a build of a solution tells each project its references are mapped to, which the project's
+    /// AssignProjectConfiguration gives each reference it builds: an XML list of projects by path, each with its
+    /// configuration and platform.</summary>
+    public const string CurrentSolutionConfigurationContents = "CurrentSolutionConfigurationContents";
+
     // What a project builds for, and with.
     public const string Configuration = "Configuration";
+    public const string Platform = "Platform";
     public const string TargetFramework = "TargetFramework";
     public const string TargetFrameworks = "TargetFrameworks";
     public const string TargetFrameworkMoniker = "TargetFrameworkMoniker";
@@ -73,6 +80,9 @@ public static class MSBuildNames
     // Where a project is and what its build makes.
     public const string ProjectDir = "ProjectDir";
     public const string AssemblyName = "AssemblyName";
+    public const string OutputType = "OutputType";
+    public const string UseArtifactsOutput = "UseArtifactsOutput";
+    public const string ArtifactsPath = "ArtifactsPath";
     public const string OutputPath = "OutputPath";
     public const string TargetDir = "TargetDir";
     public const string TargetFileName = "TargetFileName";
@@ -125,6 +135,8 @@ public static class MSBuildNames
     public const string DockerServiceName = "DockerServiceName";
     public const string DockerServiceUrl = "DockerServiceUrl";
     public const string DockerLaunchAction = "DockerLaunchAction";
+    public const string DockerLaunchBrowser = "DockerLaunchBrowser";
+    public const string DockerComposeProjectName = "DockerComposeProjectName";
 
     // A publish and its profile's (.pubxml).
     public const string PublishProfile = "PublishProfile";
@@ -156,4 +168,87 @@ public static class MSBuildNames
     /// them, with no compile.</summary>
     public const string GenerateComputedBuildStaticWebAssets = "GenerateComputedBuildStaticWebAssets";
     public const string ResolveReferencedProjectsStaticWebAssets = "ResolveReferencedProjectsStaticWebAssets";
+
+    /// <summary>The target that restores a project's packages.</summary>
+    public const string Restore = "Restore";
+
+    /// <summary>"true" has a question's evaluation pass over the restore's assets, which it reads nothing of.</summary>
+    public const string SkipResolvePackageAssets = "SkipResolvePackageAssets";
+
+    /// <summary>The version of the platform a project builds for (37.0 of net11.0-android, its own where the framework names none).</summary>
+    public const string TargetPlatformVersion = "TargetPlatformVersion";
+
+    /// <summary>The SDK's target naming the workloads a project's frameworks need that the .NET it builds with lacks.</summary>
+    public const string GetRequiredWorkloads = "_GetRequiredWorkloads";
+
+    // A mobile workload's: the device a run takes, its listing of devices, an app's install there and how it starts.
+    public const string Device = "Device";
+    public const string Devices = "Devices";
+    public const string ComputeAvailableDevices = "ComputeAvailableDevices";
+    public const string DeployToDevice = "DeployToDevice";
+    public const string ComputeRunArguments = "ComputeRunArguments";
+
+    // The Android workload's: the Android SDK and JDK it builds with, the SDK's tools, what an app needs installed and its installer.
+    public const string AndroidSdkDirectory = "AndroidSdkDirectory";
+    public const string JavaSdkDirectory = "JavaSdkDirectory";
+    public const string JavaSdkVersion = "JavaSdkVersion";
+    public const string AdbToolPath = "AdbToolPath";
+    public const string EmulatorToolPath = "EmulatorToolPath";
+    public const string GetAndroidDependencies = "GetAndroidDependencies";
+    public const string AndroidDependency = "AndroidDependency";
+    public const string JavaDependency = "JavaDependency";
+    public const string InstallAndroidDependencies = "InstallAndroidDependencies";
+    public const string AndroidInstallJavaDependencies = "AndroidInstallJavaDependencies";
+    public const string AcceptAndroidSdkLicenses = "AcceptAndroidSDKLicenses";
+
+    // An installed Android app's start, as the workload's ComputeRunArguments leaves it.
+    public const string AndroidPackage = "_AndroidPackage";
+    public const string AndroidLaunchActivity = "AndroidLaunchActivity";
+    public const string AndroidInstrumentation = "AndroidInstrumentation";
+
+    // The Apple workloads' check of the Xcode they build with: its developer folder and SDK version.
+    public const string DetectSdkLocations = "_DetectSdkLocations";
+    public const string SdkDevPath = "_SdkDevPath";
+    public const string SdkVersion = "_SdkVersion";
+
+    // The Apple workloads' reading of an app's project: the Info.plist it takes and those laid over it, the least version
+    // of the platform the project builds for and the least its workload builds for, whether the workload checks the app's
+    // scene manifest, and whether the project makes an app's bundle, an app extension's being none.
+    public const string DetectAppManifest = "_DetectAppManifest";
+    public const string AppBundleManifest = "AppBundleManifest";
+    public const string PartialAppManifest = "PartialAppManifest";
+    public const string SupportedOSPlatformVersion = "SupportedOSPlatformVersion";
+    public const string MinSupportedOSPlatformVersion = "MinSupportedOSPlatformVersion";
+    public const string ValidateSceneManifest = "ValidateSceneManifest";
+    public const string CanOutputAppBundle = "_CanOutputAppBundle";
+    public const string IsAppExtension = "IsAppExtension";
+
+    /// <summary>The Apple workload's own folder, whose Versions.plist maps Mac Catalyst's versions to macOS's.</summary>
+    public const string XamarinSdkRootDirectory = "_XamarinSdkRootDirectory";
+
+    /// <summary>The least Android API the Android workload builds an app for.</summary>
+    public const string AndroidMinimumSupportedApiLevel = "AndroidMinimumSupportedApiLevel";
+
+    // A project of .NET MAUI's, and the namespace its own code is written in.
+    public const string UseMaui = "UseMaui";
+    public const string RootNamespace = "RootNamespace";
+
+    // The folders a MAUI project takes each Apple head's files from, which its package sets where the project does not.
+    public const string PlatformsProjectFolder = "PlatformsProjectFolder";
+    public const string IosProjectFolder = "iOSProjectFolder";
+    public const string MacCatalystProjectFolder = "MacCatalystProjectFolder";
+
+    // A Mac Catalyst app's bundle as the Apple workloads' ComputeRunArguments leaves it: its folder and its program's name.
+    public const string AppBundleDir = "AppBundleDir";
+    public const string NativeExecutableName = "_NativeExecutableName";
+
+    // The Apple workloads' trimming of an app's build, which a project sets as MtouchLink and its build reads as _LinkMode:
+    // None leaves every assembly whole.
+    public const string MtouchLink = "MtouchLink";
+    public const string LinkMode = "_LinkMode";
+
+    // The Apple workloads' reading of an app's built bundle: where it is and the bundle identifier it carries.
+    public const string ReadAppManifest = "_ReadAppManifest";
+    public const string AppBundlePath = "_AppBundlePath";
+    public const string BundleIdentifier = "_BundleIdentifier";
 }

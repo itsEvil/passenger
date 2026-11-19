@@ -1,3 +1,4 @@
+using Passenger.Core;
 using Passenger.Terminal;
 
 namespace Passenger.UnitTests.Terminal;
@@ -13,9 +14,9 @@ public class UnsettingTests
     public void Env_unsets_each_variable_taken_away_and_then_runs_the_program_as_given()
     {
         Dictionary<string, string> environment = [];
-        (string app, string[] arguments) = TerminalSession.Unsetting(["GIT_DIR", "-odd"], "/bin/prog", ["a", "b=c"], environment, NoLoader);
+        (string app, string[] arguments) = TerminalSession.Unsetting([GitVariables.Dir, "-odd"], "/bin/prog", ["a", "b=c"], environment, NoLoader);
         Assert.Equal("/usr/bin/env", app);
-        Assert.Equal(["-u", "GIT_DIR", "-u", "-odd", "--", "/bin/prog", "a", "b=c"], arguments);
+        Assert.Equal(["-u", GitVariables.Dir, "-u", "-odd", "--", "/bin/prog", "a", "b=c"], arguments);
         Assert.True(TerminalSession.Unsetting([], "/bin/prog", ["a"], environment, NoLoader) is ("/bin/prog", ["a"]), "A program with nothing to take away was not run as it is");
         Assert.True(environment.Count == 0, "A start with no loader variables was given variables to carry");
     }
@@ -30,8 +31,8 @@ public class UnsettingTests
     [Fact]
     public void A_program_named_with_an_equals_sign_is_run_by_shs_exec_never_taken_by_env_for_a_variable()
     {
-        (string app, string[] arguments) = TerminalSession.Unsetting(["GIT_DIR"], "/tmp/a=b/prog", ["x"], new Dictionary<string, string>(), NoLoader);
-        Assert.True(app == "/usr/bin/env" && arguments.SequenceEqual(["-u", "GIT_DIR", "--", "/bin/sh", "-c", "exec \"$0\" \"$@\"", "/tmp/a=b/prog", "x"]),
+        (string app, string[] arguments) = TerminalSession.Unsetting([GitVariables.Dir], "/tmp/a=b/prog", ["x"], new Dictionary<string, string>(), NoLoader);
+        Assert.True(app == "/usr/bin/env" && arguments.SequenceEqual(["-u", GitVariables.Dir, "--", "/bin/sh", "-c", "exec \"$0\" \"$@\"", "/tmp/a=b/prog", "x"]),
             $"env would take the program's name for a variable, run nothing and list the whole environment on the screen: {string.Join(' ', arguments)}");
     }
 
@@ -67,6 +68,19 @@ public class UnsettingTests
         (_, string[] arguments) = TerminalSession.Unsetting(["TMUX"], "/bin/prog", [], environment, new Dictionary<string, string> { ["DYLD_A-B"] = "x" });
         Assert.True(arguments.SequenceEqual(["-u", "TMUX", "--", "/bin/prog"]) && environment.Count == 0,
             $"sh was told to set a name that is no identifier, a syntax error that runs nothing: {string.Join(' ', arguments)}");
+    }
+
+    [Fact]
+    public void Given_a_terminal_the_program_is_run_by_dash_which_takes_it_first_its_loader_variables_carried_past_dash()
+    {
+        Dictionary<string, string> environment = [];
+        (string app, string[] arguments) = TerminalSession.Unsetting([], "zsh", ["-l"], environment, new Dictionary<string, string> { ["DYLD_X"] = "value" }, "/dev/ttys003");
+        string script = $"exec 0<>'/dev/ttys003' 1>&0 2>&0; DYLD_X=\"${TerminalSession.KeptPrefix}DYLD_X\"; export DYLD_X; unset {TerminalSession.KeptPrefix}DYLD_X; exec \"$0\" \"$@\"";
+        Assert.True(app == "/bin/dash" && arguments.SequenceEqual(["-c", script, "zsh", "-l"]),
+            $"The program would run with no controlling terminal, where Ctrl+C and a hang-up reach nothing: {app} {string.Join(' ', arguments)}");
+        Assert.True(environment.GetValueOrDefault(TerminalSession.KeptPrefix + "DYLD_X") == "value", "The loader's variable was not carried past dash, which loses it");
+        Assert.True(TerminalSession.Unsetting([], "/bin/prog", [], new Dictionary<string, string>(), NoLoader, "/dev/ttys003") is ("/bin/dash", ["-c", "exec 0<>'/dev/ttys003' 1>&0 2>&0; exec \"$0\" \"$@\"", "/bin/prog"]),
+            "A program with no loader variables was not run by the shell that takes its terminal");
     }
 
     [Fact]

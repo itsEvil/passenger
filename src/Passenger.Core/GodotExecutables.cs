@@ -245,7 +245,7 @@ public static partial class GodotExecutables
     public static GodotFound At(string path, string from, bool windows)
     {
         string full = Path.GetFullPath(Environment.ExpandEnvironmentVariables(path.Trim().Trim('"')));
-        if (Directory.Exists(full) && full.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar).EndsWith(".app", StringComparison.OrdinalIgnoreCase))
+        if (Directory.Exists(full) && MacBundles.Named(full))
         {
             return InBundle(full, from);
         }
@@ -259,7 +259,7 @@ public static partial class GodotExecutables
             file = started;
         }
         // A link into a bundle (a package manager's) has the bundle's Resources beside its MacOS folder.
-        if (BundleOf(file) is { } bundle)
+        if (MacBundles.Of(file) is { } bundle)
         {
             return InBundle(bundle, from) with { Executable = file };
         }
@@ -281,9 +281,10 @@ public static partial class GodotExecutables
         char[] separators = windows ? ['/', '\\'] : ['/'];
         string[] parts = named.TrimEnd(separators).Split(separators);
         string name = parts[^1];
-        if (name.EndsWith(".app", StringComparison.OrdinalIgnoreCase) || parts is [.., { } bundle, "Contents", "MacOS", _] && bundle.EndsWith(".app", StringComparison.OrdinalIgnoreCase))
+        string? bundle = MacBundles.Named(name) ? name : MacBundles.Of(string.Join('/', parts)) is { } holding ? Path.GetFileName(holding) : null;
+        if (bundle is not null)
         {
-            return (name.EndsWith(".app", StringComparison.OrdinalIgnoreCase) ? name : parts[^4]).StartsWith("Godot", StringComparison.OrdinalIgnoreCase);
+            return bundle.StartsWith("Godot", StringComparison.OrdinalIgnoreCase);
         }
         string bare = windows && name.EndsWith(".exe", StringComparison.OrdinalIgnoreCase) ? name[..^".exe".Length] : name;
         return Names.Contains(bare, StringComparer.OrdinalIgnoreCase) || DownloadVersion().IsMatch(name);
@@ -333,16 +334,10 @@ public static partial class GodotExecutables
         return executable;
     }
 
-    /// <summary>The app bundle an executable is the program of (X.app/Contents/MacOS/Godot), or null.</summary>
-    private static string? BundleOf(string file) =>
-        Path.GetDirectoryName(file) is { } macOS && Path.GetFileName(macOS) == "MacOS" && Path.GetDirectoryName(macOS) is { } contents
-        && Path.GetFileName(contents) == "Contents" && Path.GetDirectoryName(contents) is { } bundle && bundle.EndsWith(".app", StringComparison.OrdinalIgnoreCase)
-            ? bundle : null;
-
     /// <summary>The Godot of an app bundle: Contents/MacOS/Godot, or the one program there, with its Resources' GodotSharp.</summary>
     private static GodotFound InBundle(string bundle, string from)
     {
-        string programs = Path.Combine(bundle, "Contents", "MacOS");
+        string programs = MacBundles.Programs(bundle);
         string executable = Path.Combine(programs, "Godot");
         if (!File.Exists(executable) && Directory.Exists(programs) && Directory.GetFiles(programs) is [{ } only])
         {
@@ -445,7 +440,7 @@ public static partial class GodotExecutables
         && (windows ? name.EndsWith(".exe", StringComparison.OrdinalIgnoreCase) : !name.EndsWith(".exe", StringComparison.OrdinalIgnoreCase) && !name.EndsWith(".zip", StringComparison.OrdinalIgnoreCase));
 
     /// <summary>The Godot app bundles in the folders given (Godot.app, Godot_mono.app, Godot_v4.7.2-stable_mono.app), the
-    /// newest .NET build first.</summary>
+    /// newest .NET build first (<see cref="VersionOrder"/>'s, a release above its prereleases).</summary>
     private static IEnumerable<GodotFound> Bundles(IReadOnlyList<string> folders)
     {
         List<GodotFound> found = [];
@@ -462,18 +457,15 @@ public static partial class GodotExecutables
                 // A folder this user may not list offers no Godot.
             }
         }
-        return found.OrderBy(g => g.WhyNot is null ? 0 : 1).ThenByDescending(g => Comparable(g.Version)).ThenBy(g => g.Executable, StringComparer.Ordinal);
+        return found.OrderBy(g => g.WhyNot is null ? 0 : 1).ThenByDescending(g => g.Version ?? string.Empty, VersionOrder.Instance).ThenBy(g => g.Executable, StringComparer.Ordinal);
     }
 
-    /// <summary>A version as one to compare ("4.7.2-beta1" as 4.7.2), none the oldest.</summary>
-    private static Version Comparable(string? version) =>
-        System.Version.TryParse(version?.Split('-')[0], out Version? parsed) ? parsed : new Version(0, 0);
-
-    /// <summary>The answers each Godot gave to <c>--version</c>, by its executable and when it was last written.</summary>
-    private static readonly System.Collections.Concurrent.ConcurrentDictionary<(string, DateTime), Lazy<Task<string?>>> Answered = new();
+    /// <summary>The answers each Godot gave to <c>--version</c>, by its executable and when it was last written, kept once
+    /// it gave one. Unheld, every asker's: on the first one's thread, a thread that never runs again would hold the rest.</summary>
+    private static readonly SharedWork<(string, DateTime), string?> Answered = new(answer => answer.IsCompletedSuccessfully && answer.Result is not null, unheld: true);
 
     /// <summary>The version a Godot's executable answers <c>--version</c> with, asked headless once per executable as it
-    /// is written, else the one its files gave (<see cref="GodotFound.Version"/>).</summary>
+    /// is written (again while it gives none), else the one its files gave (<see cref="GodotFound.Version"/>).</summary>
     public static async Task<string?> VersionAsync(GodotFound found, CancellationToken cancel = default) =>
         (await AnswerAsync(found, cancel).ConfigureAwait(false) is { } line ? ReadVersion(line)?.Version : null) ?? found.Version;
 
@@ -485,10 +477,8 @@ public static partial class GodotExecutables
         {
             return null;
         }
-        (string, DateTime) key = (found.Executable, File.GetLastWriteTimeUtc(found.Executable));
-        // Not held, every asker's: on the first one's thread, a thread that never runs again would hold the rest.
-        Lazy<Task<string?>> once = Answered.GetOrAdd(key, _ => new Lazy<Task<string?>>(() => BackgroundWork.Unheld(() => AskVersionAsync(found.Executable))));
-        return await once.Value.WaitAsync(cancel).ConfigureAwait(false);
+        return await Answered.Take((found.Executable, File.GetLastWriteTimeUtc(found.Executable)), () => AskVersionAsync(found.Executable))
+            .WaitAsync(cancel).ConfigureAwait(false);
     }
 
     private static async Task<string?> AskVersionAsync(string executable)

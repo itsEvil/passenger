@@ -120,14 +120,14 @@ public static class TextNavigation
         int end = line.End;
         if (stop == WordStop.End)
         {
-            while (i < end && char.IsWhiteSpace(content[i]))
+            while (i < end && ClassAt(text, content, i) == CharClass.Space)
             {
                 i++;
             }
             if (i < end)
             {
-                CharClass kind = Classify(content[i]);
-                while (i < end && Classify(content[i]) == kind)
+                CharClass kind = ClassAt(text, content, i);
+                while (i < end && ClassAt(text, content, i) == kind)
                 {
                     i++;
                 }
@@ -135,15 +135,15 @@ public static class TextNavigation
         }
         else
         {
-            CharClass kind = Classify(content[i]);
+            CharClass kind = ClassAt(text, content, i);
             if (kind != CharClass.Space)
             {
-                while (i < end && Classify(content[i]) == kind)
+                while (i < end && ClassAt(text, content, i) == kind)
                 {
                     i++;
                 }
             }
-            while (i < end && char.IsWhiteSpace(content[i]))
+            while (i < end && ClassAt(text, content, i) == CharClass.Space)
             {
                 i++;
             }
@@ -160,14 +160,14 @@ public static class TextNavigation
         }
         LineReader content = new(text, line);
         int i = Math.Min(offset, line.End);
-        while (i > line.Start && char.IsWhiteSpace(content[i - 1]))
+        while (i > line.Start && ClassAt(text, content, i - 1) == CharClass.Space)
         {
             i--;
         }
         if (i > line.Start)
         {
-            CharClass kind = Classify(content[i - 1]);
-            while (i > line.Start && Classify(content[i - 1]) == kind)
+            CharClass kind = ClassAt(text, content, i - 1);
+            while (i > line.Start && ClassAt(text, content, i - 1) == kind)
             {
                 i--;
             }
@@ -186,19 +186,19 @@ public static class TextNavigation
         }
         LineReader content = new(text, line);
         int i = Math.Min(offset, line.End);
-        bool leftIsWord = i > line.Start && Classify(content[i - 1]) == CharClass.Word;
-        if (i == line.End || (leftIsWord && Classify(content[i]) != CharClass.Word))
+        bool leftIsWord = i > line.Start && ClassAt(text, content, i - 1) == CharClass.Word;
+        if (i == line.End || (leftIsWord && ClassAt(text, content, i) != CharClass.Word))
         {
             i--;
         }
-        CharClass kind = Classify(content[i]);
+        CharClass kind = ClassAt(text, content, i);
         int start = i;
         int end = i + 1;
-        while (start > line.Start && Classify(content[start - 1]) == kind)
+        while (start > line.Start && ClassAt(text, content, start - 1) == kind)
         {
             start--;
         }
-        while (end < line.End && Classify(content[end]) == kind)
+        while (end < line.End && ClassAt(text, content, end) == kind)
         {
             end++;
         }
@@ -247,8 +247,29 @@ public static class TextNavigation
         return i;
     }
 
-    /// <summary>Where the line of a string holding an offset starts, lines broken at each '\n'.</summary>
-    public static int LineStart(string text, int offset) => offset <= 0 ? 0 : text.LastIndexOf('\n', offset - 1) + 1;
+    /// <summary>The spaces and tabs the line of a string holding an offset begins with.</summary>
+    public static string IndentOf(string text, int offset)
+    {
+        int start = LineStart(text, offset);
+        return text[start..IndentEnd(text, start)];
+    }
+
+    /// <summary>Where the line of a string holding an offset starts, lines broken at each '\n'; an offset past the text's
+    /// end is on its last line.</summary>
+    public static int LineStart(string text, int offset) => offset <= 0 ? 0 : text.LastIndexOf('\n', Math.Min(offset, text.Length) - 1) + 1;
+
+    /// <summary>Where the line of a string holding an offset ends, before its '\n' and a '\r' just before that, never before
+    /// the offset; the text's end on its last line.</summary>
+    public static int LineEnd(string text, int offset)
+    {
+        offset = Math.Clamp(offset, 0, text.Length);
+        int end = text.IndexOf('\n', offset);
+        end = end < 0 ? text.Length : end;
+        return end > offset && text[end - 1] == '\r' ? end - 1 : end;
+    }
+
+    /// <summary>Where the line after the one of a string holding an offset starts, past its '\n'; the text's end on its last line.</summary>
+    public static int NextLineStart(string text, int offset) => text.IndexOf('\n', Math.Clamp(offset, 0, text.Length)) is var end and >= 0 ? end + 1 : text.Length;
 
     /// <summary>Where the run of whitespace ending at <paramref name="offset"/> on a line begins, read no further back
     /// than it goes.</summary>
@@ -274,18 +295,60 @@ public static class TextNavigation
         return i;
     }
 
-    /// <summary>The column a character lands in on screen, tabs expanded to the next stop.</summary>
-    public static int VisualColumn(string line, int column, int tabWidth)
+    /// <summary>The column a piece of text reaches on screen drawn from <paramref name="column"/>: a tab to its next
+    /// stop, every other character its <see cref="WideCharacters.Cells"/>.</summary>
+    public static int ColumnAfter(ReadOnlySpan<char> piece, int column, int tabWidth)
     {
-        int visual = 0;
-        for (int i = 0; i < column && i < line.Length; i++)
+        for (int i = 0; i < piece.Length; i++)
         {
-            visual = line[i] == '\t' ? (visual / tabWidth + 1) * tabWidth : visual + 1;
+            char c = piece[i];
+            if (c == '\t')
+            {
+                int stop = Math.Max(1, tabWidth);
+                column = (column / stop + 1) * stop;
+            }
+            else if (c < '\u0300')
+            {
+                column++;
+            }
+            else if (char.IsHighSurrogate(c) && i + 1 < piece.Length && char.IsLowSurrogate(piece[i + 1]))
+            {
+                column += WideCharacters.Cells(char.ConvertToUtf32(c, piece[++i]));
+            }
+            else
+            {
+                column += WideCharacters.Cells(c);
+            }
         }
-        return visual;
+        return column;
     }
 
-    public static bool IsWordChar(char c) => Classify(c) == CharClass.Word;
+    /// <summary>The column a stretch of a line reaches on screen drawn from <paramref name="column"/>, read a block at a
+    /// time onto the stack and counted as <see cref="ColumnAfter(ReadOnlySpan{char}, int, int)"/> counts.</summary>
+    public static int ColumnAfter(TextSnapshot text, int from, int to, int column, int tabWidth)
+    {
+        Span<char> block = stackalloc char[256];
+        for (int at = from; at < to;)
+        {
+            int length = Math.Min(block.Length, to - at);
+            text.CopyTo(at, block[..length]);
+            if (length > 1 && at + length < to && char.IsHighSurrogate(block[length - 1]))
+            {
+                // A pair the block's end cuts is read whole with the next.
+                length--;
+            }
+            column = ColumnAfter(block[..length], column, tabWidth);
+            at += length;
+        }
+        return column;
+    }
+
+    /// <summary>The column an offset lands in on screen, counted from its line's start.</summary>
+    public static int VisualColumn(TextSnapshot text, int offset, int tabWidth)
+    {
+        LineSpan line = text.GetLine(text.GetLineFromOffset(offset));
+        return ColumnAfter(text, line.Start, Math.Min(offset, line.End), 0, tabWidth);
+    }
 
     private enum CharClass
     {
@@ -295,9 +358,15 @@ public static class TextNavigation
     }
 
     private static CharClass Classify(char c) =>
-        char.IsWhiteSpace(c) ? CharClass.Space
-        : char.IsLetterOrDigit(c) || c == '_' || char.IsSurrogate(c) ? CharClass.Word
-        : CharClass.Punctuation;
+        char.IsWhiteSpace(c) ? CharClass.Space : WordCharacters.IsWord(c) ? CharClass.Word : CharClass.Punctuation;
+
+    /// <summary>The class of the character at an offset of a line, a mark or joiner taking the class of the character
+    /// it carries on (<see cref="WordCharacters.Base"/>).</summary>
+    private static CharClass ClassAt(TextSnapshot text, LineReader content, int offset)
+    {
+        char c = content[offset];
+        return WordCharacters.Extends(c) ? Classify(text[WordCharacters.Base(text, offset)]) : Classify(c);
+    }
 
     /// <summary>Whether a grapheme always begins at this character, whatever comes before it: a Latin or CJK one, which
     /// no mark, joiner or emoji sequence reaches back over (but for the two emoji among them).</summary>

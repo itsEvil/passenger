@@ -191,7 +191,7 @@ public static class EndpointClient
             }
             catch (OperationCanceledException) when (!cancel.IsCancellationRequested)
             {
-                return new EndpointResponse { Error = $"The body's file {file} was not read within {options.Timeout.TotalSeconds:0.#} s", Elapsed = clock.Elapsed };
+                return new EndpointResponse { Error = $"The body's file {file} was not read within {Durations.Said(options.Timeout)}", Elapsed = clock.Elapsed };
             }
         }
         try
@@ -277,7 +277,7 @@ public static class EndpointClient
         }
         catch (OperationCanceledException) when (!cancel.IsCancellationRequested)
         {
-            return new EndpointResponse { Error = $"No answer within {options.Timeout.TotalSeconds:0.#} s", Elapsed = clock.Elapsed };
+            return new EndpointResponse { Error = $"No answer within {Durations.Said(options.Timeout)}", Elapsed = clock.Elapsed };
         }
         catch (HttpRequestException error)
         {
@@ -351,7 +351,7 @@ public static class EndpointClient
                 text.Append(chunk, 0, count);
                 if (text.Length > MostSent)
                 {
-                    return (null, $"it is over {MostSent / 1024 / 1024} MB");
+                    return (null, $"it is over {Sizes.Said(MostSent)}");
                 }
             }
             return (text.ToString(), null);

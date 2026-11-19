@@ -23,6 +23,10 @@ internal sealed class AvaloniaPreviewHost : IPreviewHost
 {
     private readonly XamlPreview preview;
     private readonly string output;
+
+    /// <summary>The assembly of the file's XAML as the previewer loads it: the app's own, or a library's copy beside the
+    /// program running it (<see cref="PreviewedBuild.Library"/>).</summary>
+    private readonly string xamlAssembly;
     private readonly XamlPreview.PreviewerLog log;
     private IDisposable? listening;
     private IAvaloniaRemoteTransportConnection? connection;
@@ -45,12 +49,17 @@ internal sealed class AvaloniaPreviewHost : IPreviewHost
     /// <summary>The text last loaded whose elements' boxes are yet to be asked for, once its frame is drawn.</summary>
     private TextSnapshot? unplaced;
 
+    /// <summary>The DPI a rescale asked the host to draw at whose frame is yet to come, which screenshots and tests are held
+    /// for; null while none is.</summary>
+    private double? rescaled;
+
     private AvaloniaPreviewHost(XamlPreview preview, PreviewedBuild build)
     {
         this.preview = preview;
         log = new XamlPreview.PreviewerLog(preview, "Avalonia");
         Build = build;
         output = build.Assembly;
+        xamlAssembly = build.Library ?? build.Assembly;
     }
 
     public PreviewedBuild Build { get; }
@@ -58,10 +67,18 @@ internal sealed class AvaloniaPreviewHost : IPreviewHost
     /// <summary>Starts the host on the project's last build; null, having said why, when there is none to start.</summary>
     public static async Task<AvaloniaPreviewHost?> StartAsync(XamlPreview preview, ProjectInputs inputs)
     {
-        if (XamlPreview.Output(inputs) is not { } built)
+        string? built = XamlPreview.Output(inputs);
+        string? library = null;
+        if (built is null)
         {
-            preview.SayUnbuilt(inputs);
-            return null;
+            // A library's views, a cross-platform app's shared ones, are drawn in a program that runs them.
+            IReadOnlyList<string> programs = preview.ProgramsRunning(inputs.ProjectPath);
+            if (await BackgroundWork.Run(() => XamlPreview.Hosted(inputs, programs)) is not var (program, copy))
+            {
+                preview.SayUnbuilt(inputs, programs);
+                return null;
+            }
+            (built, library) = (program, copy);
         }
         string? runs = await BackgroundWork.Run(() => RuntimeConfig.Read(built)?.TargetFramework) ?? inputs.TargetFramework;
         if (HostApp(inputs, runs) is not { } designer)
@@ -71,7 +88,7 @@ internal sealed class AvaloniaPreviewHost : IPreviewHost
             preview.Say(why);
             return null;
         }
-        AvaloniaPreviewHost started = new(preview, await BackgroundWork.Run(() => PreviewedBuild.Of(built, configured: true)));
+        AvaloniaPreviewHost started = new(preview, await BackgroundWork.Run(() => PreviewedBuild.Of(built, configured: true) with { Library = library }));
         try
         {
             await started.RunAsync(designer);
@@ -131,18 +148,30 @@ internal sealed class AvaloniaPreviewHost : IPreviewHost
         {
             return;
         }
+        // The load's first frame lets the hold go, at whatever scale its window takes.
+        rescaled = null;
         preview.Hold();
         TextSnapshot text = preview.Document.Document.Text.Snapshot;
         unanswered.Enqueue(text);
-        IdeErrors.Observe(open.Send(new UpdateXamlMessage { Xaml = text.ToString(), AssemblyPath = output, XamlFileProjectPath = preview.ProjectPath() }));
+        string xaml = preview.Size is { } size ? size.Sized(text.ToString()) : text.ToString();
+        IdeErrors.Observe(open.Send(new UpdateXamlMessage { Xaml = xaml, AssemblyPath = xamlAssembly, XamlFileProjectPath = preview.ProjectPath() }));
     }
 
+    /// <summary>The host's window drawn again at a scale, screenshots and tests held for its frame where the host has a
+    /// window drawn to draw again: none before its first frame, after a load it refused or at 0 × 0.</summary>
     public void Rescale(double scaling)
     {
-        if (connection is { } open && !disposed)
+        if (connection is not { } open || disposed)
         {
-            IdeErrors.Observe(open.Send(new ClientRenderInfoMessage { DpiX = 96 * scaling, DpiY = 96 * scaling }));
+            return;
         }
+        double dpi = 96 * scaling;
+        if (preview.Frame is not null && preview.Error is null && !empty)
+        {
+            rescaled = dpi;
+            preview.Hold();
+        }
+        IdeErrors.Observe(open.Send(new ClientRenderInfoMessage { DpiX = dpi, DpiY = dpi }));
     }
 
     private void Connected(IAvaloniaRemoteTransportConnection opened)
@@ -186,6 +215,7 @@ internal sealed class AvaloniaPreviewHost : IPreviewHost
                 preview.Error = result.Error is { Length: > 0 } ? Describe(result, answered) : null;
                 if (preview.Error is not null)
                 {
+                    rescaled = null;
                     preview.Let();
                 }
                 else if (preview.Frame is null || Math.Abs(drawnAt - (96 * preview.Scaling)) > 0.5)
@@ -200,6 +230,7 @@ internal sealed class AvaloniaPreviewHost : IPreviewHost
                 {
                     preview.Frame = null;
                     preview.Status = "Nothing to draw: the root is 0 × 0 (hidden, or sized to content with none and no d:DesignWidth and d:DesignHeight)";
+                    rescaled = null;
                     preview.Let();
                 }
                 preview.Tell();
@@ -223,7 +254,12 @@ internal sealed class AvaloniaPreviewHost : IPreviewHost
                 }
                 preview.Status = "Live";
                 preview.Tell();
-                preview.Let();
+                // One drawn before the host took a rescale is followed by the frame at the scale asked, which the hold waits for.
+                if (rescaled is not { } asked || Math.Abs(frame.DpiX - asked) <= 0.5)
+                {
+                    rescaled = null;
+                    preview.Let();
+                }
                 break;
         }
     }

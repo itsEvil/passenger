@@ -12,7 +12,12 @@
 // a method that returns a value each turn, which a debugger attaches to (LoopingConsoleAppOptimized is it built optimized).
 // With "asleep" it writes its numbers in a culture of its own and a value by its own ToString, then sleeps for good. With
 // "locked" a second thread, Holder, holds a lock a property is read under, letting it go only as it runs on, then starts a
-// third, Let go, and waits.
+// third, Let go, and waits. With "starts" it sleeps where a breakpoint's condition can start a thread that turns.
+if (args is ["starts"])
+{
+    Console.WriteLine("starts"); // stop where a condition starts a thread
+    Thread.Sleep(Timeout.Infinite);
+}
 if (args is ["locked"])
 {
     Locked locked = new();
@@ -120,13 +125,37 @@ long turns = 0;
 bool sleeps = args is ["sleep", ..];
 // Shown by its own ToString, which a thread paused in the sleep cannot run.
 TimeSpan nap = TimeSpan.FromMilliseconds(20);
-Console.WriteLine("looping");
+// Said by another thread once this one has turned its loop: said by this one, a pause just after could find it still
+// in its write, on its way back from the system's call.
+Looping looping = Looping.SayOnceTurned();
 while (true)
 {
     turns++;
+    looping.Turned = true;
     if (sleeps)
     {
         Thread.Sleep(nap);
+    }
+}
+
+// Says "looping" on a thread of its own once the thread looping has turned its loop. The loop sets an instance's field,
+// never a static's, so its code calls nothing, not even for a class's statics.
+internal sealed class Looping
+{
+    public volatile bool Turned;
+
+    public static Looping SayOnceTurned()
+    {
+        Looping looping = new();
+        new Thread(() =>
+        {
+            while (!looping.Turned)
+            {
+                Thread.Sleep(1);
+            }
+            Console.WriteLine("looping");
+        }) { IsBackground = true, Name = "Says it loops" }.Start();
+        return looping;
     }
 }
 
@@ -149,6 +178,9 @@ internal sealed class Locked
     // Set once the holder has let go of the lock, read with no code run.
     public static bool LetGo;
 
+    // Set by the holder on its sleep's line, so the program goes on to its stop only once the holder is there.
+    private static volatile bool Holding;
+
     // Set by the holder in its wait once it has let go, and by the thread it starts then once that runs.
     public static volatile bool Waiting;
     public static volatile bool Started;
@@ -168,13 +200,11 @@ internal sealed class Locked
 
     public static void Hold()
     {
-        using ManualResetEventSlim held = new();
         Thread holder = new(() =>
         {
             lock (Gate)
             {
-                held.Set();
-                Thread.Sleep(1000); // the holder sleeps holding the lock
+                Holding = true; Thread.Sleep(1000); // the holder sleeps holding the lock
             }
             LetGo = true;
             new Thread(() =>
@@ -188,7 +218,27 @@ internal sealed class Locked
             }
         }) { IsBackground = true, Name = "Holder" };
         holder.Start();
-        held.Wait();
+        SpinWait.SpinUntil(() => Holding);
+    }
+}
+
+internal static class Starter
+{
+    public static long Turns;
+
+    // A breakpoint's condition: starts a thread that turns, waits while it could turn many times, and is false.
+    public static bool Begin()
+    {
+        Thread turning = new(() =>
+        {
+            for (long turn = 0; ; turn++)
+            {
+                Turns = turn; // the started thread's turn
+            }
+        }) { IsBackground = true, Name = "Turning" };
+        turning.Start();
+        Thread.Sleep(300);
+        return false;
     }
 }
 

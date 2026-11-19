@@ -67,6 +67,10 @@ public sealed record PublishRequest(string Project, string? Profile, string? Con
     /// <summary>What the publish's dotnet is given beside Passenger's own environment: the engine's CLI first on PATH.</summary>
     public IReadOnlyDictionary<string, string>? Environment { get; init; }
 
+    /// <summary>What an AppHost's dotnet run is given for the build configuration chosen (<see cref="WorkspaceModel.BuildArgumentsFor"/>),
+    /// so its steps run on the build its runs make; none for the one MSBuild takes.</summary>
+    public IReadOnlyList<string> Configured { get; init; } = [];
+
     public string Name => System.IO.Path.GetFileNameWithoutExtension(Project);
 
     /// <summary>How the publish is named in the status bar and the Build window: "Hello (FolderProfile)", an AppHost's deploy
@@ -76,7 +80,7 @@ public sealed record PublishRequest(string Project, string? Profile, string? Con
     /// <summary>The dotnet publish command line: the same as a person types to publish with the profile, ending as a build's
     /// does (<see cref="BuildOutput.Tail"/>), Windows targeting given where the project host gave it.</summary>
     public IReadOnlyList<string> Arguments(bool windowsTargeting) => Kind == PublishKind.AppHost
-        ? ["run", "--project", Project, "--no-launch-profile", .. windowsTargeting ? (string[])[$"-p:{MSBuildNames.EnableWindowsTargeting}=true"] : [], "--",
+        ? ["run", "--project", Project, "--no-launch-profile", .. Configured, .. windowsTargeting ? (string[])[PropertySwitch.Of(MSBuildNames.EnableWindowsTargeting, "true")] : [], "--",
             .. Aspire.AppHostPipeline.RunArguments(Step, Staging ?? Folder ?? string.Empty)]
         : ["publish", Project, .. Command(), .. BuildOutput.Tail(windowsTargeting)];
 
@@ -91,7 +95,7 @@ public sealed record PublishRequest(string Project, string? Profile, string? Con
         }
         if (Profile is not null && !BuiltInProfile)
         {
-            arguments.Add($"-p:{MSBuildNames.PublishProfile}={Profile}");
+            arguments.Add(PropertySwitch.Of(MSBuildNames.PublishProfile, Profile));
         }
         if (Kind == PublishKind.Container)
         {
@@ -225,6 +229,8 @@ public static partial class PublishProfiles
         string? runtime = null)
     {
         Dictionary<string, string> globals = ProjectModels.Properties(workspace, project);
+        // A publish names its configuration alone, as its command line does: the platform is the project's own.
+        globals.Remove(MSBuildNames.Platform);
         globals[MSBuildNames.IsPublishing] = "true";
         if (profile is not null)
         {
@@ -307,7 +313,7 @@ public static partial class PublishProfiles
                 configuration ??= raw.ContainsKey(MSBuildNames.Configuration) ? read.Values.GetValueOrDefault(MSBuildNames.Configuration)
                     : raw.GetValueOrDefault(MSBuildNames.LastUsedBuildConfiguration) is { Length: > 0 } last ? last : null;
             }
-            configuration ??= "Release";
+            configuration ??= PublishProfiles.ReleaseOf(PublishProfiles.DeclaredConfigurations(project));
             if (!string.Equals(read.Values.GetValueOrDefault(MSBuildNames.Configuration), configuration, StringComparison.OrdinalIgnoreCase))
             {
                 read = await EvaluateAsync(open, project.Path, Globals(workspace, project, request.Profile, configuration, framework), cancel);

@@ -1,4 +1,6 @@
+using System.Diagnostics;
 using Avalonia.Input;
+using Passenger.Core;
 
 namespace Passenger.Editor;
 
@@ -6,6 +8,8 @@ namespace Passenger.Editor;
 /// ("meta shift L", "control alt SLASH"), so a binding reads the same in both places.</summary>
 public readonly record struct Keystroke(Key Key, KeyModifiers Modifiers)
 {
+    /// <summary>A keystroke in the keymap's notation, its parts apart by spaces, a key by its name (<see cref="ParseKey"/>)
+    /// or as the character it types on a US keyboard (<see cref="Typing"/>: "meta ," is "meta COMMA", "?" Shift with SLASH).</summary>
     public static Keystroke Parse(string text)
     {
         KeyModifiers modifiers = KeyModifiers.None;
@@ -16,13 +20,82 @@ public readonly record struct Keystroke(Key Key, KeyModifiers Modifiers)
             {
                 modifiers |= modifier;
             }
+            else if (key is not null)
+            {
+                throw new FormatException($"'{text}' names two keys");
+            }
+            else if (Typing(part) is { } typing)
+            {
+                key = typing.Key;
+                modifiers |= typing.Modifiers;
+            }
             else
             {
-                key = key is null ? ParseKey(part) : throw new FormatException($"'{text}' names two keys");
+                key = ParseKey(part);
             }
         }
         return new Keystroke(key ?? KeyOf(modifiers) ?? throw new FormatException($"'{text}' names no key"), modifiers);
     }
+
+    /// <summary>A keystroke as a command line writes one, its parts joined by + ("cmd+shift+L", "meta+,"), each part as
+    /// <see cref="Parse"/> reads it.</summary>
+    public static Keystroke ParseJoined(string text) => Parse(string.Join(' ', JoinedParts(text)));
+
+    /// <summary>The parts of a keystroke joined by + ("cmd+shift+L" is cmd, shift and L), the plus key a chord's last + where
+    /// it ends in two ("ctrl++") or the whole of it.</summary>
+    public static string[] JoinedParts(string text) =>
+        text == "+" ? [text] : text.EndsWith("++", StringComparison.Ordinal) ? [.. text[..^2].Split('+'), "+"] : text.Split('+');
+
+    /// <summary>The character this keystroke types on a US keyboard, Shift's where it holds Shift, or null where it holds
+    /// Ctrl, Alt or Meta or its key types none: what a text box takes from it when nothing takes the key itself.</summary>
+    public string? Types =>
+        (Modifiers & ~KeyModifiers.Shift) == KeyModifiers.None && UsKeys.Value.TryGetValue(Key, out PhysicalKey physical)
+        && physical.ToQwertyKeySymbol(Modifiers.HasFlag(KeyModifiers.Shift)) is { Length: > 0 } typed && typed.All(c => c >= ' ' && c != '\u007f')
+            ? typed
+            : null;
+
+    /// <summary>The key a US keyboard types a character other than a letter or digit on, with Shift for one typed with it
+    /// ("," the comma key, "&lt;" Shift with it, "$" Shift with 4, "plus" as "+"), or null for any other part.</summary>
+    private static Keystroke? Typing(string part) =>
+        part.Equals("plus", StringComparison.OrdinalIgnoreCase) ? Typing("+")
+        : part.Length == 1 && !char.IsAsciiLetterOrDigit(part[0]) && UsKeyboard.Value.TryGetValue(part[0], out Keystroke typed) ? typed : null;
+
+    /// <summary>Each of Avalonia's keys by where it is on a US keyboard, the first place for a key on two.</summary>
+    private static readonly Lazy<Dictionary<Key, PhysicalKey>> UsKeys = new(() =>
+    {
+        Dictionary<Key, PhysicalKey> keys = [];
+        foreach (PhysicalKey physical in Enum.GetValues<PhysicalKey>())
+        {
+            if (physical != PhysicalKey.None)
+            {
+                keys.TryAdd(physical.ToQwertyKey(), physical);
+            }
+        }
+        return keys;
+    });
+
+    /// <summary>Each character the main keys of a US keyboard type but its letters and digits, by the key and whether Shift
+    /// is held, as Avalonia's keys are laid out on one (what a key typed on it gives as text, read the other way).</summary>
+    private static readonly Lazy<Dictionary<char, Keystroke>> UsKeyboard = new(() =>
+    {
+        Dictionary<char, Keystroke> keys = [];
+        foreach (PhysicalKey physical in Enum.GetValues<PhysicalKey>())
+        {
+            Key key = physical.ToQwertyKey();
+            if (physical == PhysicalKey.None || Keypad(key) is not null)
+            {
+                continue;
+            }
+            foreach (bool shifted in (bool[])[false, true])
+            {
+                if (physical.ToQwertyKeySymbol(shifted) is [char typed] && typed > ' ' && typed < '\u007f' && !char.IsAsciiLetterOrDigit(typed))
+                {
+                    keys.TryAdd(typed, new Keystroke(key, shifted ? KeyModifiers.Shift : KeyModifiers.None));
+                }
+            }
+        }
+        return keys;
+    });
 
     public static Keystroke From(KeyEventArgs e) => new(e.Key, e.KeyModifiers);
 
@@ -66,8 +139,8 @@ public readonly record struct Keystroke(Key Key, KeyModifiers Modifiers)
         _ => null,
     };
 
-    /// <summary>The modifier the platform's commands take: Cmd on macOS, Ctrl elsewhere.</summary>
-    public static KeyModifiers Command => OperatingSystem.IsMacOS() ? KeyModifiers.Meta : KeyModifiers.Control;
+    /// <summary>The modifier the system's commands take (<see cref="CommandKey"/>): Cmd on macOS, Ctrl elsewhere.</summary>
+    public static KeyModifiers Command => CommandKey.IsCmd ? KeyModifiers.Meta : KeyModifiers.Control;
 
     /// <summary>Whether the key is on the numeric keypad (its operators, decimal point and digits), a key of its own
     /// beside the one that types the same character.</summary>
@@ -190,9 +263,16 @@ public readonly record struct Keystroke(Key Key, KeyModifiers Modifiers)
     };
 
     /// <summary>A key by the name IntelliJ's keymaps give it, Java's VK_ without the prefix: SLASH is the main keys' /, and
-    /// DIVIDE, MULTIPLY, ADD, SUBTRACT, DECIMAL, SEPARATOR and NUMPAD0 to NUMPAD9 the keypad's, each a key of its own.</summary>
+    /// DIVIDE, MULTIPLY, ADD, SUBTRACT, DECIMAL, SEPARATOR and NUMPAD0 to NUMPAD9 the keypad's, each a key of its own; by
+    /// Avalonia's name for it (OemComma, PageDown), in any case; or by a word an agent writes for one (esc, del, pgdn).</summary>
     private static Key ParseKey(string name) => name.ToUpperInvariant() switch
     {
+        "ESC" => Key.Escape,
+        "BACKSPACE" => Key.Back,
+        "DEL" => Key.Delete,
+        "INS" => Key.Insert,
+        "PGUP" => Key.PageUp,
+        "PGDN" => Key.PageDown,
         "SLASH" => Key.OemQuestion,
         "DIVIDE" => Key.Divide,
         "PERIOD" => Key.OemPeriod,
@@ -224,7 +304,7 @@ public readonly record struct Keystroke(Key Key, KeyModifiers Modifiers)
         { Length: 1 } single when char.IsAsciiLetter(single[0]) => Enum.Parse<Key>(single),
         { Length: 1 } digit when char.IsAsciiDigit(digit[0]) => Key.D0 + (digit[0] - '0'),
         // Only a key's name: Enum.TryParse would also take "1000" or "Left,Up" as some other key.
-        _ when char.IsAsciiLetter(name[0]) && name.All(char.IsAsciiLetterOrDigit) && Enum.TryParse(name, true, out Key parsed) => parsed,
+        _ when char.IsAsciiLetter(name[0]) && name.All(char.IsAsciiLetterOrDigit) && Enum.TryParse(name, true, out Key parsed) && parsed != Key.None => parsed,
         _ => throw new FormatException($"unknown key '{name}'"),
     };
 }
@@ -513,13 +593,14 @@ public sealed class Keymap
 /// <summary>Turns key presses into actions, holding the first half of a chord until the second, and a modifier tapped
 /// alone until it is tapped again (<see cref="Shortcut.IsDoubleTap"/>) within half a second, a double-click's time.</summary>
 /// <param name="keymap">The keymap the keys run.</param>
-/// <param name="milliseconds">The time the taps are told apart by, the system's tick count unless given.</param>
-public sealed class KeymapDispatcher(Keymap keymap, Func<long>? milliseconds = null)
+/// <param name="timestamps">The clock the taps are told apart by, in timestamps of Stopwatch's, its own unless
+/// given.</param>
+public sealed class KeymapDispatcher(Keymap keymap, Func<long>? timestamps = null)
 {
-    private readonly Func<long> now = milliseconds ?? (static () => Environment.TickCount64);
+    private readonly Func<long> now = timestamps ?? Stopwatch.GetTimestamp;
 
     /// <summary>The most time between a modifier's two taps that makes them a double tap.</summary>
-    public const long DoubleTapMs = 500;
+    public static readonly TimeSpan DoubleTap = TimeSpan.FromMilliseconds(500);
 
     private Keystroke? pending;
 
@@ -618,7 +699,7 @@ public sealed class KeymapDispatcher(Keymap keymap, Func<long>? milliseconds = n
         }
         (Keystroke Stroke, long At)? first = tapped;
         tapped = null;
-        if (first is { } tap && tap.Stroke == stroke && now() - tap.At <= DoubleTapMs
+        if (first is { } tap && tap.Stroke == stroke && Stopwatch.GetElapsedTime(tap.At, now()) <= DoubleTap
             && Keymap.ActionFor(new Shortcut(stroke, stroke)) is { } action)
         {
             held = null;
@@ -654,6 +735,6 @@ public sealed class KeymapDispatcher(Keymap keymap, Func<long>? milliseconds = n
         && (e.KeyModifiers & ~KeyModifiers.Shift) == (KeyModifiers.Control | KeyModifiers.Alt)
         && e.KeySymbol is { Length: > 0 } symbol && !char.IsControl(symbol[0]) && !char.IsWhiteSpace(symbol[0]);
 
-    private static bool IsModifierOnly(Key key) => key is Key.LeftShift or Key.RightShift or Key.LeftCtrl or Key.RightCtrl
+    internal static bool IsModifierOnly(Key key) => key is Key.LeftShift or Key.RightShift or Key.LeftCtrl or Key.RightCtrl
         or Key.LeftAlt or Key.RightAlt or Key.LWin or Key.RWin;
 }

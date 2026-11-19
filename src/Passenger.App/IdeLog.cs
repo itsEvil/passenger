@@ -1,4 +1,5 @@
 using System.Text;
+using Passenger.Core;
 using Passenger.Dap;
 using Passenger.Lsp;
 
@@ -163,8 +164,7 @@ public static partial class IdeLog
             if (writer is null)
             {
                 AppDomain.CurrentDomain.ProcessExit += (_, _) => Flush();
-                writer = new Thread(WriteQueued) { IsBackground = true, Name = "Passenger log" };
-                writer.Start();
+                writer = ApartThreads.Start("Passenger log", WriteQueued);
             }
             Monitor.Pulse(Queued);
         }
@@ -214,7 +214,7 @@ public static partial class IdeLog
         FileStream? file = null;
         try
         {
-            Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+            Containers.OwnFiles.Made(Path.GetDirectoryName(path)!);
             file = Open(path);
             long length = file.Length;
             foreach (LogLine line in lines)
@@ -251,7 +251,7 @@ public static partial class IdeLog
     /// <summary>Whether a log that could not be moved aside to rotate has grown by less than a tenth of the limit since.</summary>
     private static bool WaitsToRotate(string path, long length) => Unmoved.TryGetValue(path, out long held) && length < held + Limit / 10;
 
-    private static FileStream Open(string path) => new(path, FileMode.Append, FileAccess.Write, FileShare.ReadWrite | FileShare.Delete);
+    private static FileStream Open(string path) => Containers.OwnFiles.Append(path, FileShare.ReadWrite | FileShare.Delete);
 
     /// <summary>Rotates a log: the oldest goes, each moves up one, and the log becomes <c>passenger.1.log</c>. The log
     /// is moved aside first, so one that cannot be (Windows, a reader not sharing deletion) leaves the rotated ones as
@@ -261,7 +261,7 @@ public static partial class IdeLog
         string aside = Rotated(path, "rotating");
         try
         {
-            File.Move(path, aside, overwrite: true);
+            AtomicFile.Move(path, aside);
         }
         catch (Exception error) when (error is IOException or UnauthorizedAccessException)
         {
@@ -284,7 +284,7 @@ public static partial class IdeLog
         }
         try
         {
-            File.Move(aside, Rotated(path, 1), overwrite: true);
+            AtomicFile.Move(aside, Rotated(path, 1));
         }
         catch (Exception error) when (error is IOException or UnauthorizedAccessException)
         {

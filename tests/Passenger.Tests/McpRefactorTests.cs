@@ -69,7 +69,7 @@ public sealed class McpRefactorTests : McpRig, IClassFixture<RestoredFolders>
         try
         {
             Task<JsonElement> describing = Waiting.Apart(() => Call(client, McpTools.Refactor, Place("change_signature", "Calc.cs", Calc, "int Sca")));
-            Press(Question(window, "the question for the agent's refactoring"), "Allow");
+            Press(Question(window, "the question for the agent's refactoring"), AgentToolDialog.AllowForSession);
             JsonElement dialog = Await(describing, "Change Signature described").GetProperty("dialog");
             Assert.Equal("public static int Scale(int value, int factor, int unused)", dialog.GetProperty("preview").GetString());
             Assert.Equal(["value", "factor", "unused"], dialog.GetProperty("parameters").EnumerateArray().Select(p => p.GetProperty("name").GetString()));
@@ -108,7 +108,8 @@ public sealed class McpRefactorTests : McpRig, IClassFixture<RestoredFolders>
             Assert.Equal(Order.Replace("public class Order", "public class Order : IOrder", StringComparison.Ordinal), File.ReadAllText(PathOf("Order.cs")));
 
             JsonElement move = Refactor(client, Place("move", "Shapes.cs", Shapes, "class Circ")).GetProperty("dialog");
-            Assert.Equal(("Circle.cs", 2), (move.GetProperty("toFile").GetProperty("file").GetString(), move.GetProperty("typesInFile").GetInt32()));
+            Assert.Equal(("Circle.cs", "Shop", 2), (move.GetProperty("options").GetProperty("file").GetString(), move.GetProperty("options").GetProperty("namespace").GetString(),
+                move.GetProperty("typesInFile").GetInt32()));
             JsonElement spaced = Refactor(client, Place("move", "OrderBook.cs", OrderBook, "class OrderBo", new { @namespace = "Sales" }));
             Assert.StartsWith("Moved class OrderBook to namespace Sales", spaced.GetProperty("said").GetString(), StringComparison.Ordinal);
             Assert.Equal("using Shop;\n\n" + OrderBook.Replace("namespace Shop;", "namespace Sales;", StringComparison.Ordinal), File.ReadAllText(PathOf("OrderBook.cs")));
@@ -117,11 +118,11 @@ public sealed class McpRefactorTests : McpRig, IClassFixture<RestoredFolders>
             Assert.Equal("namespace Shop;\n\npublic class Circle\n{\n    public double Area(double radius) => Math.PI * radius * radius;\n}\n", File.ReadAllText(PathOf("Circle.cs")).ReplaceLineEndings("\n"));
             Assert.Equal("namespace Shop;\n\npublic class Square\n{\n    public int Side;\n}\n", File.ReadAllText(PathOf("Shapes.cs")));
 
-            CallToolResult both = Await(Waiting.Apart(() => Result(client, McpTools.Refactor, Place("move", "Shapes.cs", File.ReadAllText(PathOf("Shapes.cs")), "class Squ", new { file = "Square.cs", @namespace = "Shop.Shapes" }))), "a move to a file and a namespace at once");
+            CallToolResult both = Await(Waiting.Apart(() => Result(client, McpTools.Refactor, Place("move", "Shapes.cs", File.ReadAllText(PathOf("Shapes.cs")), "class Squ", new { file = "Squares.cs", @namespace = "Shop.Shapes" }))), "a move to a file and a namespace at once");
             Assert.True(both.IsError == true && Text(both).Contains("one at a time", StringComparison.Ordinal), $"A move to a file and a namespace at once answered: {Text(both)}");
 
             UndoInSolutionView(window, "Shapes.cs");
-            Assert.Equal("Undo Move to Another File? It changes Shapes.cs and Circle.cs.", asked[^1]);
+            Assert.Equal("Undo Move to Another File? It changes Shapes.cs, and deletes Circle.cs.", asked[^1]);
             Assert.False(File.Exists(PathOf("Circle.cs")), "Undo left the file Move to Another File made");
             Assert.Equal(Shapes, window.EditorArea.Documents.First(d => d.Name == "Shapes.cs").Text.Snapshot.ToString());
         }
@@ -142,7 +143,7 @@ public sealed class McpRefactorTests : McpRig, IClassFixture<RestoredFolders>
         try
         {
             Task<CallToolResult> refusing = Waiting.Apart(() => Result(client, McpTools.Refactor, Place("safe_delete", "Calc.cs", Calc, "int Sca")));
-            Press(Question(window, "the question for the agent's refactoring"), "Allow");
+            Press(Question(window, "the question for the agent's refactoring"), AgentToolDialog.AllowForSession);
             CallToolResult refused = Await(refusing, "Safe Delete of a used method");
             Assert.True(refused.IsError == true && Text(refused).Contains("has 3 usages that would no longer compile", StringComparison.Ordinal)
                 && Text(refused).Contains("Till.cs:5: public static int Total()", StringComparison.Ordinal) && Text(refused).Contains("give options {\"deleteAnyway\": true}", StringComparison.Ordinal),
@@ -206,6 +207,44 @@ public sealed class McpRefactorTests : McpRig, IClassFixture<RestoredFolders>
         }
     }
 
+    /// <summary>An agent's rename, refactorings and code action each land in Local History as one change set named for what
+    /// it did, holding every file it changed, moved, made or saved, as a refactoring run from the window does, where each
+    /// file's write and each move made a set of its own, unnamed; and Move's options, described in the shape it takes, move
+    /// the type where the one changed says, or as described into a file of its name.</summary>
+    [Fact]
+    public async Task An_agents_rename_refactorings_and_code_action_each_land_in_local_history_as_one_change_set_named_for_what_it_did()
+    {
+        await TakeFolderAsync();
+        Shop(("Calc.cs", Calc), ("Till.cs", Till), ("Report.cs", Report), ("Order.cs", Order), ("OrderBook.cs", OrderBook), ("Shapes.cs", Shapes),
+            ("shelf.cs", "namespace Shop;\n\npublic class shelf\n{\n}\n"), ("Stock.cs", "namespace Shop;\n\npublic static class Stock\n{\n    public static shelf Open() => new shelf();\n}\n"));
+        await using McpClient client = await Start(["--mcp", Folder]);
+
+        await Call(client, McpTools.Rename, new() { ["symbol"] = "Shop.Calc", ["newName"] = "Calculator" });
+        await Call(client, McpTools.Refactor, Place("change_signature", "Calculator.cs", File.ReadAllText(PathOf("Calculator.cs")), "int Sca", new
+        {
+            parameters = new object[] { new { from = "factor" }, new { from = "value" }, new { from = "unused" } },
+        }));
+        JsonElement spaced = (await Call(client, McpTools.Refactor, Place("move", "OrderBook.cs", OrderBook, "class OrderBo"))).GetProperty("dialog").GetProperty("options");
+        Assert.Equal(("OrderBook.cs", "Shop"), (spaced.GetProperty("file").GetString(), spaced.GetProperty("namespace").GetString()));
+        await Call(client, McpTools.Refactor, Place("move", "OrderBook.cs", OrderBook, "class OrderBo", new { file = "OrderBook.cs", @namespace = "Sales" }));
+        Assert.Equal("using Shop;\n\n" + OrderBook.Replace("namespace Shop;", "namespace Sales;", StringComparison.Ordinal), File.ReadAllText(PathOf("OrderBook.cs")));
+        JsonElement filed = (await Call(client, McpTools.Refactor, Place("move", "Shapes.cs", Shapes, "class Circ"))).GetProperty("dialog").GetProperty("options");
+        await Call(client, McpTools.Refactor, Place("move", "Shapes.cs", Shapes, "class Circ", filed));
+        Assert.True(File.Exists(PathOf("Circle.cs")) && !File.ReadAllText(PathOf("Shapes.cs")).Contains("Circle", StringComparison.Ordinal),
+            $"Move's options sent back as described left Shapes.cs so:\n{File.ReadAllText(PathOf("Shapes.cs"))}");
+        await Call(client, McpTools.ApplyCodeAction, new() { ["path"] = "shelf.cs", ["line"] = 3, ["column"] = 14, ["title"] = "Fix name violation: Shelf" });
+
+        JsonElement[] sets = [.. (await Call(client, McpTools.LocalHistory)).GetProperty("rows").EnumerateArray().Take(5)];
+        string listed = string.Join("\n", sets.Select(s => s.GetRawText()));
+        Assert.True(sets.Select(s => s.GetProperty("title").GetString()).SequenceEqual(
+            ["Fix name violation: Shelf", "Move Circle", "Move OrderBook", "Change Signature of Scale", "Rename Calc to Calculator"]), $"Local History's newest sets:\n{listed}");
+        Assert.True(sets.Skip(1).Select(s => string.Join(", ", s.GetProperty("files").EnumerateArray().Select(f => f.GetString()).Order(StringComparer.Ordinal))).SequenceEqual(
+            ["Circle.cs, Shapes.cs", "OrderBook.cs", "Calculator.cs, Till.cs", "Calc.cs, Calculator.cs, Order.cs, Report.cs, Till.cs"]), $"Local History's newest sets:\n{listed}");
+        List<string> fixedFiles = [.. sets[0].GetProperty("files").EnumerateArray().Select(f => f.GetString()!)];
+        Assert.True(fixedFiles.Contains("Stock.cs") && fixedFiles.All(f => f is "Stock.cs" || f.Equals("Shelf.cs", StringComparison.OrdinalIgnoreCase)),
+            $"Local History's newest sets:\n{listed}");
+    }
+
     /// <summary>An agent's rename of a symbol to the name it has says so and changes nothing, never "Renamed".</summary>
     [Fact]
     public async Task An_agents_rename_to_the_name_a_symbol_has_says_it_has_it_and_changes_nothing()
@@ -216,6 +255,38 @@ public sealed class McpRefactorTests : McpRig, IClassFixture<RestoredFolders>
         string said = (await Call(client, McpTools.Rename, new() { ["symbol"] = "Shop.Calc.Scale", ["newName"] = "Scale" })).GetString()!;
         Assert.True(said == "Scale is its name already: nothing was renamed", $"A rename of Scale to Scale answered: {said}");
         Assert.Equal(Till, File.ReadAllText(Path.Combine(Folder, "Till.cs")));
+    }
+
+    /// <summary>An agent's Fix name violation on a class named like its file renames the file with it, in letter case alone,
+    /// as Rename does, and Rename file to Crate.cs renames a file in letter case, each answer naming the rename, where the file
+    /// kept its name under an answer saying it was applied; the language server takes each file under its new name, offering
+    /// to rename it no more, where its project's load failed for good on the name it held already.</summary>
+    [Fact]
+    public async Task An_agents_code_action_renaming_a_class_takes_its_file_along_and_one_renaming_a_file_in_letter_case_renames_it()
+    {
+        await TakeFolderAsync();
+        Shop(("shelf.cs", "namespace Shop;\n\npublic class shelf\n{\n}\n"), ("Stock.cs", "namespace Shop;\n\npublic static class Stock\n{\n    public static shelf Open() => new shelf();\n}\n"),
+            ("crate.cs", "namespace Shop;\n\npublic class Crate\n{\n}\n"));
+        await using McpClient client = await Start(["--mcp", Folder]);
+
+        string named = (await Call(client, McpTools.ApplyCodeAction, new() { ["path"] = "shelf.cs", ["line"] = 3, ["column"] = 14, ["title"] = "Fix name violation: Shelf" })).GetString()!;
+        Assert.Equal("Applied 'Fix name violation: Shelf' to 2 files, renaming shelf.cs to Shelf.cs", named);
+        string moved = (await Call(client, McpTools.ApplyCodeAction, new() { ["path"] = "crate.cs", ["line"] = 3, ["column"] = 14, ["title"] = "Rename file to Crate.cs" })).GetString()!;
+        Assert.Equal("Applied 'Rename file to Crate.cs', renaming crate.cs to Crate.cs", moved);
+
+        Assert.Equal(["Crate.cs", "Shelf.cs"], Directory.GetFiles(Folder, "*.cs").Select(Path.GetFileName).OfType<string>()
+            .Where(n => n.Equals("shelf.cs", StringComparison.OrdinalIgnoreCase) || n.Equals("crate.cs", StringComparison.OrdinalIgnoreCase)).Order(StringComparer.Ordinal));
+        Assert.Equal("namespace Shop;\n\npublic class Shelf\n{\n}\n", File.ReadAllText(PathOf("Shelf.cs")));
+        Assert.Contains("public static Shelf Open() => new Shelf();", File.ReadAllText(PathOf("Stock.cs")), StringComparison.Ordinal);
+        foreach (string file in new[] { "Shelf.cs", "Crate.cs" })
+        {
+            List<string> offered = [];
+            Assert.True(await Waiting.UntilAsync(async () =>
+            {
+                offered = [.. (await Call(client, McpTools.CodeActions, new() { ["path"] = file, ["line"] = 3, ["column"] = 14 })).EnumerateArray().Select(a => a.GetString()!)];
+                return !offered.Any(a => a.StartsWith("Rename file", StringComparison.Ordinal));
+            }, TimeSpan.FromSeconds(30), TestContext.Current.CancellationToken), $"The language server still holds {file} by its old name, offering: {string.Join("; ", offered)}{Said()}");
+        }
     }
 
     [Fact]
@@ -325,6 +396,22 @@ public sealed class McpRefactorTests : McpRig, IClassFixture<RestoredFolders>
         }));
         Assert.True(deepValue.IsError == true && Text(deepValue).Contains("A parameter's value is nested too deeply to read", StringComparison.Ordinal),
             $"Change Signature giving a parameter a default value nested 1100 deep answered: {Text(deepValue)}");
+        // As deep as the server reads a type, which the parameter's declaration takes a level deeper.
+        string limitType = string.Concat(Enumerable.Repeat("List<", 1000)) + "int" + new string('>', 1000);
+        CallToolResult atLimit = await Result(client, McpTools.Refactor, Place("change_signature", "Tally.cs", Tally, "int Ad", new
+        {
+            parameters = new object[] { new { from = "a", type = limitType }, new { from = "b" } },
+        }));
+        Assert.True(atLimit.IsError == true && Text(atLimit).Contains("A parameter is nested too deeply to read", StringComparison.Ordinal)
+            && !Text(atLimit).Contains("failed", StringComparison.Ordinal),
+            $"Change Signature retyping a parameter to a type nested 1000 deep, which its declaration takes past what the parser is given, answered: {Text(atLimit)}");
+        // A parameter's row is checked as it reads: its type before its name.
+        CallToolResult unwritten = await Result(client, McpTools.Refactor, Place("change_signature", "Tally.cs", Tally, "int Ad", new
+        {
+            parameters = new object[] { new { from = "a" }, new { from = "b" }, new { type = "int[", name = "2nd", callValue = "0" } },
+        }));
+        Assert.True(unwritten.IsError == true && Text(unwritten).Contains("A parameter has an invalid type", StringComparison.Ordinal),
+            $"Change Signature adding a parameter whose type and name are both wrong answered: {Text(unwritten)}");
         Assert.Equal(Tally, File.ReadAllText(PathOf("Tally.cs")));
         const string Twins = "namespace Shop;\n\npublic class Twins\n{\n    public int Of(int a) => a;\n\n    public int Of(int b) => b;\n}\n";
         Write("Twins.cs", Twins);
@@ -951,8 +1038,9 @@ public sealed class McpRefactorTests : McpRig, IClassFixture<RestoredFolders>
 
     /// <summary>App references Lib, and a caller of Lib's method is written into App while App's design-time build is
     /// held, so the language server cannot take it in: usages of the method answer at once, saying they went without the
-    /// caller, where they waited for App and refused; a rename of it waits for App, which loads once its build is let go,
-    /// and renames the caller there too.</summary>
+    /// caller, where they waited for App and refused; a rename of it waits for App, naming the caller, the first to come,
+    /// though two new files of Lib's were waited for and let go together before, and renames the caller there too once
+    /// App's build is let go.</summary>
     [Fact]
     public async Task Usages_answer_at_once_without_a_file_another_project_has_yet_to_load_and_a_rename_waits_for_it()
     {
@@ -977,6 +1065,10 @@ public sealed class McpRefactorTests : McpRig, IClassFixture<RestoredFolders>
         await using McpClient client = await Start(["--mcp", folder]);
         // The projects loaded first, so the file written next comes after.
         await Call(client, McpTools.Diagnostics, new() { ["path"] = "Lib/Shape.cs" });
+        // Waits let go of before the caller comes, as for an agent's files written earlier.
+        TestFolders.Write(folder, "Lib/Circle.cs", "namespace Lib;\n\npublic static class Circle\n{\n}\n");
+        TestFolders.Write(folder, "Lib/Square.cs", "namespace Lib;\n\npublic static class Square\n{\n}\n");
+        await Call(client, McpTools.Diagnostics, new() { ["path"] = "Lib/Circle.cs" });
 
         TestFolders.Write(folder, "App/hold", string.Empty);
         const string Caller = "namespace App;\n\npublic static class Caller\n{\n    public static int Call() => Lib.Shape.Make();\n}\n";
@@ -1002,7 +1094,7 @@ public sealed class McpRefactorTests : McpRig, IClassFixture<RestoredFolders>
             $"The rename did not say it waited for App to load its new caller: {status}");
         if (renaming.IsCompleted)
         {
-            Assert.Fail($"The rename did not wait for App, whose build was held, to load its new caller: {Text(await renaming)}");
+            Assert.Fail($"The rename did not wait for App, whose build was held, to load its new caller ({status}): {Text(await renaming)}");
         }
         TestFolders.Write(folder, "App/released", string.Empty);
         CallToolResult renamed = await renaming;
@@ -1026,7 +1118,7 @@ public sealed class McpRefactorTests : McpRig, IClassFixture<RestoredFolders>
         {
             // System is the project's implicit using, so nothing needs it.
             Task<JsonElement> optimizing = Waiting.Apart(() => Call(client, McpTools.Refactor, new() { ["kind"] = "optimize_imports", ["path"] = "Tidy.cs" }));
-            Press(Question(window, "the question for the agent's refactoring"), "Allow");
+            Press(Question(window, "the question for the agent's refactoring"), AgentToolDialog.AllowForSession);
             JsonElement optimized = Await(optimizing, "Optimize Imports on a file");
             Assert.Equal(["Tidy.cs changed"], Files(optimized));
             string tidied = File.ReadAllText(PathOf("Tidy.cs"));

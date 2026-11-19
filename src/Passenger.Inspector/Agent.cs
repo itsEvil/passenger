@@ -11,7 +11,7 @@ namespace Passenger.Inspector;
 /// thread the UI's.</summary>
 public static class Agent
 {
-    /// <summary>How often it looks for the app's UI before it is up.</summary>
+    /// <summary>How often it looks for the app's UI while the app may be setting itself up (<see cref="Looking"/>).</summary>
     private static readonly TimeSpan Look = TimeSpan.FromMilliseconds(100);
 
     /// <summary>The app as the serve loop reaches it, once the hook has started serving it.</summary>
@@ -26,9 +26,18 @@ public static class Agent
     /// <summary>Why the app keeps a top level from an agent's input, else null (<see cref="Guard"/>).</summary>
     internal static Func<object, string?>? Refusing { get; private set; }
 
+    /// <summary>Delivers an agent's input as the app marks it, answering why the app refused what it reached, else null
+    /// (<see cref="Guard"/>).</summary>
+    internal static Func<Action, string?>? Delivering { get; private set; }
+
     /// <summary>Keeps the agent's input from the top levels the app names a reason for, called with each one input
-    /// would reach. Set before <see cref="Start"/>, on the app's UI thread.</summary>
-    public static void Guard(Func<object, string?> refusing) => Refusing = refusing;
+    /// would reach, and has the app deliver each input itself (<paramref name="delivering"/>), so what it reaches knows it
+    /// for an agent's. Set before <see cref="Start"/>, on the app's UI thread.</summary>
+    public static void Guard(Func<object, string?> refusing, Func<Action, string?> delivering)
+    {
+        Refusing = refusing;
+        Delivering = delivering;
+    }
 
     /// <summary>The file the program previews, as Avalonia's designer (<see cref="Wire.PreviewVariable"/>), whose loads are
     /// made to record where they make each element; null for an app.</summary>
@@ -52,13 +61,14 @@ public static class Agent
     private static Dispatcher WaitForUi(Thread main)
     {
         FieldInfo? made = typeof(Dispatcher).GetField("s_uiThread", BindingFlags.NonPublic | BindingFlags.Static);
+        using Looking looking = new(Look);
         while (true)
         {
             if ((Dispatcher.FromThread(main) ?? made?.GetValue(null) as Dispatcher) is { } dispatcher && HasApplication())
             {
                 return dispatcher;
             }
-            Thread.Sleep(Look);
+            looking.Wait();
         }
     }
 
@@ -133,7 +143,8 @@ public static class Agent
 
         public async Task<Reply> AnswerAsync(Request request)
         {
-            Dispatcher ui = dispatcher!;
+            // The dispatcher the UI thread runs now: a process whose dispatcher was replaced on that thread is answered on the new one.
+            Dispatcher ui = Dispatcher.FromThread(main) ?? dispatcher!;
             Inspector served = inspector!;
             bool input = request.Method == Wire.Input;
             if (input)

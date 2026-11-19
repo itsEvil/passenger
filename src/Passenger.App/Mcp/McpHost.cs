@@ -8,6 +8,8 @@ using Avalonia.Threading;
 using ModelContextProtocol;
 using ModelContextProtocol.Protocol;
 using ModelContextProtocol.Server;
+using Passenger.App.Run.Devices;
+using Passenger.App.Settings;
 using Passenger.App.State;
 using Passenger.App.Workspace;
 using Passenger.Core;
@@ -52,13 +54,17 @@ public static partial class McpHost
     /// <summary>What an agent is told as it connects: how to begin and find its way, and what a person's window asks.</summary>
     internal const string Instructions =
         "Passenger is a C# IDE (with XAML, MSBuild files and the web languages). These tools act on its open workspace as its user would. " +
-        "Lines and columns count from 1; relative paths are the open folder's. Parameters several tools share: configuration, a run " +
+        "Lines and columns count from 1; relative paths are the open folder's; a file outside it, but in a project a trusted solution or AppHost names beside it, is read only where definition and usages lead (a package's file, generated or decompiled code) and never changed. Parameters several tools share: configuration, a run " +
         "configuration (the chosen one by default); arguments, a command line in place of its own; waitSeconds, how long a call " +
         "waits for the program to stop, end or show its UI; session, a debugged program as debug_state's sessions name it (by " +
         "default the one paused, else the only one); resource, an Aspire resource (name or AppHostPath::name) or a compose " +
-        "service of the run, as workspace lists them; symbol, in place of path, line and column, a C# symbol of the solution's " +
+        "service of the run, as workspace lists them; terminal, true to start it in a Terminal tab from now on (false: the Run " +
+        "and Debug windows), as Edit Configurations' Use external console; symbol, in place of path, line and column, a C# symbol of the solution's " +
         "own code by name: Name, Type.Member or Namespace.Type, an overload as Member(string, int), or its documentation id " +
-        "(M:Namespace.Type.Member(System.String)).\n\n" +
+        "(M:Namespace.Type.Member(System.String)); within, a folder or file whose places alone usages or hierarchy lists, or whose projects, run configurations, open files and routes workspace; from, the line " +
+        "editor_text, outline, a file's diagnostics, its local_history or usages within it reads on from. An answer that would run past 40,000 characters keeps what comes first " +
+        "(usages: every file it can, counted, the first files' places listed) and says how many it left out and how to ask for them, in its " +
+        "more or, after a list, in words; a place's line is shown around its column, 200 characters at most.\n\n" +
         "Begin with workspace: the folder and solution open, their projects, run configurations and open files (open opens another folder, " +
         "solution or file). Find your way by meaning rather than by text: find_symbol finds a type or member by name, outline lists a file's " +
         "types and members with their lines, and symbol_info, definition, usages and hierarchy follow the symbol at a line " +
@@ -72,7 +78,7 @@ public static partial class McpHost
         "options to send back, changing nothing. Each change is one step of the IDE's Undo.\n\n" +
         "build, run, tests_list and tests_run build (and publish), run and test. To debug: breakpoint_set, then debug_start (or debug_attach), debug_step, " +
         "debug_evaluate, debug_state and debug_continue, each waiting for the program to stop and saying where, with the locals " +
-        "where it stopped. An Avalonia or WPF app that run or debug_start starts is looked at and used as a person tests it: app_windows, app_tree, " +
+        "where it stopped. An Avalonia, WPF or MAUI app that run or debug_start starts is looked at and used as a person tests it: app_windows, app_tree, " +
         "app_screenshot, app_click, app_type, app_key, app_scroll, app_binding_errors. A Godot game the same, Passenger its remote debugger: its " +
         "nodes are the elements, input reaching it through a helper node Passenger adds under its root; ide_action app.godot.pauseLoop " +
         "and app.godot.nextFrame pause its loop and step it a frame, and with app.liveTree.selectElement on, app_click picks the node at " +
@@ -83,13 +89,18 @@ public static partial class McpHost
         "Attached to a person's Passenger (--mcp-attach), the first call joins the Passenger window open on the agent's folder (the folder " +
         "after --mcp-attach, else the agent's working folder). With none open, it has the running Passenger open that folder, or starts " +
         "Passenger on it, in a window the person sees, and waits for it. Unless the person has turned on Enable MCP Server, or let agents " +
-        "into that folder always, the window asks them to let the agent in. The person is also asked before the agent first uses each tool " +
-        "that changes something (edit, rename, build, run, debug_start, breakpoint_set, debug_evaluate, vcs_commit and the like; reading, " +
-        "save_all, stop and stepping never ask), and before it opens another folder in their window. A call waits for each answer 2 " +
-        "minutes at most, telling its progress meanwhile when asked to; one refused or left unanswered says so, and a later call asks " +
+        "into that folder always, the window asks them to let the agent in. The person is also asked before a call of a tool that " +
+        "changes something (edit, rename, build, run, debug_start, breakpoint_set, debug_evaluate, vcs_commit, the app_ tools' input and the " +
+        "like; reading, save_all, stop and stepping never ask), allowing that call alone or the tool until the agent disconnects, an app_ " +
+        "tool's input to app ide apart from an app's; and before it opens another folder in their window. An agent about to change " +
+        "several things asks once with request_full_access, which the person may answer by allowing every tool until it disconnects. " +
+        "A call waits for each answer 2 minutes at most, telling its progress meanwhile when asked to; one refused or left unanswered says so, and a later call asks " +
         "again. A file the agent opens or edits there comes in a tab behind the person's, whose tab, caret and keys stay as they were. " +
-        "Passenger --mcp FOLDER is an agent's own IDE with no window, which asks nothing and runs apps where nobody sees them " +
-        "(an Avalonia app on its headless platform), saying so when one cannot run there.";
+        "Where the person has not trusted the folder, build, run, debug_start, tests_run, profile, hot_reload and nuget_install " +
+        "are refused until they trust it, and C# answers wait for that too. " +
+        "Passenger --mcp FOLDER is an agent's own IDE with no window, which asks nothing, trusts the folder it was started on (the agent " +
+        "runs there already), and runs apps where nobody sees them (an Avalonia app on its headless platform), saying so when one cannot " +
+        "run there.";
 
     /// <summary>The server as an agent sees it, whichever way it is reached.</summary>
     internal static Implementation ServerInfo => new()
@@ -106,7 +117,7 @@ public static partial class McpHost
 
     /// <summary>How a tool's answer is written as JSON: its text as written, quotes, angle brackets and the rest left as
     /// they are rather than as \u0022s, so code in an answer reads as code and costs an agent no more than it should.</summary>
-    private static readonly JsonSerializerOptions AnswerJson = new(McpJsonUtilities.DefaultOptions) { Encoder = JavaScriptEncoder.UnsafeRelaxedJsonEscaping };
+    internal static readonly JsonSerializerOptions AnswerJson = new(McpJsonUtilities.DefaultOptions) { Encoder = JavaScriptEncoder.UnsafeRelaxedJsonEscaping };
 
     /// <summary>How every connection and <c>--mcp-attach</c> create a tool of the build's: its answer as <see cref="AnswerJson"/>
     /// writes it, its schema the same in both.</summary>
@@ -201,8 +212,9 @@ public static partial class McpHost
 
     /// <summary>Has the system's request to end the process (SIGTERM, which a client may send just after closing the
     /// input) end it as the end of its input does, <paramref name="end"/>, so its state is written and what it started
-    /// ends, the process going after <see cref="EndLimit"/> at the latest, unless <paramref name="kept"/> takes the signal
-    /// as its own. Null where the system has no such signal.</summary>
+    /// ends, the process going after <see cref="EndLimit"/> at the latest, or once what its starts put on devices is out
+    /// (<see cref="ExitOnceEndedAsync"/>), unless <paramref name="kept"/> takes the signal as its own. Null where the system
+    /// has no such signal.</summary>
     internal static System.Runtime.InteropServices.PosixSignalRegistration? EndOnSignal(Action end, Func<bool>? kept = null)
     {
         try
@@ -215,7 +227,7 @@ public static partial class McpHost
                     return;
                 }
                 end();
-                IdeErrors.Observe(Task.Delay(EndLimit).ContinueWith(_ => Environment.Exit(143), TaskScheduler.Default));
+                IdeErrors.Observe(ExitOnceEndedAsync());
             });
         }
         catch (PlatformNotSupportedException)
@@ -224,16 +236,39 @@ public static partial class McpHost
         }
     }
 
+    /// <summary>The process gone, however far its end got, <see cref="EndLimit"/> after the system asked it to end, or later
+    /// while an app's end on a device is under way: once every start there is out, within the
+    /// <see cref="DeviceLaunches.EndLimit"/> a folder's end gives them, as an end through its input waits for them.</summary>
+    private static async Task ExitOnceEndedAsync()
+    {
+        try
+        {
+            await Task.WhenAll(Task.Delay(EndLimit), DeviceStart.EveryOut().WaitAsync(DeviceLaunches.EndLimit));
+        }
+        catch (TimeoutException)
+        {
+            // Past that limit the process goes all the same.
+        }
+        Environment.Exit(143);
+    }
+
     /// <summary><c>--mcp</c>: the IDE with no window, its tools on the standard input given (<see cref="StandardInput.Take"/>)
     /// and output until the agent closes them or the system asks it to end. Its server answers before the IDE is up (initialize and the tools' list need none of
     /// it), so an agent asking as it connects finds the tools at once; each call waits for the IDE.</summary>
     public static int RunStdio(LaunchOptions launch, Stream input)
     {
+        // Before the head start, so nothing it starts finds a display.
         PassengerApp.RunsHeadless();
         PassengerApp.RunsForAgent();
         Stream output = Console.OpenStandardOutput();
         // Standard output is the protocol's alone, and standard error the agent may never read: the console goes to the log.
         IdeLog.TakeConsole();
+        // The settings read first, so a trace they ask for has the language server begun ahead and the agent's first calls.
+        AppSettings? named = SettingsStore.KeptWhereNamed();
+        if (named is not null)
+        {
+            SettingsStore.LogsInForce(named);
+        }
         // The folder's opening begun now, on workers, while the window that takes it up is built.
         HeadStart? ahead = HeadStart.Begin(launch, StartsLanguageServer);
 
@@ -257,17 +292,13 @@ public static partial class McpHost
         }));
         using System.Runtime.InteropServices.PosixSignalRegistration? terminated = EndOnSignal(() => ended.TrySetResult());
 
-        AppBuilder.Configure<App>()
-            .UseSkia()
-            .UseHarfBuzz()
-            .UseHeadless(new AvaloniaHeadlessPlatformOptions { UseHeadlessDrawing = false })
-            .AfterSetup(builder => Program.ApplyTheme(builder.Instance!, launch))
-            .SetupWithoutStarting();
+        Program.SetUpHeadless(launch);
 
         // The agent's own IDE, which no other agent joins.
         MainWindow window = new() { Width = 1600, Height = 1000, AgentsAllowed = false, AgentsOwn = true, TakesLaunches = false, StartsLanguageServer = StartsLanguageServer, HeadStart = ahead };
         IdeErrors.Write($"Passenger {Product.Version} ({Product.Commit ?? "no commit"}) for an agent, with no window shown: its window built "
-            + $"{System.Diagnostics.Stopwatch.GetElapsedTime(Program.StartedAt).TotalSeconds:0.00} s after launch");
+            + $"{Durations.Said(System.Diagnostics.Stopwatch.GetElapsedTime(Program.StartedAt))} after launch");
+        window.OpenOnNamedSettings(launch, named);
         window.SetRenderScaling(2);
         window.Show();
         window.Start(launch);
@@ -288,15 +319,9 @@ public static partial class McpHost
     /// line starts could not start.</summary>
     public static int RunHeadless(LaunchOptions launch, Stream input)
     {
-        PassengerApp.RunsHeadless();
         // Its starter reads nothing of its output or error: the console goes to the log.
         IdeLog.TakeConsole();
-        AppBuilder.Configure<App>()
-            .UseSkia()
-            .UseHarfBuzz()
-            .UseHeadless(new AvaloniaHeadlessPlatformOptions { UseHeadlessDrawing = false })
-            .AfterSetup(builder => Program.ApplyTheme(builder.Instance!, launch))
-            .SetupWithoutStarting();
+        Program.SetUpHeadless(launch);
 
         MainWindow window = new() { Width = 1600, Height = 1000, AgentsAllowed = launch.ListenForAgents };
         window.SetRenderScaling(2);

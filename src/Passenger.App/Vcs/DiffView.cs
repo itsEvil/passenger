@@ -22,6 +22,15 @@ public sealed class DiffView : DockPanel, IOwnKeys
     private static readonly TimeSpan RediffDelay = TimeSpan.FromMilliseconds(120);
 
     private readonly DiffStrip bands;
+    /// <summary>The boxes beside the changes in view for whether each goes into the next commit, the change each stands
+    /// beside, and whether each change of the diff shown goes in.</summary>
+    private readonly Canvas hunkBoxes = new() { Width = 28, ClipToBounds = true, IsVisible = false };
+    private readonly List<int> boxedHunks = [];
+    private bool[] hunksTaken = [];
+    private Func<FileDiff, bool[]>? hunksChosen;
+    private Action<FileDiff, int, bool>? chooseHunk;
+    private bool settingHunkBoxes;
+
     private readonly TextBlock count;
     private readonly Button settings;
     private readonly Debounce rediff;
@@ -56,17 +65,24 @@ public sealed class DiffView : DockPanel, IOwnKeys
         Left.Show(head, SelectionSet.Single(0), default);
         Right = new CodeEditor { IsReadOnly = !editable, ChangeBackgrounds = true };
         Right.Show(mine, SelectionSet.Single(0), default);
-        bands = new DiffStrip(Bands, MergeSide.Left, Left, () => IsEditable, ignores: false, (band, _, _) => Revert(Hunks[band.Index])) { Width = 36 };
-
-        Grid sides = new() { ColumnDefinitions = new ColumnDefinitions("*,Auto,*"), RowDefinitions = new RowDefinitions("Auto,*") };
         named = (titles?.Left ?? "HEAD", titles?.Right ?? (editable ? "Your version" : "Your version (read-only)"));
+        bands = new DiffStrip(Bands, MergeSide.Left, Left, () => IsEditable, ignores: false, (band, _) => ($"Roll back change {band.Index + 1} to {named.Left}", null),
+            (band, _, _) => Revert(Hunks[band.Index])) { Width = 36 };
+
+        Grid sides = new() { ColumnDefinitions = new ColumnDefinitions("*,Auto,Auto,*"), RowDefinitions = new RowDefinitions("Auto,*") };
+        Left.ReadOnlyWhy = Refusals.ReadOnly(named.Left);
+        Right.ReadOnlyWhy = editable ? null : Refusals.ReadOnly(named.Right);
         sides.Children.Add(DiffLines.Title(named.Left, 0));
-        sides.Children.Add(DiffLines.Title(named.Right, 2));
+        sides.Children.Add(DiffLines.Title(named.Right, 3));
         Grid.SetRow(Left, 1);
         Grid.SetRow(bands, 1);
         Grid.SetColumn(bands, 1);
         Grid.SetRow(Right, 1);
-        Grid.SetColumn(Right, 2);
+        Grid.SetColumn(Right, 3);
+        Grid.SetColumn(hunkBoxes, 2);
+        Grid.SetRow(hunkBoxes, 1);
+        hunkBoxes.SizeChanged += (_, _) => PlaceHunkBoxes();
+        sides.Children.Add(hunkBoxes);
         sides.Children.Add(Left);
         sides.Children.Add(bands);
         sides.Children.Add(Right);
@@ -131,6 +147,88 @@ public sealed class DiffView : DockPanel, IOwnKeys
         IdeErrors.Observe(CompareAsync());
     }
 
+    /// <summary>A box beside each change for whether it goes into the next commit: <paramref name="chosen"/> asked once for
+    /// each diff shown and each change of the choice, <paramref name="choose"/> told of a box the person turns.</summary>
+    public void ChooseForCommit(Func<FileDiff, bool[]> chosen, Action<FileDiff, int, bool> choose)
+    {
+        hunksChosen = chosen;
+        chooseHunk = choose;
+        hunkBoxes.IsVisible = true;
+        RefreshCommitChoices();
+    }
+
+    /// <summary>The boxes set again from the choice, after it changed.</summary>
+    public void RefreshCommitChoices()
+    {
+        if (hunksChosen is null || settingHunkBoxes)
+        {
+            return;
+        }
+        hunksTaken = hunksChosen(shown);
+        PlaceHunkBoxes();
+    }
+
+    /// <summary>A box beside the first line of each change in view, as the file's side scrolls: only the changes in view
+    /// have one, so a diff of thousands of changes scrolls as lightly as one of a few.</summary>
+    private void PlaceHunkBoxes()
+    {
+        if (hunksChosen is null)
+        {
+            return;
+        }
+        double line = Right.LineHeight;
+        double scrolled = Right.ScrollOffset.Y;
+        int index = line > 0 ? Sorted.FirstAtOrAfter(Hunks, static h => h.NewStart, (int)(scrolled / line)) : Hunks.Count;
+        int used = 0;
+        settingHunkBoxes = true;
+        try
+        {
+            for (; index < Hunks.Count && index < hunksTaken.Length; index++)
+            {
+                double top = (Hunks[index].NewStart * line) - scrolled;
+                if (top >= hunkBoxes.Bounds.Height)
+                {
+                    break;
+                }
+                CheckBox box = used < hunkBoxes.Children.Count ? (CheckBox)hunkBoxes.Children[used] : HunkBox(used);
+                if (used == boxedHunks.Count)
+                {
+                    boxedHunks.Add(index);
+                }
+                boxedHunks[used] = index;
+                ToolButtons.Tip(box, $"Include change {index + 1} in commit");
+                box.IsChecked = hunksTaken[index];
+                box.IsVisible = true;
+                Canvas.SetTop(box, top + ((line - box.Height) / 2));
+                used++;
+            }
+            for (int i = used; i < hunkBoxes.Children.Count; i++)
+            {
+                hunkBoxes.Children[i].IsVisible = false;
+            }
+        }
+        finally
+        {
+            settingHunkBoxes = false;
+        }
+    }
+
+    /// <summary>A box for the changes in view, the <paramref name="slot"/>th from the top, which chooses whichever change it
+    /// stands beside.</summary>
+    private CheckBox HunkBox(int slot)
+    {
+        CheckBox box = new() { MinHeight = 0, Height = 24 };
+        box.IsCheckedChanged += (_, _) =>
+        {
+            if (!settingHunkBoxes && slot < boxedHunks.Count)
+            {
+                chooseHunk?.Invoke(shown, boxedHunks[slot], box.IsChecked == true);
+            }
+        };
+        hunkBoxes.Children.Add(box);
+        return box;
+    }
+
     /// <summary>Find over the diff: it searches the side with the caret, the other side's matches marked too, F3 and Shift+F3
     /// stepping through those of the side searched.</summary>
     public Editors.FindBar Find { get; }
@@ -180,6 +278,12 @@ public sealed class DiffView : DockPanel, IOwnKeys
 
     public bool IsEditable { get; }
 
+    /// <summary>The file changed from this view: typed in on its side, or a difference put back by its band.</summary>
+    public event EventHandler? Edited;
+
+    /// <summary>A difference is being put back by the band, an edit of this view's own whatever has the keys.</summary>
+    private bool reverting;
+
     /// <summary>How differences are highlighted (Highlighting Differences), Words at first.</summary>
     public DiffHighlighting Highlighting
     {
@@ -217,7 +321,15 @@ public sealed class DiffView : DockPanel, IOwnKeys
         {
             return;
         }
-        Right.ApplyEdits([shown.Restore(hunk)]);
+        reverting = true;
+        try
+        {
+            Right.ApplyEdits([shown.Restore(hunk)]);
+        }
+        finally
+        {
+            reverting = false;
+        }
         IdeErrors.Observe(CompareAsync());
     }
 
@@ -235,7 +347,14 @@ public sealed class DiffView : DockPanel, IOwnKeys
         Right.GoTo(new TextPosition(Math.Min(target.NewStart, Right.Document.Snapshot.LineCount - 1), 0));
     }
 
-    private void OnMineChanged(object? sender, DocumentChangedEventArgs e) => rediff.Restart();
+    private void OnMineChanged(object? sender, DocumentChangedEventArgs e)
+    {
+        rediff.Restart();
+        if (reverting || Right.IsKeyboardFocusWithin)
+        {
+            Edited?.Invoke(this, EventArgs.Empty);
+        }
+    }
 
     /// <summary>Compares the file's text as it is now, off the window's thread, unless the differences shown are of it;
     /// a newer text's answer wins.</summary>
@@ -258,13 +377,14 @@ public sealed class DiffView : DockPanel, IOwnKeys
     private void Show(FileDiff diff)
     {
         shown = diff;
+        RefreshCommitChoices();
         bool off = highlighting == DiffHighlighting.None;
         Left.SetChangeMarks(off ? [] : [.. Hunks.Select(h => h.OldCount == 0 ? new ChangeMark(h.OldStart, 0, ChangeMarkKind.Added)
             : h.NewCount == 0 ? new ChangeMark(h.OldStart, h.OldCount, ChangeMarkKind.Deleted)
             : new ChangeMark(h.OldStart, h.OldCount, ChangeMarkKind.Modified))]);
         Right.SetChangeMarks(off ? [] : diff.Marks);
         Count();
-        bands.InvalidateVisual();
+        bands.Refresh();
         IdeErrors.Observe(ShowWordsAsync(diff));
         IdeErrors.Observe(ShowSeparatorsAsync(diff));
     }
@@ -359,7 +479,8 @@ public sealed class DiffView : DockPanel, IOwnKeys
     /// differences above it to the other's.</summary>
     private void Follow(CodeEditor from, CodeEditor to, bool toLeft)
     {
-        bands.InvalidateVisual();
+        bands.Refresh();
+        PlaceHunkBoxes();
         if (following)
         {
             return;

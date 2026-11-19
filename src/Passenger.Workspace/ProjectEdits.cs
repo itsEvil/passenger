@@ -2,6 +2,7 @@ using System.Text.RegularExpressions;
 using System.Xml;
 using System.Xml.Linq;
 using Passenger.Core;
+using Passenger.Host;
 using Passenger.Text;
 
 namespace Passenger.Workspace;
@@ -20,13 +21,13 @@ public static class ProjectEdits
 
     public static string? AddReference(string project, string referenced) => Change(project, xml =>
     {
-        if (References(xml, project).Any(r => PathNames.Same(r.Path, referenced)))
+        if (References(xml, project).Any(r => r.Path is { } path && PathNames.Same(path, referenced)))
         {
             return $"{Path.GetFileNameWithoutExtension(project)} already references {Path.GetFileNameWithoutExtension(referenced)}";
         }
         string include = ItemPaths.Named(Path.GetRelativePath(Path.GetDirectoryName(project)!, referenced).Replace('/', '\\'));
         string element = $"<ProjectReference Include=\"{XmlEntities.Encode(include, '"')}\" />";
-        if (References(xml, project).LastOrDefault(r => r.Element.Parent is { } group && IsItemGroup(group) && !Conditioned(group)).Element is { } last)
+        if (References(xml, project).LastOrDefault(r => r.Element.Parent is { } group && ProjectItems.IsItemGroup(group) && !ProjectItems.Conditioned(group)).Element is { } last)
         {
             xml.After(last, element);
             return null;
@@ -51,8 +52,8 @@ public static class ProjectEdits
     /// or its item group (<see cref="RemoveCompiled"/>); true for a file that reads as no project, which nothing is to be added to.</summary>
     public static bool RemovesCompiled(string project, string folder) => Read(new ProjectText(project).Text) is not { Root.Name.LocalName: "Project" } xml || Removes(xml, folder);
 
-    private static bool Removes(XmlText xml, string folder) => xml.Root.Elements().Where(g => IsItemGroup(g) && !Conditioned(g)).SelectMany(g => g.Elements())
-        .Any(e => e.Name.LocalName == "Compile" && !Conditioned(e) && e.Attribute("Remove")?.Value == ItemPaths.Under(folder));
+    private static bool Removes(XmlText xml, string folder) => xml.Root.Elements().Where(g => ProjectItems.IsItemGroup(g) && !ProjectItems.Conditioned(g)).SelectMany(g => g.Elements())
+        .Any(e => e.Name.LocalName == "Compile" && !ProjectItems.Conditioned(e) && e.Attribute("Remove")?.Value == ItemPaths.Under(folder));
 
     /// <summary>A package reference added as dotnet add package writes one, its version given (none under central package
     /// management, whose Directory.Packages.props holds it): after the project's last package reference that every build
@@ -99,12 +100,68 @@ public static class ProjectEdits
         return (text, false);
     }
 
+    /// <summary>A project file's text with a package referenced in some of its frameworks alone, as dotnet add package
+    /// --framework writes it: for each a reference in the item group of its condition, the project's own, else a new one after
+    /// its last group of package references (else before &lt;/Project&gt;), with <paramref name="version"/> (none under central
+    /// package management), a VersionOverride where <paramref name="overriding"/>. Else why not: the text does not read as
+    /// XML, or a framework's group references the package already.</summary>
+    public static (string? Text, string? Why) WithFrameworkPackage(string text, string id, string? version, bool overriding, IReadOnlyList<string> frameworks)
+    {
+        if (Read(text) is not { } xml)
+        {
+            return (null, "the project does not read as XML");
+        }
+        string versioned = version is null ? string.Empty : $" {(overriding ? "VersionOverride" : "Version")}=\"{XmlEntities.Encode(version, '"')}\"";
+        string element = $"<PackageReference Include=\"{XmlEntities.Encode(id, '"')}\"{versioned} />";
+        foreach (string framework in frameworks)
+        {
+            XElement? group = xml.Root.Elements().FirstOrDefault(g => ProjectItems.IsItemGroup(g) && ForFramework(g, framework));
+            if (group?.Elements().Any(e => e.Name.LocalName == "PackageReference" && Names(e, id)) == true)
+            {
+                return (null, $"it references {id} for {framework} already");
+            }
+            if (group?.Elements().LastOrDefault(e => e.Name.LocalName == "PackageReference") is { } last)
+            {
+                xml.After(last, element);
+            }
+            else if (group is not null)
+            {
+                xml.Append(group, element, ownLine: true);
+            }
+            else
+            {
+                string condition = XmlEntities.Encode(FrameworkCondition(framework, " == "), '"');
+                string outer = xml.IndentIn(xml.Root);
+                string written = $"<ItemGroup Condition=\"{condition}\">{xml.NewLine}{outer}{xml.Unit}{element}{xml.NewLine}{outer}</ItemGroup>";
+                if (xml.Root.Elements().LastOrDefault(g => ProjectItems.IsItemGroup(g) && g.Elements().Any(e => e.Name.LocalName == "PackageReference")) is { } referencing)
+                {
+                    xml.After(referencing, written);
+                }
+                else
+                {
+                    xml.Append(xml.Root, written, ownLine: true);
+                }
+            }
+        }
+        return (xml.Text, null);
+    }
+
+    /// <summary>Whether an item group's condition holds for one framework alone, as dotnet add package --framework writes
+    /// it ('$(TargetFramework)' == 'net10.0', spaces and letter case aside).</summary>
+    private static bool ForFramework(XElement group, string framework) =>
+        group.Attributes().FirstOrDefault(a => a.Name.LocalName.Equals("Condition", StringComparison.OrdinalIgnoreCase)) is { } condition
+        && string.Concat(condition.Value.Where(c => !char.IsWhiteSpace(c))).Equals(FrameworkCondition(framework, "=="), StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>The condition an item group takes for one framework, as dotnet add package --framework writes it, its
+    /// operator spaced as <paramref name="equals"/> says.</summary>
+    private static string FrameworkCondition(string framework, string equals) => $"'$({MSBuildNames.TargetFramework})'{equals}'{framework}'";
+
     /// <summary>A Directory.Packages.props' text with its PackageVersion of a package set to a version, as dotnet add
     /// package sets it (its Version attribute, else element); null where it has none for the package or does not read as
-    /// XML.</summary>
-    public static string? WithPackageVersion(string text, string id, string version)
+    /// XML. The PackageVersion at <paramref name="line"/> (MSBuild's, from 1) where one is, else its first.</summary>
+    public static string? WithPackageVersion(string text, string id, string version, int line = 0)
     {
-        if (Read(text) is not { } xml || xml.Root.Descendants().FirstOrDefault(e => e.Name.LocalName == "PackageVersion" && Names(e, id)) is not { } held)
+        if (Read(text) is not { } xml || Item(xml, "PackageVersion", id, line) is not { } held)
         {
             return null;
         }
@@ -117,6 +174,60 @@ public static class ProjectEdits
             xml.SetAttribute(held, "Version", version);
         }
         return xml.Text;
+    }
+
+    /// <summary>A package's version as a file's item of it writes it, XML's entities read: a PackageVersion's in a
+    /// Directory.Packages.props, a PackageReference's in a project or what it imports (<paramref name="item"/>), its Version
+    /// attribute, else element; null where the text has no such item with a version or does not read as XML. The item at
+    /// <paramref name="line"/> (MSBuild's, from 1) where one is, else its first.</summary>
+    public static string? VersionWritten(string text, string item, string id, int line = 0)
+    {
+        if (Read(text) is not { } xml || Item(xml, item, id, line) is not { } held)
+        {
+            return null;
+        }
+        return (string?)held.Attribute("Version") ?? held.Elements().FirstOrDefault(e => e.Name.LocalName == "Version" && !e.HasElements)?.Value;
+    }
+
+    /// <summary>The property a version written as one names alone ("$(Linq2DbVersion)", spaces aside); else null.</summary>
+    public static string? PropertyNamed(string written) =>
+        written.Trim() is ['$', '(', .. string inside, ')'] && inside.Trim() is { Length: > 0 } name && name.All(c => char.IsAsciiLetterOrDigit(c) || c is '_' or '-')
+            ? name : null;
+
+    /// <summary>A file's text with a property's value set where its element at <paramref name="line"/> (MSBuild's, from 1)
+    /// sets it, every other character as it was; else why not: no element there sets it, it is set under a condition, or
+    /// its value is written as more than a value (another property, an item, a function).</summary>
+    public static (string? Text, string? Why) WithPropertyAt(string text, string name, int line, string value)
+    {
+        if (Read(text) is not { } xml)
+        {
+            return (null, "the file does not read as XML");
+        }
+        if (xml.Root.Descendants().FirstOrDefault(e => e.Name.LocalName == name && ((IXmlLineInfo)e).LineNumber == line && e.Parent?.Name.LocalName == "PropertyGroup")
+            is not { HasElements: false, Parent: { } group } set || xml.InnerOf(set) is not { } inner)
+        {
+            return (null, $"no property group sets it at line {line}");
+        }
+        if (ProjectItems.Conditioned(set) || ProjectItems.Conditioned(group) || group.Parent != xml.Root)
+        {
+            return (null, "it is set under a condition");
+        }
+        string written = xml.Written(inner);
+        string held = XmlEntities.DecodeText(written).Trim();
+        if (held.Length == 0 || held.Contains("$(", StringComparison.Ordinal) || held.Contains("@(", StringComparison.Ordinal) || held.Contains("%(", StringComparison.Ordinal))
+        {
+            return (null, $"it is set as {(held.Length == 0 ? "nothing" : held)}, not a version");
+        }
+        int start = inner.Start + (written.Length - written.TrimStart().Length);
+        xml.Apply([(start, written.Trim().Length, XmlEntities.Encode(value))]);
+        return (xml.Text, null);
+    }
+
+    /// <summary>The item of a type naming a package at a line where one is, else its first.</summary>
+    private static XElement? Item(XmlText xml, string item, string id, int line)
+    {
+        XElement[] held = [.. xml.Root.Descendants().Where(e => e.Name.LocalName == item && Names(e, id))];
+        return held.FirstOrDefault(e => ((IXmlLineInfo)e).LineNumber == line) ?? held.FirstOrDefault();
     }
 
     /// <summary>Whether a project file's text references a package; false for text that does not read as XML.</summary>
@@ -180,11 +291,11 @@ public static class ProjectEdits
 
     public static string? RemoveReference(string project, string referenced) => Change(project, xml =>
     {
-        if (References(xml, project).FirstOrDefault(r => PathNames.Same(r.Path, referenced)).Element is not { } reference)
+        if (References(xml, project).FirstOrDefault(r => r.Path is { } path && PathNames.Same(path, referenced)).Element is not { } reference)
         {
             return $"{Path.GetFileNameWithoutExtension(project)} does not reference {Path.GetFileNameWithoutExtension(referenced)}";
         }
-        if (reference.Parent is { } group && IsItemGroup(group) && group.Nodes().All(n => n == reference || n is XText { Value: var space } && string.IsNullOrWhiteSpace(space)))
+        if (reference.Parent is { } group && ProjectItems.IsItemGroup(group) && group.Nodes().All(n => n == reference || n is XText { Value: var space } && string.IsNullOrWhiteSpace(space)))
         {
             // The group is left empty: it goes too, with the blank line that set it apart from the next.
             xml.Remove(group, spaced: true);
@@ -195,6 +306,64 @@ public static class ProjectEdits
         }
         return null;
     });
+
+    /// <summary>A shared project's items imported into a project as Visual Studio imports them (<c>&lt;Import Project="…"
+    /// Label="Shared" /&gt;</c>, relative with backslashes): after its last import of shared items, else on a line of its own
+    /// before &lt;/Project&gt;. Null once done, else why not.</summary>
+    public static string? AddSharedImport(string project, string items) => Change(project, xml =>
+    {
+        List<(XElement Element, string Path)> imported = SharedImports(xml, project);
+        if (imported.Any(i => PathNames.Same(i.Path, items)))
+        {
+            return $"{Path.GetFileNameWithoutExtension(project)} imports {Path.GetFileName(items)} already";
+        }
+        string written = ItemPaths.Named(Path.GetRelativePath(Path.GetDirectoryName(project)!, items).Replace('/', '\\'));
+        string element = $"<Import Project=\"{XmlEntities.Encode(written, '"')}\" Label=\"Shared\" />";
+        if (imported.LastOrDefault().Element is { } last)
+        {
+            xml.After(last, element);
+        }
+        else
+        {
+            xml.Append(xml.Root, element, ownLine: true);
+        }
+        return null;
+    });
+
+    /// <summary>A shared project's items no longer imported into a project: its Import taken out, an ImportGroup it leaves
+    /// empty with it. Null once done, else why not.</summary>
+    public static string? RemoveSharedImport(string project, string items) => Change(project, xml =>
+    {
+        if (SharedImports(xml, project).FirstOrDefault(i => PathNames.Same(i.Path, items)).Element is not { } import)
+        {
+            return $"{Path.GetFileNameWithoutExtension(project)} does not import {Path.GetFileName(items)}";
+        }
+        if (import.Parent is { Name.LocalName: "ImportGroup" } group && group.Elements().All(e => e == import))
+        {
+            xml.Remove(group, spaced: true);
+        }
+        else
+        {
+            xml.Remove(import);
+        }
+        return null;
+    });
+
+    /// <summary>The project's imports of shared projects' items files, in the file's order, each with the file it names.</summary>
+    private static List<(XElement Element, string Path)> SharedImports(XmlText xml, string project)
+    {
+        string folder = Path.GetDirectoryName(project)!;
+        List<(XElement, string)> found = [];
+        foreach (XElement import in xml.Root.Descendants().Where(e => e.Name.LocalName == "Import" && e.Attribute("Sdk") is null))
+        {
+            if (ProjectItems.PathOf(folder, (string?)import.Attribute("Project") ?? string.Empty, once: true) is { Glob: false } named
+                && named.Path.EndsWith(EvaluatedItem.SharedItemsExtension, StringComparison.OrdinalIgnoreCase))
+            {
+                found.Add((import, PathNames.Canonical(named.Path)));
+            }
+        }
+        return found;
+    }
 
     /// <summary>Sets a property in the project file, as Add > Docker Support sets the SDK's container properties and Manage User
     /// Secrets a UserSecretsId (<see cref="WithProperty"/>). Null once done, else why not.</summary>
@@ -251,6 +420,127 @@ public static class ProjectEdits
         return (xml.Text, null);
     }
 
+    /// <summary>The frameworks a project file's TargetFramework and TargetFrameworks elements name, under a condition or not,
+    /// each once, those written as a property passed over; none where the text does not read as XML.</summary>
+    public static IReadOnlyList<string> FrameworksWritten(string text) =>
+        Read(text) is { } xml
+            ? [.. FrameworkElements(xml).SelectMany(e => e.Value.Split(';')).Select(f => f.Trim()).Where(f => f.Length > 0 && !f.Contains("$(", StringComparison.Ordinal))
+                .Distinct(StringComparer.OrdinalIgnoreCase)]
+            : [];
+
+    /// <summary>The TargetFramework and TargetFrameworks elements of a project's property groups.</summary>
+    private static IEnumerable<XElement> FrameworkElements(XmlText xml) =>
+        xml.Root.Descendants().Where(e => e.Name.LocalName is MSBuildNames.TargetFramework or MSBuildNames.TargetFrameworks && !e.HasElements && e.Parent?.Name.LocalName == "PropertyGroup");
+
+    /// <summary>A project file's text with each framework of <paramref name="moves"/> named anew wherever a TargetFramework or
+    /// TargetFrameworks element names it among its frameworks, under a condition or not, every other character as it was;
+    /// null where none names one or the text does not read as XML.</summary>
+    public static string? WithFrameworksMoved(string text, IReadOnlyDictionary<string, string> moves)
+    {
+        if (Read(text) is not { } xml)
+        {
+            return null;
+        }
+        List<(int Start, int Length, string With)> edits = [];
+        foreach (XElement set in FrameworkElements(xml))
+        {
+            if (xml.InnerOf(set) is not { } inner)
+            {
+                continue;
+            }
+            int at = inner.Start;
+            foreach (string part in xml.Written(inner).Split(';'))
+            {
+                string named = part.Trim();
+                if (moves.FirstOrDefault(m => string.Equals(m.Key, named, StringComparison.OrdinalIgnoreCase)).Value is { } moved)
+                {
+                    edits.Add((at + part.IndexOf(named, StringComparison.Ordinal), named.Length, moved));
+                }
+                at += part.Length + 1;
+            }
+        }
+        if (edits.Count == 0)
+        {
+            return null;
+        }
+        xml.Apply(edits);
+        return xml.Text;
+    }
+
+    /// <summary>A project file's text with a property set to <paramref name="value"/> where it sets <paramref name="was"/> for
+    /// a platform (android): the one element whose condition, or its group's, names the platform, else the one under no
+    /// condition, its value shaped as the one it replaces; null where none or several do, or the text does not read as XML.</summary>
+    public static string? WithPlatformProperty(string text, string name, string platform, string was, string value)
+    {
+        if (Read(text) is not { } xml)
+        {
+            return null;
+        }
+        List<XElement> setting = [.. xml.Root.Descendants().Where(e => e.Name.LocalName == name && !e.HasElements && e.Parent is { Name.LocalName: "PropertyGroup" } group
+            && group.Parent == xml.Root && SameValue(e.Value, was))];
+        bool Names(XElement e) => $"{(string?)e.Attribute("Condition")} {(string?)e.Parent!.Attribute("Condition")}".Contains($"'{platform}'", StringComparison.OrdinalIgnoreCase);
+        List<XElement> chosen = [.. setting.Where(Names)];
+        if (chosen.Count == 0)
+        {
+            chosen = [.. setting.Where(e => !ProjectItems.Conditioned(e) && !ProjectItems.Conditioned(e.Parent!))];
+        }
+        if (chosen is not [{ } only] || xml.InnerOf(only) is not { } inner)
+        {
+            return null;
+        }
+        string written = xml.Written(inner);
+        xml.Apply([(inner.Start + (written.Length - written.TrimStart().Length), written.Trim().Length, XmlEntities.Encode(Shaped(value, written.Trim())))]);
+        return xml.Text;
+    }
+
+    /// <summary>A version shaped as the one it replaces is written: 24 for 23, 24.0 for 21.0.</summary>
+    private static string Shaped(string value, string was) =>
+        was.Contains('.', StringComparison.Ordinal) == value.Contains('.', StringComparison.Ordinal) ? value
+        : was.Contains('.', StringComparison.Ordinal) ? value + ".0"
+        : value.EndsWith(".0", StringComparison.Ordinal) ? value[..^2] : value;
+
+    /// <summary>A project file's text with a property set for its Debug configuration alone (and for one platform's
+    /// framework, <paramref name="platform"/> where given): in its own property group conditioned on Debug alone, else
+    /// under that condition in its first unconditioned group, else in a group of its own so conditioned; null where the
+    /// project writes the property already, or the text does not read as XML.</summary>
+    public static string? WithDebugProperty(string text, string name, string value, string? platform)
+    {
+        if (Read(text) is not { } xml || xml.Root.Descendants().Any(e => e.Name.LocalName == name))
+        {
+            return null;
+        }
+        string debug = $"'$({MSBuildNames.Configuration})' == 'Debug'";
+        string condition = platform is null ? debug
+            : $"{debug} And $([MSBuild]::GetTargetPlatformIdentifier('$({MSBuildNames.TargetFramework})')) == '{platform}'";
+        string written = XmlEntities.Encode(value);
+        List<XElement> groups = [.. xml.Root.Elements().Where(e => e.Name.LocalName == "PropertyGroup")];
+        if (platform is null && groups.FirstOrDefault(g => ((string?)g.Attribute("Condition"))?.Replace(" ", string.Empty, StringComparison.Ordinal)
+            .Equals(debug.Replace(" ", string.Empty, StringComparison.Ordinal), StringComparison.OrdinalIgnoreCase) == true) is { } debugGroup)
+        {
+            xml.Append(debugGroup, $"<{name}>{written}</{name}>");
+        }
+        else if (groups.FirstOrDefault(g => !ProjectItems.Conditioned(g)) is { } plain)
+        {
+            xml.Append(plain, $"<{name} Condition=\"{XmlEntities.Encode(condition, '"')}\">{written}</{name}>");
+        }
+        else
+        {
+            string outer = xml.IndentIn(xml.Root);
+            xml.Append(xml.Root, $"<PropertyGroup Condition=\"{XmlEntities.Encode(condition, '"')}\">{xml.NewLine}{outer}{xml.Unit}<{name}>{written}</{name}>{xml.NewLine}{outer}</PropertyGroup>",
+                ownLine: true);
+        }
+        return xml.Text;
+    }
+
+    /// <summary>Whether a property's text is a value (15, 15.0, 23), the same as another, as versions where both read as one.</summary>
+    private static bool SameValue(string written, string value)
+    {
+        string one = written.Trim();
+        string two = value.Trim();
+        return one == two || (Version.TryParse(one.Contains('.', StringComparison.Ordinal) ? one : one + ".0", out Version? a)
+            && Version.TryParse(two.Contains('.', StringComparison.Ordinal) ? two : two + ".0", out Version? b) && a == b);
+    }
+
     /// <summary>A property's value as the project file's own text sets it in an unconditioned property group; null where it
     /// sets none, or the text does not read as XML.</summary>
     public static string? PropertyIn(string text, string name) =>
@@ -258,22 +548,37 @@ public static class ProjectEdits
             ? PropertyGroups(xml).SelectMany(g => g.Elements()).FirstOrDefault(e => e.Name.LocalName == name && !e.HasElements)?.Value.Trim()
             : null;
 
-    /// <summary>The project (at its path now) following files and folders that moved or were renamed: each path it names
-    /// from its folder (an item's Include, Update, Remove or Exclude, a glob by its folder; an Import's Project and the
-    /// Exists of its Condition, not an SDK's; a HintPath) names where that went, a list or a property staying as written,
-    /// and a DependentUpon or LastGenOutput (from its item's file) names it there. A project that moved reads its paths
-    /// from where it was, so one naming a file outside it still finds it. Whether it changed.</summary>
+    /// <summary>The project (at its path now) following files and folders moved or renamed, as <see cref="WithItemsMoved"/>
+    /// writes it. Whether it changed.</summary>
     public static bool MoveItems(string project, IReadOnlyList<(string From, string To)> moves)
     {
         ProjectText file = new(project);
-        if (Read(file.Text) is not { } xml)
+        if (WithItemsMoved(file.Text, project, moves) is not { } moved)
         {
             return false;
         }
+        file.Write(moved);
+        return true;
+    }
+
+    /// <summary>A project file's text (the file at <paramref name="project"/> now) following files and folders moved: each path
+    /// it names from its folder, or from $(MSBuildThisFileDirectory) (each of an item's Include, Update, Remove or Exclude, a
+    /// glob by its folder; an Import's Project and its Condition's Exists; a HintPath), names where that went, unless another
+    /// item of its type takes it there (<see cref="NamedOnce"/>), and a DependentUpon or LastGenOutput names it from its item's
+    /// file. A project moved reads its paths from where it was. Null where nothing changed or the text is no XML.</summary>
+    public static string? WithItemsMoved(string text, string project, IReadOnlyList<(string From, string To)> moves)
+    {
+        if (Read(text) is not { } xml)
+        {
+            return null;
+        }
         string folder = Path.GetDirectoryName(project)!;
-        string Moved(string path) => moves.FirstOrDefault(m => PathNames.Within(path, m.From)) is { From: not null } move ? PathNames.Moved(path, move.From, move.To) : path;
-        string before = Path.GetDirectoryName(moves.FirstOrDefault(m => PathNames.Within(project, m.To)) is { To: not null } back ? PathNames.Moved(project, back.To, back.From) : project)!;
+        // In turn, as the moves were made: one may move again what one before it moved.
+        string Moved(string path) => moves.Aggregate(path, (at, move) => PathNames.Moved(at, move.From, move.To));
+        string before = Path.GetDirectoryName(Enumerable.Reverse(moves).Aggregate(project, (at, move) => PathNames.Moved(at, move.To, move.From)))!;
         List<(int Start, int Length, string With)> edits = [];
+        // Where the files an Include names went, which another item may take there.
+        HashSet<string> arrived = new(PathNames.Comparer);
         foreach (XElement item in xml.Root.Descendants())
         {
             switch (item.Name.LocalName)
@@ -300,8 +605,12 @@ public static class ProjectEdits
                 {
                     continue;
                 }
-                own ??= kind is "Include" or "Update" && ItemPaths.Read(XmlEntities.DecodeText(xml.Written(span)).Trim()) is { Glob: false, Path.Length: > 0 } one ? one.Path : null;
-                Follow(span, once: kind == "Exclude");
+                own ??= kind is "Include" or "Update" && ItemPaths.Read(ProjectItems.FromThisFolder(XmlEntities.DecodeText(xml.Written(span)).Trim())) is { Glob: false, Path.Length: > 0 } one ? one.Path : null;
+                // Each name of a list (A.cs;B.cs) as MSBuild splits it, the rest of the list as written.
+                foreach ((int Start, int Length) part in xml.PartsOf(span))
+                {
+                    Follow(part, xml.Text[span.Start - 1], once: kind == "Exclude", arriving: kind == "Include");
+                }
             }
             if (own is null)
             {
@@ -328,14 +637,13 @@ public static class ProjectEdits
         }
         if (edits.Count == 0)
         {
-            return false;
+            return null;
         }
         xml.Apply(edits);
-        file.Write(xml.Text);
-        return true;
+        return arrived.Count == 0 ? xml.Text : NamedOnce(xml.Text, project, arrived);
 
         // A path named from the project's folder names where that is now; a glob, by its folder. Read and written as XML.
-        void Follow((int Start, int Length)? at, char? quote = null, bool once = false, bool quoted = false)
+        void Follow((int Start, int Length)? at, char? quote = null, bool once = false, bool quoted = false, bool arriving = false)
         {
             if (at is not { } span)
             {
@@ -344,6 +652,9 @@ public static class ProjectEdits
             string raw = xml.Written(span);
             string written = raw.Trim();
             int start = span.Start + raw.Length - raw.TrimStart().Length;
+            // A path from the file's own folder named as such is a path from the project's: only what follows it changes.
+            int own = written.Length - ProjectItems.FromThisFolder(written).Length;
+            (start, written) = (start + own, written[own..]);
             if (ItemPaths.Read(XmlEntities.DecodeText(written), once) is not { Path.Length: > 0 } item)
             {
                 return;
@@ -353,10 +664,70 @@ public static class ProjectEdits
             {
                 string moved = item.At(Written(Path.GetRelativePath(folder, now), item.Path));
                 edits.Add((start, written.Length, XmlEntities.Encode(quoted ? ItemPaths.InCondition(moved) : moved, quote ?? xml.Text[span.Start - 1])));
+                if (arriving && !item.Glob)
+                {
+                    arrived.Add(now);
+                }
             }
         }
 
         static string Full(string folder, string relative) => Path.GetFullPath(Path.Combine(folder, relative.Replace('\\', '/')));
+    }
+
+    /// <summary>A project's text without the names of files a move brought (<paramref name="arrived"/>) where another item of
+    /// its type every build sees takes them already, a wildcard's too, as MSBuild would take such a file twice (NETSDK1022):
+    /// each out of its list as written, an item naming no other going whole. One whose item says more of it than its name
+    /// (a Link, its metadata) stays.</summary>
+    private static string NamedOnce(string text, string project, IReadOnlySet<string> arrived)
+    {
+        string folder = Path.GetDirectoryName(project)!;
+        while (Twice(text) is { } without)
+        {
+            text = without;
+        }
+        return text;
+
+        // The text without the first such name; null where there is none.
+        string? Twice(string now)
+        {
+            XmlText xml = new(now);
+            List<XElement> items = [.. SharedProjects.ItemsIn(xml.Root)];
+            for (int index = 0; index < items.Count; index++)
+            {
+                XElement item = items[index];
+                string type = item.Name.LocalName;
+                if (xml.ValueOf(item, "Include") is not { } span || item.Elements().Any() || item.Attributes().Any(a => a.Name.LocalName is not ("Include" or "Condition")))
+                {
+                    continue;
+                }
+                List<(int Start, int Length)> parts = xml.PartsOf(span);
+                for (int at = 0; at < parts.Count; at++)
+                {
+                    if (ProjectItems.PathOf(folder, XmlEntities.DecodeText(xml.Written(parts[at]))) is not { Glob: false } named || !arrived.Contains(named.Whole)
+                        || !items.Any(e => e != item && e.Name.LocalName.Equals(type, StringComparison.OrdinalIgnoreCase) && ProjectItems.Unconditioned(e)
+                            && SharedProjects.Includes(folder, e, named.Whole)))
+                    {
+                        continue;
+                    }
+                    XmlText without = new(now);
+                    List<string> kept = [.. parts.Where((_, other) => other != at).Select(xml.Written).Where(p => p.Trim().Length > 0)];
+                    if (kept.Count == 0)
+                    {
+                        SharedProjects.RemoveItem(without, SharedProjects.ItemsIn(without.Root).ElementAt(index));
+                    }
+                    else
+                    {
+                        without.Apply([(span.Start, span.Length, string.Join(';', kept).Trim())]);
+                    }
+                    // A later Remove of it leaves the name it needs.
+                    if (SharedProjects.Taking(without.Text, project, named.Whole).Any(i => i.Type.Equals(type, StringComparison.OrdinalIgnoreCase)))
+                    {
+                        return without.Text;
+                    }
+                }
+            }
+            return null;
+        }
     }
 
     /// <summary>Reads the project, makes a change on its text, and writes it back unless the change says why not.</summary>
@@ -395,18 +766,19 @@ public static class ProjectEdits
     }
 
     /// <summary>An item put in an item group of its own before &lt;/Project&gt;, indented as the file indents.</summary>
-    private static void InGroupOfItsOwn(XmlText xml, string element)
+    internal static void InGroupOfItsOwn(XmlText xml, string element)
     {
         string outer = xml.IndentIn(xml.Root);
         xml.Append(xml.Root, $"<ItemGroup>{xml.NewLine}{outer}{xml.Unit}{element}{xml.NewLine}{outer}</ItemGroup>", ownLine: true);
     }
 
-    /// <summary>The project's references, in the file's order, each with the project it names.</summary>
-    private static List<(XElement Element, string Path)> References(XmlText xml, string project)
+    /// <summary>The project's references, in the file's order, each with the project it names; none for one naming a list,
+    /// a wildcard or anything else MSBuild expands.</summary>
+    private static List<(XElement Element, string? Path)> References(XmlText xml, string project)
     {
         string folder = Path.GetDirectoryName(project)!;
         return [.. xml.Root.Descendants().Where(e => e.Name.LocalName == "ProjectReference" && e.Attribute("Include") is not null)
-            .Select(e => (e, PathNames.Canonical(Path.Combine(folder, ItemPaths.Unescaped(e.Attribute("Include")!.Value).Replace('\\', '/')))))];
+            .Select(e => (e, ProjectItems.PathOf(folder, e.Attribute("Include")!.Value) is { Glob: false } named ? PathNames.Canonical(named.Path) : null))];
     }
 
     private static List<XElement> PackageReferences(XmlText xml) => [.. xml.Root.Descendants().Where(e => e.Name.LocalName == "PackageReference")];
@@ -418,7 +790,7 @@ public static class ProjectEdits
     /// own before &lt;/Project&gt;.</summary>
     private static void Referenced(XmlText xml, List<XElement> references, string element)
     {
-        if (references.LastOrDefault(Unconditioned) is { } last)
+        if (references.LastOrDefault(ProjectItems.Unconditioned) is { } last)
         {
             xml.After(last, element);
         }
@@ -431,29 +803,19 @@ public static class ProjectEdits
     /// <summary>A package reference's package and the version it writes (its Version attribute, else element); null for
     /// one that writes none.</summary>
     private static (string Id, string Version)? Versioned(XElement reference) =>
-        ((string?)reference.Attribute("Include"))?.Trim() is { Length: > 0 } id
-        && ((string?)reference.Attribute("Version") ?? reference.Elements().FirstOrDefault(e => e.Name.LocalName == "Version" && !e.HasElements)?.Value)?.Trim() is { Length: > 0 } version
+        ((string?)reference.Attribute("Include"))?.Trim() is { Length: > 0 } id && ProjectItems.Value(reference, "Version")?.Trim() is { Length: > 0 } version
             ? (id, version) : null;
 
     /// <summary>The project's own property groups that no condition holds, in the file's order.</summary>
     private static List<XElement> PropertyGroups(XmlText xml) =>
-        [.. xml.Root.Elements().Where(e => e.Name.LocalName == "PropertyGroup" && !Conditioned(e))];
-
-    private static bool IsItemGroup(XElement element) => element.Name.LocalName == "ItemGroup";
-
-    /// <summary>Whether every build sees an item: neither it nor its item group has a condition, and the group is the
-    /// project's own, in no Choose or Target.</summary>
-    private static bool Unconditioned(XElement item) =>
-        !Conditioned(item) && item.Parent is { } group && IsItemGroup(group) && !Conditioned(group) && group.Parent?.Name.LocalName == "Project";
-
-    private static bool Conditioned(XElement element) => element.Attributes().Any(a => a.Name.LocalName.Equals("Condition", StringComparison.OrdinalIgnoreCase));
+        [.. xml.Root.Elements().Where(e => e.Name.LocalName == "PropertyGroup" && !ProjectItems.Conditioned(e))];
 
     /// <summary>A path as a project writes it, with the separators the value it replaces had.</summary>
     private static string Written(string relative, string was) => was.Contains('\\') ? relative.Replace('/', '\\') : relative.Replace('\\', '/');
 
     /// <summary>A project file read for one change as a save reads a file: its encoding, byte order mark and line breaks,
     /// which go back as they came.</summary>
-    private sealed class ProjectText
+    internal sealed class ProjectText
     {
         private readonly string path;
         private readonly FileText file;

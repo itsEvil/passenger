@@ -16,7 +16,8 @@ namespace Passenger.App.Profiling;
 /// file panel for a snapshot to open, going to a place in the code, choosing a control of a process in the Live Visual
 /// Tree, the editors, whose text a control's XAML place is read in, the choice of a .NET program in a running container
 /// (Attach to Process's dialog), and such a program made ready to profile: Passenger's tools put in its container, its id
-/// there, and the place it is recorded at.</summary>
+/// there, and the place it is recorded at; and a tab of the Terminal window a program runs in, shown, for a configuration
+/// that uses the terminal.</summary>
 public sealed record ProfilerParts(
     Func<ProjectSession> Session,
     Func<BuildRunController> Builds,
@@ -34,7 +35,8 @@ public sealed record ProfilerParts(
     Func<DotnetProcess, ContainerPaths, Action<string>, CancellationToken, Task<(DotnetProcess Target, ProfilePlace Place)>> InContainer,
     Action<string> ShowInFileManager,
     Func<string, string, string, Task<bool>> Confirm,
-    Func<RunConfiguration, string?, Task<string?>>? ProfileAspire = null);
+    Func<RunConfiguration, string?, Task<string?>>? ProfileAspire = null,
+    Func<string, System.Diagnostics.ProcessStartInfo, Task<TerminalRun>>? InTerminal = null);
 
 /// <summary>The window's profiler: Profile builds and starts the chosen configuration under the sampling profiler (an
 /// Avalonia app with the inspector in it, which records its frames), or Attach Profiler profiles the program Run or Debug
@@ -81,13 +83,16 @@ public sealed class ProfilerCommands
         this.parts = parts;
         window = new ToolWindow(ToolWindowIds.Profiler, "Performance Profiler", IconKeys.Profile, Make, ToolAnchor.BottomLeft)
         {
+            Serves = ToolWindowServes.EveryFolder,
             Action = AppActions.ShowProfiler,
             Menus = [new MenuPlace("Tools", 0, 1)],
         };
         parts.Dock.Add(window);
         parts.Actions.Add(new IdeAction(AppActions.Profile, "Profile", "Run", context => IdeErrors.Observe(ProfileReportingAsync()))
         {
-            WhyNot = _ => WhyNotProfile(Session) ?? (Session.Configurations.Chosen is null ? Session.NothingTo("profile") : null),
+            WhyNot = _ => WhyNotProfile(Session) ?? (Session.Configurations.Chosen is null ? Session.NothingTo("profile")
+                : Session.Configurations.Chosen is { IsMultiple: true } several ? LaunchPlan.SeveralProjects(several.Name)
+                : Session.Configurations.Chosen is { IsScript: true } script ? Refusals.ScriptOnlyRuns(script.Name) : null),
             Menus = [new MenuPlace("Run", 0, 2)],
         });
         // Nothing of the folder's running, it offers the programs of the engine's running containers to choose from.
@@ -118,7 +123,7 @@ public sealed class ProfilerCommands
             }
             else
             {
-                Session.Profiled?.Run.Kill();
+                Session.Profiled?.Kill();
             }
         };
         made.OpenRequested += (_, method) => IdeErrors.Observe(OpenMethodAsync(method));
@@ -262,7 +267,12 @@ public sealed class ProfilerCommands
     private string? WhyNotProfile(ProjectSession folder, RunConfiguration? configuration = null)
     {
         RunConfiguration? chosen = configuration ?? folder.Configurations.Chosen;
-        return Busy(folder) ?? (chosen is not null && folder.Aspire.IsAspire(chosen) ? null : GoesOn(folder) ?? RunConsoleTaken(folder, chosen));
+        if (folder.Folder is not null && !folder.Trusted)
+        {
+            return Refusals.Untrusted;
+        }
+        return Busy(folder) ?? (chosen is not null && folder.Aspire.IsAspire(chosen) ? null
+            : GoesOn(folder) ?? (chosen?.Console == ConsoleKind.Terminal ? null : RunConsoleTaken(folder, chosen)));
     }
 
     private async Task<string?> LaunchAsync(ProjectSession profiled, string? arguments, Working work, RunConfiguration? configuration)
@@ -287,7 +297,9 @@ public sealed class ProfilerCommands
             return problem;
         }
         parts.Dock.Show(ToolWindowIds.Profiler);
-        if ((plan is null ? problem : plan.WhyNot("profile")) is { } why)
+        if ((plan is null ? problem : plan.Functions ? Refusals.FunctionsUnprofiled(plan.Name)
+            : plan.MacCatalyst is not null ? Refusals.MacCatalystUnprofiled(plan.Name)
+            : plan.WhyNot("profile")) is { } why)
         {
             plan?.Dashboard?.Dispose();
             View.Stopped(why);
@@ -300,6 +312,8 @@ public sealed class ProfilerCommands
         (LaunchPlan listened, Godot.GodotGame? game) = profiled.Listened(plan!);
         LaunchPlan launched = profiled.InspectedProfile(listened);
         LiveApp? inspected = profiled.ProfiledApp;
+        // A configuration that uses the terminal runs in a tab of the Terminal window, its keys its own, the Run console left as it is.
+        bool inTerminal = launched.Console == ConsoleKind.Terminal && parts.InTerminal is not null;
         using CancellationTokenSource stop = new();
         // The toolbar's Stop ends the start as the window's Kill does.
         using CancellationTokenRegistration toolbarStop = work.Stopping.Register(stop.Cancel);
@@ -311,14 +325,20 @@ public sealed class ProfilerCommands
                 Called = launched.Godot is not null || launched.ByAppHost ? launched.ProgramName : null,
                 OwnDesktop = launched.OnOwnDesktop ? launched.OwnDesktopWhy : null,
             };
-            run.Clear();
-            foreach (string note in plan!.Notes)
+            if (!inTerminal)
             {
-                run.Append($"{note}\n");
+                run.Clear();
+                foreach (string note in plan!.Notes)
+                {
+                    run.Append($"{note}\n");
+                }
+                builds.ShowInRun(dashboard);
             }
-            builds.ShowInRun(dashboard);
+            // What the program says it needs is heard from the Run console it writes to; one in the terminal needs nothing more.
+            builds.HearProfiled(inTerminal ? null : run, chosen.Name);
             ConsoleSink console = run.Sink;
             ProfilingSession running;
+            TerminalRun? tab = null;
             // Kill is there while the program starts; the folder's end ends it too.
             starting = stop;
             profiled.ProfileStarting = stop;
@@ -328,8 +348,9 @@ public sealed class ProfilerCommands
             {
                 ProgramPump pump = (reader, error, lines) => console.PumpAsync(reader, error ? ConsoleStream.Error : ConsoleStream.Output, lines: lines);
                 // A game of GDScript alone runs no .NET code to sample: Godot's own profiler's frames are the whole run.
-                running = launched.ScriptsAlone ? await ProfilingSession.StartFramesAsync(target, SnapshotFolder, pump)
-                    : await ProfilingSession.StartAsync(target, SnapshotFolder, SocketFolders.Own(State.StateStore.DefaultRoot), pump, stop.Token);
+                (tab, running) = inTerminal ? await StartInTerminalAsync(chosen.Name, launched, target, stop.Token)
+                    : (null, launched.ScriptsAlone ? await ProfilingSession.StartFramesAsync(target, SnapshotFolder, pump)
+                        : await ProfilingSession.StartAsync(target, SnapshotFolder, SocketFolders.Own(State.StateStore.DefaultRoot), pump, stop.Token));
             }
             starting = null;
             if (game is not null)
@@ -338,11 +359,21 @@ public sealed class ProfilerCommands
             }
             profiled.Profiling = running;
             TaskCompletionSource landed = new(TaskCreationOptions.RunContinuationsAsynchronously);
-            ProfiledProgram program = new(running, chosen.Name, target.Name, landed.Task);
+            ProfiledProgram program = new(running, chosen.Name, target.Name, landed.Task) { Terminal = tab };
             profiled.Profiled = program;
             ConsoleInput? input = running.Input is { } writer ? ProgramInput.Of(writer) : null;
             // Only its end puts the run away, however that comes: a snapshot leaves the program running.
-            builds.Keep(dashboard, running.ExitedAsync(), () => false, said => run.Append($"{said}\n"));
+            builds.Keep(dashboard, running.ExitedAsync(), () => false, said =>
+            {
+                if (inTerminal)
+                {
+                    parts.Say(said);
+                }
+                else
+                {
+                    run.Append($"{said}\n");
+                }
+            });
             dashboard = null;
             IdeErrors.Observe(running.ExitedAsync().ContinueWith(_ => UiThread.Post(() =>
             {
@@ -352,13 +383,18 @@ public sealed class ProfilerCommands
             if (profiled.IsEnded)
             {
                 // Its folder was left as it started: it ends with the folder's other programs.
-                running.Kill();
+                program.Kill();
                 return Refusals.SolutionClosed;
             }
             profilingName = chosen.Name;
-            run.Input = input;
+            if (!inTerminal)
+            {
+                run.Input = input;
+            }
             View.Running(chosen.Name, () => running.Elapsed);
-            parts.Say(running.Samples ? $"Profiling {chosen.Name}" : FramesAloneSaid(chosen.Name));
+            parts.Say(!running.Samples ? FramesAloneSaid(chosen.Name)
+                : inTerminal ? string.Join("; ", [$"Profiling {chosen.Name} in a tab of the Terminal window", .. plan!.Notes])
+                : $"Profiling {chosen.Name}");
             return null;
         }
         catch (OperationCanceledException) when (stop.IsCancellationRequested)
@@ -400,6 +436,46 @@ public sealed class ProfilerCommands
                 profiled.ProfileStarting = null;
             }
             dashboard?.Dispose();
+        }
+    }
+
+    /// <summary>Starts a program to profile in a tab of the Terminal window, shown, its keys going to it: held at its start by
+    /// its runtime until the profiler records it there, then let go, so the run has it from its first instruction (a game of
+    /// GDScript alone, which runs no .NET code, is not held, its run Godot's own frames). A start that fails, or is stopped,
+    /// ends the program, its tab saying how it ended; one that fails is a <see cref="ProfilingException"/> saying why.</summary>
+    private async Task<(TerminalRun Tab, ProfilingSession Running)> StartInTerminalAsync(string name, LaunchPlan launched, ProfileTarget target, CancellationToken stop)
+    {
+        string program = GodotConsole.Program(launched, launched.Program);
+        System.Diagnostics.ProcessStartInfo start = ChildProcesses.Command(program, launched.Arguments, launched.WorkingDirectory);
+        ChildProcesses.WithVariables(start, launched.Environment);
+        if (!launched.ScriptsAlone)
+        {
+            ChildProcesses.WithVariables(start, HeldStart.Variables(changeable: false));
+        }
+        TerminalRun tab;
+        try
+        {
+            tab = await parts.InTerminal!(name, start);
+        }
+        catch (LaunchException failed)
+        {
+            throw new ProfilingException(failed.Message, failed);
+        }
+        try
+        {
+            // Through Godot's console wrapper, the game is the process the wrapper starts.
+            await GodotConsole.FollowAsync(tab, launched.Program, program);
+            return (tab, launched.ScriptsAlone ? ProfilingSession.AttachFrames(tab.Debuggee, target.Name, SnapshotFolder)
+                : await ProfilingSession.AttachAsync(tab.Debuggee, target.Name, SnapshotFolder, stop, resume: true));
+        }
+        catch (LaunchException unfollowed)
+        {
+            throw new ProfilingException(unfollowed.Message, unfollowed);
+        }
+        catch (Exception failed) when (failed is ProfilingException or OperationCanceledException)
+        {
+            tab.Stop();
+            throw;
         }
     }
 
@@ -478,9 +554,12 @@ public sealed class ProfilerCommands
     }
 
     /// <summary>What the status says of a snapshot read: what it holds, and that it is kept among the Snapshots page's, which
-    /// names their folder, deep in Passenger's state, with a button that shows it.</summary>
-    public static string SnapshotSaid(string name, Snapshot snapshot) => snapshot.FramesAlone
+    /// names their folder, deep in Passenger's state, with a button that shows it. One whose trace was cut short says so,
+    /// as its program's end where the program has <paramref name="ended"/>.</summary>
+    public static string SnapshotSaid(string name, Snapshot snapshot, bool ended = false) => snapshot.FramesAlone
         ? $"Snapshot of {name}: {Plural.Of(snapshot.GameFrames.Count, "frame")} as Godot's profiler measured them, no samples (GDScript alone), kept on the Performance Profiler's Snapshots page"
+        : snapshot.CutShort is { } cut
+        ? $"{(ended ? $"{name} ended before its trace was whole" : $"The trace of {name} was cut short ({cut.TrimEnd('.')})")}: its snapshot holds what was written before, {snapshot.Samples:N0} samples, kept on the Performance Profiler's Snapshots page"
         : $"Snapshot of {name}: {snapshot.Samples:N0} samples, kept on the Performance Profiler's Snapshots page";
 
     /// <summary>What Profile says of a Godot game of GDScript alone it runs, whose run is Godot's own frames.</summary>
@@ -958,7 +1037,7 @@ public sealed class ProfilerCommands
         {
             // Held by the scope, and back on no thread of the window's, which may be gone by then.
             Snapshot snapshot = await BackgroundWork.Unheld(() => run.StopAsync()).ConfigureAwait(false);
-            string read = SnapshotSaid(name, snapshot);
+            string read = SnapshotSaid(name, snapshot, Ended(run));
             if (closing.IsCancellationRequested)
             {
                 // Its folder was left as it was read: it is that folder's to list when it opens again.
@@ -989,9 +1068,11 @@ public sealed class ProfilerCommands
             }
             return new SnapshotRead(snapshot, read);
         }
-        catch (Exception error) when (error is IOException or InvalidOperationException or TimeoutException)
+        catch (Exception error) when (error is InvalidOperationException or TimeoutException || TraceFailures.Of(error))
         {
-            string unread = $"The snapshot could not be read: {error.Message}";
+            string unread = TraceFailures.Broken(error) && Ended(run)
+                ? $"{name} ended before its trace was whole, so it has no snapshot: {error.Message}"
+                : $"The snapshot could not be read: {error.Message}";
             if (!closing.IsCancellationRequested)
             {
                 try
@@ -1038,6 +1119,9 @@ public sealed class ProfilerCommands
             }
         }
     }
+
+    /// <summary>Whether a run's program, on this machine, has ended: a trace cut short is then its end's doing.</summary>
+    private static bool Ended(ProfilingSession run) => run.Place is null && run.HasExited;
 
     /// <summary>Get Memory Snapshot: the running program's heap, listed on the Memory page with the run's earlier ones to
     /// compare it with; the run goes on. One given up (<paramref name="cancel"/>) is said so.</summary>
@@ -1094,7 +1178,7 @@ public sealed class ProfilerCommands
                 heap = await run.TakeMemorySnapshotAsync(intoOutput: true, stopping.Token);
             }
             View.ShowMemory(heap);
-            parts.Say($"{heap.Name} of {name}: {heap.Objects:N0} objects, {heap.Bytes / 1048576.0:N1} MB{(heap.Lacks is null ? string.Empty : ", read from its runtime's GC heap dump")}");
+            parts.Say(string.Create(System.Globalization.CultureInfo.InvariantCulture, $"{heap.Name} of {name}: {heap.Objects:N0} objects, {Sizes.Said(heap.Bytes)}{(heap.Lacks is null ? string.Empty : ", read from its runtime's GC heap dump")}"));
             return (heap, note ?? heap.Lacks);
         }
         catch (Exception error) when (error is HeapUnreadableException or ProfilingException or OperationCanceledException || DiagnosticsFailures.Of(error))
@@ -1138,10 +1222,10 @@ public sealed class ProfilerCommands
             shownProcess = null;
             Show(snapshot, Path.GetFileNameWithoutExtension(path));
             ShowKill();
-            parts.Say($"{Path.GetFileName(path)}: {snapshot.Samples:N0} samples");
+            parts.Say($"{Path.GetFileName(path)}: {snapshot.Samples:N0} samples{(snapshot.CutShort is { } cut ? $", its trace cut short ({cut.TrimEnd('.')})" : string.Empty)}");
             return snapshot;
         }
-        catch (Exception error) when (error is IOException or InvalidOperationException or UnauthorizedAccessException or FormatException)
+        catch (Exception error) when (error is InvalidOperationException || TraceFailures.Of(error))
         {
             parts.Say($"{Path.GetFileName(path)} is not a snapshot Passenger can read: {error.Message}");
             return null;
@@ -1256,4 +1340,22 @@ public sealed record SnapshotRead(Snapshot? Snapshot, string Message);
 /// <summary>A program Profile started: its run, which records it until Get Snapshot or its end and holds it after; its
 /// configuration's name, as the window says it, and its program's, as its snapshots' files are named; and its end, done
 /// once the Run console has the last of what it wrote.</summary>
-public sealed record ProfiledProgram(ProfilingSession Run, string Name, string File, Task Landed);
+public sealed record ProfiledProgram(ProfilingSession Run, string Name, string File, Task Landed)
+{
+    /// <summary>The tab of the Terminal window it runs in, for a configuration that uses the terminal; null for one writing
+    /// to the Run console.</summary>
+    public TerminalRun? Terminal { get; init; }
+
+    /// <summary>Ends the program (Kill, Stop, its folder's end): its terminal tab's, with all it started, else the run's own.</summary>
+    public void Kill()
+    {
+        if (Terminal is { } tab)
+        {
+            tab.Stop();
+        }
+        else
+        {
+            Run.Kill();
+        }
+    }
+}

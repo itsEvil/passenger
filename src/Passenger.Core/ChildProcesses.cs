@@ -5,7 +5,9 @@ using System.Diagnostics;
 using System.IO.Pipes;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
+using System.Runtime.Versioning;
 using System.Text;
+using Microsoft.Win32.SafeHandles;
 
 namespace Passenger.Core;
 
@@ -24,8 +26,8 @@ public static class ChildProcesses
     /// otherwise take it for its folder's.</summary>
     private static readonly string[] HookVariables =
     [
-        "GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES",
-        "GIT_COMMON_DIR", "GIT_PREFIX", "GIT_NAMESPACE", "GIT_QUARANTINE_PATH",
+        GitVariables.Dir, GitVariables.WorkTree, GitVariables.IndexFile, GitVariables.ObjectDirectory, GitVariables.AlternateObjectDirectories,
+        GitVariables.CommonDir, GitVariables.Prefix, GitVariables.Namespace, GitVariables.QuarantinePath,
     ];
 
     /// <summary>A child started; raised on the thread that started it, for the IDE's log.</summary>
@@ -101,12 +103,54 @@ public static class ChildProcesses
         }
     }
 
-    /// <summary>The .NET command line (<see cref="Dotnet.Host"/>) with these arguments, in English (the IDE reads what it
-    /// says) and with no first-run banner. It builds in its own process and worker nodes, never in MSBuild's server, which
-    /// would outlive it; a node left for the next build is the IDE's alone, so it ends with the IDE
-    /// (<see cref="Lifeline"/>). A <see cref="FileNotFoundException"/> when there is none.</summary>
-    public static ProcessStartInfo DotnetCommand(IEnumerable<string> arguments, string? folder = null) =>
-        AsDotnet(Command(Dotnet.Host(), arguments, folder));
+    /// <summary>The .NET command line (<see cref="Dotnet.Host"/>, the one the folder's projects take) with these arguments,
+    /// in English (the IDE reads what it says) and with no first-run banner. It builds in its own process and worker nodes,
+    /// never in MSBuild's server, which would outlive it; a node left for the next build is the IDE's alone, so it ends with
+    /// the IDE (<see cref="Lifeline"/>). A <see cref="FileNotFoundException"/> when there is none.</summary>
+    public static ProcessStartInfo DotnetCommand(IEnumerable<string> arguments, string? folder = null)
+    {
+        string[] given = [.. arguments];
+        return TakingDotnet(AsDotnet(Command(Dotnet.Host(folder), given, DotnetFolder(given, folder))), folder);
+    }
+
+    /// <summary><see cref="DotnetCommand(IEnumerable{string}, string?)"/> of the dotnet at <paramref name="host"/>, an
+    /// installation's own, in place of the folder's.</summary>
+    public static ProcessStartInfo DotnetCommand(string host, IEnumerable<string> arguments, string? folder)
+    {
+        string[] given = [.. arguments];
+        return AsDotnet(Command(host, given, DotnetFolder(given, folder)));
+    }
+
+    /// <summary>Where a dotnet run for <paramref name="folder"/> works: there, but where the command runs an SDK (anything but
+    /// a program's own, <see cref="RunsSdk"/>), which the dotnet takes from the global.json over the folder it works in, whose
+    /// sdk.paths may name the folder's own, and the folder or that global.json's is not trusted (<see cref="Dotnet.TakesOnlyTrusted"/>):
+    /// there the person's home (above it, the disk's root, where the folder holds the home folder), the folder named in the
+    /// arguments where the command needs it.</summary>
+    private static string? DotnetFolder(IReadOnlyList<string> arguments, string? folder)
+    {
+        if (folder is null || !RunsSdk(arguments) || Dotnet.TakesOnlyTrusted(folder))
+        {
+            return folder;
+        }
+        string home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+        return home.Length > 0 && !PathNames.Within(PathNames.Canonical(home), PathNames.Canonical(folder)) ? home : Path.GetPathRoot(Path.GetFullPath(folder));
+    }
+
+    /// <summary>Whether dotnet runs an SDK for these arguments: every command but a program's own, named by its path (an
+    /// assembly, an app) or after <c>exec</c>.</summary>
+    internal static bool RunsSdk(IReadOnlyList<string> arguments) => arguments is not [var first, ..]
+        || !(first == "exec" || first.EndsWith(".dll", StringComparison.OrdinalIgnoreCase) || first.EndsWith(".exe", StringComparison.OrdinalIgnoreCase));
+
+    /// <summary>A start for a folder whose projects take an installation of their own (<see cref="Dotnet.Apart"/>) given it as
+    /// DOTNET_ROOT, so what it starts finds that installation's runtimes, and MSBuild's locator its SDKs, before any other.</summary>
+    private static ProcessStartInfo TakingDotnet(ProcessStartInfo start, string? folder)
+    {
+        if (Dotnet.Apart(folder) is { } root)
+        {
+            start.Environment[RuntimeVariables.Root] = root;
+        }
+        return start;
+    }
 
     /// <summary>The helper host carried beside the app (src/Passenger.Helper), by its name.</summary>
     public const string HelperHost = "passenger-helper";
@@ -114,7 +158,7 @@ public static class ChildProcesses
     /// <summary>One of Passenger's own helper programs (an assembly the app carries: Roslyn's server, the project host, the
     /// debug adapter) with these arguments, on the runtime Passenger itself runs on, never the person's dotnet: run by the
     /// helper host's apphost beside the app, which beside a self-contained app takes its runtime, else by the muxer of the
-    /// runtime this build runs on, at its version, with the .NET command line's environment (<see cref="DotnetCommand"/>).
+    /// runtime this build runs on, at its version, with the .NET command line's environment (<see cref="DotnetCommand(IEnumerable{string}, string?)"/>).
     /// A <see cref="FileNotFoundException"/> when the host is missing.</summary>
     public static ProcessStartInfo HelperCommand(string assembly, IEnumerable<string> arguments, string? folder = null)
     {
@@ -150,23 +194,24 @@ public static class ChildProcesses
     /// <summary>The <see cref="RuntimeVariables.ConserveMemory"/> of <see cref="ConservingMemory"/>.</summary>
     public const string HelperConservesMemory = "7";
 
-    /// <summary>A helper's start (<see cref="HelperCommand"/>) naming the person's .NET command line (<see cref="Dotnet.Host"/>)
-    /// as the one MSBuild, its SDK resolvers and its tools take for the installation, as the command line names itself to
-    /// the builds it runs: the helper's own host is none of the person's. Where there is none, none is named.</summary>
-    public static ProcessStartInfo NamingDotnet(ProcessStartInfo start)
+    /// <summary>A helper's start (<see cref="HelperCommand"/>) naming the person's .NET command line (<see cref="Dotnet.Host"/>,
+    /// the one the folder's projects take) as the one MSBuild, its SDK resolvers and its tools take for the installation, as
+    /// the command line names itself to the builds it runs: the helper's own host is none of the person's. Where there is
+    /// none, none is named.</summary>
+    public static ProcessStartInfo NamingDotnet(ProcessStartInfo start, string? folder = null)
     {
         try
         {
-            start.Environment[RuntimeVariables.HostPath] = Dotnet.Host();
+            start.Environment[RuntimeVariables.HostPath] = Dotnet.Host(folder);
         }
         catch (FileNotFoundException)
         {
             start.Environment.Remove(RuntimeVariables.HostPath);
         }
-        return start;
+        return TakingDotnet(start, folder);
     }
 
-    /// <summary>A start given the .NET command line's environment (<see cref="DotnetCommand"/>).</summary>
+    /// <summary>A start given the .NET command line's environment (<see cref="DotnetCommand(IEnumerable{string}, string?)"/>).</summary>
     private static ProcessStartInfo AsDotnet(ProcessStartInfo start)
     {
         start.Environment["DOTNET_CLI_UI_LANGUAGE"] = "en";
@@ -190,14 +235,14 @@ public static class ChildProcesses
     }
 
     /// <summary>The IDE's own question of the .NET command line, asked in a folder of the person's and taken as its answer
-    /// comes (<see cref="AnswerAsync"/>): <see cref="DotnetCommand"/> with the command line's telemetry off, so it ends
+    /// comes (<see cref="AnswerAsync"/>): <see cref="DotnetCommand(IEnumerable{string}, string?)"/> with the command line's telemetry off, so it ends
     /// with its answer, where it would send its telemetry for seconds after it, its folder held meanwhile on Windows (no
     /// one could delete or rename it).</summary>
     public static ProcessStartInfo DotnetQuestion(IEnumerable<string> arguments, string folder) => Asked(DotnetCommand(arguments, folder));
 
     /// <summary><see cref="DotnetQuestion(IEnumerable{string}, string)"/> of the dotnet at <paramref name="host"/>, an
     /// installation's own, in place of <see cref="Dotnet.Host"/>.</summary>
-    public static ProcessStartInfo DotnetQuestion(string host, IEnumerable<string> arguments, string folder) => Asked(AsDotnet(Command(host, arguments, folder)));
+    public static ProcessStartInfo DotnetQuestion(string host, IEnumerable<string> arguments, string folder) => Asked(DotnetCommand(host, arguments, folder));
 
     private static ProcessStartInfo Asked(ProcessStartInfo start)
     {
@@ -216,9 +261,18 @@ public static class ChildProcesses
     public static Task<Process> StartAsync(ProcessStartInfo start) => StartOffAsync(start, answers: null);
 
     /// <summary>The fork, unheld: what started the child holds its own wait for it, and the window's end may wait for a
-    /// start with no UI thread to come back to.</summary>
-    private static async Task<Process> StartOffAsync(ProcessStartInfo start, IReadOnlyCollection<int>? answers) =>
-        SynchronizationContext.Current is null ? Start(start, answers) : await BackgroundWork.Unheld(() => Start(start, answers));
+    /// start with no UI thread to come back to. What the start throws (its folder gone) is the caller's as it comes back,
+    /// and seen as it is thrown, so a caller whose thread never runs again leaves it to no finalizer.</summary>
+    private static async Task<Process> StartOffAsync(ProcessStartInfo start, IReadOnlyCollection<int>? answers)
+    {
+        if (SynchronizationContext.Current is null)
+        {
+            return Start(start, answers);
+        }
+        Task<Process> starting = BackgroundWork.Unheld(() => Start(start, answers));
+        UnawaitedWork.Dismiss(starting);
+        return await starting;
+    }
 
     /// <summary><see cref="Start(ProcessStartInfo)"/>, with the exit codes that are the child's answer, not its failure.</summary>
     private static Process Start(ProcessStartInfo start, IReadOnlyCollection<int>? answers)
@@ -241,28 +295,36 @@ public static class ChildProcesses
         string command = Display(start);
         long began = Stopwatch.GetTimestamp();
         Process process;
-        if (OperatingSystem.IsWindows() && OnOwnDesktops.TryGetValue(start, out string? why))
+        Action? givenBack = ThroughCmdWhereBatch(start);
+        try
         {
-            OwnDesktopStart started = OwnDesktop.Start(start, suspended: false);
-            process = started.Process;
-            OwnStreams.AddOrUpdate(process, started);
-            process.EnableRaisingEvents = true;
-            process.Exited += (_, _) => OnExited(process, start, command, began, answers);
-            PassengerLog.Write($"Started {Path.GetFileName(start.FileName)} (process {process.Id}) on a desktop of its own: {why}");
+            if (OperatingSystem.IsWindows() && OnOwnDesktops.TryGetValue(start, out string? why))
+            {
+                OwnDesktopStart started = OwnDesktop.Start(start, suspended: false);
+                process = started.Process;
+                OwnStreams.AddOrUpdate(process, started);
+                process.EnableRaisingEvents = true;
+                process.Exited += (_, _) => OnExited(process, start, command, began, answers);
+                PassengerLog.Write($"Started {Path.GetFileName(start.FileName)} (process {process.Id}) on a desktop of its own: {why}");
+            }
+            else
+            {
+                process = new() { StartInfo = start, EnableRaisingEvents = true };
+                process.Exited += (_, _) => OnExited(process, start, command, began, answers);
+                try
+                {
+                    process.Start();
+                }
+                catch
+                {
+                    process.Dispose();
+                    throw;
+                }
+            }
         }
-        else
+        finally
         {
-            process = new() { StartInfo = start, EnableRaisingEvents = true };
-            process.Exited += (_, _) => OnExited(process, start, command, began, answers);
-            try
-            {
-                process.Start();
-            }
-            catch
-            {
-                process.Dispose();
-                throw;
-            }
+            givenBack?.Invoke();
         }
         Lifeline.Adopt(process);
         // An id the IDE ended before, whose end went untold (its process disposed first), is another child's now.
@@ -273,6 +335,39 @@ public static class ChildProcesses
             Input(process).Close();
         }
         return process;
+    }
+
+    /// <summary>A batch file's start on Windows made cmd.exe's, which alone runs one, its words given as cmd reads them
+    /// (<see cref="WindowsCommandLine.ThroughCmd"/>), so none is taken for an operator or a variable of cmd's; what gives the
+    /// start back its own program and words once the child is started, so it still says what was asked. Null for another
+    /// start, or one whose arguments are one string; a word cmd cannot carry refuses the start.</summary>
+    private static Action? ThroughCmdWhereBatch(ProcessStartInfo start)
+    {
+        if (!OperatingSystem.IsWindows() || !WindowsCommandLine.IsBatch(start.FileName) || (start.ArgumentList.Count == 0 && start.Arguments.Length > 0))
+        {
+            return null;
+        }
+        string program = start.FileName;
+        string[] words = [.. start.ArgumentList];
+        try
+        {
+            start.Arguments = WindowsCommandLine.ThroughCmd(program, words);
+        }
+        catch (ArgumentException uncarried)
+        {
+            throw new InvalidOperationException(uncarried.Message, uncarried);
+        }
+        start.ArgumentList.Clear();
+        start.FileName = WindowsCommandLine.Cmd;
+        return () =>
+        {
+            start.FileName = program;
+            start.Arguments = string.Empty;
+            foreach (string word in words)
+            {
+                start.ArgumentList.Add(word);
+            }
+        };
     }
 
     /// <summary>The starts to be made on a desktop of their own (<see cref="OnDesktopOfItsOwn"/>), each with why.</summary>
@@ -366,9 +461,14 @@ public static class ChildProcesses
     }
 
     /// <summary>A one-line shell command run on macOS and Linux once the IDE's process has ended, however it ended, after
-    /// its children are: for what lives outside any child (the containers an engine runs), which only a command ends. It
-    /// takes the place of the one given before; on Windows nothing runs it, and the next start ends what is left.</summary>
-    public static void AtIdeEnd(string command) => Lifeline.AtEnd(command);
+    /// its children are: for what lives outside any child (the containers an engine runs, a simulator it booted), which only
+    /// a command ends. It takes the place of the one <paramref name="key"/> gave before, null of none; on Windows nothing
+    /// runs it, and the next start ends what is left.</summary>
+    public static void AtIdeEnd(string key, string? command) => Lifeline.AtEnd(key, command);
+
+    /// <summary>What ends the command line of the watchdog of the IDE's process <paramref name="ide"/> (<see cref="Lifeline"/>)
+    /// on macOS and Linux, which is in no process tree of the IDE's.</summary>
+    public static string WatchdogOf(int ide) => Lifeline.NameOf(ide);
 
     /// <summary>Runs a child to its end, its output and errors read whole, <paramref name="input"/> written to it first; an
     /// exit code among <paramref name="answers"/> is its answer (git's "no such file"), not a failure to log. Canceled, or
@@ -398,7 +498,7 @@ public static class ChildProcesses
         }
         if (!ran)
         {
-            throw new TimeoutException($"{Shown(start)} had not ended after {limit.GetValueOrDefault().TotalSeconds:0} s");
+            throw new TimeoutException($"{Shown(start)} had not ended after {Durations.Said(limit.GetValueOrDefault())}");
         }
         return new ChildResult(process.ExitCode, output.Text, errors.Text);
     }
@@ -516,7 +616,7 @@ public static class ChildProcesses
             process.Dispose();
             ending.Dispose();
             cancel.ThrowIfCancellationRequested();
-            throw new TimeoutException($"{Shown(start)} had not answered after {limit.GetValueOrDefault().TotalSeconds:0} s");
+            throw new TimeoutException($"{Shown(start)} had not answered after {Durations.Said(limit.GetValueOrDefault())}");
         }
         UnawaitedWork.Dismiss(read);
         using (process)
@@ -815,11 +915,20 @@ public static class ChildProcesses
     /// elsewhere its process group already holds them.</summary>
     public static void HoldFamily(Process process) => Lifeline.HoldFamily(process);
 
-    /// <summary>Ends a child and everything it started, now, passing over what has ended: its tree on Windows, but for a
-    /// process of it Windows will not end (one ending, or not ours where a parent's id was reused), and the whole of a
-    /// family held (<see cref="HoldFamily"/>); on macOS and Linux its
-    /// process group, which holds what it started and what it left behind, whether or not it has ended itself. Never the
-    /// runtime's tree kill there, which stops each process before killing it and can then hang for good on macOS.</summary>
+    /// <summary>Ends what is left of a child, by its id, as <see cref="Kill"/> ends it: on macOS and Linux its process
+    /// group, which holds what it started after it has ended (MSBuild's nodes a build left for the next, and what they run
+    /// for a later build); on Windows its held family (<see cref="HoldFamily"/>).</summary>
+    public static void KillLeft(int id) => Lifeline.KillGroup(id);
+
+    /// <summary>Whether something of a child, by its id, may still be left for <see cref="KillLeft"/> to end: its process
+    /// group still has a process, or its family is still held.</summary>
+    public static bool Leaves(int id) => Lifeline.Holds(id);
+
+    /// <summary>Ends a child and everything it started, now, passing over what has ended: its tree on Windows
+    /// (<see cref="ProcessTree"/>), whatever another thread does with the process meanwhile, and the whole of a family held
+    /// (<see cref="HoldFamily"/>); on macOS and Linux its process group, which holds what it started and what it left
+    /// behind, whether or not it has ended itself. Never the runtime's tree kill there, which stops each process before
+    /// killing it and can then hang for good on macOS.</summary>
     public static void Kill(Process process)
     {
         Ending(process);
@@ -833,19 +942,7 @@ public static class ChildProcesses
         {
             if (OperatingSystem.IsWindows())
             {
-                try
-                {
-                    process.Kill(entireProcessTree: true);
-                }
-                catch (AggregateException partly) when (partly.InnerExceptions.All(e => e is Win32Exception or InvalidOperationException))
-                {
-                    // Windows refuses a process of the tree that has ended or is ending, or is not ours: the child must still go.
-                    process.Kill();
-                }
-                finally
-                {
-                    Lifeline.KillGroup(process);
-                }
+                KillTreeOnWindows(process);
                 return;
             }
             Lifeline.KillGroup(process);
@@ -853,7 +950,42 @@ public static class ChildProcesses
         }
         catch (Exception error) when (error is InvalidOperationException or Win32Exception)
         {
-            // It had ended, or was ending.
+            // It had ended, or was ending, or was let go before it was ended.
+        }
+    }
+
+    /// <summary>A child's tree ended from a hold on its handle taken before anything ends, so a Dispose of the process on
+    /// another thread as it goes (its reader's, once the child's output ends with it) leaves the walk whole; then its
+    /// family held, by an id the hold keeps the child's. A child let go before it is held has nothing left to end by.</summary>
+    [SupportedOSPlatform("windows")]
+    private static void KillTreeOnWindows(Process process)
+    {
+        int id = process.Id;
+        // Null, or closed (thrown as it is held), only as it is let go at this moment.
+        SafeProcessHandle? handle = process.SafeHandle;
+        if (handle is null)
+        {
+            return;
+        }
+        bool held = false;
+        try
+        {
+            handle.DangerousAddRef(ref held);
+            try
+            {
+                ProcessTree.End(id, handle);
+            }
+            finally
+            {
+                Lifeline.KillGroup(id);
+            }
+        }
+        finally
+        {
+            if (held)
+            {
+                handle.DangerousRelease();
+            }
         }
     }
 
@@ -869,8 +1001,19 @@ public static class ChildProcesses
         {
             start.StartDetached = true;
         }
-        using Process process = Process.Start(start) ?? throw new InvalidOperationException($"{start.FileName} did not start");
-        Started?.Invoke(null, new ChildStart(process.Id, Display(start), start.WorkingDirectory) { Start = start });
+        string command = Display(start);
+        Action? givenBack = ThroughCmdWhereBatch(start);
+        Process? started;
+        try
+        {
+            started = Process.Start(start);
+        }
+        finally
+        {
+            givenBack?.Invoke();
+        }
+        using Process process = started ?? throw new InvalidOperationException($"{start.FileName} did not start");
+        Started?.Invoke(null, new ChildStart(process.Id, command, start.WorkingDirectory) { Start = start });
         // What it writes is nobody's: its pipes closed here, its writes to them fail, which .NET's console passes over.
         process.StandardInput.Close();
         process.StandardOutput.Close();
@@ -1003,5 +1146,5 @@ public sealed record ChildEnd(int ProcessId, string Command, int ExitCode, TimeS
     public bool Notable => !EndedByIde && ((ExitCode != 0 && !Answered) || Time >= TimeSpan.FromSeconds(1));
 
     public override string ToString() =>
-        $"Process {ProcessId} {(EndedByIde ? "ended by the IDE, " : string.Empty)}exited with code {ExitCode} after {Time.TotalSeconds:0.00} s: {(Start is { } start ? ChildProcesses.Shown(start) : Command)}";
+        $"Process {ProcessId} {(EndedByIde ? "ended by the IDE, " : string.Empty)}exited with code {ExitCode} after {Durations.Said(Time)}: {(Start is { } start ? ChildProcesses.Shown(start) : Command)}";
 }

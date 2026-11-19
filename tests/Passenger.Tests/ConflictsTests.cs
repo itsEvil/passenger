@@ -3,7 +3,9 @@ using Avalonia.Controls;
 using Avalonia.Headless;
 using Avalonia.Headless.XUnit;
 using Avalonia.Input;
+using Avalonia.VisualTree;
 using Passenger.App;
+using Passenger.App.Editors;
 using Passenger.App.ToolWindows;
 using Passenger.App.Vcs;
 using Passenger.Core;
@@ -16,7 +18,8 @@ namespace Passenger.Tests;
 /// merged in the three-way window (its non-conflicting changes in one go, the conflict by its arrow, a simple one by
 /// the magic wand, all undoable) and written, git marking each resolved and the commit finishing the merge; a rebase's
 /// sides named by their branches as Update Project stops on them, and the rebase going on once they are resolved; an
-/// unstash's conflict.</summary>
+/// unstash's conflict; a file in conflict saying so over its text, its Merge… opening the merge window, and Commit greyed
+/// while any is.</summary>
 public sealed class ConflictsTests : IDisposable
 {
     private const string Shop = "class Shop\n{\n    int count;\n\n    void Add() { count++; }\n}\n";
@@ -56,7 +59,7 @@ public sealed class ConflictsTests : IDisposable
         Assert.Equal(["Prices.cs", "Shop.cs"], conflicts.Rows.Select(r => r.Change.Name));
         Assert.DoesNotContain(commit.Chosen, c => c.Kind == ChangeKind.Conflicted);
         Assert.Equal("Merge branch 'feature'", commit.Message);
-        Assert.Equal("Resolve conflicts in order to commit", CommitRefused(window));
+        Assert.Equal(Refusals.CommitWithConflicts, CommitRefused(window));
 
         Assert.True(window.Perform(AppActions.ResolveConflicts), window.Status);
         Ui.Settle();
@@ -255,6 +258,11 @@ public sealed class ConflictsTests : IDisposable
         MergeWindow merge = (MergeWindow)window.Frontmost;
         MergeView view = merge.View;
         Assert.Equal((mine, Menu, theirs), (view.Texts.Left, view.ResultText, view.Texts.Right));
+        // Each change's arrow and X say what they do, the arrow with the keys that accept the change at the caret.
+        Assert.Empty(UiRulesTests.Untold(view));
+        string[] tips = [.. view.GetVisualDescendants().OfType<Button>().Where(b => b.IsEffectivelyVisible).Select(b => ToolTip.GetTip(b) as string ?? string.Empty)];
+        Assert.Contains(tips, t => t.StartsWith("Accept Left Side (", StringComparison.Ordinal));
+        Assert.Contains("Ignore Right Side", tips);
 
         Press(merge, "Apply All Non-Conflicting Changes");
         Click(merge, view, view.IconAt(0, MergeSide.Left, ignore: false));
@@ -576,6 +584,148 @@ public sealed class ConflictsTests : IDisposable
         window.OpenFile(Path.Combine(folder, "Shop.cs"));
         Ui.Settle();
         return window;
+    }
+
+    /// <summary>The merge window's sides are read-only: every action of the Edit menu that would change one greys saying
+    /// so and that the result between them takes changes, and what is typed there and those actions' keys say it in the
+    /// status bar, changing nothing; Copy and Select All stay enabled there, and the result takes the changes.</summary>
+    [AvaloniaFact]
+    public void Every_action_of_the_edit_menu_that_would_change_a_merges_side_greys_saying_the_result_takes_changes()
+    {
+        Git("switch", "-q", "-c", "feature");
+        Write("Shop.cs", Shop.Replace("int count", "int total", StringComparison.Ordinal));
+        Git("commit", "-q", "-am", "Total");
+        Git("switch", "-q", "main");
+        Write("Shop.cs", Shop.Replace("int count", "long count", StringComparison.Ordinal));
+        Git("commit", "-q", "-am", "Long");
+        Conflicting("merge", "feature");
+
+        MainWindow window = Open();
+        ConflictsDialog dialog = window.ShowConflicts()!;
+        Ui.Settle();
+        dialog.Chosen = [dialog.Rows.Single()];
+        Press(dialog, "Merge…");
+        Ui.Landed(() => window.Frontmost is MergeWindow, "the merge window");
+        MergeWindow merge = (MergeWindow)window.Frontmost;
+        MergeView view = merge.View;
+        (string Left, string Right) sides = (view.Left.Document.Snapshot.ToString(), view.Right.Document.Snapshot.ToString());
+        foreach ((Passenger.Editor.CodeEditor side, string where) in new[] { (view.Left, "the merge's left side, yours"), (view.Right, "the merge's right side, theirs") })
+        {
+            side.Focus();
+            Ui.Settle();
+            Assert.Same(side, window.Actions.Context().Focused);
+            ReadOnlyFilesTests.AssertChangesGreyed(window, Refusals.MergeSideReadOnly, where);
+        }
+
+        // Save's key in the main window says something of its own, so the status bar holds other words before each.
+        Ui.Press(window, Ui.Shortcut(AppActions.Save));
+        Assert.NotEqual(Refusals.MergeSideReadOnly, window.Status);
+        merge.KeyTextInput("x");
+        Ui.Settle();
+        Assert.Equal(Refusals.MergeSideReadOnly, window.Status);
+        view.Left.Focus();
+        Ui.Press(window, Ui.Shortcut(AppActions.Save));
+        Assert.NotEqual(Refusals.MergeSideReadOnly, window.Status);
+        Ui.Run(merge, Passenger.Editor.EditorActions.Duplicate);
+        Assert.Equal(Refusals.MergeSideReadOnly, window.Status);
+        Assert.Equal(sides, (view.Left.Document.Snapshot.ToString(), view.Right.Document.Snapshot.ToString()));
+
+        view.Result.Focus();
+        Ui.Settle();
+        Assert.Null(window.Actions.WhyNot(Passenger.Editor.EditorActions.Duplicate, window.Actions.Context()));
+        window.Confirm = (_, _, _) => Task.FromResult(true);
+        Press(merge, "Cancel");
+        Ui.Landed(() => !merge.IsVisible, "the merge window closed");
+        window.Close();
+    }
+
+    /// <summary>A file Git has in conflict, opened in the editor, says so over its text with Merge…, which opens the merge
+    /// window on it and writes nothing there until the merge is applied; a file in no conflict says nothing, and once the
+    /// merge resolves the file its banner goes.</summary>
+    [AvaloniaFact]
+    public void A_file_in_conflict_says_so_over_its_text_and_its_Merge_opens_the_merge_window_writing_nothing_until_applied()
+    {
+        ConflictingPrices();
+        string prices = Path.Combine(folder, "Prices.cs");
+        byte[] conflicted = File.ReadAllBytes(prices);
+
+        MainWindow window = Open();
+        EditorGroup group = window.EditorArea.ActiveGroup;
+        Assert.True(group.BannerText is null && !group.MergeLink.IsEffectivelyVisible, $"Shop.cs, in no conflict, has a banner saying \"{group.BannerText}\"");
+        window.OpenFile(prices);
+        Ui.WaitFor(() => group.BannerText == EditorGroup.Conflicted && group.MergeLink.IsEffectivelyVisible,
+            () => $"Prices.cs's banner saying it has conflicts, with Merge… (it says \"{group.BannerText}\")");
+
+        Ui.Click(group.MergeLink);
+        MergeWindow merge = Merging(window);
+        Assert.Equal(conflicted, File.ReadAllBytes(prices));
+        Press(merge, "Cancel");
+        Ui.Landed(() => !merge.IsVisible, "the merge window closed by Cancel");
+        Assert.Equal(conflicted, File.ReadAllBytes(prices));
+        Assert.Equal(["Prices.cs"], Unmerged());
+        Assert.Equal(EditorGroup.Conflicted, group.BannerText);
+
+        Ui.Click(group.MergeLink);
+        merge = Merging(window);
+        Press(merge, "Accept Left");
+        Ui.WaitFor(() => !merge.IsVisible && group.BannerText is null && !group.MergeLink.IsEffectivelyVisible,
+            () => $"Prices.cs's banner gone once Accept Left resolved it (it says \"{group.BannerText}\")");
+        Assert.Empty(Unmerged());
+        Assert.Equal(Prices.Replace("Base() => 10", "Base() => 11", StringComparison.Ordinal), Read("Prices.cs"));
+        window.Close();
+
+        static MergeWindow Merging(MainWindow window)
+        {
+            Ui.Landed(() => window.Frontmost is MergeWindow, "the merge window over Prices.cs");
+            MergeWindow merge = (MergeWindow)window.Frontmost!;
+            Assert.Equal("Merge Revisions for Prices.cs", merge.Title);
+            return merge;
+        }
+    }
+
+    /// <summary>The Commit window's Commit and Commit and Push… are greyed while a file is in conflict, the merge's message
+    /// written, their tip saying why as a press would; once the conflict is resolved they take a press, and with the
+    /// message emptied they are greyed again, saying so.</summary>
+    [AvaloniaFact]
+    public void Commit_is_greyed_saying_why_while_a_file_is_in_conflict_and_takes_a_press_once_it_is_resolved()
+    {
+        ConflictingPrices();
+        MainWindow window = Open();
+        CommitView commit = window.CommitView;
+        window.Perform(AppActions.ShowCommit);
+        Ui.Landed(() => commit.Rows.OfType<CommitGroup>().Any(g => g.Name == "Merge Conflicts"), "the Merge Conflicts group");
+        Assert.Equal("Merge branch 'feature'", commit.Message);
+        Button[] buttons = [.. Avalonia.VisualTree.VisualExtensions.GetVisualDescendants(commit).OfType<Button>().Where(b => b.Content is "Commit" or "Commit and Push…")];
+        Assert.Equal(2, buttons.Length);
+        Assert.All(buttons, b => Assert.True(!b.IsEffectivelyEnabled && ToolTip.GetTip(b) as string == Refusals.CommitWithConflicts,
+            $"With Prices.cs in conflict, {b.Content} is {(b.IsEffectivelyEnabled ? "on" : "greyed")}, its tip saying \"{ToolTip.GetTip(b)}\""));
+
+        Assert.True(window.Perform(AppActions.ResolveConflicts), window.Status);
+        Ui.Settle();
+        ConflictsDialog dialog = Assert.IsType<ConflictsDialog>(window.Frontmost);
+        dialog.Chosen = [dialog.Rows.Single()];
+        Press(dialog, "Accept Theirs");
+        Ui.WaitFor(() => window.ConflictsWindow is null && window.Vcs.Conflicts.Count == 0 && buttons.All(b => b.IsEffectivelyEnabled),
+            () => $"Commit to take a press once Prices.cs was resolved (its tip says \"{ToolTip.GetTip(buttons[0])}\")");
+        Assert.All(buttons, b => Assert.Null(ToolTip.GetTip(b)));
+
+        commit.Message = string.Empty;
+        Ui.Settle();
+        Assert.All(buttons, b => Assert.True(!b.IsEffectivelyEnabled && ToolTip.GetTip(b) as string == Refusals.EmptyCommitMessage,
+            $"With no message, {b.Content} is {(b.IsEffectivelyEnabled ? "on" : "greyed")}, its tip saying \"{ToolTip.GetTip(b)}\""));
+        window.Close();
+    }
+
+    /// <summary>A merge of the feature stopped on Prices.cs, which both branches changed on one line.</summary>
+    private void ConflictingPrices()
+    {
+        Git("switch", "-q", "-c", "feature");
+        Write("Prices.cs", Prices.Replace("Base() => 10", "Base() => 12", StringComparison.Ordinal));
+        Git("commit", "-q", "-am", "Feature prices");
+        Git("switch", "-q", "main");
+        Write("Prices.cs", Prices.Replace("Base() => 10", "Base() => 11", StringComparison.Ordinal));
+        Git("commit", "-q", "-am", "Main prices");
+        Conflicting("merge", "feature");
     }
 
     /// <summary>What the Commit window's Commit answered when pressed: why it would not commit.</summary>

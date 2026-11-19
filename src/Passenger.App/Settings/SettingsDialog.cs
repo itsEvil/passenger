@@ -10,7 +10,7 @@ namespace Passenger.App.Settings;
 
 /// <summary>Settings: the pages down the left under a search box, the chosen page's options on the right, OK, Cancel
 /// and Apply below. A search keeps the pages with an option whose words match and shows only those options. The options
-/// edit a copy, which Apply and OK hand back.</summary>
+/// edit a copy, previewing its visual changes until Apply or OK commits them or closing discards them.</summary>
 public sealed partial class SettingsDialog : IdeWindow
 {
     public const string Appearance = "Appearance";
@@ -51,16 +51,10 @@ public sealed partial class SettingsDialog : IdeWindow
     public static readonly (OpenProjectIn Choice, string Name)[] OpenProjectChoices =
         [(OpenProjectIn.NewWindow, "New window"), (OpenProjectIn.CurrentWindow, "Current window"), (OpenProjectIn.Ask, "Ask")];
 
-    /// <summary>The themes, in the order Settings offers them.</summary>
-    public static readonly (Look Look, string Name)[] LookChoices = [.. Enum.GetValues<Look>().Select(l => (l, l.ToString()))];
-
-    /// <summary>The code's colour schemes, in the order Settings offers them.</summary>
-    public static readonly (ColourScheme Scheme, string Name)[] ColourSchemeChoices = [(ColourScheme.Theme, "Same as theme"), (ColourScheme.Rider, "Rider")];
-
     /// <summary>The names of <see cref="DiscordShown"/>'s choices, in its order.</summary>
     public static readonly string[] DiscordChoices = ["Passenger only", "The solution", "The solution and the file"];
 
-    private static readonly string[] Order = [Appearance, SystemPage, UpdatesPage, ExplorerPage, EditorPage, CodeFoldingPage, PostfixPage, XamlCodeStylePage, GDScriptCodeStylePage, LiveTemplatesPage,
+    private static readonly string[] Order = [Appearance, SystemPage, TrustPage, UpdatesPage, ExplorerPage, EditorPage, CodeFoldingPage, PostfixPage, XamlCodeStylePage, GDScriptCodeStylePage, LiveTemplatesPage,
         VersionControlPage, BuildPage, RunPage, HotReloadPage, NodePage, EslintPage, PrettierPage, SchemasPage, StylesheetsPage, DockerPage, GodotPage, TerminalPage, McpPage, DiscordPage, DiagnosticsPage, KeymapPage];
 
     /// <summary>The names of Attributes format's choices, in <see cref="Passenger.Xaml.Features.XamlAttributeStyle"/>'s
@@ -85,6 +79,7 @@ public sealed partial class SettingsDialog : IdeWindow
 
     /// <summary>Puts what the options changed in force: from the settings as they were applied last, to the options'.</summary>
     private readonly Action<AppSettings, AppSettings> apply;
+    private readonly SettingsPreview? preview;
 
     /// <summary>The settings as the dialog opened on them or last applied them, which what is changed since is told
     /// from, so another window's change meanwhile is not undone.</summary>
@@ -99,17 +94,31 @@ public sealed partial class SettingsDialog : IdeWindow
     private readonly StackPanel body;
     private readonly TextBlock nothing;
 
+    /// <summary>The page's room at its right: its gutter, where its scroll bar shows over the page, clear of what it shows.</summary>
+    private const double Gutter = Gaps.Page;
+
+    /// <summary>The search field's room in the pages' column, the pages' bands as wide as it below.</summary>
+    private static readonly Thickness PagesInset = new(Gaps.Normal);
+
     /// <summary>What a page keeps above its options as they scroll (the Keymap page's toolbar).</summary>
-    private readonly Decorator pageTop = new();
+    private readonly Decorator pageTop = new() { Margin = new Thickness(0, 0, Gutter, 0) };
 
     /// <summary>OK and Apply, which put the options in force: greyed while an option holds a value Settings refuses.</summary>
     private readonly Button ok = DialogFooter.Default();
     private readonly Button applyButton = new() { Content = "Apply" };
 
+    /// <param name="preview">An optional temporary visual overlay, released when this dialog closes.</param>
     /// <param name="agents">The agents' setup the MCP Server page shows: this copy's, and the window's folder.</param>
-    public SettingsDialog(AppSettings current, ActionRegistry actions, Action<AppSettings, AppSettings> apply, Mcp.AgentSetup? agents = null)
+    /// <param name="editorConfigs">What the window's folder's .editorconfig files set over the rows, followed while it is open.</param>
+    /// <param name="trust">The folders the person answered for, which the Trusted Folders page shows, where the window keeps them.</param>
+    public SettingsDialog(AppSettings current, ActionRegistry actions, Action<AppSettings, AppSettings> apply, Mcp.AgentSetup? agents = null, SettingsPreview? preview = null,
+        FolderEditorConfigs? editorConfigs = null, TrustAnswers? trust = null)
     {
         this.apply = apply;
+        this.trust = trust;
+        this.preview = preview;
+        this.editorConfigs = editorConfigs;
+        Closed += (_, _) => preview?.Dispose();
         this.actions = actions;
         Working = current;
         applied = current;
@@ -121,13 +130,14 @@ public sealed partial class SettingsDialog : IdeWindow
         WindowStartupLocation = WindowStartupLocation.CenterOwner;
 
         AddOptions(agents ?? Mcp.AgentSetup.Here(null, current.TerminalShell));
-        search = new TextBox { Classes = { StyleClasses.Search }, PlaceholderText = "Search settings", Margin = new Thickness(10, 10, 10, 6) };
+        search = new TextBox { Classes = { StyleClasses.Search }, PlaceholderText = "Search settings", Margin = new Thickness(PagesInset.Left, PagesInset.Top, PagesInset.Right, Gaps.Small) };
         search.TextChanged += (_, _) => Filter();
-        pages = new ListBox { Classes = { StyleClasses.Tree, StyleClasses.Pages } };
+        pages = new ListBox { Classes = { StyleClasses.Tree, StyleClasses.Pages }, Padding = new Thickness(PagesInset.Left, 0) };
         pages.SelectionChanged += (_, _) => ShowPage();
-        heading = new TextBlock { FontSize = 16, FontWeight = FontWeight.SemiBold, Margin = new Thickness(0, 0, 0, 14) };
-        body = new StackPanel { Spacing = 12 };
-        nothing = new TextBlock { Classes = { StyleClasses.Muted }, Text = "Nothing matches", IsVisible = false, Margin = new Thickness(21, 4) };
+        heading = new TextBlock { FontSize = 16, FontWeight = FontWeight.SemiBold, Margin = new Thickness(0, 0, Gutter, Gaps.Wide) };
+        // The scroll bar shows over the scrolled page's right, so the gutter is inside it: the bar stands there, beside the rows.
+        body = new StackPanel { Spacing = Gaps.Wide, Margin = new Thickness(0, 0, Gutter, 0) };
+        nothing = new TextBlock { Classes = { StyleClasses.Muted }, Text = "Nothing matches", IsVisible = false, Margin = new Thickness(PagesInset.Left + SearchFields.TextStart, Gaps.Tight) };
 
         ok.Click += (_, _) => Ok();
         applyButton.Click += (_, _) => Apply();
@@ -136,9 +146,9 @@ public sealed partial class SettingsDialog : IdeWindow
         DockPanel.SetDock(search, Dock.Top);
         left.Children.Add(search);
         left.Children.Add(new Panel { Children = { pages, nothing } });
-        Border leftPane = new() { BorderThickness = new Thickness(0, 0, 1, 0), Child = left };
+        Border leftPane = new() { BorderThickness = Hairlines.After, Child = left };
         leftPane.Bind(Border.BorderBrushProperty, leftPane.GetResourceObservable(TokenKeys.Divider));
-        DockPanel right = new() { Margin = new Thickness(20, 16, 20, 0) };
+        DockPanel right = new() { Margin = new Thickness(Gaps.Page, Gaps.Group, 0, 0) };
         DockPanel.SetDock(heading, Dock.Top);
         DockPanel.SetDock(pageTop, Dock.Top);
         right.Children.Add(heading);
@@ -148,6 +158,12 @@ public sealed partial class SettingsDialog : IdeWindow
         Content = DialogFooter.Page(new DockPanel { Children = { leftPane, right } }, DialogFooter.OkCancel(ok, () => Close(false), more: applyButton));
         Filter();
         Opened += (_, _) => Dispatcher.UIThread.Post(() => search.Focus(), DispatcherPriority.Loaded);
+        if (editorConfigs is not null)
+        {
+            editorConfigs.Changed += EditorConfigsChanged;
+            Closed += (_, _) => editorConfigs.Changed -= EditorConfigsChanged;
+            IdeErrors.Observe(ShowSaidOverAsync());
+        }
     }
 
     /// <summary>The settings as the options now stand.</summary>
@@ -198,6 +214,8 @@ public sealed partial class SettingsDialog : IdeWindow
         {
             apply(applied, Working);
             applied = Working;
+            preview?.Update(applied, Working);
+            ApplyTrust();
         }
     }
 
@@ -206,6 +224,7 @@ public sealed partial class SettingsDialog : IdeWindow
     {
         Working = change(Working);
         ok.IsEnabled = applyButton.IsEnabled = Refused is null;
+        preview?.Update(applied, Working);
         foreach ((_, Control editor, SettingWhen when) in dependents)
         {
             Follow(editor, when);
@@ -246,8 +265,7 @@ public sealed partial class SettingsDialog : IdeWindow
 
     private void AddOptions(Mcp.AgentSetup agents)
     {
-        Add(Declared.Look);
-        Add(Declared.Theme);
+        AddThemes();
         if (TitleBars.Offered)
         {
             CheckBox merge = Check(Working.MergeMainMenuWithWindowTitle, v => Change(s => s with { MergeMainMenuWithWindowTitle = v }));
@@ -261,9 +279,14 @@ public sealed partial class SettingsDialog : IdeWindow
             Add(Declared.MainMenuBar);
         }
         Add(Declared.WindowFontFamily);
+        Add(Declared.DisplayScale);
+        Add(Declared.EditorTabs);
+        Add(Declared.ToolWindowLook);
+        Add(Declared.ClosedToolWindows);
+        Add(Declared.FindResults);
 
         Add(Declared.ReopenProjectsOnStartup);
-        StackPanel openIn = new() { Orientation = Orientation.Horizontal, Spacing = 16 };
+        StackPanel openIn = new() { Orientation = Orientation.Horizontal, Spacing = Gaps.Group };
         foreach ((OpenProjectIn choice, string name) in OpenProjectChoices)
         {
             RadioButton radio = new() { Content = name, GroupName = "openProjectIn", IsChecked = Working.OpenProjectIn == choice };
@@ -278,6 +301,7 @@ public sealed partial class SettingsDialog : IdeWindow
         }
         Add(SystemPage, "Open project in", openIn,
             "open solution project folder new window current window this window ask confirm where frame");
+        Add(Declared.ConfirmBeforeClosing);
         Add(Declared.SaveOnDeactivation);
         NumericUpDown seconds = Declared.IdleSeconds.Box(Working, Change);
         seconds.IsEnabled = Working.SaveWhenIdle;
@@ -286,29 +310,32 @@ public sealed partial class SettingsDialog : IdeWindow
             Change(s => s with { SaveWhenIdle = v });
             seconds.IsEnabled = v;
         });
-        TextBlock unit = new() { Text = "seconds", VerticalAlignment = VerticalAlignment.Center };
-        Add(SystemPage, "Save when idle for", new StackPanel { Orientation = Orientation.Horizontal, Spacing = 8, Children = { idle, seconds, unit } },
+        Add(SystemPage, "Save when idle for", new StackPanel { Orientation = Orientation.Horizontal, Spacing = Gaps.Normal, Children = { idle, NumberSetting.WithUnit(seconds, "seconds") } },
             "autosave files idle inactive seconds");
 
+        AddTrust();
         Add(Declared.CheckForUpdates);
 
         Add(Declared.AlwaysSelectOpenedFile);
         Add(Declared.OpenFilesWithSingleClick);
         Add(Declared.NestFiles);
 
-        Add(Declared.ColourScheme);
         Add(Declared.EditorFontFamily);
         Add(Declared.EditorFontSize);
         Add(Declared.EditorLineSpacing);
+        Add(Declared.CaretWidth);
         Add(Declared.Ligatures);
         Add(Declared.ShowLineNumbers);
         Add(Declared.RainbowBraces);
+        Add(Declared.VimMode);
+        Add(Declared.VimKeysToKeymap, Declared.VimKeysToKeymap.Box(Working, Change, stroke => KeymapDoes(actions, stroke)));
         Add(Declared.CloseTags);
+        Add(Declared.CompletionParentheses);
         Add(Declared.XamlWorkspace);
         Add(Declared.SolutionWideAnalysis);
         Add(Declared.ParameterHints);
         Add(Declared.TypeHints);
-        TextBox masks = new() { Classes = { StyleClasses.Search }, Text = Working.SoftWrapFiles, PlaceholderText = "No files", Width = 260, IsEnabled = Working.SoftWrap };
+        TextBox masks = new() { Classes = { StyleClasses.Search }, Text = Working.SoftWrapFiles, PlaceholderText = "No files", IsEnabled = Working.SoftWrap };
         ToolTip.SetTip(masks, "Use * and ? as wildcards and ; to separate patterns");
         masks.TextChanged += (_, _) => Change(s => s with { SoftWrapFiles = masks.Text ?? string.Empty });
         CheckBox wrapFiles = Check(Working.SoftWrap, v =>
@@ -316,11 +343,14 @@ public sealed partial class SettingsDialog : IdeWindow
             Change(s => s with { SoftWrap = v });
             masks.IsEnabled = v;
         });
-        Add(EditorPage, "Soft-wrap these files", new StackPanel { Orientation = Orientation.Horizontal, Spacing = 8, Children = { wrapFiles, masks } },
+        DockPanel.SetDock(wrapFiles, Dock.Left);
+        Add(EditorPage, "Soft-wrap these files", new DockPanel { HorizontalSpacing = 8, MaxWidth = OptionRow.EditorWidth, Children = { wrapFiles, masks } },
             "soft wrap wrapping long lines width markdown text files masks");
         Add(Declared.SoftWrapIndent);
         Add(Declared.ShowWhitespaces);
         Add(Declared.WheelZoom);
+        Add(Declared.ReformatOnSave);
+        Add(Declared.EnsureFinalLineBreak);
 
         Add(Declared.FoldFileHeader);
         Add(Declared.FoldImports);
@@ -366,10 +396,10 @@ public sealed partial class SettingsDialog : IdeWindow
         Add(Declared.XamlHotReloadOnSave);
         Add(Declared.RestartOnRudeEdit);
         Add(Declared.ConsoleBufferKb);
-        Add(Declared.DebugBrowser);
+        Add(Declared.Browser);
 
         string? onPath = Passenger.Core.Programs.Node();
-        TextBox node = new() { Classes = { StyleClasses.Search }, Text = Working.NodeInterpreter ?? string.Empty, PlaceholderText = onPath ?? "Not found on the PATH", Width = 320 };
+        TextBox node = new() { Classes = { StyleClasses.Search }, Text = Working.NodeInterpreter ?? string.Empty, PlaceholderText = onPath ?? "Not found on the PATH", MaxWidth = OptionRow.EditorWidth };
         node.TextChanged += (_, _) => Change(s => s with { NodeInterpreter = string.IsNullOrWhiteSpace(node.Text) ? null : node.Text.Trim() });
         Add(NodePage, "Node interpreter", node, "node nodejs interpreter javascript typescript html css json language server npm path",
             "The Node.js the JavaScript, TypeScript, HTML, CSS and JSON language servers run on. Empty, it is the first on the PATH, "
@@ -421,22 +451,25 @@ public sealed partial class SettingsDialog : IdeWindow
         Add(DiscordPage, "Only Passenger when idle for", new StackPanel
         {
             Orientation = Orientation.Horizontal,
-            Spacing = 8,
-            Children = { whenIdle, idleMinutes, new TextBlock { Text = "minutes", VerticalAlignment = VerticalAlignment.Center } },
+            Spacing = Gaps.Normal,
+            Children = { whenIdle, NumberSetting.WithUnit(idleMinutes, "minutes") },
         }, $"{Discord} idle inactive away timeout minutes");
 
         Add(Declared.TraceProtocols);
         Add(Declared.LogEveryProgram);
 
+        Add(Declared.ChordWaitSeconds);
         AddKeymap();
     }
 
     /// <summary>A declared setting's own row, on its page, its editor made from the declaration.</summary>
-    private void Add(Setting setting)
+    private void Add(Setting setting) => Add(setting, setting.Editor(Working, Change));
+
+    /// <summary>A declared setting's own row, its editor made by the dialog round what only the dialog knows.</summary>
+    private void Add(Setting setting, Control editor)
     {
         SettingRow row = setting.Row ?? throw new ArgumentException("A setting with no row of its own goes in a row the dialog builds", nameof(setting));
-        Control editor = setting.Editor(Working, Change);
-        Add(row.Page, row.Label, editor, row.Words, row.Note);
+        Add(row.Page, row.Label, editor, row.Words, row.NoteShown, over: row.Over);
         if (row.When is { } when)
         {
             // Greyed, saying why, while the setting it follows leaves it no effect.
@@ -460,40 +493,73 @@ public sealed partial class SettingsDialog : IdeWindow
     public string? WhyGreyed(string label) =>
         dependents.FirstOrDefault(d => d.Label == label) is { Editor: { } editor, When: { } when } && !when.Holds(Working) && !editor.IsEnabled ? when.Why : null;
 
+    /// <summary>What the folder's .editorconfig files set over the rows, followed while the dialog is open.</summary>
+    private readonly FolderEditorConfigs? editorConfigs;
+
+    /// <summary>Each row the folder's .editorconfig files may set, by its label, with what says so under it.</summary>
+    private readonly List<(string Label, EditorConfigOver Over, TextBlock Said)> saidOver = [];
+
+    /// <summary>Reads of what the .editorconfig files set, the last asked alone landing.</summary>
+    private int saidAsked;
+
+    /// <summary>What the folder's .editorconfig files set over a row, by its label, a line to each key as the row shows them;
+    /// null where they set nothing over it.</summary>
+    public string? SaidOver(string label) => saidOver.FirstOrDefault(s => s.Label == label).Said is { IsVisible: true } said ? said.Text : null;
+
+    private void EditorConfigsChanged(object? sender, EventArgs e) => IdeErrors.Observe(ShowSaidOverAsync());
+
+    /// <summary>Says under each row what the folder's .editorconfig files set over it, once read off the window's thread.</summary>
+    private async Task ShowSaidOverAsync()
+    {
+        int mine = ++saidAsked;
+        EditorConfigLines read = await editorConfigs!.ReadAsync();
+        if (mine != saidAsked)
+        {
+            return;
+        }
+        foreach ((_, EditorConfigOver over, TextBlock said) in saidOver)
+        {
+            IReadOnlyList<string> lines = read.Shortly(over);
+            said.Text = string.Join('\n', lines);
+            said.IsVisible = lines.Count > 0;
+        }
+    }
+
     /// <summary>A page that is one control of its own (the live templates' list and editor), the whole of its width, found
     /// by a search for any of its words.</summary>
     private void AddPage(string page, Control content, string keywords) => options.Add(new Option(page, page, content, $"{page} {keywords}"));
 
     /// <summary>An option's row: its label, what edits it, and a note under the editor when it needs saying what it
-    /// does; a keymap row names its action.</summary>
-    private Control Add(string page, string label, Control editor, string keywords, string? note = null, string? action = null)
+    /// does; a keymap row names its action, and one the folder's .editorconfig files may set the keys it is said over by.</summary>
+    private Control Add(string page, string label, Control editor, string keywords, string? note = null, string? action = null, EditorConfigOver? over = null)
     {
         // Beside an editor of several lines the label stands level with its first line.
         double firstLine = editor switch
         {
             TextBox { AcceptsReturn: true } => 5,
             StackPanel { Orientation: Orientation.Vertical, Children: [TextBox, ..] } => 5,
+            global::Passenger.App.Settings.ThemeExplorer => 5,
             StackPanel { Orientation: Orientation.Vertical, Children: [RadioButton or Border { Classes: [StyleClasses.Framed] }, ..] } => 6,
             _ => -1,
         };
         TextBlock name = new()
         {
             Text = label,
-            Width = 220,
-            Padding = new Thickness(0, 0, 16, 0),
+            Padding = new Thickness(0, 0, Gaps.Group, 0),
             TextWrapping = TextWrapping.Wrap,
-            VerticalAlignment = firstLine < 0 ? VerticalAlignment.Center : VerticalAlignment.Top,
-            Margin = new Thickness(0, Math.Max(0, firstLine), 0, 0),
         };
         AutomationProperties.SetLabeledBy(editor, name);
-        Control row = new StackPanel { Orientation = Orientation.Horizontal, Children = { name, editor } };
-        if (note is not null)
+        TextBlock? said = note is null ? null : new TextBlock { Text = note, TextWrapping = TextWrapping.Wrap, HorizontalAlignment = HorizontalAlignment.Left, Classes = { StyleClasses.Muted } };
+        TextBlock? setOver = null;
+        if (over is not null)
         {
-            TextBlock said = new() { Text = note, TextWrapping = TextWrapping.Wrap, MaxWidth = 360, Margin = new Thickness(name.Width, 0, 0, 0), HorizontalAlignment = HorizontalAlignment.Left };
-            said.Classes.Add(StyleClasses.Muted);
-            row = new StackPanel { Spacing = 4, Children = { row, said } };
+            setOver = new TextBlock { TextWrapping = TextWrapping.Wrap, HorizontalAlignment = HorizontalAlignment.Left, IsVisible = false, Classes = { StyleClasses.SaidOver } };
+            saidOver.Add((label, over, setOver));
         }
-        options.Add(new Option(page, label, row, $"{page} {label} {keywords}", action));
+        OptionRow row = new(name, editor, said, firstLine, setOver);
+        // A row an .editorconfig says over is found by the keys that do, as a person reads them in the file.
+        string keys = over is null ? string.Empty : $" editorconfig {string.Join(' ', over.Keys.Concat(over.Aliases))}";
+        options.Add(new Option(page, label, row, $"{page} {label} {keywords}{keys}", action));
         return row;
     }
 

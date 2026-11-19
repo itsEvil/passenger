@@ -16,7 +16,8 @@ public sealed class SymbolsNamed : IExtensionWorkspaceMessageHandler<SymbolsAske
         SymbolNames.FindAsync(context.Solution, message.Name, message.Limit, cancellationToken);
 }
 
-/// <summary>The symbol at a caret, the one a name there refers to or a declaration there declares, with its documentation id.</summary>
+/// <summary>The symbol at a caret, the one a name there refers to or a declaration there declares (at a record's positional
+/// parameter, the property it declares), with its documentation id.</summary>
 public sealed class SymbolAt : IExtensionDocumentMessageHandler<Caret, SymbolsFound>
 {
     public async Task<SymbolsFound> ExecuteAsync(Caret message, ExtensionDocumentMessageContext context, CancellationToken cancellationToken)
@@ -25,7 +26,47 @@ public sealed class SymbolAt : IExtensionDocumentMessageHandler<Caret, SymbolsFo
         SourceText text = await document.GetTextAsync(cancellationToken).ConfigureAwait(false);
         int position = text.Lines.GetPosition(new LinePosition(message.At.Line, message.At.Character));
         ISymbol? symbol = await SymbolFinder.FindSymbolAtPositionAsync(document, position, cancellationToken).ConfigureAwait(false);
+        if (symbol is not null && await document.GetSyntaxTreeAsync(cancellationToken).ConfigureAwait(false) is { } tree)
+        {
+            symbol = SymbolNames.PositionalPropertyAt(symbol, tree, position) ?? symbol;
+        }
         return new SymbolsFound(symbol is null ? [] : [SymbolNames.Named(context.Solution, symbol)], 0);
+    }
+}
+
+/// <summary>What the symbols declared at places are in (<see cref="SymbolNames.ContainerOf"/>), as a symbol found by name is
+/// told it, for symbols found otherwise (Go to Symbol's).</summary>
+public sealed class SymbolContainers : IExtensionWorkspaceMessageHandler<ContainersAsked, ContainersFound>
+{
+    public async Task<ContainersFound> ExecuteAsync(ContainersAsked message, ExtensionWorkspaceMessageContext context, CancellationToken cancellationToken)
+    {
+        List<string?> found = [];
+        foreach (UriSpan declared in message.Declarations)
+        {
+            found.Add(await ContainerAsync(context.Solution, declared, cancellationToken).ConfigureAwait(false));
+        }
+        return new ContainersFound(found);
+    }
+
+    /// <summary>The container of the symbol whose declaration's name is at a span's start: the first a node from its token
+    /// outward declares.</summary>
+    private static async Task<string?> ContainerAsync(Solution solution, UriSpan declared, CancellationToken cancel)
+    {
+        if ((await solution.GetTextDocumentsAsync(new global::Roslyn.LanguageServer.Protocol.DocumentUri(declared.Uri), cancel).ConfigureAwait(false)).OfType<Document>().FirstOrDefault() is not { } document
+            || await document.GetSyntaxRootAsync(cancel).ConfigureAwait(false) is not { } root
+            || await document.GetSemanticModelAsync(cancel).ConfigureAwait(false) is not { } model)
+        {
+            return null;
+        }
+        int at = WrittenPlaces.Offset(await document.GetTextAsync(cancel).ConfigureAwait(false), declared.Start);
+        for (SyntaxNode? node = root.FindToken(at).Parent; node is not null; node = node.Parent)
+        {
+            if (model.GetDeclaredSymbol(node, cancel) is { } symbol)
+            {
+                return SymbolNames.ContainerOf(symbol);
+            }
+        }
+        return null;
     }
 }
 
@@ -53,7 +94,7 @@ internal static class SymbolNames
     /// project's.</summary>
     public static async Task<ComponentFound> ComponentAsync(Solution solution, string path, CancellationToken cancel)
     {
-        foreach (DocumentId id in solution.GetDocumentIdsWithFilePath(path))
+        foreach (DocumentId id in DocumentIdsOf(solution, path))
         {
             if (solution.GetAdditionalDocument(id) is not { FilePath: { } file } razor || !RazorFiles.Is(file) || MadeOf(razor.Project, file) is not { } made)
             {
@@ -115,9 +156,10 @@ internal static class SymbolNames
                     }
                 }
             }
+            string bare = Bare(last);
             IEnumerable<ISymbol> declared = bracketed ? [] :
-                [.. await SymbolFinder.FindSourceDeclarationsAsync(solution, Bare(last), ignoreCase: false, cancel).ConfigureAwait(false),
-                .. await RazorDeclarationsAsync(solution, Bare(last), cancel).ConfigureAwait(false)];
+                [.. await SymbolFinder.FindSourceDeclarationsAsync(solution, Exactly(bare), SymbolFilter.All, cancel).ConfigureAwait(false),
+                .. await GeneratedDeclarationsAsync(solution, bare, cancel).ConfigureAwait(false)];
             foreach (ISymbol symbol in declared)
             {
                 if (In(symbol, path) && Takes(symbol, parameters))
@@ -131,19 +173,50 @@ internal static class SymbolNames
                 }
             }
         }
-        // Each target framework's project declares the symbol again: one of each, by its id and its first place.
-        List<NamedSymbol> named = [.. found.Select(s => Named(solution, s)).Where(s => s.Path is not null)
-            .DistinctBy(s => (s.Id ?? s.Shown, s.Path, s.At))
-            .OrderBy(s => s.Shown, StringComparer.Ordinal).ThenBy(s => s.Path, StringComparer.Ordinal)];
+        // Each target framework's project declares the symbol again: one of each, the solution's own files' first.
+        List<NamedSymbol> named = [.. found.Distinct(SymbolEqualityComparer.Default).Select(s => Named(solution, s)).Where(s => s.Path is not null || s.Generated is not null)
+            .DistinctBy(s => (s.Id ?? s.Shown, s.Path ?? s.Generated, s.At))
+            .OrderBy(s => s.Path is null).ThenBy(s => s.Shown, StringComparer.Ordinal).ThenBy(s => s.Path ?? s.Generated, StringComparer.Ordinal)];
         return new SymbolsFound([.. named.Take(limit)], Math.Max(0, named.Count - limit));
     }
 
     public static NamedSymbol Named(Solution solution, ISymbol symbol)
     {
         (string? path, Place? at) = Declared(solution, symbol);
-        string? container = symbol.ContainingType?.ToDisplayString(Short)
-            ?? (symbol.ContainingNamespace is { IsGlobalNamespace: false } space ? space.ToDisplayString() : null);
-        return new NamedSymbol(symbol.Name, symbol.ToDisplayString(Short), KindOf(symbol), symbol.OriginalDefinition.GetDocumentationCommentId(), container, path, at);
+        NamedSymbol named = new(symbol.Name, symbol.ToDisplayString(Short), KindOf(symbol), symbol.OriginalDefinition.GetDocumentationCommentId(), ContainerOf(symbol), path, at);
+        if (path is not null || GeneratedPlace(solution, symbol) is not { } made)
+        {
+            return named;
+        }
+        return named with { Generated = made.Uri, At = made.At, MadeOf = ToolkitRenames.MakerOf(symbol, solution) is { } maker ? Named(solution, maker) : null };
+    }
+
+    /// <summary>The property a record's positional parameter declares, where a place is on the parameter's declaration, which
+    /// declares both: the symbol a name finds there (<see cref="FindAsync"/>); null for any other symbol or place, and for a
+    /// parameter whose name a member the record declares itself takes, which then declares no property.</summary>
+    public static IPropertySymbol? PositionalPropertyAt(ISymbol symbol, SyntaxTree tree, int position) =>
+        symbol is IParameterSymbol { ContainingSymbol: IMethodSymbol { MethodKind: MethodKind.Constructor, ContainingType: { IsRecord: true } record } } parameter
+        && parameter.Locations.FirstOrDefault(l => l.SourceTree == tree && l.SourceSpan.Start <= position && position <= l.SourceSpan.End) is { } declared
+            ? record.GetMembers(parameter.Name).OfType<IPropertySymbol>().FirstOrDefault(p => p.Locations.Contains(declared))
+            : null;
+
+    /// <summary>What a symbol is in, as an agent is told it: a member's or a nested type's type, else its namespace; null in
+    /// the global namespace.</summary>
+    public static string? ContainerOf(ISymbol symbol) => symbol.ContainingType?.ToDisplayString(Short)
+        ?? (symbol.ContainingNamespace is { IsGlobalNamespace: false } space ? space.ToDisplayString() : null);
+
+    /// <summary>The first of a symbol's declarations in a source generator's document, by the server's URI of it; null for a
+    /// symbol no generator declares.</summary>
+    private static (string Uri, Place At)? GeneratedPlace(Solution solution, ISymbol symbol)
+    {
+        foreach (Location location in symbol.Locations.Where(l => l.IsInSource && l.SourceTree is not null))
+        {
+            if (solution.GetDocument(location.SourceTree!) is SourceGeneratedDocument generated)
+            {
+                return (SourceGeneratedDocumentUri.Create(generated.Identity).UriString, PlaceOf(location.GetLineSpan().StartLinePosition));
+            }
+        }
+        return null;
     }
 
     /// <summary>The first of a symbol's declarations in a file of the solution's own, a Razor file's where its generated
@@ -174,19 +247,19 @@ internal static class SymbolNames
         return (null, null);
     }
 
-    /// <summary>The symbols a name names that Razor files declare, in the C# Razor's generator makes of them, which the
-    /// solution's index of declarations does not read; only a project with Razor files is asked.</summary>
-    private static async Task<IReadOnlyList<ISymbol>> RazorDeclarationsAsync(Solution solution, string name, CancellationToken cancel)
+    /// <summary>The symbols a name names that source generators declare (a Razor file's C#, a regular expression's, a XAML
+    /// file's names), which the solution's index of declarations does not read; only a project whose generators made
+    /// documents is asked.</summary>
+    private static async Task<IReadOnlyList<ISymbol>> GeneratedDeclarationsAsync(Solution solution, string name, CancellationToken cancel)
     {
         List<ISymbol> found = [];
-        foreach (Project project in solution.Projects.Where(p => p.AdditionalDocuments.Any(d => RazorFiles.Is(d.FilePath))))
+        foreach (Project project in solution.Projects)
         {
-            HashSet<string> generated = [.. (await project.GetSourceGeneratedDocumentsAsync(cancel).ConfigureAwait(false))
-                .Where(d => IsRazorGenerated(d.HintName) && d.FilePath is not null).Select(d => d.FilePath!)];
-            if (generated.Count > 0 && await project.GetCompilationAsync(cancel).ConfigureAwait(false) is { } compilation)
+            if ((await project.GetSourceGeneratedDocumentsAsync(cancel).ConfigureAwait(false)).Any()
+                && await project.GetCompilationAsync(cancel).ConfigureAwait(false) is { } compilation)
             {
-                found.AddRange(compilation.GetSymbolsWithName(n => n == name, SymbolFilter.TypeAndMember, cancel)
-                    .Where(s => s.Locations.Any(l => l.SourceTree?.FilePath is { } tree && generated.Contains(tree))));
+                found.AddRange(compilation.GetSymbolsWithName(Exactly(name), SymbolFilter.TypeAndMember, cancel)
+                    .Where(s => s.Locations.Any(l => l.SourceTree is { } tree && solution.GetDocument(tree) is SourceGeneratedDocument)));
             }
         }
         return found;
@@ -253,6 +326,10 @@ internal static class SymbolNames
     }
 
     private static string Bare(string part) => part.IndexOf('<', StringComparison.Ordinal) is int angle and >= 0 ? part[..angle].Trim() : part.Trim();
+
+    /// <summary>A search for a name itself, given as a test of each name: the compiler's search given the name alone passes
+    /// over a record's positional properties, which a test finds.</summary>
+    private static Func<string, bool> Exactly(string name) => each => each == name;
 
     /// <summary>Whether the parts before a name are the names of what the symbol is in, the nearest last.</summary>
     private static bool In(ISymbol symbol, List<string> path)

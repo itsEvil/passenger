@@ -75,6 +75,132 @@ public sealed class RefactoringDialogsTests
         window.Close();
     }
 
+    /// <summary>Each dialog offers Next only for what Passenger's extension in the language server takes, saying why not in
+    /// the server's own words as the options are typed: Change Signature's value that is no expression, params before the
+    /// last parameter, a default before a parameter with none, and a type nested deeper than the server reads, alone or as
+    /// the parameter it declares; a new file's name naming a folder; the namespace the type is in already; and Push Members
+    /// Down to no class.</summary>
+    [AvaloniaFact]
+    public void Each_refactoring_dialog_offers_Next_only_for_what_the_language_server_takes_saying_why_in_its_words()
+    {
+        folder = PathNames.Canonical(TestFolders.Create("refactoring-checks-"));
+        File.WriteAllText(PathOf("Shop.csproj"), TestProjects.Library("<Nullable>enable</Nullable>"));
+        foreach ((string name, string text) in (ReadOnlySpan<(string, string)>)[("Calc.cs", Calc), ("Order.cs", Order), ("Shapes.cs", Shapes),
+            ("Animal.cs", Animal), ("Dog.cs", Dog), ("Cat.cs", Cat)])
+        {
+            File.WriteAllText(PathOf(name), text);
+        }
+        ChildResult restored = Restore.Run(folder);
+        Assert.True(restored.Succeeded, $"The project did not restore:\n{restored.Output}{restored.Error}");
+        MainWindow window = Open("Calc.cs");
+        List<string> wrong = [];
+
+        Ui.PlaceAfter(window.EditorArea.CodeEditor, "int Sca");
+        Ui.Run(window, AppActions.ChangeSignature);
+        ChangeSignatureDialog signature = Shown<ChangeSignatureDialog>(window, "Change Signature");
+        ChangeSignatureDialog.ParameterRow value = signature.Parameters[0];
+        Retype(signature, signature.Parameters[1].DefaultBox, "1 +");
+        Refuses(wrong, signature, "a default value that is no expression", "Error in default value expression");
+        Retype(signature, signature.Parameters[1].DefaultBox, string.Empty);
+        value.ModifierBox.SelectedItem = "params";
+        Refuses(wrong, signature, "params on the first of three parameters", "'value' parameter must appear after all other parameters");
+        value.ModifierBox.SelectedItem = string.Empty;
+        Retype(signature, value.DefaultBox, "1");
+        Refuses(wrong, signature, "a default value before parameters with none", "Optional parameters must appear after all regular parameters");
+        Retype(signature, value.DefaultBox, string.Empty);
+        Retype(signature, value.TypeBox, Nested(1100));
+        Refuses(wrong, signature, "a type nested 1100 deep", "A parameter's type is nested too deeply to read");
+        // As deep as the server reads a type, which its declaration's brackets take a level deeper.
+        Retype(signature, value.TypeBox, Nested(1000));
+        Refuses(wrong, signature, "a type nested 1000 deep", "A parameter is nested too deeply to read");
+        Retype(signature, value.TypeBox, "int");
+        Ui.Click(signature.Parameters[2].NameBox);
+        Ui.Click(signature.AddButton);
+        Refuses(wrong, signature, "a new parameter with neither a type nor a name", "A parameter has an invalid type");
+        signature.KeyTextInput("int");
+        Refuses(wrong, signature, "a new parameter with a type and no name", "Parameter name can not be empty");
+        Retype(signature, signature.Parameters[3].NameBox, "offset");
+        Retype(signature, signature.Parameters[3].DefaultBox, "1 +");
+        Refuses(wrong, signature, "a new parameter whose calls pass what is no expression", "Error in default value expression");
+        Cancel(signature);
+
+        window.OpenFile(PathOf("Order.cs"));
+        Ui.PlaceAfter(window.EditorArea.CodeEditor, "class Ord");
+        Assert.True(window.RunFromMenu(AppActions.ExtractInterface), window.Status);
+        ExtractInterfaceDialog extract = Shown<ExtractInterfaceDialog>(window, "Extract Interface");
+        Retype(extract, extract.FileBox, "sub/IOrder.cs");
+        Refuses(wrong, extract, "a file name naming a folder", "'sub/IOrder.cs' is not a file name");
+        Cancel(extract);
+
+        Ui.Run(window, AppActions.Move);
+        Ui.Press(window, "DOWN");
+        Ui.Press(window, "ENTER");
+        MoveTypeDialog space = Shown<MoveTypeDialog>(window, "Move to Namespace");
+        Retype(space, space.TargetBox, "Shop");
+        Refuses(wrong, space, "the namespace Order is in", "'Order' is already in namespace 'Shop'");
+        Cancel(space);
+
+        window.OpenFile(PathOf("Shapes.cs"));
+        Ui.PlaceAfter(window.EditorArea.CodeEditor, "class Circ");
+        Ui.Run(window, AppActions.Move);
+        Ui.Press(window, "ENTER");
+        MoveTypeDialog file = Shown<MoveTypeDialog>(window, "Move to Another File");
+        Retype(file, file.TargetBox, "sub/Circle.cs");
+        Refuses(wrong, file, "a file name naming a folder", "'sub/Circle.cs' is not a file name");
+        Cancel(file);
+
+        window.OpenFile(PathOf("Animal.cs"));
+        Ui.PlaceAfter(window.EditorArea.CodeEditor, "class Anim");
+        Assert.True(window.RunFromMenu(AppActions.PushMembersDown), window.Status);
+        MembersMoveDialog down = Shown<MembersMoveDialog>(window, "Push Members Down");
+        Ui.Click(down.Members[1].Moved);
+        foreach ((_, CheckBox inheritor) in down.Inheritors)
+        {
+            Ui.Click(inheritor);
+        }
+        Refuses(wrong, down, "no class to push down to", "Choose the classes derived from 'Animal' to push members down to");
+        Cancel(down);
+        window.Close();
+        Assert.True(wrong.Count == 0, "A dialog takes what the language server refuses, or refuses it in other words than an agent is told, "
+            + $"so a person learns it only after Next or differently:\n{string.Join("\n", wrong)}");
+    }
+
+    /// <summary>A type's name nested this many levels deep.</summary>
+    private static string Nested(int levels) => string.Concat(Enumerable.Repeat("List<", levels)) + "int" + new string('>', levels);
+
+    /// <summary>A box's text typed over, as a person clicks into it, chooses it all and types.</summary>
+    private static void Retype(RefactoringDialog dialog, TextBox box, string text)
+    {
+        Ui.Click(box);
+        box.SelectAll();
+        if (text.Length == 0)
+        {
+            Ui.Press(dialog, "BACK_SPACE");
+        }
+        else
+        {
+            dialog.KeyTextInput(text);
+        }
+        Ui.Settle();
+        Assert.Equal(text, box.Text);
+    }
+
+    /// <summary>Notes how a dialog's options as they stand differ from what the language server refuses them saying.</summary>
+    private static void Refuses(List<string> wrong, RefactoringDialog dialog, string what, string why)
+    {
+        Ui.Settle();
+        if (dialog.Problem != why || dialog.NextButton.IsEnabled)
+        {
+            wrong.Add($"{dialog.Title} given {what} said \"{dialog.Problem}\" with Next {(dialog.NextButton.IsEnabled ? "offered" : "not offered")}, where the server says \"{why}\"");
+        }
+    }
+
+    private static void Cancel(RefactoringDialog dialog)
+    {
+        Ui.Press(dialog, "ESCAPE");
+        Ui.WaitFor(() => !dialog.IsVisible, $"{dialog.Title} to close on Escape");
+    }
+
     /// <summary>Change Signature adds, removes and reorders parameters, and every call passes its arguments in the new order,
     /// a change of texts alone that makes no Explorer row again and has the project checked no more.</summary>
     private void ChangeSignature(MainWindow window, List<(string Title, string Text)> asked)
@@ -179,7 +305,7 @@ public sealed class RefactoringDialogsTests
 
         window.EditorArea.CodeEditor.Focus();
         Ui.Run(window, EditorActions.Undo);
-        Assert.Equal([("Undo", "Undo Extract Interface? It changes Order.cs and IOrder.cs.")], asked);
+        Assert.Equal([("Undo", "Undo Extract Interface? It changes Order.cs, and deletes IOrder.cs.")], asked);
         Assert.False(File.Exists(extracted), "Undo left IOrder.cs");
         Assert.Equal(Order, window.EditorArea.Active?.Text.Snapshot.ToString());
     }
@@ -206,7 +332,7 @@ public sealed class RefactoringDialogsTests
 
         window.EditorArea.CodeEditor.Focus();
         Ui.Run(window, EditorActions.Undo);
-        Assert.Equal([("Undo", "Undo Move to Another File? It changes Shapes.cs and Circle.cs.")], asked);
+        Assert.Equal([("Undo", "Undo Move to Another File? It changes Shapes.cs, and deletes Circle.cs.")], asked);
         Assert.False(File.Exists(moved), "Undo left Circle.cs");
         Assert.Equal(Shapes, window.EditorArea.Active?.Text.Snapshot.ToString());
     }
@@ -315,7 +441,7 @@ public sealed class RefactoringDialogsTests
     }
 
     /// <summary>The dialog a refactoring opened, once it shows.</summary>
-    private static T Shown<T>(MainWindow window, string what) where T : RefactoringDialog
+    internal static T Shown<T>(MainWindow window, string what) where T : RefactoringDialog
     {
         Ui.WaitFor(() => window.OwnedWindows.OfType<T>().Any() || window.Status?.Contains(what, StringComparison.Ordinal) == true, $"{what}'s dialog to open");
         return DialogButtonsTests.Check(window.OwnedWindows.OfType<T>().FirstOrDefault() ?? throw new Xunit.Sdk.XunitException($"{what} opened no dialog: {window.Status}"));
@@ -323,7 +449,7 @@ public sealed class RefactoringDialogsTests
 
     /// <summary>Next clicked, and the dialog waited out: closed once the refactoring is made, failing with what it says
     /// when it stays open.</summary>
-    private static void Next(RefactoringDialog dialog)
+    internal static void Next(RefactoringDialog dialog)
     {
         Assert.True(dialog.NextButton.IsEnabled, $"Next is disabled: {dialog.Problem}");
         Ui.Click(dialog.NextButton);
@@ -332,7 +458,7 @@ public sealed class RefactoringDialogsTests
     }
 
     /// <summary>Agrees to every question the window asks, keeping each one's title and text in order.</summary>
-    private static List<(string Title, string Text)> Answer(MainWindow window)
+    internal static List<(string Title, string Text)> Answer(MainWindow window)
     {
         List<(string, string)> asked = [];
         window.Confirm = (title, text, _) =>

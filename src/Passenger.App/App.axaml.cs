@@ -20,20 +20,40 @@ public partial class App : Application
     /// make several Apps, and each adding them again would make every template applied anywhere ask each one.</summary>
     private static bool classHandlersAdded;
 
+    /// <summary>Makes the start fail in <see cref="Initialize"/>, the exception's message its value: what a start that fails
+    /// before the log is set up leaves (<see cref="CrashFile"/>) is held by making one.</summary>
+    [IdentifierHome]
+    public const string FailVariable = "PASSENGER_START_FAILS";
+
     public override void Initialize()
     {
+        if (Environment.GetEnvironmentVariable(FailVariable) is { Length: > 0 } failure)
+        {
+            throw new InvalidOperationException(failure);
+        }
         AvaloniaXamlLoader.Load(this);
+        if (OperatingSystem.IsMacOS())
+        {
+            // macOS takes the application's menu as setup ends, before any window: none set, it shows Avalonia's About.
+            NativeMenu.SetMenu(this, new NativeMenu());
+        }
         Themes.TakeAccentFromTokens(this);
-        Passenger.Editor.FallbackFonts.Install(PlatformFallback.Named);
+        Passenger.Editor.FallbackFonts.Install(PlatformFallback.Named, FaceTracking.Set);
+        Passenger.Editor.CodeFonts.Install(PlatformWidths.Monospaced);
         Passenger.Editor.CodeFonts.Use(this, Passenger.Editor.CodeEditor.CodeFont);
         WindowFonts.Use(this, WindowFonts.Carried);
+        InterfaceScale.Use(this, 1);
+        Passenger.Editor.Carets.UseBlink(this, CaretBlink.Default);
+        Passenger.Editor.Carets.UseWidth(this, Passenger.Editor.Carets.DefaultWidth);
         if (classHandlersAdded)
         {
             return;
         }
         classHandlersAdded = true;
+        InterfaceScale.Install();
         MenuShadow.Install();
         AgentAsks.Install();
+        DropDownSearch.Install();
         // In-window menus write keys as the keymap does (⇧⌘R), not as Fluent writes a KeyGesture (Shift+Cmd+R).
         TemplatedControl.TemplateAppliedEvent.AddClassHandler<MenuItem>((item, e) =>
         {
@@ -49,23 +69,29 @@ public partial class App : Application
         // Whichever dispatcher is the UI thread's when a tracked task ends: a headless session can bring its own.
         BackgroundWork.Install(work => Dispatcher.UIThread.Post(work));
         IdeErrors.Install();
+        SystemMotion.LookAgain();
+        if (MacTextElements.Install() is { } unread)
+        {
+            IdeErrors.Write($"VoiceOver reads the editor and the terminal by their caret's line alone: {unread}");
+        }
         // The screenshot mode has no lifetime and makes its own window.
         if (ApplicationLifetime is IClassicDesktopStyleApplicationLifetime desktop)
         {
             // Only the person's window updates Passenger, and only a copy its installer or disk image put in place.
             Updates.Updater? updater = Updates.Updater.OfThisCopy(State.StateStore.DefaultRoot, out string notUpdating);
-            MainWindow window = new() { AgentsAllowed = Program.Options.ListenForAgents, SelfUpdate = updater };
+            MainWindow window = new() { AgentsAllowed = Program.Options.ListenForAgents, SelfUpdate = updater, SaysLastCrash = true };
             // The person's windows open on the layout and settings they left; headless ones keep the defaults.
             window.KeepLayout();
             window.KeepSettings();
             // A theme named on the command line is the run's, over the one kept.
             Program.ApplyTheme(this, Program.Options);
-            // Its default size is a large screen's: on a smaller one it opens inside the working area, centred.
-            window.FitToScreen(keepPlace: false);
+            // A new state's first start asks the theme and dark or light before anything else, from the first frame.
+            window.ShowFirstStartOnce();
+            window.OpenWherePlaced();
             window.Opened += (_, _) =>
             {
                 IdeErrors.Write($"Passenger {Product.Version} ({Product.Commit ?? "no commit"}) on {RuntimeInformation.OSDescription} "
-                    + $"({Product.Runtime}): window shown {Stopwatch.GetElapsedTime(Program.StartedAt).TotalSeconds:0.00} s after launch");
+                    + $"({Product.Runtime}): window shown {Durations.Said(Stopwatch.GetElapsedTime(Program.StartedAt))} after launch");
                 window.Start(Program.Options);
                 IdeErrors.Observe(Program.EndUnlessStartedAsync(window, desktop.Shutdown));
                 // The process asks for the latest release once, in this window, which hands the watch on as it closes.
@@ -83,10 +109,6 @@ public partial class App : Application
                 window.ShowActivityInDiscord();
             };
             desktop.MainWindow = window;
-            if (OperatingSystem.IsMacOS())
-            {
-                NativeMenu.SetMenu(this, window.ApplicationMenu());
-            }
             // macOS hands the running Passenger what the Finder or the Dock's icon opens, rather than starting another.
             if (TryGetFeature(typeof(IActivatableLifetime)) is IActivatableLifetime activatable)
             {

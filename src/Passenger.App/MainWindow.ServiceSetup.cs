@@ -37,7 +37,7 @@ public partial class MainWindow
         made.TakeOpen();
         if (await ReadProjectAsync(project) is not { } model)
         {
-            return NotSetUp($"{name} was not set up to run with {SetupWords(setup)}: it was not read within {Waits.Of(SetUpRead).TotalMinutes:0} minutes");
+            return NotSetUp($"{name} was not set up to run with {SetupWords(setup)}: it was not read within {Durations.Said(Waits.Of(SetUpRead))}");
         }
         if (!model.IsRunnable)
         {
@@ -125,7 +125,7 @@ public partial class MainWindow
         IReadOnlyList<ProjectModel> all = Projects;
         ProjectModel? host = all.FirstOrDefault(p => p.Exists && p.IsAspireHost);
         // The AppHost's services reference theirs; else one is known by its name or the service discovery it brings.
-        bool Served(ProjectModel defaults) => host is not null && all.Any(s => host.ProjectReferences.Any(r => PathNames.Same(r, s.Path))
+        bool Served(ProjectModel defaults) => host is not null && all.Any(s => session.AspireFiles.AppHostsRunning(s.Path).Contains(host.Path, PathNames.Comparer)
             && s.ProjectReferences.Any(r => PathNames.Same(r, defaults.Path)));
         ProjectModel? defaults = all.Where(p => p.Exists && !p.IsAspireHost && !p.IsRunnable && !p.IsTestProject
                 && p.TargetFrameworks.Any(project.TargetFrameworks.Contains)
@@ -140,7 +140,7 @@ public partial class MainWindow
         string hostPath = host?.Path ?? Path.Combine(root, $"{solution.Name}.AppHost", $"{solution.Name}.AppHost.csproj");
         return await ReadProjectAsync(hostPath) is { IsAspireHost: true } read
             ? (null, read.Path)
-            : ($"its AppHost {Path.GetFileNameWithoutExtension(hostPath)} was not read as one within {Waits.Of(SetUpRead).TotalMinutes:0} minutes", null);
+            : ($"its AppHost {Path.GetFileNameWithoutExtension(hostPath)} was not read as one within {Durations.Said(Waits.Of(SetUpRead))}", null);
     }
 
     /// <summary>A project of the workspace once MSBuild has read it (its image, frameworks and kind known), waited for as

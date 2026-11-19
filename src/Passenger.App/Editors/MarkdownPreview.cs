@@ -1,6 +1,9 @@
+using System.Runtime.CompilerServices;
 using Avalonia;
 using Avalonia.Controls;
 using Avalonia.Controls.Primitives;
+using Avalonia.Input;
+using Avalonia.Interactivity;
 using Avalonia.LogicalTree;
 using Avalonia.Media.Imaging;
 using Avalonia.Threading;
@@ -14,9 +17,10 @@ namespace Passenger.App.Editors;
 /// <summary>A Markdown file's preview beside its editor, a group's own (each split and editor window has one), drawn by
 /// <see cref="Markdown"/> as a page of the blocks in sight (<see cref="MarkdownBlocks"/>), each file's page kept while its
 /// tab is open. It follows the text as typing pauses, read off the window's thread, keeping the control of every block
-/// whose lines did not change, and follows the editor's scroll, the block at the editor's top line at its own top. Its
-/// web links open through the window's browser, a link to a file beside it opens that file, a <c>#heading</c> scrolls to
-/// the heading, and it draws the images of files inside the open folder alone, the rest as their words.</summary>
+/// whose lines did not change. It follows the editor's scroll, the block at the editor's top line at its own top, and
+/// once the person scrolls it the editor follows it, the line at its top the editor's top line. Its web links open through
+/// the window's browser, a link to a file beside it opens that file, a <c>#heading</c> scrolls to the heading, and it
+/// draws the images of files inside the open folder alone, the rest as their words.</summary>
 public sealed class MarkdownPreview : ScrollViewer
 {
     /// <summary>How long typing pauses before the text is read again.</summary>
@@ -45,11 +49,20 @@ public sealed class MarkdownPreview : ScrollViewer
         HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled;
         links = new MarkdownPage(Follow) { LocalLinks = true, ImageFile = ImageFile, Load = LoadAsync };
         typing = new Debounce(Pause, RenderAsync);
-        editor.ScrollChanged += (_, _) => FollowEditor();
+        editor.ScrollChanged += (_, _) => OnEditorScrolled();
+        // Before the preview scrolls for them, so the move they make is the preview's own.
+        AddHandler(PointerWheelChangedEvent, (_, _) => Lead(), RoutingStrategies.Tunnel, handledEventsToo: true);
+        AddHandler(PointerPressedEvent, (_, _) => Lead(), RoutingStrategies.Tunnel, handledEventsToo: true);
+        AddHandler(KeyDownEvent, (_, _) => Lead(), RoutingStrategies.Tunnel, handledEventsToo: true);
+        AddHandler(ScrollGestureEvent, (_, _) => Lead(), RoutingStrategies.Bubble, handledEventsToo: true);
+        AddHandler(GotFocusEvent, (_, _) => Lead(), RoutingStrategies.Bubble, handledEventsToo: true);
     }
 
     /// <summary>The file it previews, null for none.</summary>
     public OpenDocument? Document => document;
+
+    /// <summary>How many of the file's lines its last read of the text read again, for a test of what a typing pause costs.</summary>
+    public int LinesRead { get; private set; }
 
     /// <summary>The controls of the top-level blocks drawn now, in order.</summary>
     public IReadOnlyList<Control> Blocks => page is null ? [] : [.. page.Shown.Select(e => e.Control!)];
@@ -67,6 +80,10 @@ public sealed class MarkdownPreview : ScrollViewer
     /// <summary>The heading drawn of an anchor (GitHub's: its words in lower case, hyphens for spaces), null for none.</summary>
     public Control? Heading(string anchor) => page?.Shown.FirstOrDefault(e => e.Anchor == anchor)?.Control;
 
+    /// <summary>The line of the file (from zero) drawn at the preview's top, which stands as far down the page as the
+    /// page's top stands above it.</summary>
+    public int TopLine => page is { } shown && Offset.Y > 0 ? shown.LineAt(-shown.Bounds.Top) : 0;
+
     /// <summary>Where the preview's scroll stands with a block at its top.</summary>
     public double TopOf(Control block) => page is not null && block.TranslatePoint(default, page) is { } at ? Offset.Y + page.Bounds.Top + at.Y : 0;
 
@@ -80,6 +97,7 @@ public sealed class MarkdownPreview : ScrollViewer
         typing.Stop();
         generation++;
         document = next;
+        leads = false;
         if (next is null)
         {
             page = null;
@@ -176,6 +194,7 @@ public sealed class MarkdownPreview : ScrollViewer
     {
         base.OnDetachedFromVisualTree(e);
         onScreen = false;
+        leads = false;
         Hear(null);
         typing.Stop();
         generation++;
@@ -219,20 +238,23 @@ public sealed class MarkdownPreview : ScrollViewer
         TextSnapshot text = shown.Text.Snapshot;
         int version = shown.Text.Version;
         IReadOnlyList<MarkdownBlocks.Entry> drawn = into.Entries;
-        MarkdownBlocks.Entry[] read = await BackgroundWork.Run(() => Read(text.ToString(), drawn));
+        TextDocument from = shown.Text;
+        (MarkdownBlocks.Entry[] read, Markdown.Parsed parsed) = await BackgroundWork.Run(() => Read(from, text, drawn));
         if (asked != generation || document != shown || page != into)
         {
             return;
         }
+        LinesRead = parsed.Read;
         into.Take(read, shown.Text, version);
         FollowLaidOut();
     }
 
-    /// <summary>A text's blocks, each taking the block drawn it is (by its lines as written, in order), and each heading's
-    /// anchor.</summary>
-    private static MarkdownBlocks.Entry[] Read(string text, IReadOnlyList<MarkdownBlocks.Entry> drawn)
+    /// <summary>A text's blocks, read again only where it changed since the document's last read (<see cref="Markdown.ReadOf"/>),
+    /// each taking the block drawn it is (by its lines as written, in order), and each heading's anchor.</summary>
+    private static (MarkdownBlocks.Entry[] Read, Markdown.Parsed Parsed) Read(TextDocument document, TextSnapshot text, IReadOnlyList<MarkdownBlocks.Entry> drawn)
     {
-        IReadOnlyList<Markdown.Placed> placed = Markdown.ParsePlaced(text);
+        Markdown.Parsed parsed = Markdown.ReadOf(document, text);
+        IReadOnlyList<Markdown.Placed> placed = parsed.Placed;
         Dictionary<string, Queue<MarkdownBlocks.Entry>> byLines = new(StringComparer.Ordinal);
         foreach (MarkdownBlocks.Entry entry in drawn)
         {
@@ -251,13 +273,90 @@ public sealed class MarkdownPreview : ScrollViewer
             if (placed[i].Block is Markdown.Heading heading)
             {
                 // A second heading of the same words is GitHub's "-1", a third "-2".
-                string slug = Markdown.Slug(Markdown.Plain(Markdown.Inlines(heading.Text)));
+                string slug = Slugs.GetValue(heading, static read => Markdown.Slug(Markdown.Plain(Markdown.Inlines(read.Text))));
                 anchor = taken.TryGetValue(slug, out int count) ? $"{slug}-{count}" : slug;
                 taken[slug] = count + 1;
             }
             read[i] = new MarkdownBlocks.Entry(i, placed[i], anchor, kept);
         }
-        return read;
+        return (read, parsed);
+    }
+
+    /// <summary>Each heading's anchor before a count, by the heading read, which a read of its text again keeps.</summary>
+    private static readonly ConditionalWeakTable<Markdown.Heading, string> Slugs = new();
+
+    /// <summary>Whether the person moved the preview last (its wheel, bar or keys, a press in it): the editor follows it, and
+    /// nothing laid out moves it, until the editor's top line moves by anything but the preview.</summary>
+    private bool leads;
+
+    /// <summary>The editor's top line as the preview leading last left it.</summary>
+    private int steered;
+
+    private bool steering;
+    private bool leading;
+
+    /// <summary>The person moved or reached into the preview: from here the editor follows it.</summary>
+    private void Lead()
+    {
+        if (!leads)
+        {
+            leads = true;
+            steered = editor.LinesShown.First;
+        }
+    }
+
+    /// <summary>The editor scrolled: the preview follows it, unless the preview leads and the editor's top line is still
+    /// where the preview put it (a frame's rows, a wrap kept at the top line).</summary>
+    private void OnEditorScrolled()
+    {
+        if (leads)
+        {
+            if (steering || editor.LinesShown.First == steered)
+            {
+                return;
+            }
+            leads = false;
+        }
+        FollowEditor();
+    }
+
+    protected override void OnPropertyChanged(AvaloniaPropertyChangedEventArgs change)
+    {
+        base.OnPropertyChanged(change);
+        if (change.Property == OffsetProperty && leads && !leading)
+        {
+            // Once laid out, so the blocks coming into sight stand where they are drawn.
+            leading = true;
+            Dispatcher.UIThread.Post(() =>
+            {
+                leading = false;
+                LeadEditor();
+            }, DispatcherPriority.Background);
+        }
+    }
+
+    /// <summary>The editor scrolled so the line at the preview's top is its top line.</summary>
+    private void LeadEditor()
+    {
+        if (!leads || document is null || page is null || editor.Document != document.Text || !editor.IsEffectivelyVisible)
+        {
+            return;
+        }
+        TextSnapshot text = editor.Document.Snapshot;
+        int line = Math.Min(TopLine, text.LineCount - 1);
+        if (line != editor.LinesShown.First)
+        {
+            steering = true;
+            try
+            {
+                editor.ScrollTo(new Vector(editor.ScrollOffset.X, editor.PointOf(text.GetLineStart(line)).Y + editor.ScrollOffset.Y));
+            }
+            finally
+            {
+                steering = false;
+            }
+        }
+        steered = editor.LinesShown.First;
     }
 
     private bool following;
@@ -278,10 +377,10 @@ public sealed class MarkdownPreview : ScrollViewer
     }
 
     /// <summary>The preview scrolled so the block at the editor's top line stands at its top, a long block's part as far
-    /// down it as the line is; whether it moved.</summary>
+    /// down it as the line is, unless the preview leads; whether it moved.</summary>
     private bool FollowEditor()
     {
-        if (document is null || page is not { } shown || editor.Document != document.Text || shown.Entries.Count == 0 || !editor.IsEffectivelyVisible)
+        if (leads || document is null || page is not { } shown || editor.Document != document.Text || shown.Entries.Count == 0 || !editor.IsEffectivelyVisible)
         {
             return false;
         }
@@ -366,6 +465,7 @@ public sealed class MarkdownPreview : ScrollViewer
         {
             return false;
         }
+        Lead();
         ScrollWithin(Offset.Y + shown.Bounds.Top + shown.Drawn(index).Top);
         return true;
     }
@@ -392,7 +492,9 @@ public sealed class MarkdownPreview : ScrollViewer
         }
         try
         {
-            return PathNames.Canonical(Path.Combine(from, rest));
+            // Climbed out by its dots to an automount root (../../net/host), it is no file of the folder's to ask about.
+            string combined = Path.Combine(from, rest);
+            return FoundPaths.Askable(combined, [from]) ? PathNames.Canonical(combined) : null;
         }
         catch (Exception error) when (error is ArgumentException or IOException or NotSupportedException)
         {

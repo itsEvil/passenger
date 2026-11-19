@@ -26,7 +26,7 @@ internal static class Docker
     /// run's end removes whatever carries it, and a later run what carries a run's of this machine whose process is gone.</summary>
     public static readonly string RunLabel = $"{RunKey}={ContainerLabels.MachineValue}.{ContainerLabels.ProcessValue}";
 
-    public const string Image = "busybox:1.37";
+    public const string Image = "busybox:1.38";
 
     /// <summary>What every test's <c>docker run</c> takes: Docker's CLI on Podman's socket otherwise makes a container that
     /// holds one process (pids.max 1, Podman 5.7's reading of what the CLI sends; Compose's are Podman's 2048), where no
@@ -269,6 +269,9 @@ internal static class Docker
         return (PathNames.Canonical(folder), project);
     }
 
+    /// <summary>Takes down what <see cref="ComposeUp"/> brought up in a folder, so no later test of the run lists it.</summary>
+    public static void ComposeDown(string folder) => Run("compose", "-f", Path.Combine(folder, "compose.yaml"), "down", "--timeout", "0");
+
     /// <summary>A container of busybox running <paramref name="command"/>, named and labelled as the test's, with more labels.</summary>
     public static string Container(string name, string command, params string[] labels)
     {
@@ -361,13 +364,13 @@ public sealed class ContainersTests
     /// <summary>A web server answering on a port the engine chooses, healthy once it answers, and a worker that ticks.</summary>
     private const string Shop = """
           web:
-            image: busybox:1.37
+            image: busybox:1.38
             command: ["sh", "-c", "mkdir -p /www && echo hello > /www/index.html && echo 'web listening on http://localhost:8080/ at /app/Program.cs:line 12' && exec httpd -f -v -p 8080 -h /www"]
             ports: ["8080"]
             labels: { $LABEL }
             healthcheck: { test: ["CMD", "wget", "-q", "-O", "-", "http://localhost:8080/"], interval: 1s, retries: 30 }
           worker:
-            image: busybox:1.37
+            image: busybox:1.38
             command: ["sh", "-c", "i=0; while true; do i=$$((i+1)); echo \"worker tick $$i\"; sleep 1; done"]
             labels: { $LABEL }
         """;
@@ -400,55 +403,92 @@ public sealed class ContainersTests
         }
     }
 
+    /// <summary>Prune asks its question once the engine says it serves, however late, before the window is quiet: what waits
+    /// for the window (a screenshot's next step, a test's next key) finds the question asked, never left to come later and
+    /// take the keys from whatever comes next. Cancelled, it prunes nothing.</summary>
+    [AvaloniaFact]
+    public void Prune_asks_its_question_before_the_window_is_quiet_however_late_the_engine_answers()
+    {
+        Assert.SkipWhen(OperatingSystem.IsWindows(), "The stand-in engine is a shell script");
+        string folder = TestFolders.Create("prune-late-");
+        TestFolders.Write(folder, "README.md", "# Shop\n");
+        string engineFolder = TestFolders.Create("prune-late-engine-");
+        (string cli, _) = StandInEngine(engineFolder, up: true, compose: true, late: true);
+        MainWindow window = ContainerRunsTests.Open(folder, engine: new ContainerEngine(cli: cli));
+        try
+        {
+            Assert.True(window.Perform(AppActions.ContainerPrune), $"Prune did not run: {window.Status}");
+            Ui.Settle();
+            ConfirmDialog asked = window.Asked is { IsVisible: true, Title: "Prune" } shown ? shown : throw new Xunit.Sdk.XunitException(
+                $"With the window quiet, Prune had not yet asked its question (the status bar says '{window.Status}'), which would come later and take the keys from what was done next");
+            Ui.ClickButton(asked, "Cancel");
+            Ui.Settle();
+            string[] calls = File.ReadAllLines(Path.Combine(engineFolder, "calls"));
+            Assert.True(!asked.IsVisible && !calls.Contains("container"),
+                $"Cancelled, Prune's question {(asked.IsVisible ? "stayed open" : "closed")} and the engine was asked [{string.Join(", ", calls)}]");
+        }
+        finally
+        {
+            window.Close();
+        }
+    }
+
     [AvaloniaFact]
     public void A_compose_project_is_listed_with_its_services_ports_and_health_and_its_logs_stream_with_links_and_merge_its_services()
     {
         Assert.SkipWhen(Docker.WhyNot is not null, Docker.WhyNot ?? string.Empty);
         (string folder, string project) = Docker.ComposeUp("list", Shop);
-        MainWindow window = Ui.OpenFolder(folder);
-        ContainersView view = Shown(window);
-        Ui.WaitFor(() => view.Rows.Any(r => r.Kind == ContainerRowKind.Project && r.Label == project), $"{project} listed under Compose");
+        try
+        {
+            MainWindow window = Ui.OpenFolder(folder);
+            ContainersView view = Shown(window);
+            Ui.WaitFor(() => view.Rows.Any(r => r.Kind == ContainerRowKind.Project && r.Label == project), $"{project} listed under Compose");
 
-        ContainerRow web = Service(view, project, "web");
-        Assert.Equal("healthy", web.Container!.Health);
-        Assert.True(web.Container.IsRunning, $"web is {web.Container.State}");
-        ContainerPort port = Assert.Single(web.Container.Ports);
-        Assert.Equal("8080", port.Inside);
-        Assert.Equal(Docker.Image, Docker.Short(Service(view, project, "worker").Container!.Image));
-        // Scrolled into view: an engine holding many projects lists web below the rows the list makes.
-        Button? link = null;
-        Ui.WaitFor(() => view.Choose(r => r.Key == web.Key)
-            && (link = view.GetVisualDescendants().OfType<Button>().FirstOrDefault(b => b.Name == "containerPort" && Equals(b.Content, port.ToString()))) is not null,
-            "web's port link");
-        Ui.Click(link!);
-        Assert.Contains(new Uri($"http://localhost:{port.HostPort}/"), window.Browsed);
+            ContainerRow web = Service(view, project, "web");
+            Assert.Equal("healthy", web.Container!.Health);
+            Assert.True(web.Container.IsRunning, $"web is {web.Container.State}");
+            ContainerPort port = Assert.Single(web.Container.Ports);
+            Assert.Equal("8080", port.Inside);
+            Assert.Equal(Docker.Image, Docker.Short(Service(view, project, "worker").Container!.Image));
+            // Scrolled into view: an engine holding many projects lists web below the rows the list makes.
+            Button? link = null;
+            Ui.WaitFor(() => view.Choose(r => r.Key == web.Key)
+                && (link = view.GetVisualDescendants().OfType<Button>().FirstOrDefault(b => b.Name == "containerPort" && Equals(b.Content, port.ToString()))) is not null,
+                "web's port link");
+            Ui.Click(link!);
+            Assert.Contains(new Uri($"http://localhost:{port.HostPort}/"), window.Browsed);
 
-        OutputView console = view.Log.Console;
-        Ui.WaitFor(() => Text(console).Contains("web listening on http://localhost:8080/", StringComparison.Ordinal), "web's first line in its log");
-        string line = Text(console).Split('\n').First(l => l.Contains("web listening", StringComparison.Ordinal));
-        Assert.Contains(console.Links.In(line), l => l.Target is WebLink { Address.Port: 8080 });
+            OutputView console = view.Log.Console;
+            Ui.WaitFor(() => Text(console).Contains("web listening on http://localhost:8080/", StringComparison.Ordinal), "web's first line in its log");
+            string line = Text(console).Split('\n').First(l => l.Contains("web listening", StringComparison.Ordinal));
+            Assert.Contains(console.Links.In(line), l => l.Target is WebLink { Address.Port: 8080 });
 
-        Assert.True(view.Choose(r => r.Kind == ContainerRowKind.Project && r.Label == project), "The project's row was not listed");
-        Ui.WaitFor(() => Text(console).Contains("worker tick", StringComparison.Ordinal) && Text(console).Contains("web listening", StringComparison.Ordinal),
-            "both services' lines in the project's log");
-        Assert.Equal(["web", "worker"], view.Log.ServiceToggles.Select(t => (string)t.Content!));
-        int ticks = Ticks(console);
-        Ui.WaitFor(() => Ticks(console) > ticks, "the worker's next tick, streamed");
+            Assert.True(view.Choose(r => r.Kind == ContainerRowKind.Project && r.Label == project), "The project's row was not listed");
+            Ui.WaitFor(() => Text(console).Contains("worker tick", StringComparison.Ordinal) && Text(console).Contains("web listening", StringComparison.Ordinal),
+                "both services' lines in the project's log");
+            Assert.Equal(["web", "worker"], view.Log.ServiceToggles.Select(t => (string)t.Content!));
+            int ticks = Ticks(console);
+            Ui.WaitFor(() => Ticks(console) > ticks, "the worker's next tick, streamed");
 
-        view.Log.OpenFind();
-        Ui.Settle();
-        view.Log.Find.FindControl<Avalonia.Controls.Primitives.ToggleButton>("UseRegex")!.IsChecked = true;
-        view.Log.Find.FindControl<TextBox>("Query")!.Text = @"worker tick \d+$";
-        Ui.Settle();
-        Assert.Matches(@"^\d+/([2-9]|\d\d+)$", view.Log.Find.CountText);
-        // Find Next's keys in the log step its own matches, never the editor's Find.
-        view.Log.Find.FindControl<TextBox>("Query")!.Focus();
-        Ui.Settle();
-        Passenger.Text.Selection matched = console.Editor.Selections.Primary;
-        Ui.Press(window, Ui.Shortcut(AppActions.FindNext));
-        Assert.True(console.Editor.Selections.Primary != matched, "Find Next's keys in the Containers log left its match where it was");
-        Assert.False(window.EditorArea.FindBar.IsVisible, "Find Next's keys in the Containers log went to the editor's Find");
-        window.Close();
+            view.Log.OpenFind();
+            Ui.Settle();
+            view.Log.Find.FindControl<Avalonia.Controls.Primitives.ToggleButton>("UseRegex")!.IsChecked = true;
+            view.Log.Find.FindControl<TextBox>("Query")!.Text = @"worker tick \d+$";
+            Ui.Settle();
+            Assert.Matches(@"^\d+/([2-9]|\d\d+)$", view.Log.Find.CountText);
+            // Find Next's keys in the log step its own matches, never the editor's Find.
+            view.Log.Find.FindControl<TextBox>("Query")!.Focus();
+            Ui.Settle();
+            Passenger.Text.Selection matched = console.Editor.Selections.Primary;
+            Ui.Press(window, Ui.Shortcut(AppActions.FindNext));
+            Assert.True(console.Editor.Selections.Primary != matched, "Find Next's keys in the Containers log left its match where it was");
+            Assert.False(window.EditorArea.FindBar.IsVisible, "Find Next's keys in the Containers log went to the editor's Find");
+            window.Close();
+        }
+        finally
+        {
+            Docker.ComposeDown(folder);
+        }
 
         static int Ticks(OutputView console) => Text(console).Split('\n').Count(l => l.Contains("worker tick", StringComparison.Ordinal));
     }
@@ -606,10 +646,10 @@ public sealed class ContainersTests
         try
         {
             ContainersView view = Shown(window);
-            Queue<TaskCompletionSource<(int Process, Passenger.Profiler.ProfilePlace Place)?>> lookups = [];
+            Queue<TaskCompletionSource<DotnetLookup?>> lookups = [];
             view.DotnetOf = (_, _) =>
             {
-                TaskCompletionSource<(int Process, Passenger.Profiler.ProfilePlace Place)?> lookup = new(TaskCreationOptions.RunContinuationsAsynchronously);
+                TaskCompletionSource<DotnetLookup?> lookup = new(TaskCreationOptions.RunContinuationsAsynchronously);
                 lookups.Enqueue(lookup);
                 return lookup.Task;
             };
@@ -619,7 +659,7 @@ public sealed class ContainersTests
             Ui.WaitFor(() => view.Choose(r => r.Kind == ContainerRowKind.Service && r.Service == "web"), "web's row");
             view.ShowTab(RunWindows.StatsTab);
             Ui.WaitFor(() => lookups.Count == 1, "web's program to be looked for");
-            lookups.Dequeue().SetResult((1, place));
+            lookups.Dequeue().SetResult(DotnetLookup.Found(1, place));
             Ui.WaitFor(() => view.Metrics.Said == paused, () => $"web's metrics to be followed, not \"{view.Metrics.Said}\"");
             Assert.True(view.Metrics.IsVisible, "web's metrics had no room under its Stats");
 
@@ -629,12 +669,70 @@ public sealed class ContainersTests
 
             window.ShowToolWindow(ToolWindowIds.Containers);
             Ui.WaitFor(() => lookups.Count == 1, "web's program to be looked for again as its Stats show once more");
-            TaskCompletionSource<(int Process, Passenger.Profiler.ProfilePlace Place)?> underWay = lookups.Dequeue();
+            TaskCompletionSource<DotnetLookup?> underWay = lookups.Dequeue();
             window.DockHost.Hide(ToolWindowIds.Containers);
             Ui.Settle();
-            underWay.SetResult((1, place));
+            underWay.SetResult(DotnetLookup.Found(1, place));
             Ui.Settle();
             Assert.True(view.Metrics.Said.Length == 0 && !view.Metrics.IsVisible, $"A lookup that ended with the window hidden began a reading: \"{view.Metrics.Said}\"");
+        }
+        finally
+        {
+            window.Close();
+        }
+    }
+
+    /// <summary>A .NET service chosen before its program can be reached has its metrics say so in their place, looking for it
+    /// meanwhile, then why it was not reached, and look again by themselves, nothing else changing, until it is found; and
+    /// once its run has ended they let go and look no more. The stand-in's program is held paused, so the pane says what it
+    /// follows without a session.</summary>
+    [AvaloniaFact]
+    public void A_services_metrics_say_why_its_program_is_not_reached_and_look_again_until_found_or_its_run_ends()
+    {
+        Assert.SkipWhen(OperatingSystem.IsWindows(), "The stand-in engine is a shell script");
+        string folder = TestFolders.Create("ctr-metrics-unreached-");
+        (string cli, _) = StandInEngine(folder, up: true);
+        MainWindow window = new() { Width = 1200, Height = 800, Engine = new ContainerEngine(cli: cli) };
+        window.Show();
+        window.OpenFolder(TestFolders.Create("ctr-metrics-unreached-window-"));
+        Ui.Settle();
+        try
+        {
+            ContainersView view = Shown(window);
+            Queue<TaskCompletionSource<DotnetLookup?>> lookups = [];
+            view.DotnetOf = (_, _) =>
+            {
+                TaskCompletionSource<DotnetLookup?> lookup = new(TaskCreationOptions.RunContinuationsAsynchronously);
+                lookups.Enqueue(lookup);
+                return lookup.Task;
+            };
+            view.Metrics.Paused = (_, _) => true;
+            Passenger.Profiler.ProfilePlace place = new(_ => throw new InvalidOperationException("The stand-in's metrics were read"), "a stand-in", path => path);
+            const string Unreached = "web: its runtime has yet to open its diagnostic port";
+            Ui.WaitFor(() => view.Choose(r => r.Kind == ContainerRowKind.Service && r.Service == "web"), "web's row");
+            view.ShowTab(RunWindows.StatsTab);
+            Ui.WaitFor(() => lookups.Count == 1, "web's program to be looked for");
+            Assert.True(view.Metrics.IsVisible && view.Metrics.Said == ContainersView.Looking("web"),
+                $"While web's program was looked for, its metrics said nothing of it: \"{view.Metrics.Said}\"");
+
+            lookups.Dequeue().SetResult(DotnetLookup.Missing(Unreached));
+            Ui.WaitFor(() => view.Metrics.Said == ContainersView.LookingAgain(Unreached), () => $"web's metrics to say why its program was not reached, not \"{view.Metrics.Said}\"");
+            Assert.True(view.Metrics.IsVisible, "web's metrics said why its program was not reached where nobody sees it");
+            Ui.WaitFor(() => lookups.Count == 1, "web's program to be looked for again, nothing else having changed");
+            lookups.Dequeue().SetResult(DotnetLookup.Found(1, place));
+            Ui.WaitFor(() => view.Metrics.Said == Refusals.MetricsWhilePaused("web"), () => $"web's metrics to be followed once its program was found, not \"{view.Metrics.Said}\"");
+
+            Assert.True(view.Choose(r => r.Kind == ContainerRowKind.Project), "the project's row");
+            Ui.Settle();
+            Assert.True(view.Choose(r => r.Kind == ContainerRowKind.Service && r.Service == "web"), "web's row again");
+            Ui.WaitFor(() => lookups.Count == 1, "web's program to be looked for as its row is chosen again");
+            lookups.Dequeue().SetResult(DotnetLookup.Missing(Unreached));
+            Ui.WaitFor(() => lookups.Count == 1, "web's program to be looked for again");
+            // Its run ended: none to look for.
+            lookups.Dequeue().SetResult(null);
+            Ui.WaitFor(() => view.Metrics.Said.Length == 0 && !view.Metrics.IsVisible, () => $"web's metrics to be let go once its run ended, not \"{view.Metrics.Said}\"");
+            Ui.Hold(TimeSpan.FromSeconds(3), "longer than the first wait between lookups");
+            Assert.True(lookups.Count == 0, "web's program was looked for again after its run had ended");
         }
         finally
         {
@@ -821,7 +919,7 @@ public sealed class ContainersTests
             File.Copy(Path.Combine(StandInTools("[]"), ContainerTools.Executable), Path.Combine(folder, ContainerTools.Executable));
             File.Copy(typeof(Assert).Assembly.Location, Path.Combine(folder, $"{ContainerTools.Executable}.dll"));
         }
-        ContainerToolsSource source = new([stale], new Passenger.App.Updates.ReleaseFeed(new Uri("http://127.0.0.1:9/repos/Zaneris/passenger/releases/latest"),
+        ContainerToolsSource source = new([stale], new Passenger.App.Updates.ReleaseFeed(new Uri("http://127.0.0.1:9/repos/Zaneris/passenger/releases"),
             TimeSpan.FromSeconds(5)), TestFolders.Create("ctr-tools-cache-"));
         string bare = Docker.Container("bare", "sleep 600");
         MainWindow window = new() { Width = 1200, Height = 800, ContainerToolsFrom = source };
@@ -1051,13 +1149,338 @@ public sealed class ContainersTests
         }
     }
 
+    /// <summary>A Docker Compose project (.dcproj) naming its Compose project (DockerComposeProjectName) runs under that name
+    /// over the one Compose's model of its files gives: every command of its run takes it, from reading its files to its
+    /// up, and Stop takes down the containers that carry it. The engine is a stand-in, whose every command is written down.</summary>
+    [AvaloniaFact]
+    public void A_Docker_Compose_projects_own_project_name_is_its_runs_from_reading_its_files_to_its_take_down()
+    {
+        Assert.SkipWhen(OperatingSystem.IsWindows(), "The stand-in engine is a shell script");
+        using StandInHttp web = new(exchange => exchange.ReplyAsync(200, "text/plain", "web"));
+        string engineFolder = TestFolders.Create("ctr-dcname-");
+        string cli = StandInComposeEngine(engineFolder, "tcp://127.0.0.1:2376", web.Port);
+        string folder = ComposeProject("ctr-dcname-window-", "<DockerComposeProjectName>my-shop</DockerComposeProjectName>");
+        MainWindow window = new() { Width = 1200, Height = 800, Engine = new ContainerEngine(cli: cli) };
+        window.Show();
+        window.OpenFolder(Path.Combine(folder, "Shop.slnx"));
+        Ui.Settle();
+        string calls = Path.Combine(engineFolder, "calls");
+        try
+        {
+            Assert.True(window.SelectConfiguration("docker-compose"), $"No configuration of the .dcproj: [{string.Join(", ", window.Configurations.Select(c => c.Name))}]");
+            Ui.Launched(window, window.RunAsync(), "the Docker Compose project's run to come up");
+            string[] run = [.. File.ReadAllLines(calls).Where(c => c.Contains(" -f ", StringComparison.Ordinal))];
+            Assert.Contains(run, c => c.Contains(" config", StringComparison.Ordinal));
+            Assert.Contains(run, c => c.Contains(" up ", StringComparison.Ordinal));
+            Assert.True(run.All(c => c.StartsWith("compose -p my-shop -f ", StringComparison.Ordinal)),
+                $"A command of the run took another project name than the .dcproj's my-shop:\n{string.Join('\n', run.Where(c => !c.StartsWith("compose -p my-shop -f ", StringComparison.Ordinal)))}");
+            window.Perform(AppActions.Stop);
+            Ui.WaitFor(() => File.ReadAllLines(calls).Any(c => c.StartsWith("ps -aq ", StringComparison.Ordinal) && c.Contains($"label={ComposeLabels.Project}=my-shop", StringComparison.Ordinal)),
+                "Stop to take down the containers carrying the .dcproj's project name");
+        }
+        finally
+        {
+            window.Close();
+            File.WriteAllText(Path.Combine(engineFolder, "down"), string.Empty);
+        }
+    }
+
+    /// <summary>A Docker Compose project that opens the browser (DockerLaunchBrowser, with no DockerLaunchAction) opens its
+    /// service's address (DockerServiceUrl, its {ServiceIPAddress} the host the published port is reached on) only once the
+    /// service answers HTTP there, the status adding meanwhile that it waits: the engine takes a connection on a published
+    /// port from its container's start, before its program listens, which a port here that takes each request and lets it go
+    /// unanswered stands in for; once it answers, the page opens and the status says what the run said alone.</summary>
+    [AvaloniaFact]
+    public void A_Docker_Compose_projects_browser_opens_once_its_service_answers_HTTP_the_status_saying_meanwhile_that_it_waits()
+    {
+        Assert.SkipWhen(OperatingSystem.IsWindows(), "The stand-in engine is a shell script");
+        int asked = 0;
+        int answering = 0;
+        using StandInHttp web = new(exchange =>
+        {
+            Interlocked.Increment(ref asked);
+            return Volatile.Read(ref answering) == 1 ? exchange.ReplyAsync(200, "text/plain", "web") : Task.CompletedTask;
+        });
+        string engineFolder = TestFolders.Create("ctr-dcwait-");
+        string cli = StandInComposeEngine(engineFolder, "tcp://127.0.0.1:2376", web.Port);
+        string folder = ComposeProject("ctr-dcwait-window-", """
+            <DockerLaunchBrowser>true</DockerLaunchBrowser>
+            <DockerServiceUrl>{Scheme}://{ServiceIPAddress}:{ServicePort}/swagger</DockerServiceUrl>
+            <DockerServiceName>web</DockerServiceName>
+            """);
+        MainWindow window = new() { Width = 1200, Height = 800, Engine = new ContainerEngine(cli: cli) };
+        window.Show();
+        window.OpenFolder(Path.Combine(folder, "Shop.slnx"));
+        Ui.Settle();
+        Uri page = new($"http://127.0.0.1:{web.Port.ToString(CultureInfo.InvariantCulture)}/swagger");
+        try
+        {
+            Assert.True(window.SelectConfiguration("docker-compose"), $"No configuration of the .dcproj: [{string.Join(", ", window.Configurations.Select(c => c.Name))}]");
+            Ui.Launched(window, window.RunAsync(), "the Docker Compose project's run to come up");
+            Ui.WaitFor(() => Volatile.Read(ref asked) >= 2, "web asked twice, its requests let go unanswered");
+            Assert.True(window.Browsed.Count == 0, $"The browser opened at {string.Join(", ", window.Browsed)} before web answered");
+            string waiting = window.Status ?? string.Empty;
+            Assert.True(waiting.StartsWith("Running docker-compose", StringComparison.Ordinal) && waiting.EndsWith($"; waiting for web to answer at {page} before opening the browser…", StringComparison.Ordinal),
+                $"While web let its requests go, the status said: {waiting}");
+            Volatile.Write(ref answering, 1);
+            Ui.WaitFor(() => window.Browsed.Count > 0, "the browser to open once web answered");
+            Assert.Equal([page], window.Browsed);
+            Assert.Equal(waiting[..waiting.LastIndexOf("; waiting for web", StringComparison.Ordinal)], window.Status);
+        }
+        finally
+        {
+            window.Perform(AppActions.Stop);
+            window.Close();
+            File.WriteAllText(Path.Combine(engineFolder, "down"), string.Empty);
+        }
+    }
+
+    /// <summary>Detach lets go of a Docker Compose project's run, taking nothing down: its log no longer followed, the Run
+    /// window and the status saying its containers run on, Stop and Detach then greyed. Closing the window then asks, its
+    /// containers still running, whether to stop them or leave them running: Stop takes them down with the folder. The
+    /// engine is a stand-in, whose every command is written down, its project's container and network listed while up.</summary>
+    [AvaloniaFact]
+    public void Detach_lets_go_of_a_Docker_Compose_projects_run_and_the_windows_close_asks_and_stops_its_containers()
+    {
+        Assert.SkipWhen(OperatingSystem.IsWindows(), "The stand-in engine is a shell script");
+        (MainWindow window, string engineFolder) = LetGoOf("ctr-dcdetach-", unseen: false);
+        try
+        {
+            Assert.False(window.IsRunning, "The run was still followed once let go of");
+            Assert.Null(window.Builds.Containers);
+            Assert.Equal("Nothing is running", window.Actions.WhyNot(AppActions.Stop, window.Actions.Context()));
+            Assert.NotNull(window.Actions.WhyNot(AppActions.Detach, window.Actions.Context()));
+            Assert.False(TakenDown(engineFolder), "Detach took the run's containers down");
+
+            window.Close();
+            ChoiceDialog asked = AskedOfLetGo(window);
+            Assert.Contains("Detach let go of docker-compose, and its containers still run", Said(asked), StringComparison.Ordinal);
+            Ui.ClickButton(asked, "Stop");
+            Ui.WaitFor(() => !window.IsVisible, "the window to close once Stop was chosen");
+        }
+        finally
+        {
+            window.Close();
+            File.WriteAllText(Path.Combine(engineFolder, "down"), string.Empty);
+        }
+        Ui.WaitFor(() => TakenDown(engineFolder), "the folder's close to take down the containers of the run let go of");
+    }
+
+    /// <summary>Close Solution over a run Detach let go of asks too: Cancel keeps the solution open, and Leave Running closes it
+    /// leaving the containers running as the person's, never taken down, recorded on disk by the time the solution has closed
+    /// so the next start's clean-up passes them over however soon Passenger quits; the window's close after asks nothing
+    /// more.</summary>
+    [AvaloniaFact]
+    public void Leave_Running_keeps_a_runs_containers_let_go_of_as_the_solution_closes_and_records_them_as_the_persons()
+    {
+        Assert.SkipWhen(OperatingSystem.IsWindows(), "The stand-in engine is a shell script");
+        (MainWindow window, string engineFolder) = LetGoOf("ctr-dcleave-", unseen: false);
+        try
+        {
+            string folder = window.Folder!;
+            Assert.NotNull(window.CloseSolution());
+            Ui.ClickButton(AskedOfLetGo(window), "Cancel");
+            Assert.Equal(folder, window.Folder);
+            Assert.NotNull(window.CloseSolution());
+            Ui.ClickButton(AskedOfLetGo(window), "Leave Running");
+            Ui.WaitFor(() => window.Folder is null, "the solution to close once Leave Running was chosen");
+            IReadOnlyList<string> written = LeftOnDisk(TestRun.Settings);
+            Assert.True(written.Contains("c0ffee000001") && written.Contains("beef00000001"),
+                $"Leave Running's record was not on disk once the solution closed, so a Passenger quitting then leaves the next start to remove the containers: [{string.Join(", ", written)}]");
+            Assert.False(TakenDown(engineFolder), "Leave Running took the containers down");
+            Assert.Contains("c0ffee000001", ContainerLabels.LeftIn(TestRun.Settings));
+            Assert.Contains("beef00000001", ContainerLabels.LeftIn(TestRun.Settings));
+            window.Close();
+            Ui.WaitFor(() => !window.IsVisible, "the window to close asking nothing more");
+            Assert.Empty(window.OwnedWindows.OfType<ChoiceDialog>());
+            Assert.False(TakenDown(engineFolder), "The window's close took down the containers left running");
+        }
+        finally
+        {
+            window.Close();
+            File.WriteAllText(Path.Combine(engineFolder, "down"), string.Empty);
+        }
+    }
+
+    /// <summary>The system's quit over a run Detach let go of asks too: Cancel gives the quit up, the window open, and Stop
+    /// carries it on, the window closed and the containers taken down.</summary>
+    [AvaloniaFact]
+    public void A_quit_over_a_run_let_go_of_asks_Cancel_gives_it_up_and_Stop_carries_it_on_taking_its_containers_down()
+    {
+        Assert.SkipWhen(OperatingSystem.IsWindows(), "The stand-in engine is a shell script");
+        (MainWindow window, string engineFolder) = LetGoOf("ctr-dcquit-", unseen: false);
+        try
+        {
+            Ui.CloseAsQuit(window);
+            ChoiceDialog asked = AskedOfLetGo(window);
+            Assert.Contains("as Passenger quits", Said(asked), StringComparison.Ordinal);
+            Ui.ClickButton(asked, "Cancel");
+            Assert.True(window.IsVisible, "Cancel carried the quit on");
+            Assert.False(TakenDown(engineFolder), "Cancel took the containers down");
+            Ui.CloseAsQuit(window);
+            Ui.ClickButton(AskedOfLetGo(window), "Stop");
+            Ui.WaitFor(() => !window.IsVisible, "the quit to carry on once Stop was chosen");
+        }
+        finally
+        {
+            window.Close();
+            File.WriteAllText(Path.Combine(engineFolder, "down"), string.Empty);
+        }
+        Ui.WaitFor(() => TakenDown(engineFolder), "the quit to take down the containers of the run let go of");
+    }
+
+    /// <summary>A Passenger nobody sees never asks: its window's close takes the containers of a run let go of down, as the
+    /// folder's close takes all it started.</summary>
+    [AvaloniaFact]
+    public void A_Passenger_nobody_sees_asks_nothing_and_its_close_stops_a_runs_containers_let_go_of()
+    {
+        Assert.SkipWhen(OperatingSystem.IsWindows(), "The stand-in engine is a shell script");
+        (MainWindow window, string engineFolder) = LetGoOf("ctr-dcunseen-", unseen: true);
+        try
+        {
+            window.Close();
+            Ui.WaitFor(() => !window.IsVisible, "the window to close asking nothing");
+            Assert.Empty(window.OwnedWindows.OfType<ChoiceDialog>());
+        }
+        finally
+        {
+            window.Close();
+            File.WriteAllText(Path.Combine(engineFolder, "down"), string.Empty);
+        }
+        Ui.WaitFor(() => TakenDown(engineFolder), "the close to take down the containers of the run let go of");
+    }
+
+    /// <summary>The next start's clean-up of what a Passenger that is gone left passes over what the person chose to leave
+    /// running as theirs, reading the record as it stands on disk the moment the choice is made, as a start after a Passenger
+    /// that quit at once does: of two containers such a Passenger labelled, the one recorded as left runs on, the other is
+    /// removed.</summary>
+    [AvaloniaFact]
+    public void The_next_starts_clean_up_passes_over_what_the_person_chose_to_leave_running_just_before_Passenger_ended()
+    {
+        Assert.SkipWhen(Docker.WhyNot is not null, Docker.WhyNot ?? string.Empty);
+        MainWindow window = Ui.OpenFolder(TestFolders.Create("ctr-leftkept-"), languageServer: false);
+        string[] labels = [.. window.Session.Containers.Labels.Where(word => word != "--label")];
+        ContainerLabels.Flush();
+        // The next start's state folder, given this one's record as it stands once the choice is made.
+        string next = TestFolders.Create("ctr-leftnext-");
+        string state = $"{ContainerLabels.State}={ContainerLabels.StateValueOf(next)}";
+        string machine = labels.Single(l => l.StartsWith(ContainerLabels.Machine, StringComparison.Ordinal));
+        string gone = $"{ContainerLabels.Process}={ContainerLabels.Of(int.MaxValue - 9, 1)}";
+        string kept = Docker.Container("leftkept", "sleep 600", state, machine, gone);
+        string removed = Docker.Container("leftremoved", "sleep 600", state, machine, gone);
+        try
+        {
+            Ui.Await(ContainerLabels.LeaveToPersonAsync(ContainerEngine.Shared, [Docker.Run("inspect", "-f", "{{.Id}}", kept)[..12]]), "the choice to leave a container running");
+            File.Copy(Path.Combine(TestRun.Settings, ContainersFile), Path.Combine(next, ContainersFile));
+            IReadOnlyList<string> cleaned = Ui.Await(Waiting.Apart(() => ContainerLabels.RemoveLeftoversAsync(ContainerEngine.Shared, next)), "the clean-up of what a gone Passenger left");
+            Assert.True(Docker.State(kept) == "running",
+                $"The next start's clean-up removed {kept}, which the person chose to leave running just before Passenger ended: it removed [{string.Join(", ", cleaned)}]");
+            Assert.True(Docker.State(removed) is null, $"The clean-up left {removed}, which nobody chose to leave running: it removed [{string.Join(", ", cleaned)}]");
+        }
+        finally
+        {
+            Docker.Ask(["rm", "-f", kept, removed]);
+            window.Close();
+            TestFolders.Delete(next);
+        }
+    }
+
+    /// <summary>A choice to leave containers running is on disk once made, never a moment later, so a Passenger that ends at
+    /// once leaves it for the next start; and what another Passenger over the same state left running meanwhile stays beside
+    /// it, the two records joined rather than one taking the other's place.</summary>
+    [AvaloniaFact]
+    public void A_choice_to_leave_containers_running_is_on_disk_once_made_and_another_Passengers_stays_beside_it()
+    {
+        string file = Path.Combine(TestRun.Settings, ContainersFile);
+        Ui.Await(ContainerLabels.LeaveToPersonAsync(ContainerEngine.Shared, ["17580a000001"]), "the choice to leave a container running");
+        Assert.True(LeftOnDisk(TestRun.Settings).Contains("17580a000001"),
+            $"The choice to leave a container running was not on disk once made, so a Passenger ending then has the next start remove it: [{string.Join(", ", LeftOnDisk(TestRun.Settings))}]");
+
+        // Another Passenger over the same state leaves one of its own, writing the record before this one's next choice.
+        System.Text.Json.Nodes.JsonObject other = (System.Text.Json.Nodes.JsonObject)System.Text.Json.Nodes.JsonNode.Parse(File.ReadAllText(file))!;
+        other["left"]!.AsArray().Add("17580b000001");
+        File.WriteAllText(file, other.ToJsonString());
+        Ui.Await(ContainerLabels.LeaveToPersonAsync(ContainerEngine.Shared, ["17580c000001"]), "a second choice to leave a container running");
+        IReadOnlyList<string> written = LeftOnDisk(TestRun.Settings);
+        Assert.True(written.Contains("17580a000001") && written.Contains("17580b000001") && written.Contains("17580c000001"),
+            $"Two Passengers' choices to leave containers running did not both stay in the record, so the next start removes the other's: [{string.Join(", ", written)}]");
+    }
+
+    /// <summary>The record of what was left running, in a state folder.</summary>
+    private const string ContainersFile = "containers.json";
+
+    /// <summary>What a state folder's record holds as left running, as the disk has it now: nothing where there is no record.</summary>
+    private static IReadOnlyList<string> LeftOnDisk(string stateFolder) => File.Exists(Path.Combine(stateFolder, ContainersFile))
+        ? System.Text.Json.Nodes.JsonNode.Parse(File.ReadAllText(Path.Combine(stateFolder, ContainersFile)))?["left"]?.AsArray().Select(id => id!.GetValue<string>()).ToList() ?? []
+        : [];
+
+    /// <summary>A window on a .dcproj's solution run on a stand-in engine that lists its container and network while up, the
+    /// run let go of by Detach: said in the Run window and the status.</summary>
+    private static (MainWindow Window, string EngineFolder) LetGoOf(string prefix, bool unseen)
+    {
+        string engineFolder = TestFolders.Create(prefix);
+        string cli = StandInComposeEngine(engineFolder, "tcp://127.0.0.1:2376", 1);
+        File.WriteAllText(Path.Combine(engineFolder, "up"), string.Empty);
+        string folder = ComposeProject($"{prefix}window-", "<DockerComposeProjectName>my-shop</DockerComposeProjectName>");
+        MainWindow window = new() { Width = 1200, Height = 800, Engine = new ContainerEngine(cli: cli), Unseen = unseen };
+        window.Show();
+        window.OpenFolder(Path.Combine(folder, "Shop.slnx"));
+        Ui.Settle();
+        Assert.True(window.SelectConfiguration("docker-compose"), $"No configuration of the .dcproj: [{string.Join(", ", window.Configurations.Select(c => c.Name))}]");
+        Ui.Launched(window, window.RunAsync(), "the Docker Compose project's run to come up");
+        Assert.Null(window.Actions.WhyNot(AppActions.Detach, window.Actions.Context()));
+        Assert.True(window.Perform(AppActions.Detach), "Detach did not run");
+        Ui.WaitFor(() => window.Status?.StartsWith("Detached from docker-compose", StringComparison.Ordinal) == true, () => $"Detach to be said, not \"{window.Status}\"");
+        Assert.Equal("Detached from docker-compose: its containers run on until the Containers window stops them or the folder closes", window.Status);
+        window.BottomPanel.Run.Flush();
+        Assert.Contains("Detached from docker-compose: its containers run on", window.BottomPanel.Run.Document.Snapshot.ToString(), StringComparison.Ordinal);
+        return (window, engineFolder);
+    }
+
+    /// <summary>Whether the stand-in was told to remove the project's container, as a take-down by its labels does.</summary>
+    private static bool TakenDown(string engineFolder) => File.ReadAllLines(Path.Combine(engineFolder, "calls")).Any(c => c == "rm -f c0ffee000001");
+
+    /// <summary>The question leaving the folder asks of runs Detach let go of, held to the dialogs' rules.</summary>
+    internal static ChoiceDialog AskedOfLetGo(MainWindow window)
+    {
+        Ui.WaitFor(() => window.OwnedWindows.OfType<ChoiceDialog>().Any(), "the window to ask whether to stop the containers of the run let go of");
+        ChoiceDialog asked = DialogButtonsTests.Check(window.OwnedWindows.OfType<ChoiceDialog>().Single());
+        Assert.Equal("Containers Left Running", asked.Title);
+        return asked;
+    }
+
+    /// <summary>What a question says, its paragraphs joined.</summary>
+    private static string Said(Window asked) => string.Join('\n', asked.GetVisualDescendants().OfType<TextBlock>().Select(t => t.Text).OfType<string>());
+
+    /// <summary>A folder of a solution naming a Docker Compose project (.dcproj) alone, whose docker-compose.yml runs a busybox
+    /// web publishing its port 80, the .dcproj's properties those given.</summary>
+    private static string ComposeProject(string prefix, string properties)
+    {
+        string folder = PathNames.Canonical(TestFolders.Create(prefix));
+        TestFolders.Write(folder, "docker-compose.yml", $"services:\n  web:\n    image: {Docker.Image}\n    ports: [\"8080:80\"]\n");
+        TestFolders.Write(folder, "docker-compose.dcproj", $"""
+            <?xml version="1.0" encoding="utf-8"?>
+            <Project ToolsVersion="15.0" Sdk="Microsoft.Docker.Sdk">
+              <PropertyGroup Label="Globals">
+                <ProjectVersion>2.1</ProjectVersion>
+                <DockerTargetOS>Linux</DockerTargetOS>
+                {properties}
+              </PropertyGroup>
+            </Project>
+
+            """);
+        TestFolders.Write(folder, "Shop.slnx", "<Solution>\n  <Project Path=\"docker-compose.dcproj\" />\n</Solution>\n");
+        return folder;
+    }
+
     /// <summary>A docker of the test's own for a compose run: a Linux server at <paramref name="host"/> with Compose v2, whose
     /// model of any compose files is a project "remote" of one service web (busybox, its port 80 published on 8080), which
-    /// comes up at once, publishes 80 on <paramref name="port"/>, and lists, logs and follows nothing until a file
-    /// <c>down</c> is made beside it; every command it is given written to <c>calls</c>. The CLI.</summary>
+    /// comes up at once, publishes 80 on <paramref name="port"/>, and logs and follows nothing until a file <c>down</c> is
+    /// made beside it, and lists one container's and one network's id (c0ffee000001, beef00000001) to <c>ps -q</c> and
+    /// <c>network ls -q</c> while a file <c>up</c> is, else none; every command it is given written to <c>calls</c>. The CLI.</summary>
     private static string StandInComposeEngine(string folder, string host, int port)
     {
-        const string Model = """{"name":"remote","services":{"web":{"image":"busybox:1.37","ports":[{"mode":"ingress","target":80,"published":"8080","protocol":"tcp"}],"networks":{"default":null}}},"networks":{"default":{"name":"remote_default"}}}""";
+        const string Model = """{"name":"remote","services":{"web":{"image":"busybox:1.38","ports":[{"mode":"ingress","target":80,"published":"8080","protocol":"tcp"}],"networks":{"default":null}}},"networks":{"default":{"name":"remote_default"}}}""";
         const string Wait = "while [ ! -f \"$here/down\" ]; do sleep 0.2; done; exit 0";
         string cli = Path.Combine(folder, "docker");
         File.WriteAllText(cli, string.Join('\n', (string[])[
@@ -1069,6 +1492,7 @@ public sealed class ContainersTests
             $"  context) echo '[{{\"Name\":\"remote\",\"Endpoints\":{{\"docker\":{{\"Host\":\"{host}\"}}}}}}]'; exit 0 ;;",
             "  info) echo '{\"SecurityOptions\":[\"name=seccomp,profile=builtin\"]}'; exit 0 ;;",
             $"  events) {Wait} ;;",
+            "  ps|network) if [ -f \"$here/up\" ]; then case \" $* \" in *\" -q \"*|*\" -aq \"*) if [ \"$1\" = ps ]; then echo c0ffee000001; else echo beef00000001; fi ;; esac; fi; exit 0 ;;",
             "  compose) ;;",
             "  *) exit 0 ;;",
             "esac",
@@ -1099,9 +1523,9 @@ public sealed class ContainersTests
     {
         Assert.SkipWhen(OperatingSystem.IsWindows(), "The stand-in engine is a shell script");
         (string cli, _) = StandInEngine(TestFolders.Create("ctr-failed-"), up: true, more: [
-            """{"ID":"5a5d0c0ffee3","Names":"crashy","Image":"busybox:1.37","State":"restarting","Status":"Restarting (1) 3 seconds ago","Ports":"","Labels":""}""",
-            """{"ID":"5a5d0c0ffee4","Names":"broken","Image":"busybox:1.37","State":"exited","Status":"Exited (1) 2 minutes ago","Ports":"","Labels":""}""",
-            """{"ID":"5a5d0c0ffee5","Names":"halted","Image":"busybox:1.37","State":"exited","Status":"Exited (137) 1 minute ago","Ports":"","Labels":""}"""]);
+            """{"ID":"5a5d0c0ffee3","Names":"crashy","Image":"busybox:1.38","State":"restarting","Status":"Restarting (1) 3 seconds ago","Ports":"","Labels":""}""",
+            """{"ID":"5a5d0c0ffee4","Names":"broken","Image":"busybox:1.38","State":"exited","Status":"Exited (1) 2 minutes ago","Ports":"","Labels":""}""",
+            """{"ID":"5a5d0c0ffee5","Names":"halted","Image":"busybox:1.38","State":"exited","Status":"Exited (137) 1 minute ago","Ports":"","Labels":""}"""]);
         MainWindow window = new() { Width = 1200, Height = 800, Engine = new ContainerEngine(cli: cli) };
         window.Show();
         window.OpenFolder(TestFolders.Create("ctr-failed-window-"));
@@ -1142,6 +1566,8 @@ public sealed class ContainersTests
         }
     }
 
+    /// <summary>A stopped container's log, read whole (its lines and its command's end), stays as it was read while the window
+    /// reads the engine again.</summary>
     [AvaloniaFact]
     public void A_stopped_containers_log_stays_as_it_was_read_while_the_window_reads_the_engine_again()
     {
@@ -1154,19 +1580,81 @@ public sealed class ContainersTests
             ContainersView view = Shown(window);
             Ui.WaitFor(() => view.Choose(r => r.Kind == ContainerRowKind.Container && r.Label == name), $"{name}'s row");
             OutputView console = view.Log.Console;
-            Ui.WaitFor(() => Text(console).Contains("stopped line 5", StringComparison.Ordinal), "the stopped container's log");
-            int changes = 0;
-            console.Document.Changed += (_, _) => changes++;
-            Ui.Await(view.RefreshAsync().ContinueWith(_ => true, TaskScheduler.Default), "the window's next read of the engine");
-            Ui.Await(view.RefreshAsync().ContinueWith(_ => true, TaskScheduler.Default), "the window's read after that");
-            Ui.Settle();
-            Assert.Equal(0, changes);
+            // The engine's CLI may go on a moment after its last line, the end then said after it.
+            Ui.WaitFor(() => Text(console).Contains("stopped line 5", StringComparison.Ordinal) && Text(console).Contains(LogEnded, StringComparison.Ordinal),
+                () => $"the stopped container's log read whole: [{Text(console)}]");
+            StaysAsRead(view);
             Assert.Equal(5, Text(console).Split('\n').Count(l => l.StartsWith("stopped line", StringComparison.Ordinal)));
         }
         finally
         {
             window.Close();
         }
+    }
+
+    /// <summary>A stopped container's log whose command ends only well after its last line has landed (the engine's CLI goes
+    /// on a moment after its last line, longer on a loaded machine) stays as it was read while the window reads the engine
+    /// again before that end and after it, the end said once beneath the lines.</summary>
+    [AvaloniaFact]
+    public void A_stopped_containers_log_whose_end_comes_after_its_last_line_stays_as_read_while_the_window_reads_the_engine_again()
+    {
+        Assert.SkipWhen(OperatingSystem.IsWindows(), "The stand-in engine is a shell script");
+        string folder = TestFolders.Create("ctr-late-end-");
+        string release = Path.Combine(folder, "release");
+        // Its lines written, the log's command ends only once the test lets it.
+        (string cli, _) = StandInEngine(folder, up: true,
+            logs: $"for i in 1 2 3 4 5; do echo \"stopped line $i\"; done; while [ ! -e '{release}' ]; do sleep 0.1; done");
+        MainWindow window = new() { Width = 1200, Height = 800, Engine = new ContainerEngine(cli: cli) };
+        window.Show();
+        window.OpenFolder(TestFolders.Create("ctr-late-end-window-"));
+        Ui.Settle();
+        try
+        {
+            ContainersView view = Shown(window);
+            Ui.WaitFor(() => view.Choose(r => r.Kind == ContainerRowKind.Container && r.Label == "solo"), "solo's row");
+            OutputView console = view.Log.Console;
+            Ui.WaitFor(() => Text(console).Contains("stopped line 5", StringComparison.Ordinal), "the stopped container's log");
+            Assert.True(view.Log.Streaming is not null && !Text(console).Contains(LogEnded, StringComparison.Ordinal),
+                $"The log's command was said to have ended while it still ran: [{Text(console)}]");
+            string lines = StaysAsRead(view);
+
+            File.WriteAllText(release, string.Empty);
+            Ui.WaitFor(() => Text(console).Contains(LogEnded, StringComparison.Ordinal), () => $"the log's command said to have ended: [{Text(console)}]");
+            string read = Text(console);
+            Assert.True(read.StartsWith(lines, StringComparison.Ordinal) && read.Split('\n').Count(l => l.StartsWith("stopped line", StringComparison.Ordinal)) == 5,
+                $"The log's end took the place of what was read before it, [{lines}], where it was said beneath it: [{read}]");
+            StaysAsRead(view);
+        }
+        finally
+        {
+            window.Close();
+        }
+    }
+
+    /// <summary>What the Containers window's console says as a log's command ends.</summary>
+    private const string LogEnded = "Process finished with exit code 0.";
+
+    /// <summary>Has the window read the engine again twice, finding its log as it was read, and gives that log.</summary>
+    private static string StaysAsRead(ContainersView view)
+    {
+        OutputView console = view.Log.Console;
+        string read = Text(console);
+        int changes = 0;
+        console.Document.Changed += Count;
+        try
+        {
+            Ui.Await(view.RefreshAsync().ContinueWith(_ => true, TaskScheduler.Default), "the window's next read of the engine");
+            Ui.Await(view.RefreshAsync().ContinueWith(_ => true, TaskScheduler.Default), "the window's read after that");
+            Ui.Settle();
+        }
+        finally
+        {
+            console.Document.Changed -= Count;
+        }
+        Assert.True(changes == 0, $"The log changed {changes} times as the window read the engine again, from [{read}] to [{Text(console)}]");
+        return read;
+
+        void Count(object? sender, Passenger.Text.DocumentChangedEventArgs change) => changes++;
     }
 
     [AvaloniaFact]
@@ -1201,12 +1689,12 @@ public sealed class ContainersTests
     }
 
     /// <summary>A docker of the test's own, up or down as its <c>state</c> file says (held: down, its events kept until the
-    /// state changes), each command's first word written to <c>calls</c>: a Linux server at <paramref name="host"/> with no
-    /// Compose v2 or buildx, holding a container of a Compose project "shop" (service web, port 8080) and a stopped one whose
-    /// id begins as web's, its events going on while up, its logs and stats what <paramref name="logs"/> and <paramref
-    /// name="stats"/> write, and <paramref name="more"/> listed too (<c>docker ps</c> lines). The CLI and the state file.</summary>
+    /// state changes), each command's first word written to <c>calls</c>: a Linux server at <paramref name="host"/>, with Compose
+    /// v2 and buildx only where <paramref name="compose"/>, holding a Compose project "shop"'s web (port 8080) and a stopped
+    /// container whose id begins as web's, its events going on while up, its logs, stats and more <c>docker ps</c> lines as given,
+    /// its version said a second late where <paramref name="late"/>. The CLI and the state file.</summary>
     internal static (string Cli, string State) StandInEngine(string folder, bool up, string host = "unix:///nowhere/docker.sock",
-        string logs = "echo 'hello from the stand-in web'", string stats = "exit 1", IReadOnlyList<string>? more = null)
+        string logs = "echo 'hello from the stand-in web'", string stats = "exit 1", IReadOnlyList<string>? more = null, bool compose = false, bool late = false)
     {
         string state = Path.Combine(folder, "state");
         File.WriteAllText(state, up ? "up" : "down");
@@ -1218,16 +1706,18 @@ public sealed class ContainersTests
             "running=$(cat \"$here/state\")",
             "echo \"$1\" >> \"$here/calls\"",
             "case \"$1\" in",
-            "  version) if [ \"$running\" = up ]; then echo '{\"Client\":{\"Version\":\"29.0.0\",\"Context\":\"stand-in\"},\"Server\":{\"Version\":\"29.0.0\",\"Os\":\"linux\",\"Arch\":\"arm64\"}}'; exit 0; fi",
+            (late ? "  version) sleep 1; " : "  version) ") + "if [ \"$running\" = up ]; then echo '{\"Client\":{\"Version\":\"29.0.0\",\"Context\":\"stand-in\"},\"Server\":{\"Version\":\"29.0.0\",\"Os\":\"linux\",\"Arch\":\"arm64\"}}'; exit 0; fi",
             $"    echo '{{\"Client\":{{\"Version\":\"29.0.0\",\"Context\":\"stand-in\"}},\"Server\":null}}'; {Down} ;;",
             $"  context) echo '[{{\"Name\":\"stand-in\",\"Endpoints\":{{\"docker\":{{\"Host\":\"{host}\"}}}}}}]'; exit 0 ;;",
-            "  compose|buildx) echo \"docker: '$1' is not a docker command.\" >&2; exit 1 ;;",
+            .. compose
+                ? (string[])["  compose) [ \"$2\" = version ] && { echo '{\"version\":\"2.30.0\"}'; exit 0; } ;;", "  buildx) echo 'github.com/docker/buildx v0.19.0 stand-in'; exit 0 ;;"]
+                : ["  compose|buildx) echo \"docker: '$1' is not a docker command.\" >&2; exit 1 ;;"],
             "esac",
             "if [ \"$1\" = events ] && [ \"$running\" = held ]; then while [ \"$(cat \"$here/state\")\" = held ]; do sleep 0.2; done; echo events-ended >> \"$here/calls\"; fi",
             $"[ \"$running\" = up ] || {{ {Down}; }}",
             "case \"$1\" in",
-            "  ps) echo '{\"ID\":\"5a5d0c0ffee1\",\"Names\":\"shop-web-1\",\"Image\":\"busybox:1.37\",\"State\":\"running\",\"Status\":\"Up 5 minutes\",\"Ports\":\"0.0.0.0:8080->80/tcp\",\"Labels\":\"com.docker.compose.project=shop,com.docker.compose.service=web\"}'",
-            "    echo '{\"ID\":\"5a5d0c0ffee2\",\"Names\":\"solo\",\"Image\":\"busybox:1.37\",\"State\":\"exited\",\"Status\":\"Exited (0) 2 minutes ago\",\"Ports\":\"\",\"Labels\":\"\"}'",
+            "  ps) echo '{\"ID\":\"5a5d0c0ffee1\",\"Names\":\"shop-web-1\",\"Image\":\"busybox:1.38\",\"State\":\"running\",\"Status\":\"Up 5 minutes\",\"Ports\":\"0.0.0.0:8080->80/tcp\",\"Labels\":\"com.docker.compose.project=shop,com.docker.compose.service=web\"}'",
+            "    echo '{\"ID\":\"5a5d0c0ffee2\",\"Names\":\"solo\",\"Image\":\"busybox:1.38\",\"State\":\"exited\",\"Status\":\"Exited (0) 2 minutes ago\",\"Ports\":\"\",\"Labels\":\"\"}'",
             .. (more ?? []).Select(line => $"    echo '{line}'"),
             "    ;;",
             "  images|volume|network) ;;",

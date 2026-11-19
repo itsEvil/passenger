@@ -101,8 +101,7 @@ public abstract class Updater
     protected static async Task<(string Saved, string Sha256)> DownloadCheckedAsync(ReleasePackage package, string folder, Action<int> progress, CancellationToken cancel)
     {
         string name = package.Download.Name;
-        string expected = ReleaseSums.Of(await Releases.ReadTextAsync(package.Sums, cancel).ConfigureAwait(false), name)
-            ?? throw new UpdateRefusedException($"the release's {ReleaseSums.Name} gives no SHA-256 for {name}");
+        string expected = await SumAsync(package, cancel).ConfigureAwait(false);
         string saved = Path.Combine(folder, name);
         string actual = await Releases.DownloadAsync(package.Download, saved, progress, cancel).ConfigureAwait(false);
         if (actual != expected)
@@ -111,6 +110,12 @@ public abstract class Updater
         }
         return (saved, expected);
     }
+
+    /// <summary>The SHA-256 the release's SHA256SUMS gives its package for this system; an
+    /// <see cref="UpdateRefusedException"/> where it gives none.</summary>
+    protected static async Task<string> SumAsync(ReleasePackage package, CancellationToken cancel) =>
+        ReleaseSums.Of(await Releases.ReadTextAsync(package.Sums, cancel).ConfigureAwait(false), package.Download.Name)
+            ?? throw new UpdateRefusedException($"the release's {ReleaseSums.Name} gives no SHA-256 for {package.Download.Name}");
 
     /// <summary>The other Passenger processes whose executable is <paramref name="executable"/>, as the system names a
     /// process's executable, links resolved: the look of macOS and Linux.</summary>
@@ -131,17 +136,18 @@ public abstract class Updater
         return here;
     }
 
-    /// <summary>The Passengers but the agents' relays running from <paramref name="from"/>, named, for which the install of
-    /// <paramref name="version"/> waits, as the log says; null where none runs.</summary>
-    protected static string? WaitsFor(IReadOnlyList<OtherCopy> others, string version, string from)
+    /// <summary>Whether the Passengers but the agents' relays running from <paramref name="from"/> hold the install of
+    /// <paramref name="version"/> back, each named in the log and in why it did not install (<see cref="NotInstalled"/>).</summary>
+    protected bool HeldBack(IReadOnlyList<OtherCopy> others, string version, string from)
     {
         if (!others.Any(other => !other.Relay))
         {
-            return null;
+            return false;
         }
         string named = Listed(others.Where(other => !other.Relay));
         IdeErrors.Write($"Updates: Passenger {version} waits to install: another Passenger runs from {from}: {named}");
-        return named;
+        NotInstalled = $"another Passenger ran from {from} ({named})";
+        return true;
     }
 
     /// <summary>Removes a folder an update made, a failure logged.</summary>
@@ -157,24 +163,6 @@ public abstract class Updater
         catch (Exception error) when (error is IOException or UnauthorizedAccessException)
         {
             IdeErrors.Write($"Updates: {folder} could not be removed: {error.Message}");
-        }
-    }
-
-    /// <summary>Starts the install again through <paramref name="start"/> for Restart to Update, a failure logged.</summary>
-    protected void Restart(bool restart, Func<string, Task> start)
-    {
-        if (!restart)
-        {
-            return;
-        }
-        try
-        {
-            // As the process ends, after its last window: nothing is left to await it.
-            Synchronously.Run(() => start(Installed));
-        }
-        catch (Exception error) when (ChildFailures.Of(error))
-        {
-            IdeErrors.Write($"Updates: {Installed} could not be started again: {error.Message}");
         }
     }
 
@@ -326,7 +314,7 @@ public abstract class Updater
         }
         if (holding.Count > 0)
         {
-            IdeErrors.Write($"Updates: {Plural.Of(holding.Count, "agent's relay", "agents' relays")} did not let go of the app within {limit.TotalSeconds:0} s, and {Plural.Agreeing(holding.Count, "is", "are")} ended");
+            IdeErrors.Write($"Updates: {Plural.Of(holding.Count, "agent's relay", "agents' relays")} did not let go of the app within {Durations.Said(limit)}, and {Plural.Agreeing(holding.Count, "is", "are")} ended");
             EndRelays(holding, version);
         }
     }
@@ -388,7 +376,7 @@ public abstract class Updater
                     {
                         process.Kill();
                         process.WaitForExit(limit);
-                        how = $"killed, still running {limit.TotalSeconds:0} s after it was told to end";
+                        how = $"killed, still running {Durations.Said(limit)} after it was told to end";
                     }
                     IdeErrors.Write($"Updates: ended the agent's relay on {relay.Folder} (process {relay.ProcessId}) to install Passenger {version}: {how}");
                 }

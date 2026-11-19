@@ -1,6 +1,8 @@
+using System.Buffers.Binary;
 using System.Reflection.Metadata;
 using System.Text;
 using Microsoft.CodeAnalysis.CSharp;
+using Passenger.Dap;
 using Passenger.Debugger.ExpressionEvaluator;
 using Passenger.Debugger.ExpressionEvaluator.Cil;
 using Passenger.Debugger.Interop;
@@ -11,11 +13,11 @@ namespace Passenger.Debugger;
 /// gives them.</summary>
 public sealed record DebuggerDisplay(string Value, string? Name, string? Type);
 
-/// <summary>[DebuggerDisplay] rendered. The format is literal text and {fragments}, \{ and \} being braces; each
-/// fragment is an expression on the value, with format specifiers after its last top-level comma (",nq" leaves a string
-/// unquoted), and is evaluated on its own, so one that fails says so in its own place and the rest still shows. A
-/// fragment's value is formatted as the debugger formats any value: a string quoted, a value with its own display shown
-/// by it. The attribute is inherited, as it is declared to be.</summary>
+/// <summary>[DebuggerDisplay] rendered, its format read as a tracepoint's message is (<see cref="DisplayFormat"/>): each
+/// fragment is an expression on the value, evaluated on its own, so one that fails says so in its own place and the rest
+/// still shows. A fragment's value is formatted as the debugger formats any value, a string quoted, a value with its own
+/// display shown by it, then as its specifiers say (",nq" a string unquoted, ",h" a whole number in hexadecimal), as
+/// every debugger shows one (<see cref="DisplayFormat.Shown"/>). The attribute is inherited, as it is declared to be.</summary>
 public partial class ManagedDebugger
 {
     /// <summary>How deep displays inside displays go, before a value is shown by its type alone.</summary>
@@ -112,28 +114,18 @@ public partial class ManagedDebugger
         StringBuilder rendered = new();
         bool failed = false;
         string? loneType = null;
-        int i = 0;
-        while (i < format.Length)
+        IReadOnlyList<(string Text, bool Expression)> pieces = DisplayFormat.Pieces(format);
+        foreach ((string text, bool expression) in pieces)
         {
-            char c = format[i];
-            if (c == '\\' && i + 1 < format.Length && format[i + 1] is '{' or '}')
+            if (!expression)
             {
-                rendered.Append(format[i + 1]);
-                i += 2;
-            }
-            else if (c == '{' && FragmentEnd(format, i) is int end)
-            {
-                (string text, bool fragmentFailed, string? type) = await RenderFragmentAsync(format[(i + 1)..end], target, threadId, frameStackDepth, nesting);
                 rendered.Append(text);
-                failed |= fragmentFailed;
-                loneType = i == 0 && end == format.Length - 1 ? type : null;
-                i = end + 1;
+                continue;
             }
-            else
-            {
-                rendered.Append(c);
-                i++;
-            }
+            (string shown, bool fragmentFailed, string? type) = await RenderFragmentAsync(text, target, threadId, frameStackDepth, nesting);
+            rendered.Append(shown);
+            failed |= fragmentFailed;
+            loneType = pieces.Count == 1 ? type : null;
         }
         return (rendered.ToString(), failed, loneType);
     }
@@ -141,7 +133,7 @@ public partial class ManagedDebugger
     /// <summary>A fragment's text, whether it failed, and the type of the value it shows, where it shows one.</summary>
     private async Task<(string Text, bool Failed, string? Type)> RenderFragmentAsync(string fragment, ICorDebugValue? target, ThreadId threadId, FrameStackDepth frameStackDepth, int nesting)
     {
-        (string expression, IReadOnlyList<string> specifiers) = SplitSpecifiers(fragment);
+        (string expression, IReadOnlyList<string> specifiers) = DisplayFormat.Specifiers(fragment);
         if (expression.Length == 0)
         {
             return (string.Empty, false, null);
@@ -151,37 +143,74 @@ public partial class ManagedDebugger
         {
             CompiledExpressionEvaluationContext context = new(thread, threadId, frameStackDepth, target);
             using EvaluationResult result = await _expressionEvaluator!.Evaluate(expression, context);
-            // "nq" (no quotes) and "raw" (as it is, which CoreLib's spans use for their ToString()) show a string bare.
-            bool quoted = !specifiers.Contains("nq") && !specifiers.Contains("raw");
             if (result.Text is { } text)
             {
-                return (quoted ? SymbolDisplay.FormatLiteral(text, quote: true) : text, false, "string");
+                return (DisplayFormat.Shown(DisplayValue.OfText(text, SymbolDisplay.FormatLiteral(text, quote: true)), specifiers), false, "string");
             }
             if ((result.Error is not null || result.Value is null) && target is not null && IsDottedName(expression)
                 && await target.GetPropertyValue(ProcessRuntimeEventsUntilEvalEvent, EvalStatus, GetIlFrameForThreadIdAndStackDepth(threadId, frameStackDepth), expression) is { } implemented)
             {
                 // Roslyn's own types name an explicitly implemented property by its metadata name (System.Collections.ICollection.Count).
-                FormattedValue shown = await FormatCorDebugValueAsync(ResolveCorDebugValue(implemented), threadId, frameStackDepth, quoted, nesting + 1);
-                return (shown.Value, shown.ResultIsError, shown.FriendlyTypeName);
+                return await SpecifiedAsync(ResolveCorDebugValue(implemented));
             }
             if (result.Error is not null || result.Value is null)
             {
                 return ($"<error: {ShortError(result.Error)}>", true, null);
             }
-            FormattedValue formatted = await FormatCorDebugValueAsync(ResolveCorDebugValue(result.Value), threadId, frameStackDepth, quoted, nesting + 1);
-            return (formatted.Value, formatted.ResultIsError, formatted.FriendlyTypeName);
+            return await SpecifiedAsync(ResolveCorDebugValue(result.Value));
         }
         catch (Exception error) when (error is not OperationCanceledException)
         {
             return ($"<error: {ShortError(error.Message)}>", true, null);
         }
+
+        async Task<(string Text, bool Failed, string? Type)> SpecifiedAsync(ResolvedCorDebugValue value)
+        {
+            FormattedValue formatted = await FormatCorDebugValueAsync(value, threadId, frameStackDepth, true, nesting + 1);
+            return (DisplayFormat.Shown(Displayed(value.Value, formatted), specifiers), formatted.ResultIsError, formatted.FriendlyTypeName);
+        }
+    }
+
+    /// <summary>A fragment's value as every debugger tells one to its specifiers (<see cref="DisplayFormat.Shown"/>): a
+    /// string with its own text, a whole number of the program's integer types with its value and size, anything else as the
+    /// debugger formatted it.</summary>
+    private static DisplayValue Displayed(ICorDebugValue? value, FormattedValue formatted) => formatted.ResultIsError ? DisplayValue.Said(formatted.Value)
+        : value?.UnwrapDebugValue() switch
+        {
+            ICorDebugStringValue text => DisplayValue.OfText(text.String, formatted.Value),
+            ICorDebugGenericValue number when WholeOf(number) is { } whole => DisplayValue.OfWhole(whole, number.Size),
+            _ => DisplayValue.Said(formatted.Value),
+        };
+
+    /// <summary>The value of a whole number of one of the program's integer types (its native ones as wide as it holds them);
+    /// null for any other value.</summary>
+    private static Int128? WholeOf(ICorDebugGenericValue value)
+    {
+        if (value.Type is not (CorElementType.I1 or CorElementType.U1 or CorElementType.I2 or CorElementType.U2 or CorElementType.I4 or CorElementType.U4
+            or CorElementType.I8 or CorElementType.U8 or CorElementType.I or CorElementType.U))
+        {
+            return null;
+        }
+        byte[] bytes = value.GetValueAsBytes();
+        // Little-endian, as the runtime holds them on every processor it runs on.
+        return (value.Type, bytes.Length) switch
+        {
+            (CorElementType.I1, _) => (sbyte)bytes[0],
+            (CorElementType.U1, _) => bytes[0],
+            (CorElementType.I2, _) => BinaryPrimitives.ReadInt16LittleEndian(bytes),
+            (CorElementType.U2, _) => BinaryPrimitives.ReadUInt16LittleEndian(bytes),
+            (CorElementType.I4 or CorElementType.I, 4) => BinaryPrimitives.ReadInt32LittleEndian(bytes),
+            (CorElementType.U4 or CorElementType.U, 4) => BinaryPrimitives.ReadUInt32LittleEndian(bytes),
+            (CorElementType.I8 or CorElementType.I, _) => BinaryPrimitives.ReadInt64LittleEndian(bytes),
+            _ => BinaryPrimitives.ReadUInt64LittleEndian(bytes),
+        };
     }
 
     /// <summary>Whether a fragment is names joined by dots, as an explicitly implemented member's full name is.</summary>
     private static bool IsDottedName(string expression)
     {
         string[] parts = expression.Split('.');
-        return parts.Length > 1 && parts.All(p => p.Length > 0 && (char.IsLetter(p[0]) || p[0] == '_') && p.All(c => char.IsLetterOrDigit(c) || c == '_'));
+        return parts.Length > 1 && parts.All(p => p.Length > 0 && SyntaxFacts.IsIdentifierStartCharacter(p[0]) && p.All(SyntaxFacts.IsIdentifierPartCharacter));
     }
 
     /// <summary>The compiler's message without its code: "The name 'x' does not exist in the current context".</summary>
@@ -190,90 +219,5 @@ public partial class ManagedDebugger
         string text = error ?? "no value";
         int colon = text.IndexOf(": ", StringComparison.Ordinal);
         return colon > 0 && text.StartsWith("error", StringComparison.OrdinalIgnoreCase) ? text[(colon + 2)..] : text;
-    }
-
-    /// <summary>Where a fragment opened at <paramref name="open"/> closes, skipping braces nested in it
-    /// and anything inside quotes; null for one that never closes, which is then literal text.</summary>
-    private static int? FragmentEnd(string format, int open)
-    {
-        int depth = 0;
-        char? quote = null;
-        for (int i = open; i < format.Length; i++)
-        {
-            char c = format[i];
-            if (quote is { } q)
-            {
-                if (c == '\\')
-                {
-                    i++;
-                }
-                else if (c == q)
-                {
-                    quote = null;
-                }
-                continue;
-            }
-            switch (c)
-            {
-                case '"' or '\'':
-                    quote = c;
-                    break;
-                case '{':
-                    depth++;
-                    break;
-                case '}' when --depth == 0:
-                    return i;
-            }
-        }
-        return null;
-    }
-
-    /// <summary>A fragment's expression and the format specifiers after its last comma that is outside
-    /// brackets and quotes: "Items.Count, d" is the count, in decimal.</summary>
-    private static (string Expression, IReadOnlyList<string> Specifiers) SplitSpecifiers(string fragment)
-    {
-        int depth = 0;
-        char? quote = null;
-        int comma = -1;
-        for (int i = 0; i < fragment.Length; i++)
-        {
-            char c = fragment[i];
-            if (quote is { } q)
-            {
-                if (c == '\\')
-                {
-                    i++;
-                }
-                else if (c == q)
-                {
-                    quote = null;
-                }
-                continue;
-            }
-            switch (c)
-            {
-                case '"' or '\'':
-                    quote = c;
-                    break;
-                case '(' or '[' or '{' or '<':
-                    depth++;
-                    break;
-                case ')' or ']' or '}' or '>':
-                    depth--;
-                    break;
-                case ',' when depth == 0:
-                    comma = i;
-                    break;
-            }
-        }
-        if (comma < 0)
-        {
-            return (fragment.Trim(), []);
-        }
-        string[] specifiers = fragment[(comma + 1)..].Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
-        // Only words are specifiers: "a, b" in a call's arguments never reaches here, but "x, 2" is not one either.
-        return specifiers.All(s => s.All(char.IsAsciiLetterOrDigit) && char.IsAsciiLetter(s[0]))
-            ? (fragment[..comma].Trim(), specifiers)
-            : (fragment.Trim(), []);
     }
 }

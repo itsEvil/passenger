@@ -65,7 +65,7 @@ public sealed class HierarchyView : DockPanel
     private const int ExpandAllDepth = 5;
 
     private readonly TreeRows<HierarchyRow> rows = [];
-    private readonly ListBox list;
+    private readonly TreeList list;
     private readonly TextBlock title;
     private readonly ToggleButton first;
     private readonly ToggleButton second;
@@ -79,26 +79,25 @@ public sealed class HierarchyView : DockPanel
 
     public HierarchyView()
     {
-        title = new TextBlock { VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(8, 0), FontWeight = FontWeight.SemiBold, TextTrimming = TextTrimming.CharacterEllipsis };
+        title = new TextBlock { VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(Gaps.Normal, 0), FontWeight = FontWeight.SemiBold, TextTrimming = TextTrimming.CharacterEllipsis };
         first = Toggle();
         second = Toggle();
         first.Click += (_, _) => IdeErrors.Observe(ChooseAsync(first: true));
         second.Click += (_, _) => IdeErrors.Observe(ChooseAsync(first: false));
         DockPanel top = new();
-        StackPanel toggles = new() { Orientation = Orientation.Horizontal, Spacing = 2, Margin = new Thickness(8, 0), VerticalAlignment = VerticalAlignment.Center, Children = { first, second } };
+        StackPanel toggles = new() { Orientation = Orientation.Horizontal, Spacing = Gaps.Hair, Margin = new Thickness(Gaps.Normal, 0), VerticalAlignment = VerticalAlignment.Center, Children = { first, second } };
         DockPanel.SetDock(toggles, Dock.Right);
         top.Children.Add(toggles);
         top.Children.Add(title);
         bar = ToolBars.Top(top);
         bar.IsVisible = false;
         Children.Add(bar);
-        list = new ListBox
+        list = new TreeList
         {
             Classes = { StyleClasses.Tree },
             ItemsSource = rows,
         };
         ReusedRows.Use(list, Row);
-        list.DoubleTapped += (_, _) => Go();
         TreeKeys.Attach<HierarchyRow>(list, Toggle, row =>
         {
             GoToRequested?.Invoke(this, row.Node);
@@ -269,23 +268,15 @@ public sealed class HierarchyView : DockPanel
     /// <summary>A row opened or closed is the one chosen.</summary>
     private void Choose(HierarchyRow row) => list.SelectedItem = row;
 
-    private void Go()
-    {
-        if (list.SelectedItem is HierarchyRow row)
-        {
-            GoToRequested?.Invoke(this, row.Node);
-        }
-    }
-
     /// <summary>A row for whichever symbol the list hands its container: its chevron, name, and what and where it is.</summary>
     private Control Row()
     {
-        RowIcon chevron = new() { Width = 10, Height = 10, Margin = new Thickness(0, 0, 4, 0) };
+        RowIcon chevron = new() { Width = 10, Height = 10, Margin = new Thickness(0, 0, Gaps.Tight, 0) };
         TextBlock name = new() { VerticalAlignment = VerticalAlignment.Center };
         TextBlock detail = new()
         {
             VerticalAlignment = VerticalAlignment.Center,
-            Margin = new Thickness(10, 0, 0, 0),
+            Margin = new Thickness(Gaps.Wide, 0, 0, 0),
             FontSize = 12,
             TextTrimming = TextTrimming.CharacterEllipsis,
         };
@@ -301,7 +292,7 @@ public sealed class HierarchyView : DockPanel
         };
         return line.Showing<HierarchyRow>(row =>
         {
-            line.Margin = new Thickness(8 + (row.Depth * 16), 0, 8, 0);
+            line.Margin = new Thickness(Gaps.Normal + (row.Depth * Gaps.Indent), 0, Gaps.Normal, 0);
             chevron.IsVisible = row.Expands;
             chevron.DataKey = row.IsExpanded ? IconKeys.ChevronDown : IconKeys.ChevronRight;
             name.Text = row.Node.Item.Name;
@@ -311,5 +302,5 @@ public sealed class HierarchyView : DockPanel
     }
 
     // As wide as its words: an option toggle is otherwise an icon's square.
-    private static ToggleButton Toggle() => new() { Classes = { StyleClasses.Option }, FontSize = 12, Width = double.NaN, Padding = new Thickness(8, 2) };
+    private static ToggleButton Toggle() => new() { Classes = { StyleClasses.Option }, FontSize = 12, Width = double.NaN, Padding = new Thickness(Gaps.Normal, Gaps.Hair) };
 }

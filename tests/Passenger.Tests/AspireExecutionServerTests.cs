@@ -185,6 +185,66 @@ public sealed class AspireExecutionServerTests
     }
 
     [Fact]
+    public async Task An_azure_functions_launch_is_offered_and_reaches_the_launch_callback_as_a_functions_app_with_its_overlays()
+    {
+        TaskCompletionSource<AspireProjectLaunch> launched = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        await using AspireExecutionServer server = await AspireExecutionServer.StartAsync((launch, _) =>
+        {
+            launched.TrySetResult(launch);
+            return Task.FromResult(new AspireProjectSession(launch.SessionId, 42));
+        }, (_, _) => Task.CompletedTask, Cancel);
+        using (JsonDocument info = JsonDocument.Parse(server.SessionInfo))
+        {
+            Assert.Equal(["project", FunctionsHost.LaunchType], JsonMembers.Items(info.RootElement, "supported_launch_configurations").Select(e => e.GetString()));
+        }
+        string functions = JsonSerializer.Serialize(new
+        {
+            launch_configurations = new[] { new { type = FunctionsHost.LaunchType, project_path = Path.GetFullPath("Fn.csproj"), mode = "Debug" } },
+            env = new[] { new { name = "FUNCTIONS_WORKER_RUNTIME", value = "dotnet-isolated" } },
+            args = new[] { "--port", "7071" },
+        });
+        using ClientWebSocket notifications = await Subscribe(server);
+        await Create(server, body: functions);
+        AspireProjectLaunch launch = await launched.Task.WaitAsync(Limit, Cancel);
+        notifications.Abort();
+        Assert.True(launch.Functions, "An azure-functions launch reached the callback as a project's");
+        Assert.Equal(Path.GetFullPath("Fn.csproj"), launch.ProjectPath);
+        Assert.Equal("Debug", launch.Mode);
+        Assert.Equal(["--port", "7071"], launch.Arguments);
+        Assert.Equal("dotnet-isolated", Assert.Single(launch.Environment).Value);
+    }
+
+    /// <summary>DCP connects to localhost, which it may try first as IPv6's loopback: the server holds its port there too,
+    /// so no other program can listen on it and be handed the token, and a request there is the server's.</summary>
+    [Fact]
+    public async Task The_servers_port_is_its_own_on_both_loopbacks_where_DCP_may_connect()
+    {
+        using (TcpListener probe = new(IPAddress.IPv6Loopback, 0))
+        {
+            try
+            {
+                probe.Start();
+            }
+            catch (SocketException none)
+            {
+                Assert.Skip($"This machine has no IPv6 loopback for another program to listen on: {none.SocketErrorCode}");
+            }
+        }
+        await using AspireExecutionServer server = await AspireExecutionServer.StartAsync(
+            (launch, _) => Task.FromResult(new AspireProjectSession(launch.SessionId, 7)), (_, _) => Task.CompletedTask, Cancel);
+        Assert.Equal($"localhost:{server.Port}", server.Environment[AspireVariables.DebugSessionPort]);
+
+        using TcpListener other = new(IPAddress.IPv6Loopback, server.Port);
+        SocketException taken = Assert.Throws<SocketException>(other.Start);
+        Assert.Equal(SocketError.AddressAlreadyInUse, taken.SocketErrorCode);
+        using TcpClient client = new(AddressFamily.InterNetworkV6);
+        await client.ConnectAsync(IPAddress.IPv6Loopback, server.Port, Cancel).AsTask().WaitAsync(Limit, Cancel);
+        using Wire wire = new(client);
+        await wire.Write(Head(server, "GET", "/info", ""));
+        Assert.Equal(200, await wire.Status());
+    }
+
+    [Fact]
     public async Task Committed_201_survives_normal_HTTP_close_and_remains_instance_owned()
     {
         ConcurrentQueue<string> stopped = new();

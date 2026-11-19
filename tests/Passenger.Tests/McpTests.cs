@@ -19,7 +19,8 @@ namespace Passenger.Tests;
 
 /// <summary>Passenger as an agent's IDE with no window (<c>--mcp</c>), over the Model Context Protocol with the SDK's own
 /// client: a project worked through it (its tests, packages, actions, publish, Git and the terminal), a folder given it in
-/// other letter case, and a start or a load that runs long.</summary>
+/// other letter case, a start or a load that runs long, and an assembly written into .NET's packs that no project references,
+/// which the language server never hears of.</summary>
 public sealed class McpTests : McpRig, IClassFixture<RestoredFolders>
 {
     public McpTests(RestoredFolders folders)
@@ -54,6 +55,71 @@ public sealed class McpTests : McpRig, IClassFixture<RestoredFolders>
         Assert.True(wrong.IsError == true && Text(wrong).Contains("there are passed, failed, skipped and notRun", StringComparison.Ordinal), $"tests_list in no state answered: {Text(wrong)}");
     }
 
+    /// <summary>Roslyn's server watches the packs folder of the .NET that DOTNET_ROOT names every .dll at once, and told of
+    /// any .dll written there runs every project's source generators again, as installing a workload writes thousands: here
+    /// a .NET whose packs folder is the test's own, holding a pack of its own beside links to the machine's packs, the rest
+    /// of it the machine's through links. An assembly written there that no project references never reaches the server,
+    /// and one the project references, written after it, does.</summary>
+    [Fact]
+    public async Task An_assembly_written_into_the_packs_folder_that_no_project_references_never_reaches_the_language_server()
+    {
+        string root = PathNames.Canonical(TestFolders.Create("dotnet-root-"));
+        DeleteAtEnd(root);
+        string pack = Directory.CreateDirectory(Path.Combine(root, "packs", "Passenger.Test.Pack", "1.0.0")).FullName;
+        try
+        {
+            foreach (string entry in Directory.EnumerateFileSystemEntries(Dotnet.Root()).Where(e => Path.GetFileName(e) != "packs"))
+            {
+                string link = Path.Combine(root, Path.GetFileName(entry));
+                if (Directory.Exists(entry))
+                {
+                    Directory.CreateSymbolicLink(link, entry);
+                }
+                else
+                {
+                    File.CreateSymbolicLink(link, entry);
+                }
+            }
+            // Windows' MSBuild takes the SDK through DOTNET_ROOT's links unresolved, so its targeting packs are found here.
+            foreach (string machines in Directory.EnumerateDirectories(Path.Combine(Dotnet.Root(), "packs")))
+            {
+                Directory.CreateSymbolicLink(Path.Combine(root, "packs", Path.GetFileName(machines)), machines);
+            }
+        }
+        catch (Exception error) when (error is IOException or UnauthorizedAccessException)
+        {
+            Assert.Skip($"A .NET of the test's own takes links to the machine's, which this account may not make: {error.Message}");
+        }
+        string referenced = Path.Combine(pack, "Referenced.dll");
+        File.Copy(typeof(PathNames).Assembly.Location, referenced);
+        string folder = PathNames.Canonical(TestFolders.Create("mcp-packs-"));
+        DeleteAtEnd(folder);
+        TestFolders.Write(folder, "App.csproj", TestProjects.Console().With(
+            $"  <ItemGroup>\n    <Reference Include=\"Referenced\">\n      <HintPath>{Passenger.Text.XmlEntities.Encode(referenced)}</HintPath>\n    </Reference>\n  </ItemGroup>\n"));
+        TestFolders.Write(folder, "Program.cs", "System.Console.WriteLine(typeof(Passenger.Core.PathNames).Name);\n");
+        await Restore.RunAsync(Path.Combine(folder, "App.csproj"));
+
+        await using McpClient client = await Start(["--mcp", folder], environment: new() { [RuntimeVariables.Root] = root });
+        await Call(client, McpTools.SettingsSet, new() { ["changes"] = new Dictionary<string, object> { ["traceProtocols"] = true } });
+        JsonElement found = await Call(client, McpTools.Diagnostics, new() { ["path"] = "Program.cs" });
+        Assert.True(!found.EnumerateArray().Any(d => d.GetProperty("severity").GetString() == "error"), $"The app referencing the pack's assembly has errors: {found}");
+        string packs = Path.Combine(root, "packs");
+        string log = Path.Combine(OwnState, "logs", "passenger.log");
+        await Until(() => File.Exists(log) && Ui.Shared(log).Contains($"the watcher of {packs} records", StringComparison.Ordinal),
+            $"the language server's registration of {packs} to be watched whole for it and its first walk done");
+
+        File.WriteAllBytes(Path.Combine(pack, "Unreferenced.dll"), File.ReadAllBytes(referenced));
+        File.Copy(typeof(PathNames).Assembly.Location, referenced, overwrite: true);
+        File.SetLastWriteTimeUtc(referenced, DateTime.UtcNow);
+        string trace = Path.Combine(OwnState, "logs", "lsp.log");
+        await Until(() => Told(trace, "/Referenced.dll") > 0, "the language server to be told of the referenced assembly written again");
+        Assert.True(Told(trace, "/Unreferenced.dll") == 0,
+            $"The language server was told of an assembly written into {packs} that no project references, so it ran every project's source generators again");
+
+        static int Told(string trace, string file) => Ui.Shared(trace).Split('\n').Count(l => l.Contains("] --> ", StringComparison.Ordinal)
+            && l.Contains($"\"method\":\"{Passenger.Lsp.LspMethods.DidChangeWatchedFiles}\"", StringComparison.Ordinal) && l.Contains(file + "\"", StringComparison.Ordinal));
+    }
+
     /// <summary>A project whose global.json asks for a .NET SDK that is not installed: workspace says so and how the person
     /// mends it, and run refuses in the same words rather than finding no executable project.</summary>
     [Fact]
@@ -74,6 +140,112 @@ public sealed class McpTests : McpRig, IClassFixture<RestoredFolders>
         Assert.True(run.IsError == true && Text(run).Contains(Missing, StringComparison.Ordinal), $"run without the SDK answered: {Text(run)}");
     }
 
+    /// <summary>An agent's own Passenger trusts the folder it was started on, since the agent runs there already: it says
+    /// so in its instructions and in workspace, and runs the folder's code without asking.</summary>
+    [Fact]
+    public async Task An_agents_own_Passenger_trusts_the_folder_it_was_started_on_and_says_so()
+    {
+        string folder = PathNames.Canonical(TestFolders.Create("mcp-trusted-"));
+        DeleteAtEnd(folder);
+        File.WriteAllText(Path.Combine(folder, "App.csproj"), TestProjects.Console());
+        File.WriteAllText(Path.Combine(folder, "Program.cs"), "System.Console.WriteLine(\"App\");\n");
+        await using McpClient client = await Start(["--mcp", folder], languageServer: false);
+        Assert.True(client.ServerInstructions?.Contains("trusts the folder it was started on", StringComparison.Ordinal) == true,
+            $"The server's instructions leave out that an agent's own Passenger trusts its folder: {client.ServerInstructions}");
+        JsonElement workspace = await Call(client, McpTools.Workspace);
+        Assert.True(workspace.TryGetProperty("trust", out JsonElement trust) && trust.GetString() == "trusted", $"workspace on an agent's own Passenger's folder answered: {workspace}");
+    }
+
+    /// <summary>The code tools asked of a folder whose projects have no SDK to load with, its language server ready with
+    /// none of their code: each says so, why and what mends it, as workspace does, never an empty answer.</summary>
+    [Fact]
+    public async Task An_agent_whose_projects_have_no_SDK_hears_why_from_each_code_tool_rather_than_nothing_found()
+    {
+        string folder = PathNames.Canonical(TestFolders.Create("mcp-no-sdk-code-"));
+        DeleteAtEnd(folder);
+        File.WriteAllText(Path.Combine(folder, "global.json"), MissingSdkTests.Pinned);
+        File.WriteAllText(Path.Combine(folder, "Lib.csproj"), TestProjects.Library());
+        File.WriteAllText(Path.Combine(folder, "Greeter.cs"), Greeter);
+        File.WriteAllText(Path.Combine(folder, "Caller.cs"), Caller);
+        await using McpClient client = await Start(["--mcp", folder]);
+        JsonElement workspace = await Call(client, McpTools.Workspace);
+        Assert.True(workspace.TryGetProperty("sdkMissing", out _), $"workspace, where global.json asks for an SDK not installed, answered: {workspace}");
+        const string Missing = "The folder's projects are not loaded, so the C# language server has none of their code to search or read: "
+            + "The .NET SDK 1.0.100 that global.json asks for is not installed";
+        foreach ((string tool, Dictionary<string, object?> arguments) in CodeAsks("Greeter.cs", "Caller.cs"))
+        {
+            CallToolResult answer = await Result(client, tool, arguments);
+            Assert.True(answer.IsError == true && Text(answer).Contains(Missing, StringComparison.Ordinal),
+                $"{tool} {JsonSerializer.Serialize(arguments)}, of a project with no SDK to load with, answered: {Text(answer)}");
+        }
+    }
+
+    /// <summary>The code tools asked of a project the language server met an error loading (its file cut off before its
+    /// end) say it did not load and why, beside a project that loaded, which answers as ever.</summary>
+    [Fact]
+    public async Task An_agent_asking_of_a_project_that_did_not_load_hears_why_and_the_loaded_one_answers()
+    {
+        string folder = PathNames.Canonical(TestFolders.Create("mcp-unloaded-"));
+        DeleteAtEnd(folder);
+        TestFolders.Write(folder, "Good/Good.csproj", TestProjects.Library());
+        TestFolders.Write(folder, "Good/Fine.cs", "namespace Good;\n\npublic class Fine\n{\n}\n");
+        TestFolders.Write(folder, "Bad/Bad.csproj", TestProjects.Library().Replace("</Project>", string.Empty, StringComparison.Ordinal));
+        TestFolders.Write(folder, "Bad/Greeter.cs", Greeter);
+        TestFolders.Write(folder, "Bad/Caller.cs", Caller);
+        await using McpClient client = await Start(["--mcp", folder]);
+        JsonElement fine = Assert.Single((await Call(client, McpTools.FindSymbol, new() { ["query"] = "Fine" })).EnumerateArray());
+        Assert.Equal(Path.Combine("Good", "Fine.cs"), fine.GetProperty("path").GetString());
+        foreach ((string tool, Dictionary<string, object?> arguments) in CodeAsks("Bad/Greeter.cs", "Bad/Caller.cs"))
+        {
+            CallToolResult answer = await Result(client, tool, arguments);
+            string said = Text(answer);
+            string[] why = arguments.ContainsKey("query") || arguments.ContainsKey("symbol")
+                ? ["Greeter, but the C# language server met errors loading ", "whose code it may not hold: ", "Bad: "]
+                : ["Bad did not load into the C# language server, which holds none of its code to answer from: "];
+            Assert.True(answer.IsError == true && why.All(w => said.Contains(w, StringComparison.Ordinal)), $"{tool} {JsonSerializer.Serialize(arguments)}, of a project that did not load, answered: {said}");
+        }
+    }
+
+    /// <summary>An agent's change of a project file, through edit or written by its own file tool, then at once a question
+    /// whose answer is what the project compiles now (a folder it removed no longer removed, a symbol it defines): the
+    /// project is evaluated anew and the language server's load of it again waited for, so find_symbol finds what the change
+    /// brought in.</summary>
+    [Fact]
+    public async Task An_agents_question_after_its_change_of_a_project_file_waits_for_the_project_to_load_again()
+    {
+        string folder = PathNames.Canonical(TestFolders.Create("mcp-reloaded-"));
+        DeleteAtEnd(folder);
+        TestFolders.Write(folder, "Lib/Lib.csproj", TestProjects.Library().With("  <ItemGroup>\n    <Compile Remove=\"Extra/**\" />\n  </ItemGroup>\n"));
+        TestFolders.Write(folder, "Lib/Fine.cs", "namespace Lib;\n\npublic class Fine\n{\n}\n\n#if PASSENGER_GATED\npublic class Gated\n{\n}\n#endif\n");
+        TestFolders.Write(folder, "Lib/Extra/Helper.cs", "namespace Lib;\n\npublic static class Helper\n{\n    public static string Help() => \"help\";\n}\n");
+        await using McpClient client = await Start(["--mcp", folder]);
+        Assert.Single((await Call(client, McpTools.FindSymbol, new() { ["query"] = "Fine", ["exact"] = true })).EnumerateArray());
+
+        await Call(client, McpTools.Edit, new() { ["path"] = "Lib/Lib.csproj", ["oldText"] = "    <Compile Remove=\"Extra/**\" />\n", ["newText"] = string.Empty });
+        JsonElement helper = Assert.Single((await Call(client, McpTools.FindSymbol, new() { ["query"] = "Helper", ["exact"] = true })).EnumerateArray());
+        Assert.Equal(Path.Combine("Lib", "Extra", "Helper.cs"), helper.GetProperty("path").GetString());
+
+        TestFolders.Write(folder, "Lib/Lib.csproj", TestProjects.Library("<DefineConstants>$(DefineConstants);PASSENGER_GATED</DefineConstants>"));
+        JsonElement gated = Assert.Single((await Call(client, McpTools.FindSymbol, new() { ["query"] = "Gated", ["exact"] = true })).EnumerateArray());
+        Assert.Equal(Path.Combine("Lib", "Fine.cs"), gated.GetProperty("path").GetString());
+    }
+
+    private const string Greeter = "namespace Lib;\n\npublic class Greeter\n{\n    public string Greet(string name) => \"Hello, \" + name;\n}\n";
+
+    private const string Caller = "namespace Lib;\n\npublic static class Caller\n{\n    public static string Call() => new Greeter().Greet(\"you\");\n}\n";
+
+    /// <summary>Each code tool that reads a project's code, asked of <see cref="Greeter"/> and <see cref="Caller"/> in the files given.</summary>
+    private static IEnumerable<(string Tool, Dictionary<string, object?> Arguments)> CodeAsks(string greeter, string caller) =>
+    [
+        (McpTools.FindSymbol, new() { ["query"] = "Greeter" }),
+        (McpTools.Usages, new() { ["symbol"] = "Greeter" }),
+        (McpTools.Usages, new() { ["path"] = greeter, ["line"] = 3, ["column"] = 14 }),
+        (McpTools.Definition, new() { ["path"] = caller, ["line"] = 5, ["column"] = 42 }),
+        (McpTools.Outline, new() { ["path"] = greeter }),
+        (McpTools.Hierarchy, new() { ["path"] = greeter, ["line"] = 5, ["column"] = 19 }),
+        (McpTools.SymbolInfo, new() { ["path"] = greeter, ["line"] = 5, ["column"] = 19 }),
+    ];
+
     /// <summary>An agent holds modifiers by the keymap's words and the aliases agents write (command, opt, win, super), in
     /// any case, and primary; a word of none is refused naming those there are, before any key is pressed.</summary>
     [Fact]
@@ -92,6 +264,49 @@ public sealed class McpTests : McpRig, IClassFixture<RestoredFolders>
         CallToolResult refused = await Result(client, McpTools.AppKey, new() { ["app"] = "ide", ["keys"] = "hyper+F24" });
         Assert.True(refused.IsError == true && Text(refused).Contains("No modifier 'hyper': there are ctrl, shift, alt, cmd (meta) and primary", StringComparison.Ordinal),
             $"app_key with a modifier of no name answered: {Text(refused)}");
+    }
+
+    /// <summary>An agent's primary is the command key Passenger's keymap takes on the system it runs on, Cmd on a Mac and
+    /// Ctrl elsewhere, in a Passenger drawn on no screen as on one: primary+shift+A opens Find Action.</summary>
+    [Fact]
+    public async Task An_agents_primary_is_the_command_key_of_passengers_keymap_on_its_system_so_primary_shift_A_opens_find_action()
+    {
+        string folder = PathNames.Canonical(TestFolders.Create("mcp-primary-"));
+        DeleteAtEnd(folder);
+        File.WriteAllText(Path.Combine(folder, "Notes.txt"), "one\n");
+        await using McpClient client = await Start(["--mcp", folder], languageServer: false);
+        Dictionary<string, object?> findAction = new() { ["app"] = "ide", ["filter"] = "ActionPopup" };
+        string before = Text(await Call(client, McpTools.AppTree, findAction));
+        Assert.StartsWith("Nothing in Passenger matches ActionPopup", before, StringComparison.Ordinal);
+
+        string pressed = Text(await Call(client, McpTools.AppKey, new() { ["app"] = "ide", ["keys"] = "primary+shift+A" }));
+        string found = before;
+        Assert.True(await Waiting.UntilAsync(async () => !(found = Text(await Call(client, McpTools.AppTree, findAction))).StartsWith("Nothing in", StringComparison.Ordinal),
+            TimeSpan.FromMinutes(1), Cancel, TimeSpan.FromMilliseconds(100)),
+            $"primary+shift+A, the keymap's Find Action with {(OperatingSystem.IsMacOS() ? "Cmd" : "Ctrl")} as primary, did not open it ({pressed}): {found}");
+        Assert.Contains("ActionPopup", found, StringComparison.Ordinal);
+    }
+
+    /// <summary>A text box of a Passenger drawn on no screen takes the hotkeys of the system it runs on, as one on the screen
+    /// does: an agent's primary+A in Find Action's search selects what it typed there for the next key to replace.</summary>
+    [Fact]
+    public async Task An_agents_primary_A_in_a_text_box_of_a_passenger_drawn_on_no_screen_selects_its_text_for_the_next_key_to_replace()
+    {
+        string folder = PathNames.Canonical(TestFolders.Create("mcp-select-all-"));
+        DeleteAtEnd(folder);
+        File.WriteAllText(Path.Combine(folder, "Notes.txt"), "one\n");
+        await using McpClient client = await Start(["--mcp", folder], languageServer: false);
+        Dictionary<string, object?> findAction = new() { ["app"] = "ide", ["filter"] = "ActionPopup" };
+        await Call(client, McpTools.AppKey, new() { ["app"] = "ide", ["keys"] = "primary+shift+A" });
+        string found = string.Empty;
+        Assert.True(await Waiting.UntilAsync(async () => !(found = Text(await Call(client, McpTools.AppTree, findAction))).StartsWith("Nothing in", StringComparison.Ordinal),
+            TimeSpan.FromMinutes(1), Cancel, TimeSpan.FromMilliseconds(100)), $"primary+shift+A did not open Find Action: {found}");
+
+        string typed = Text(await Call(client, McpTools.AppType, new() { ["app"] = "ide", ["text"] = "Settings" }));
+        Assert.True(typed.Contains("it shows \"Settings\"", StringComparison.Ordinal), $"Typing into Find Action's search did not reach it: {typed}");
+        string replaced = Text(await Call(client, McpTools.AppKey, new() { ["app"] = "ide", ["keys"] = "primary+A G" }));
+        Assert.True(replaced.Contains("it shows \"g\"", StringComparison.Ordinal),
+            $"primary+A, {(CommandKey.IsCmd ? "Cmd" : "Ctrl")}+A, did not select Find Action's search for G to replace, as the system's own Select All does: {replaced}");
     }
 
     /// <summary>A folder whose .slnx does not read: workspace names it with where its reader stopped and why, and no
@@ -332,6 +547,42 @@ public sealed class McpTests : McpRig, IClassFixture<RestoredFolders>
         Assert.False(log.Contains("at design time in", StringComparison.Ordinal), $"The window built the folder's project at design time again once built:\n{log}");
     }
 
+    /// <summary>An agent's own Passenger whose settings trace the protocols writes the language server it started ahead of
+    /// its window to lsp.log from that server's start: the initialize it was sent, the project it was given to load, and its
+    /// word that the project loaded.</summary>
+    [Fact]
+    public async Task An_agents_own_passenger_tracing_by_its_settings_traces_the_server_started_ahead_of_its_window_from_its_start()
+    {
+        string folder = PathNames.Canonical(await TakeFolderAsync());
+        File.WriteAllText(Path.Combine(OwnState, Passenger.App.State.StateStore.SettingsFile), new System.Text.Json.Nodes.JsonObject
+        {
+            ["version"] = AppSettings.Upgrades.Count,
+            ["traceProtocols"] = true,
+        }.ToJsonString());
+        await using McpClient client = await Start(["--mcp", folder]);
+        string answered = (await Call(client, McpTools.SymbolInfo, new() { ["path"] = "Helper.cs", ["line"] = 3, ["column"] = 23 })).GetString()!;
+        Assert.StartsWith("int Helper.Twice(int value)", answered, StringComparison.Ordinal);
+
+        string logged = Path.Combine(OwnState, "logs", "passenger.log");
+        string log = string.Empty;
+        await Until(() => (log = Ui.Shared(logged)).Contains($"started ahead taken up for {folder}", StringComparison.Ordinal),
+            "the log to say the window took up the language server started ahead");
+        string server = Regex.Match(log, $@"C# language server \(process (\d+)\) started ahead for {Regex.Escape(folder)} ").Groups[1].Value;
+        string trace = Path.Combine(OwnState, "logs", "lsp.log");
+        // lsp.log is written a moment after its lines come.
+        Assert.True(await Waiting.UntilAsync(() => Traced("<--", Passenger.Lsp.LspMethods.ProjectInitializationComplete), TimeSpan.FromSeconds(10).Scaled(), Cancel),
+            $"lsp.log lacks the word of the language server started ahead (process {server}) that its project loaded:\n{Head()}");
+        Assert.True(Traced("-->", Passenger.Lsp.LspMethods.Initialize),
+            $"lsp.log lacks the initialize sent to the language server started ahead (process {server}), so whoever reads it misses how that server started:\n{Head()}");
+        Assert.True(Traced("-->", Passenger.Roslyn.Extension.ProjectMethods.Load),
+            $"lsp.log lacks the project the language server started ahead (process {server}) was given to load:\n{Head()}");
+
+        string[] Lines() => File.Exists(trace) ? Ui.Shared(trace).Split('\n') : [];
+        bool Traced(string direction, string method) => server.Length > 0 && Lines().Any(l =>
+            l.Contains($"[server {server}] {direction} ", StringComparison.Ordinal) && l.Contains($"\"method\":\"{method}\"", StringComparison.Ordinal));
+        string Head() => string.Join('\n', Lines().Take(20).Select(l => l.Length > 300 ? l[..300] + "…" : l));
+    }
+
     /// <summary>An agent's own Passenger, its window built over the folder's head start as <c>--mcp</c> builds it, whose
     /// settings as its C# starts are not the defaults the server started ahead has (solution-wide analysis turned on before
     /// its projects were found) takes that server up, telling it the settings, and starts no second one: Problems' Solution
@@ -382,14 +633,18 @@ public sealed class McpTests : McpRig, IClassFixture<RestoredFolders>
         await Call(client, McpTools.SettingsSet, new() { ["changes"] = new Dictionary<string, object> { ["solutionWideAnalysis"] = true } });
         await Call(client, McpTools.Open, new() { ["path"] = folder });
 
-        const string still = "Still loading 1 project after 2 seconds; the language server's log says where it is";
+        const string still = "Still loading 1 project after 2 s; the language server's log says where it is";
         string state = string.Empty;
         Assert.True(await Waiting.UntilAsync(async () => (state = await LanguageServerState(client)) == still, TimeSpan.FromMinutes(2), Cancel, TimeSpan.FromMilliseconds(100)),
             $"The language server's state past the limit was not that it is still loading but \"{state}\".{Said()}");
         string status = Text(await Call(client, McpTools.AppTree, new() { ["app"] = "ide", ["filter"] = "#StatusText" }));
         Assert.True(status.Contains(still, StringComparison.Ordinal), $"The status bar did not warn that the load runs long: {status}");
+        // Asked while the projects load, the code tools wait for them rather than answer from none.
+        Task<JsonElement> twice = Call(client, McpTools.FindSymbol, new() { ["query"] = "Twice" });
 
         ReleaseDesignTimeBuilds(folder);
+        JsonElement found = Assert.Single((await twice).EnumerateArray());
+        Assert.True(found.GetProperty("path").GetString() == "Helper.cs", $"find_symbol asked as the projects loaded answered once they had: {found}");
         Assert.True(await Waiting.UntilAsync(async () => (state = await LanguageServerState(client)) == "ready", TimeSpan.FromMinutes(2), Cancel, TimeSpan.FromMilliseconds(100)),
             $"The language server was not ready once its load ended past the limit: \"{state}\".{Said()}");
         status = Text(await Call(client, McpTools.AppTree, new() { ["app"] = "ide", ["filter"] = "#StatusText" }));
@@ -410,7 +665,7 @@ public sealed class McpTests : McpRig, IClassFixture<RestoredFolders>
         HoldDesignTimeBuilds(folder);
         await using McpClient client = await Start(["--mcp", folder], environment: new() { [global::Passenger.App.CSharp.CSharpService.SlowLoadVariable] = "2000" });
 
-        const string still = "Still starting C# for 1 project after 2 seconds, waiting for its design-time builds";
+        const string still = "Still starting C# for 1 project after 2 s, waiting for its design-time builds";
         string state = string.Empty;
         Assert.True(await Waiting.UntilAsync(async () => (state = await LanguageServerState(client)) == still, TimeSpan.FromMinutes(2), Cancel, TimeSpan.FromMilliseconds(100)),
             $"The language server's state past the limit was not that it is still starting but \"{state}\".{Said()}");
@@ -443,7 +698,7 @@ public sealed class McpTests : McpRig, IClassFixture<RestoredFolders>
         {
             Assert.True(await Waiting.Within(passenger.WaitForExitAsync(Cancel), TimeSpan.FromMinutes(3), Cancel), $"The screenshot of a folder whose load runs long never ended.{Said()}");
             string said = Ui.Shared(Path.Combine(OwnState, "logs", "passenger.log"));
-            Assert.True(said.Contains("had not loaded 1 project after 2 seconds, and goes on loading it", StringComparison.Ordinal), $"The load was never said to run long.{Said()}");
+            Assert.True(said.Contains("had not loaded 1 project after 2 s, and goes on loading it", StringComparison.Ordinal), $"The load was never said to run long.{Said()}");
             Assert.True(passenger.ExitCode == 0 && File.Exists(picture),
                 $"The screenshot of a folder whose load was said to run long ended with exit code {passenger.ExitCode}, the load holding background work past its warning.{Said()}");
         }
@@ -506,6 +761,64 @@ public sealed class McpTests : McpRig, IClassFixture<RestoredFolders>
             $"The program wrote caf\u00e9 1\u202f234,5 \u6f22 but its run answered something else: {ran.GetProperty("output").GetString()}");
     }
 
+    /// <summary>An agent's run of a program reading a key, which refuses the Run window's pipe, answers that it needs a
+    /// terminal and how to give it one; run with terminal true then runs it in a Terminal tab, where it reads the key the
+    /// agent types there, and the configuration keeps running there.</summary>
+    [Fact]
+    public async Task An_agents_run_of_a_program_needing_a_terminal_says_so_and_terminal_true_runs_it_in_one()
+    {
+        await TakeFolderAsync();
+        Write("Program.cs", "Console.WriteLine(\"key?\");\nConsoleKeyInfo key = Console.ReadKey(intercept: true);\nConsole.WriteLine($\"key {key.KeyChar}\");\n");
+        await using McpClient client = await Start(["--mcp", Folder], languageServer: false);
+        JsonElement ran = await Call(client, McpTools.Run, new() { ["waitSeconds"] = 60 });
+        string status = ran.GetProperty("status").GetString()!;
+        Assert.True(status.EndsWith($". Sum needs a terminal for Console.ReadKey: the Run window gives it pipes: {McpTools.Run} with terminal true runs it in a Terminal tab", StringComparison.Ordinal),
+            $"The run of a program refusing the Run window's pipe did not say it needs a terminal: {ran}");
+
+        JsonElement inTerminal = await Call(client, McpTools.Run, new() { ["terminal"] = true, ["waitSeconds"] = 5 });
+        Assert.True(inTerminal.GetProperty("stillRunning").GetBoolean(), $"The program did not wait for a key in the terminal: {inTerminal}");
+        string typed = Text(await Result(client, McpTools.TerminalRun, new() { ["command"] = "q", ["waitSeconds"] = 30 }));
+        JsonElement output = await Call(client, McpTools.Output, new() { ["of"] = "run" });
+        Assert.True(output.GetString()?.Contains("key q", StringComparison.Ordinal) == true, $"The program in the terminal did not read the key typed there ({typed}): {output}");
+        JsonElement again = await Call(client, McpTools.Run, new() { ["waitSeconds"] = 5 });
+        Assert.True(again.GetProperty("stillRunning").GetBoolean() && again.GetProperty("status").GetString()?.Contains("needs a terminal", StringComparison.Ordinal) == false,
+            $"The configuration did not keep running in the terminal: {again}");
+    }
+
+    /// <summary>An agent's profile of a program reading a key, which refuses the Run window's pipe, answers that it needs a
+    /// terminal and how to give it one, and its debug_start stops at the exception and answers so there; debug_start with
+    /// terminal true then debugs it in a Terminal tab, where it reads the key the agent types there with debug_input, and
+    /// profile with terminal true profiles it there as it waits for its key.</summary>
+    [Fact]
+    public async Task An_agents_debug_start_of_a_program_needing_a_terminal_says_so_at_its_stop_and_terminal_true_debugs_it_in_one()
+    {
+        await TakeFolderAsync();
+        Write("Program.cs", "Console.WriteLine(\"key?\");\nConsoleKeyInfo key = Console.ReadKey(intercept: true);\nConsole.WriteLine($\"key {key.KeyChar}\");\n");
+        await using McpClient client = await Start(["--mcp", Folder], languageServer: false);
+        JsonElement profiled = await Call(client, McpTools.Profile);
+        Assert.True(profiled.TryGetProperty("needsTerminal", out JsonElement need) && need.GetString() ==
+            $"Sum needs a terminal for Console.ReadKey: the Run window gives it pipes: {McpTools.Profile} with terminal true profiles it in a Terminal tab",
+            $"The profile of a program refusing the Run window's pipe did not say it needs a terminal: {profiled}");
+
+        JsonElement stopped = await Call(client, McpTools.DebugStart, new() { ["waitSeconds"] = 60 });
+        Assert.True(stopped.GetProperty("state").GetString() == "paused" && stopped.GetProperty("status").GetString()?.EndsWith(
+            $". Sum needs a terminal for Console.ReadKey: the Debug window gives it pipes: {McpTools.DebugStart} with terminal true debugs it in a Terminal tab", StringComparison.Ordinal) == true,
+            $"The stop of a program refusing the Debug window's pipe did not say it needs a terminal: {stopped}");
+
+        JsonElement inTerminal = await Call(client, McpTools.DebugStart, new() { ["terminal"] = true, ["waitSeconds"] = 5 });
+        Assert.True(inTerminal.GetProperty("state").GetString() == "running", $"The program did not wait for a key in the terminal: {inTerminal}");
+        string typed = Text(await Result(client, McpTools.DebugInput, new() { ["text"] = "q", ["newline"] = false }));
+        string shown = string.Empty;
+        Assert.True(await Waiting.UntilAsync(async () => (shown = (await Call(client, McpTools.Output, new() { ["of"] = "debug" })).GetString() ?? string.Empty).Contains("key q", StringComparison.Ordinal),
+            TimeSpan.FromSeconds(30), Cancel, TimeSpan.FromMilliseconds(100)), $"The program debugged in the terminal did not read the key typed there ({typed}): {shown}");
+        Assert.StartsWith("Sum, debugged", shown, StringComparison.Ordinal);
+
+        JsonElement waiting = await Call(client, McpTools.Profile, new() { ["seconds"] = 2, ["terminal"] = true });
+        Assert.True(waiting.GetProperty("samples").GetInt32() > 0 && !waiting.TryGetProperty("needsTerminal", out _),
+            $"The profile of the program in the terminal as it waited for its key took no samples, or said it needs a terminal: {waiting}");
+        await Call(client, McpTools.Stop);
+    }
+
     /// <summary>A run refused for a reason of its own (here a launch profile's command named RetryFailed, which Passenger does
     /// not run) is answered with that reason alone, though the last build's errors are still in Problems; a run refused for
     /// the build it ran failing still names them.</summary>
@@ -531,6 +844,34 @@ public sealed class McpTests : McpRig, IClassFixture<RestoredFolders>
         CallToolResult sum = await Result(client, McpTools.Run, new() { ["configuration"] = "Sum" });
         Assert.True(sum.IsError == true && Text(sum).Contains($"{code} ", StringComparison.Ordinal) && Text(sum).Contains("Program.cs:1:", StringComparison.Ordinal),
             $"A run refused for its own build's failure did not name that build's error: {Text(sum)}");
+    }
+
+    /// <summary>An agent's run or debug_start of another configuration that is refused (a launch profile of a command
+    /// Passenger does not run) leaves the window's chosen configuration as it was, so the agent's next call and the person's
+    /// Run act on the one they chose; a run that starts chooses its configuration, as a person's Run does.</summary>
+    [Fact]
+    public async Task An_agents_refused_run_of_another_configuration_leaves_the_chosen_one_and_a_started_run_chooses_its_own()
+    {
+        await TakeFolderAsync();
+        Write("Program.cs", "Console.WriteLine(\"ran\");\n");
+        Directory.CreateDirectory(Path.Combine(Folder, "Properties"));
+        File.WriteAllText(Path.Combine(Folder, "Properties", "launchSettings.json"),
+            "{\n  \"profiles\": {\n    \"First\": { \"commandName\": \"Project\" },\n    \"Again\": { \"commandName\": \"Project\" },\n    \"Jobs\": { \"commandName\": \"RetryFailed\" }\n  }\n}\n");
+        await using McpClient client = await Start(["--mcp", Folder], languageServer: false);
+        async Task<string?> ChosenAsync() => (await Call(client, McpTools.Workspace)).GetProperty("chosenConfiguration").GetString();
+        string? chosen = await ChosenAsync();
+        Assert.True(chosen is not null && chosen != "Sum: Jobs" && chosen != "Sum: Again", $"The folder opened on {chosen} chosen");
+
+        CallToolResult ran = await Result(client, McpTools.Run, new() { ["configuration"] = "Sum: Jobs" });
+        Assert.True(ran.IsError == true, $"The run of a profile Passenger does not run was answered: {Text(ran)}");
+        Assert.Equal(chosen, await ChosenAsync());
+        CallToolResult debugged = await Result(client, McpTools.DebugStart, new() { ["configuration"] = "Sum: Jobs" });
+        Assert.True(debugged.IsError == true, $"The debugged start of a profile Passenger does not run was answered: {Text(debugged)}");
+        Assert.Equal(chosen, await ChosenAsync());
+
+        JsonElement again = await Call(client, McpTools.Run, new() { ["configuration"] = "Sum: Again", ["waitSeconds"] = 60 });
+        Assert.True(again.GetProperty("output").GetString()?.Contains("ran\n", StringComparison.Ordinal) == true, $"The profile's run did not print its line: {again}");
+        Assert.Equal("Sum: Again", await ChosenAsync());
     }
 
     /// <summary>An agent's run of a web app, which serves until it is stopped, answers once the app's host has started,
@@ -601,6 +942,160 @@ public sealed class McpTests : McpRig, IClassFixture<RestoredFolders>
         Assert.True(!remove.TryGetProperty("version", out JsonElement left) || left.ValueKind == JsonValueKind.Null, $"nuget_install with remove answered a version: {remove}");
         string removed = (await Call(client, McpTools.EditorText, project)).GetString()!;
         Assert.False(removed.Contains("Passenger.Sample", StringComparison.Ordinal), $"nuget_install with remove answered with the open project file still holding the package:\n{removed}");
+    }
+
+    /// <summary>nuget_search names, of each package found, its newest version and those the projects have that the stand-in
+    /// feed's VulnerabilityInfo says are vulnerable or its registration says their owner deprecated, with why, what to use
+    /// instead and the projects that have them, so an agent knows before it installs; a package with neither says none.</summary>
+    [Fact]
+    public async Task An_agents_package_search_names_the_vulnerable_and_deprecated_versions_with_why()
+    {
+        const string Advisory = "https://github.com/advisories/GHSA-pass-mcp0-test";
+        string folder = PathNames.Canonical(TestFolders.Create("mcp-nuget-deprecated-"));
+        DeleteAtEnd(folder);
+        await using StandInFeed feed = new();
+        feed.Add("Passenger.Legacy", "1.0.0");
+        feed.Add("Passenger.Legacy", "2.0.0");
+        feed.Add("Passenger.Modern", "2.0.0");
+        feed.Advise("Passenger.Legacy", 2, Advisory, "[1.0.0, 1.0.1)");
+        feed.Deprecate("Passenger.Legacy", "1.0.0", ["Legacy"], "Kept no more.", "Passenger.Modern", "[2.0.0, )");
+        feed.Deprecate("Passenger.Legacy", "2.0.0", ["CriticalBugs"], "Broken past repair.");
+        File.WriteAllText(Path.Combine(folder, "nuget.config"), $"""
+            <configuration>
+              <packageSources>
+                <clear />
+                <add key="stand-in" value="{feed.Index}" protocolVersion="3" allowInsecureConnections="true" />
+              </packageSources>
+              <auditSources>
+                <clear />
+                <add key="stand-in" value="{feed.Index}" allowInsecureConnections="true" />
+              </auditSources>
+              <config>
+                <add key="globalPackagesFolder" value="packages" />
+              </config>
+            </configuration>
+            """);
+        File.WriteAllText(Path.Combine(folder, "Lib.csproj"),
+            TestProjects.Library().With("  <ItemGroup>\n    <PackageReference Include=\"Passenger.Legacy\" Version=\"1.0.0\" />\n  </ItemGroup>\n"));
+        await using McpClient client = await Start(["--mcp", folder], languageServer: false);
+
+        JsonElement[] found = [.. (await Call(client, McpTools.NugetSearch, new() { ["query"] = "Passenger" })).EnumerateArray()];
+        JsonElement legacy = Assert.Single(found, p => p.GetProperty("id").GetString() == "Passenger.Legacy");
+        Assert.Equal([$"1.0.0 (Lib): high severity, {Advisory}"], Texts(legacy, "vulnerable"));
+        Assert.Equal(["2.0.0: critical bugs; Broken past repair.", "1.0.0 (Lib): legacy, no longer maintained; use Passenger.Modern 2.0.0 or later instead; Kept no more."],
+            Texts(legacy, "deprecated"));
+        JsonElement modern = Assert.Single(found, p => p.GetProperty("id").GetString() == "Passenger.Modern");
+        Assert.True(Texts(modern, "vulnerable").Length == 0 && Texts(modern, "deprecated").Length == 0 && Texts(modern, "unknown").Length == 0,
+            $"nuget_search said Passenger.Modern, which nothing advises against or deprecates, was: {modern.GetRawText()}");
+
+        static string[] Texts(JsonElement package, string member) =>
+            !package.TryGetProperty(member, out JsonElement said) || said.ValueKind == JsonValueKind.Null ? []
+            : said.ValueKind == JsonValueKind.Array ? [.. said.EnumerateArray().Select(t => t.GetString()!)]
+            : [said.GetString()!];
+    }
+
+    /// <summary>nuget_install of a version the stand-in feed's VulnerabilityInfo says is vulnerable and its registration says
+    /// its owner deprecated puts it in and says both as nuget_search does, the gravest advisory with the least version above
+    /// it that none affects, and why, what to use instead and the owner's words; moved to a version with neither, it says none.</summary>
+    [Fact]
+    public async Task An_agents_package_install_of_a_vulnerable_and_deprecated_version_says_both_and_the_version_that_fixes_it()
+    {
+        const string Advisory = "https://github.com/advisories/GHSA-pass-mcp1-test";
+        string folder = PathNames.Canonical(TestFolders.Create("mcp-nuget-install-warned-"));
+        DeleteAtEnd(folder);
+        await using StandInFeed feed = new();
+        feed.Add("Passenger.Legacy", "1.0.0");
+        feed.Add("Passenger.Legacy", "1.0.1");
+        feed.Add("Passenger.Legacy", "2.0.0");
+        feed.Advise("Passenger.Legacy", 2, Advisory, "[1.0.0, 1.0.1)");
+        feed.Deprecate("Passenger.Legacy", "1.0.0", ["Legacy"], "Kept no more.", "Passenger.Modern", "[2.0.0, )");
+        File.WriteAllText(Path.Combine(folder, "nuget.config"), $"""
+            <configuration>
+              <packageSources>
+                <clear />
+                <add key="stand-in" value="{feed.Index}" protocolVersion="3" allowInsecureConnections="true" />
+              </packageSources>
+              <auditSources>
+                <clear />
+                <add key="stand-in" value="{feed.Index}" allowInsecureConnections="true" />
+              </auditSources>
+              <config>
+                <add key="globalPackagesFolder" value="packages" />
+              </config>
+            </configuration>
+            """);
+        File.WriteAllText(Path.Combine(folder, "Lib.csproj"), TestProjects.Library());
+        await using McpClient client = await Start(["--mcp", folder], languageServer: false);
+
+        JsonElement installed = await Call(client, McpTools.NugetInstall, new() { ["project"] = "Lib", ["id"] = "Passenger.Legacy", ["version"] = "1.0.0" });
+        Assert.Equal("1.0.0", installed.GetProperty("version").GetString());
+        Assert.Equal([$"high severity, {Advisory}; fixed in 1.0.1"], Said(installed, "vulnerable"));
+        Assert.Equal(["legacy, no longer maintained; use Passenger.Modern 2.0.0 or later instead; Kept no more."], Said(installed, "deprecated"));
+
+        JsonElement moved = await Call(client, McpTools.NugetInstall, new() { ["project"] = "Lib", ["id"] = "Passenger.Legacy", ["version"] = "2.0.0" });
+        Assert.True(moved.GetProperty("version").GetString() == "2.0.0" && Said(moved, "vulnerable").Length == 0 && Said(moved, "deprecated").Length == 0
+            && Said(moved, "unknown").Length == 0, $"nuget_install of Passenger.Legacy 2.0.0, which nothing advises against or deprecates, answered: {moved.GetRawText()}");
+
+        static string[] Said(JsonElement change, string member) =>
+            !change.TryGetProperty(member, out JsonElement said) || said.ValueKind == JsonValueKind.Null ? [] : [said.GetString()!];
+    }
+
+    /// <summary>A project built for two frameworks that gets a vulnerable version through another package in one: an agent
+    /// finds it among the project file's diagnostics on what brings it in, is offered its fix there among code_actions, and
+    /// nuget_install with that framework references the fixed version there alone, the other framework's reference as it
+    /// was, as the NuGet window's Fix does; a framework the project is not built for is refused, naming those it is.</summary>
+    [Fact]
+    public async Task An_agents_install_for_one_framework_fixes_the_vulnerable_version_it_gets_through_another_package_there_alone()
+    {
+        const string Advisory = "https://github.com/advisories/GHSA-pass-mcp2-test";
+        string folder = PathNames.Canonical(TestFolders.Create("mcp-nuget-framework-"));
+        DeleteAtEnd(folder);
+        await using StandInFeed feed = new();
+        feed.Add("Passenger.Sample", "1.0.0");
+        feed.Add("Passenger.Sample", "1.0.1");
+        feed.Add("Passenger.Charts", "1.0.0", ("Passenger.Sample", "1.0.0"));
+        feed.Advise("Passenger.Sample", 1, Advisory, "[1.0.0, 1.0.1)");
+        File.WriteAllText(Path.Combine(folder, "nuget.config"), $"""
+            <configuration>
+              <packageSources>
+                <clear />
+                <add key="stand-in" value="{feed.Index}" protocolVersion="3" allowInsecureConnections="true" />
+              </packageSources>
+              <auditSources>
+                <clear />
+                <add key="stand-in" value="{feed.Index}" allowInsecureConnections="true" />
+              </auditSources>
+              <config>
+                <add key="globalPackagesFolder" value="packages" />
+              </config>
+            </configuration>
+            """);
+        string own = "  <ItemGroup Condition=\"'$(TargetFramework)' == 'net11.0'\">\n    <PackageReference Include=\"Passenger.Sample\" Version=\"1.0.1\" />\n  </ItemGroup>\n";
+        string lib = Path.Combine(folder, "Lib.csproj");
+        File.WriteAllText(lib, $"<Project Sdk=\"Microsoft.NET.Sdk\">\n  <PropertyGroup>\n    <TargetFrameworks>net11.0;{TestProjects.Framework}</TargetFrameworks>\n  </PropertyGroup>\n"
+            + "  <ItemGroup>\n    <PackageReference Include=\"Passenger.Charts\" Version=\"1.0.0\" />\n  </ItemGroup>\n" + own + "</Project>\n");
+        await Restore.RunAsync(lib);
+        await using McpClient client = await Start(["--mcp", folder], languageServer: false);
+
+        JsonElement[] found = [.. (await Call(client, McpTools.Diagnostics, new() { ["path"] = "Lib.csproj" })).EnumerateArray()];
+        Assert.True(found.Any(f => f.GetProperty("code").GetString() == "NU1902" && f.GetProperty("line").GetInt32() == 6),
+            $"diagnostics of Lib.csproj leave out the vulnerable Passenger.Sample 1.0.0 that Passenger.Charts brings in for {TestProjects.Framework}: "
+            + string.Join("; ", found.Select(f => f.GetRawText())));
+        string[] offered = [.. (await Call(client, McpTools.CodeActions, new() { ["path"] = "Lib.csproj", ["line"] = 6, ["column"] = 32 })).EnumerateArray().Select(a => a.GetString()!)];
+        Assert.True(offered.Any(a => a.StartsWith($"Reference Passenger.Sample's fixed version for {TestProjects.Framework}", StringComparison.Ordinal)),
+            $"code_actions at Passenger.Charts' reference offer [{string.Join("; ", offered)}], not the fix of what it brings in");
+
+        CallToolResult refused = await Result(client, McpTools.NugetInstall,
+            new() { ["project"] = "Lib", ["id"] = "Passenger.Sample", ["version"] = "1.0.1", ["framework"] = "net9.0" });
+        Assert.True(refused.IsError == true && Text(refused).Contains($"Lib is not built for net9.0: it builds for net11.0 and {TestProjects.Framework}", StringComparison.Ordinal),
+            $"nuget_install for a framework Lib is not built for answered: {Text(refused)}");
+        JsonElement installed = await Call(client, McpTools.NugetInstall,
+            new() { ["project"] = "Lib", ["id"] = "Passenger.Sample", ["version"] = "1.0.1", ["framework"] = TestProjects.Framework });
+        string text = File.ReadAllText(lib);
+        Assert.True(installed.GetProperty("changed").EnumerateArray().Select(c => c.GetString()).Contains("Lib.csproj") && text.Contains(own, StringComparison.Ordinal)
+            && text.Contains($"  <ItemGroup Condition=\"'$(TargetFramework)' == '{TestProjects.Framework}'\">\n    <PackageReference Include=\"Passenger.Sample\" Version=\"1.0.1\" />\n",
+                StringComparison.Ordinal),
+            $"nuget_install for {TestProjects.Framework} answered {installed.GetRawText()}, leaving Lib.csproj as:\n{text}");
     }
 
     /// <summary>In a project that restores with a lock file, the files nuget_install names are all it changed: the lock file
@@ -779,8 +1274,8 @@ public sealed class McpTests : McpRig, IClassFixture<RestoredFolders>
     }
 
     /// <summary>Two terminal commands an agent sends at once take turns in the Agent Shell, each answer holding its own
-    /// command's output and none of the other's; and settings_set refuses a shell path that names no program, as Settings
-    /// does, nothing changed, the Agent Shell still taking commands.</summary>
+    /// command's output and none of the other's; and settings_set refuses an agent the shell's path, the person's alone,
+    /// nothing changed, the Agent Shell still taking commands.</summary>
     [Fact]
     public async Task An_agents_terminal_commands_sent_at_once_take_turns_each_answering_its_own_output()
     {
@@ -798,11 +1293,101 @@ public sealed class McpTests : McpRig, IClassFixture<RestoredFolders>
             $"The agent's second command, sent beside another, answered what was not its own:\n{second}");
 
         CallToolResult refused = await Result(client, McpTools.SettingsSet, new() { ["changes"] = new Dictionary<string, object> { ["terminalShell"] = "\"\"" } });
-        Assert.True(refused.IsError == true && Text(refused).Contains("Shell path \"\" (Settings | Terminal) names no program to start", StringComparison.Ordinal),
-            $"settings_set of a shell path naming no program answered: {Text(refused)}");
+        Assert.True(refused.IsError == true && Text(refused).Contains("terminalShell names a program Passenger runs, or code it loads: the person sets it in Settings", StringComparison.Ordinal),
+            $"settings_set of the shell's path, the person's alone, answered: {Text(refused)}");
         JsonElement shell = (await Call(client, McpTools.Settings)).GetProperty("settings").EnumerateArray().Single(s => s.GetProperty("name").GetString() == "terminalShell");
         Assert.True(shell.GetProperty("value").ValueKind == JsonValueKind.Null, $"The refused shell path was kept all the same: {shell.GetRawText()}");
         Assert.Contains("gamma", (await Call(client, McpTools.TerminalRun, new() { ["command"] = "echo gamma" })).GetString()!, StringComparison.Ordinal);
+    }
+
+    /// <summary>What a program and a terminal say reaches an agent with its secrets masked by the one rule: a password a
+    /// program writes and a token the folder's .env holds, in run's answer and output of run, and a password a command
+    /// echoes and that token, in terminal_run's answer and output of terminal, each shown as the mask, the rest as written.</summary>
+    [Fact]
+    public async Task What_a_program_and_a_terminal_say_reaches_an_agent_with_its_secrets_masked()
+    {
+        const string Password = "hunter2-from-the-program";
+        const string Token = "tok-from-the-env-file-0123";
+        const string Typed = "hunter3-typed-in-the-terminal";
+        await TakeFolderAsync();
+        Write(".env", $"SHOP_API_TOKEN={Token}\n");
+        Write("Program.cs", $"Console.WriteLine(\"connecting with Password={Password}\");\nConsole.WriteLine(\"the token is {Token}\");\n");
+        await using McpClient client = await Start(["--mcp", Folder], languageServer: false);
+        JsonElement ran = await Call(client, McpTools.Run, new() { ["waitSeconds"] = 60 });
+        string output = ran.GetProperty("output").GetString()!;
+        string console = (await Call(client, McpTools.Output, new() { ["of"] = "run" })).GetString()!;
+        foreach ((string what, string said) in (ReadOnlySpan<(string, string)>)[(McpTools.Run, output), ($"{McpTools.Output} of run", console)])
+        {
+            Assert.True(said.Contains($"connecting with Password={ContainerSecrets.Masked}\n", StringComparison.Ordinal)
+                && said.Contains($"the token is {ContainerSecrets.Masked}\n", StringComparison.Ordinal)
+                && !said.Contains(Password, StringComparison.Ordinal) && !said.Contains(Token, StringComparison.Ordinal),
+                $"{what} gave an agent the program's secrets: {said}");
+        }
+
+        string echoed = (await Call(client, McpTools.TerminalRun, new() { ["command"] = $"echo DB_PASSWORD={Typed} {Token}" })).GetString()!;
+        string screen = (await Call(client, McpTools.Output, new() { ["of"] = "terminal" })).GetString()!;
+        foreach ((string what, string said) in (ReadOnlySpan<(string, string)>)[(McpTools.TerminalRun, echoed), ($"{McpTools.Output} of terminal", screen)])
+        {
+            Assert.True(said.Contains($"DB_PASSWORD={ContainerSecrets.Masked}", StringComparison.Ordinal)
+                && !said.Contains(Typed, StringComparison.Ordinal) && !said.Contains(Token, StringComparison.Ordinal),
+                $"{what} gave an agent the terminal's secrets: {said}");
+        }
+    }
+
+    /// <summary>A Passenger makes the state it keeps the person's alone as it starts, where an earlier one left it open to
+    /// every user: the state folder and its logs 0700, a log written before 0600, the folder's Local History store 0700
+    /// with each folder and file it held put right, and the version of a .env it keeps from then on 0600.</summary>
+    [Fact]
+    public async Task The_state_its_logs_and_local_history_are_made_the_persons_alone_as_passenger_starts()
+    {
+        if (OperatingSystem.IsWindows())
+        {
+            Assert.Skip("Windows keeps the state under the person's profile, theirs alone already, and has no file modes");
+            return;
+        }
+        const UnixFileMode Folder = UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute;
+        const UnixFileMode File = UnixFileMode.UserRead | UnixFileMode.UserWrite;
+        const UnixFileMode Others = UnixFileMode.GroupRead | UnixFileMode.OtherRead;
+        string folder = PathNames.Canonical(TestFolders.Create("mcp-own-state-"));
+        DeleteAtEnd(folder);
+        System.IO.File.WriteAllText(Path.Combine(folder, ".env"), "SHOP_API_TOKEN=tok-before\n");
+        string state = PathNames.Canonical(OwnState);
+        string logs = Path.Combine(state, "logs");
+        string history = Path.Combine(global::Passenger.App.State.ProjectState.FolderOf(state, folder), "localHistory");
+        string earlier = Path.Combine(history, "blobs", "ab", new string('c', 30));
+        Directory.CreateDirectory(logs);
+        Directory.CreateDirectory(Path.GetDirectoryName(earlier)!);
+        System.IO.File.WriteAllText(Path.Combine(logs, "passenger.1.log"), "an earlier start's log\n");
+        System.IO.File.WriteAllText(earlier, "an earlier version\n");
+        foreach (string made in (string[])[state, logs, history, Path.GetDirectoryName(earlier)!])
+        {
+            System.IO.File.SetUnixFileMode(made, Folder | Others | UnixFileMode.GroupExecute | UnixFileMode.OtherExecute);
+        }
+        foreach (string written in (string[])[Path.Combine(logs, "passenger.1.log"), earlier])
+        {
+            System.IO.File.SetUnixFileMode(written, File | Others);
+        }
+
+        await using McpClient client = await Start(["--mcp", folder], languageServer: false);
+        await Call(client, McpTools.Edit, new() { ["path"] = ".env", ["oldText"] = "tok-before", ["newText"] = "tok-after" });
+        string blobs = Path.Combine(history, "blobs");
+        // A version is written beside its place first, under a name of its own ending in .tmp.
+        IEnumerable<string> Kept() => Directory.EnumerateFiles(blobs, "*", SearchOption.AllDirectories).Where(f => f != earlier && !f.EndsWith(AtomicFile.Temporary, StringComparison.Ordinal));
+        Assert.True(await Waiting.UntilAsync(() => Kept().Any(), TimeSpan.FromSeconds(30), Cancel), "Local History kept no version of the .env the agent edited");
+        string kept = Kept().First();
+        Assert.True(await Waiting.UntilAsync(() => System.IO.File.Exists(Path.Combine(logs, "passenger.log")), TimeSpan.FromSeconds(30), Cancel), "The Passenger wrote no log");
+        List<string> open = [];
+        foreach ((string path, UnixFileMode own) in (ReadOnlySpan<(string, UnixFileMode)>)[(state, Folder), (logs, Folder), (history, Folder), (blobs, Folder),
+            (Path.GetDirectoryName(earlier)!, Folder), (Path.GetDirectoryName(kept)!, Folder), (Path.Combine(logs, "passenger.1.log"), File),
+            (Path.Combine(logs, "passenger.log"), File), (earlier, File), (kept, File), (Path.Combine(history, "changes.log"), File)])
+        {
+            UnixFileMode mode = System.IO.File.GetUnixFileMode(path);
+            if (mode != own)
+            {
+                open.Add($"{path} ({mode})");
+            }
+        }
+        Assert.True(open.Count == 0, $"The state is not the person's alone: {string.Join("; ", open)}");
     }
 
     /// <summary>settings names the fonts an agent may give the editor briefly, the carried one, and the window's, the carried
@@ -839,6 +1424,83 @@ public sealed class McpTests : McpRig, IClassFixture<RestoredFolders>
             $"settings_set of a window font not installed answered: {Text(missing)}");
         JsonElement system = Assert.Single((await Call(client, McpTools.SettingsSet, new() { ["changes"] = new Dictionary<string, object> { ["windowFontFamily"] = WindowFontNames.SystemUi } })).EnumerateArray());
         Assert.Equal(WindowFontNames.SystemUi, system.GetProperty("after").GetString());
+    }
+
+    /// <summary>settings lists the Ctrl keys Vim mode may give the keymap, saying what each does on either side; settings_set
+    /// gives one to the keymap as Settings does and refuses a key Vim mode has no say over, nothing changed.</summary>
+    [Fact]
+    public async Task Settings_lists_the_ctrl_keys_vim_mode_may_give_the_keymap_and_settings_set_gives_one_as_settings_does()
+    {
+        string folder = TestFolders.Create("mcp-vimkeys-");
+        DeleteAtEnd(folder);
+        await using McpClient client = await Start(["--mcp", folder], languageServer: false);
+        JsonElement listed = (await Call(client, McpTools.Settings)).GetProperty("settings").EnumerateArray().Single(s => s.GetProperty("name").GetString() == "vimKeysToKeymap");
+        Assert.True(listed.GetProperty("choices").EnumerateArray().Select(c => c.GetString()).SequenceEqual([VimKeys.CtrlR, VimKeys.CtrlV, VimKeys.CtrlO, VimKeys.CtrlI]),
+            $"settings listed Vim mode's Ctrl keys as: {listed.GetRawText()}");
+        Assert.True(listed.GetProperty("note").GetString()!.Contains("<C-v> (Vim mode: Visual block mode; keymap: ", StringComparison.Ordinal),
+            $"settings said nothing of what each Ctrl key does on either side: {listed.GetRawText()}");
+
+        CallToolResult refused = await Result(client, McpTools.SettingsSet, new() { ["changes"] = new Dictionary<string, object> { ["vimKeysToKeymap"] = "<C-v> <C-x>" } });
+        Assert.True(refused.IsError == true && Text(refused).Contains("Vim mode's Ctrl keys (Settings | Editor) has no key <C-x>", StringComparison.Ordinal),
+            $"settings_set of a Ctrl key Vim mode does not give answered: {Text(refused)}");
+        JsonElement changed = Assert.Single((await Call(client, McpTools.SettingsSet, new() { ["changes"] = new Dictionary<string, object> { ["vimKeysToKeymap"] = "<C-o> <C-v>" } })).EnumerateArray());
+        Assert.True((changed.GetProperty("before").GetString(), changed.GetProperty("after").GetString()) == ("", "<C-o> <C-v>")
+            && (!changed.TryGetProperty("note", out JsonElement note) || note.ValueKind == JsonValueKind.Null),
+            $"settings_set giving the keymap Ctrl+O and Ctrl+V answered: {changed.GetRawText()}");
+        JsonElement read = (await Call(client, McpTools.Settings)).GetProperty("settings").EnumerateArray().Single(s => s.GetProperty("name").GetString() == "vimKeysToKeymap");
+        Assert.Equal("<C-o> <C-v>", read.GetProperty("value").GetString());
+    }
+
+    /// <summary>settings says how an agent names a theme, by its source and name, and some of Passenger's themes
+    /// repository's; settings_set takes one of them, which the windowless Passenger fetches and keeps.</summary>
+    [Fact]
+    public async Task Settings_names_a_theme_by_its_source_and_name_and_settings_set_takes_one_of_the_themes_repository()
+    {
+        string folder = TestFolders.Create("mcp-themes-");
+        DeleteAtEnd(folder);
+        await using McpClient client = await Start(["--mcp", folder], languageServer: false);
+        JsonElement look = (await Call(client, McpTools.Settings)).GetProperty("settings").EnumerateArray().Single(s => s.GetProperty("name").GetString() == "look");
+        Assert.True(look.GetProperty("value").ValueKind == JsonValueKind.Null && look.GetProperty("kind").GetString() == "object"
+            && look.GetProperty("note").GetString()!.Contains($"{ThemeSource.RepositoryName} holds Harbour", StringComparison.Ordinal)
+            && look.GetProperty("note").GetString()!.Contains($"{ThemeSource.BuiltIn.Name} holds Cubicle", StringComparison.Ordinal),
+            $"settings said of the theme: {look.GetRawText()}");
+        // The theme Passenger carries, by the source the note names.
+        Dictionary<string, object> cubicle = new() { ["source"] = ThemeSource.BuiltIn.Name, ["name"] = "Cubicle" };
+        JsonElement carried = Assert.Single((await Call(client, McpTools.SettingsSet, new() { ["changes"] = new Dictionary<string, object> { ["look"] = cubicle } })).EnumerateArray());
+        Assert.Equal((ThemeSource.BuiltIn.Name, "Cubicle"), (carried.GetProperty("after").GetProperty("source").GetString(), carried.GetProperty("after").GetProperty("name").GetString()));
+        Dictionary<string, object> orbit = new() { ["source"] = ThemeSource.RepositoryName, ["name"] = "Orbit" };
+        JsonElement changed = Assert.Single((await Call(client, McpTools.SettingsSet, new() { ["changes"] = new Dictionary<string, object> { ["look"] = orbit } })).EnumerateArray());
+        Assert.Equal("Orbit", changed.GetProperty("after").GetProperty("name").GetString());
+        // Kept in the agent's Passenger's own state, as KeptThemes keeps one in the run's.
+        string kept = Path.Combine(OwnState, Path.GetRelativePath(Passenger.App.State.StateStore.DefaultRoot, KeptThemes.PathOf(ThemeSource.Repository, false, "Orbit")));
+        Assert.True(await Waiting.UntilAsync(() => File.Exists(kept), TimeSpan.FromSeconds(30), TestContext.Current.CancellationToken),
+            $"Orbit set by an agent was not fetched from the themes repository and kept as {kept}");
+    }
+
+    /// <summary>settings_set of a theme its source does not list, a name mistyped or Cubicle named from the themes repository,
+    /// is refused naming those the source lists, nothing changed; a code colour scheme the source lists is kept from it
+    /// before settings_set answers, as choosing it in Settings keeps it.</summary>
+    [Fact]
+    public async Task Settings_set_refuses_a_theme_its_source_does_not_list_naming_those_it_does()
+    {
+        string folder = TestFolders.Create("mcp-unlisted-theme-");
+        DeleteAtEnd(folder);
+        await using McpClient client = await Start(["--mcp", folder], languageServer: false);
+        foreach (string name in (string[])["Slat", "Cubicle"])
+        {
+            Dictionary<string, object> look = new() { ["source"] = ThemeSource.RepositoryName, ["name"] = name };
+            CallToolResult refused = await Result(client, McpTools.SettingsSet, new() { ["changes"] = new Dictionary<string, object> { ["look"] = look } });
+            Assert.True(refused.IsError == true && Text(refused).Contains($"{ThemeSource.RepositoryName} lists no theme named {name}; it lists Bonbon, Harbour, ", StringComparison.Ordinal)
+                && Text(refused).Contains(", Slate and Sorbet; nothing changed", StringComparison.Ordinal), $"settings_set of {name}, a theme the themes repository does not list, answered: {Text(refused)}");
+        }
+        JsonElement kept = (await Call(client, McpTools.Settings)).GetProperty("settings").EnumerateArray().Single(s => s.GetProperty("name").GetString() == "look");
+        Assert.True(kept.GetProperty("value").ValueKind == JsonValueKind.Null, $"A theme refused was set all the same: {kept.GetRawText()}");
+
+        Dictionary<string, object> reef = new() { ["source"] = ThemeSource.RepositoryName, ["name"] = ThemeSource.FormerScheme };
+        JsonElement changed = Assert.Single((await Call(client, McpTools.SettingsSet, new() { ["changes"] = new Dictionary<string, object> { ["colourScheme"] = reef } })).EnumerateArray());
+        Assert.Equal(ThemeSource.FormerScheme, changed.GetProperty("after").GetProperty("name").GetString());
+        string scheme = Path.Combine(OwnState, Path.GetRelativePath(Passenger.App.State.StateStore.DefaultRoot, KeptThemes.PathOf(ThemeSource.Repository, true, ThemeSource.FormerScheme)));
+        Assert.True(File.Exists(scheme), $"settings_set answered before {ThemeSource.FormerScheme} was fetched from the themes repository and kept as {scheme}");
     }
 
     /// <summary>vcs_log gives each signed commit's signature as the Git log's details say it: a good one by its signer
@@ -1293,6 +1955,24 @@ public sealed class McpTests : McpRig, IClassFixture<RestoredFolders>
             $"ide_action of an action there is not answered: {Text(refused)}");
     }
 
+    /// <summary>An agent's own Passenger, which nobody is at, refuses its ide_action of an install, a change of the person's
+    /// shell PATH or Restart to Update in the words a person's window refuses an agent's, never taking them as the window's own.</summary>
+    [Fact]
+    public async Task An_agents_own_passenger_refuses_its_ide_action_to_install_change_the_shells_path_or_restart_to_update()
+    {
+        string folder = TestFolders.Create("mcp-own-installs-");
+        DeleteAtEnd(folder);
+        await using McpClient client = await Start(["--mcp", folder], languageServer: false);
+        foreach ((string action, string why) in ((string, string)[])[(AppActions.InstallDotnetSdk, Refusals.AgentInstalls),
+            (AppActions.AddDotnetToPath, Refusals.AgentChangesPath), (AppActions.InstallWorkloads, Refusals.AgentInstallsMobile),
+            (AppActions.InstallAndroidDependencies, Refusals.AgentInstallsMobile), (AppActions.RestartToUpdate, Refusals.RestartIsThePersons)])
+        {
+            CallToolResult refused = await Result(client, McpTools.IdeAction, new() { ["action"] = action });
+            Assert.True(refused.IsError == true && Text(refused).Contains(why, StringComparison.Ordinal),
+                $"An agent's own Passenger's ide_action of {action} answered: {Text(refused)}");
+        }
+    }
+
     /// <summary>An agent's checkout of a branch the repository has not is refused naming create, which makes it, and the
     /// branches there are, never git's "fatal: invalid reference"; the head stays where it was. A log of no commits is
     /// refused, never answered with one.</summary>
@@ -1394,6 +2074,99 @@ public sealed class McpTests : McpRig, IClassFixture<RestoredFolders>
             $"telemetry with nothing running answered: {Text(refused)}");
     }
 
+    /// <summary>vcs_commit commits the changes of a file its lines touch, through the Commit window's partial commit: one of
+    /// two changes goes in, the other stays in the working tree; lines that no longer name a change, as once the file moved on
+    /// since vcs_status numbered it, are refused saying where its changes are now, and nothing is committed; tracking a
+    /// remote's branch, vcs_status then says the commit to push.</summary>
+    [Fact]
+    public async Task An_agents_commit_of_one_of_a_files_two_changes_leaves_the_other_and_refuses_lines_that_name_none()
+    {
+        string repository = TestFolders.Create("mcp-partial-");
+        DeleteAtEnd(repository);
+        string notes = Path.Combine(repository, "Notes.txt");
+        File.WriteAllText(notes, "one\ntwo\nthree\nfour\nfive\nsix\nseven\n");
+        await TestGit.InitAsync(repository);
+        File.WriteAllText(notes, "ONE\ntwo\nthree\nfour\nfive\nsix\nSEVEN\n");
+
+        await using McpClient client = await Start(["--mcp", repository], languageServer: false);
+        string diff = Text(await Call(client, McpTools.VcsStatus, new() { ["path"] = "Notes.txt" }));
+        Assert.True(diff.Contains("+SEVEN", StringComparison.Ordinal) && diff.Contains("+ONE", StringComparison.Ordinal), $"vcs_status of Notes.txt answered: {diff}");
+        // The file moves on after the agent read its diff, so line 7 is no longer SEVEN's.
+        await Call(client, McpTools.Edit, new() { ["path"] = "Notes.txt", ["oldText"] = "ONE\n", ["newText"] = "zero\nONE\n" });
+        CallToolResult refused = await Result(client, McpTools.VcsCommit, new() { ["message"] = "Capital seven", ["lines"] = new Dictionary<string, string> { ["Notes.txt"] = "7" } });
+        Assert.True(refused.IsError == true && Text(refused).Contains("Notes.txt: no change is at line 7: its changes are at lines 1-2 and line 8", StringComparison.Ordinal),
+            $"vcs_commit of line 7, which no longer names a change, answered: {Text(refused)}");
+        Assert.Equal("First", (await TestGit.RunAsync(repository, "log", "-1", "--format=%s")).Trim());
+
+        string made = Text(await Call(client, McpTools.VcsCommit, new() { ["message"] = "Capital seven", ["lines"] = new Dictionary<string, string> { ["Notes.txt"] = "8" } }));
+        Assert.EndsWith(" Capital seven; left uncommitted: 1 change of Notes.txt", made, StringComparison.Ordinal);
+        Assert.Equal("one\ntwo\nthree\nfour\nfive\nsix\nSEVEN\n", await TestGit.RunAsync(repository, "show", "HEAD:Notes.txt"));
+        Assert.Equal("zero\nONE\ntwo\nthree\nfour\nfive\nsix\nSEVEN\n", File.ReadAllText(notes));
+        string left = await TestGit.RunAsync(repository, "diff", "--no-color", "-U0", "--", "Notes.txt");
+        Assert.True(left.Contains("-one\n+zero\n+ONE\n", StringComparison.Ordinal) && !left.Contains("SEVEN", StringComparison.Ordinal),
+            $"What the working tree holds beyond the commit is not the change left out: {left}");
+
+        // The branch set to track a remote's branch at the first commit, vcs_status says the commit to push.
+        await TestGit.RunAsync(repository, "remote", "add", "origin", repository);
+        await TestGit.RunAsync(repository, "update-ref", "refs/remotes/origin/main", "HEAD~1");
+        await TestGit.RunAsync(repository, "branch", "-q", "--set-upstream-to=origin/main");
+        JsonElement tracked = await Call(client, McpTools.VcsStatus);
+        Assert.True(tracked.TryGetProperty("upstream", out JsonElement upstream) && upstream.GetString() == "origin/main"
+            && tracked.GetProperty("ahead").GetInt32() == 1 && tracked.GetProperty("behind").GetInt32() == 0, $"vcs_status of a branch one commit ahead of its upstream answered: {tracked}");
+    }
+
+    /// <summary>vcs_commit's lines commit one change of a file whose index holds a change taken back out of the working
+    /// tree since: the change only staged stays staged, the committed one taken in beside it, and the change left out
+    /// stays in the working tree.</summary>
+    [Fact]
+    public async Task An_agents_commit_of_some_lines_keeps_a_change_only_staged_staged()
+    {
+        string repository = TestFolders.Create("mcp-partial-staged-");
+        DeleteAtEnd(repository);
+        string notes = Path.Combine(repository, "Notes.txt");
+        File.WriteAllText(notes, "one\ntwo\nthree\nfour\nfive\nsix\nseven\n");
+        await TestGit.InitAsync(repository);
+        File.WriteAllText(notes, "one\nTWO\nthree\nfour\nfive\nsix\nseven\n");
+        await TestGit.RunAsync(repository, "add", "Notes.txt");
+        File.WriteAllText(notes, "ONE\ntwo\nthree\nfour\nfive\nsix\nSEVEN\n");
+
+        await using McpClient client = await Start(["--mcp", repository], languageServer: false);
+        string made = Text(await Call(client, McpTools.VcsCommit, new() { ["message"] = "Capital one", ["lines"] = new Dictionary<string, string> { ["Notes.txt"] = "1" } }));
+        Assert.EndsWith(" Capital one; left uncommitted: 1 change of Notes.txt", made, StringComparison.Ordinal);
+        Assert.Equal("ONE\ntwo\nthree\nfour\nfive\nsix\nseven\n", await TestGit.RunAsync(repository, "show", "HEAD:Notes.txt"));
+        string index = await TestGit.RunAsync(repository, "show", ":Notes.txt");
+        Assert.True(index == "ONE\nTWO\nthree\nfour\nfive\nsix\nseven\n", $"The change only staged did not stay staged beside the one committed: the index holds\n{index}");
+        Assert.Equal("ONE\ntwo\nthree\nfour\nfive\nsix\nSEVEN\n", File.ReadAllText(notes));
+    }
+
+    /// <summary>vcs_commit with movesFirst commits a file git mv moved and then rewrote past what git finds alike as a rename,
+    /// as the Commit window offers: the move first, a commit of its own with that message, then the edits with the
+    /// message, the answer naming both; a commit whose moves git keeps with their edits makes no commit of them first.</summary>
+    [Fact]
+    public async Task An_agents_commit_of_a_moved_and_rewritten_file_with_moves_first_commits_the_move_as_a_rename_first()
+    {
+        string repository = TestFolders.Create("mcp-moves-first-");
+        DeleteAtEnd(repository);
+        File.WriteAllText(Path.Combine(repository, "Shop.cs"), "class Shop\n{\n    int count;\n\n    void Add() { count++; }\n}\n");
+        File.WriteAllText(Path.Combine(repository, "Till.cs"), "class Till\n{\n    int total;\n\n    void Ring(int price) { total += price; }\n}\n");
+        await TestGit.InitAsync(repository);
+        await TestGit.RunAsync(repository, "mv", "Shop.cs", "Store.cs");
+        File.WriteAllText(Path.Combine(repository, "Store.cs"), "record Store(string Name, decimal Takings);\n\nstatic class Stores\n{\n    public static Store Open(string name) => new(name, 0m);\n}\n");
+
+        await using McpClient client = await Start(["--mcp", repository], languageServer: false);
+        string made = Text(await Call(client, McpTools.VcsCommit, new() { ["message"] = "Rework the store", ["movesFirst"] = "Rename the shop" }));
+        Assert.Matches("^[0-9a-f]{7,} Rename the shop \\(the moves\\), then [0-9a-f]{7,} Rework the store$", made);
+        Assert.Equal("Rework the store\nRename the shop\nFirst", (await TestGit.RunAsync(repository, "log", "-3", "--format=%s")).Trim());
+        Assert.Equal("R100\tShop.cs\tStore.cs", (await TestGit.RunAsync(repository, "show", "--name-status", "--format=", "-M", "HEAD~1")).Trim());
+
+        // A move git still finds alike once its edit goes in with it is committed with the edit, as one.
+        await TestGit.RunAsync(repository, "mv", "Till.cs", "Register.cs");
+        File.AppendAllText(Path.Combine(repository, "Register.cs"), "// rung up\n");
+        string kept = Text(await Call(client, McpTools.VcsCommit, new() { ["message"] = "Rename the till", ["movesFirst"] = "Move the till" }));
+        Assert.Matches("^[0-9a-f]{7,} Rename the till$", kept);
+        Assert.Matches("^R[0-9]{3}\tTill.cs\tRegister.cs$", (await TestGit.RunAsync(repository, "show", "--name-status", "--format=", "-M", "HEAD")).Trim());
+    }
+
     /// <summary>An agent's edit the IDE could not save (its file read-only) is never committed as the disk's older text:
     /// vcs_commit is refused naming the file, and nothing is committed.</summary>
     [Fact]
@@ -1415,6 +2188,91 @@ public sealed class McpTests : McpRig, IClassFixture<RestoredFolders>
             $"vcs_commit with Notes.txt's edit unsaved answered: {Text(refused)}");
         Assert.Equal("First", (await TestGit.RunAsync(repository, "log", "-1", "--format=%s")).Trim());
         File.SetAttributes(notes, FileAttributes.Normal);
+    }
+
+    /// <summary>An agent's format, Code Cleanup and Optimize Imports of a file the editor shows read-only, a library's XAML
+    /// as Source Link gave it and a framework type the language server decompiled, are refused saying so: nothing there
+    /// changes, so nothing is said to be reformatted, tidied or already so; and each other refactoring, rename and code
+    /// action there are refused up front in the same words. Reformat Code, Code Cleanup, Optimize Imports, the
+    /// refactorings and the Edit menu's changes grey on the decompiled file, saying why.</summary>
+    [Fact]
+    public async Task An_agents_format_tidy_refactorings_rename_and_code_actions_of_a_read_only_xaml_or_cs_file_are_refused_saying_it_is_read_only()
+    {
+        string folder = await TakeFolderAsync();
+        // Where Passenger keeps what Source Link gives of a library, as it would hold Fluent's Button.xaml.
+        string button = TestFolders.Write(Path.Combine(OwnState, "MetadataAsSource", "SourceLink", "Avalonia.Themes.Fluent", "0123456789abcdef", "Controls"), "Button.xaml",
+            "<ResourceDictionary xmlns=\"https://github.com/avaloniaui\">\n<ControlTheme x:Key=\"{x:Type Button}\"   TargetType=\"Button\" xmlns:x=\"http://schemas.microsoft.com/winfx/2006/xaml\">\n"
+            + "<Setter Property=\"Padding\"    Value=\"8\"/>\n</ControlTheme>\n</ResourceDictionary>\n");
+        string laid = File.ReadAllText(button);
+        await using McpClient client = await Start(["--mcp", folder]);
+
+        CallToolResult markup = await Result(client, McpTools.Format, new() { ["path"] = button });
+        Assert.True(markup.IsError == true && Text(markup).Contains("Reformat Code was not applied: Button.xaml is read-only", StringComparison.Ordinal),
+            $"format of a read-only XAML file answered: {Text(markup)}");
+        Assert.True(File.ReadAllText(button) == laid, "format wrote a read-only XAML file");
+        CallToolResult cleaned = await Result(client, McpTools.Refactor, new() { ["kind"] = "code_cleanup", ["path"] = button });
+        Assert.True(cleaned.IsError == true && Text(cleaned).Contains("Code Cleanup was not applied: Button.xaml is read-only", StringComparison.Ordinal),
+            $"code_cleanup of a read-only XAML file answered: {Text(cleaned)}");
+        Assert.True(File.ReadAllText(button) == laid, "code_cleanup wrote a read-only XAML file");
+        CallToolResult extracted = await Result(client, McpTools.ApplyCodeAction, new() { ["path"] = button, ["line"] = 3, ["column"] = 38, ["title"] = "Extract Resource", ["name"] = "Padding8" });
+        Assert.True(extracted.IsError == true && Text(extracted).Contains("'Extract Resource' was not applied: Button.xaml is read-only", StringComparison.Ordinal),
+            $"apply_code_action on a read-only XAML file answered: {Text(extracted)}");
+        Assert.True(File.ReadAllText(button) == laid, "apply_code_action wrote a read-only XAML file");
+
+        string decompiled = Assert.Single((await Call(client, McpTools.Definition, new() { ["path"] = "Program.cs", ["line"] = 6, ["column"] = 1 })).EnumerateArray())
+            .GetProperty("path").GetString()!;
+        Assert.Contains("MetadataAsSource", decompiled, StringComparison.Ordinal);
+        string written = File.ReadAllText(decompiled);
+        CallToolResult code = await Result(client, McpTools.Format, new() { ["path"] = decompiled });
+        Assert.True(code.IsError == true && Text(code).Contains($"Reformat Code was not applied: {Path.GetFileName(decompiled)} is read-only", StringComparison.Ordinal),
+            $"format of a decompiled C# file answered: {Text(code)}");
+        Assert.True(File.ReadAllText(decompiled) == written, "format wrote a decompiled C# file");
+        foreach ((string kind, string name) in new[] { ("optimize_imports", "Optimize Imports"), ("code_cleanup", "Code Cleanup") })
+        {
+            CallToolResult tidied = await Result(client, McpTools.Refactor, new() { ["kind"] = kind, ["path"] = decompiled });
+            Assert.True(tidied.IsError == true && Text(tidied).Contains($"{name} was not applied: {Path.GetFileName(decompiled)} is read-only", StringComparison.Ordinal),
+                $"{kind} of a decompiled C# file answered: {Text(tidied)}");
+        }
+        Assert.True(File.ReadAllText(decompiled) == written, "Optimize Imports or Code Cleanup wrote a decompiled C# file");
+        // The type's declaration, where each refactoring and rename would begin.
+        string[] lines = written.Split('\n');
+        int declared = Array.FindIndex(lines, l => l.Contains("class Console", StringComparison.Ordinal));
+        Assert.True(declared >= 0, $"The decompiled {Path.GetFileName(decompiled)} declares no class Console:\n{written}");
+        int column = lines[declared].IndexOf("Console", StringComparison.Ordinal) + 1;
+        List<string> answered = [];
+        foreach ((string kind, string name) in new[] { ("change_signature", "Change Signature"), ("safe_delete", "Safe Delete"), ("move", "Move"),
+            ("extract_interface", "Extract Interface"), ("pull_members_up", "Pull Members Up"), ("push_members_down", "Push Members Down"),
+            ("introduce_field", "Introduce Field"), ("introduce_parameter", "Introduce Parameter"), ("encapsulate_field", "Encapsulate Field") })
+        {
+            CallToolResult refactored = await Result(client, McpTools.Refactor, new() { ["kind"] = kind, ["path"] = decompiled, ["line"] = declared + 1, ["column"] = column });
+            if (refactored.IsError != true || !Text(refactored).Contains($"{name} was not applied: {Path.GetFileName(decompiled)} is read-only", StringComparison.Ordinal))
+            {
+                answered.Add($"{kind}: {Text(refactored)}");
+            }
+        }
+        CallToolResult renamed = await Result(client, McpTools.Rename, new() { ["path"] = decompiled, ["line"] = declared + 1, ["column"] = column, ["newName"] = "Terminal" });
+        if (renamed.IsError != true || !Text(renamed).Contains($"Rename was not applied: {Path.GetFileName(decompiled)} is read-only", StringComparison.Ordinal))
+        {
+            answered.Add($"rename: {Text(renamed)}");
+        }
+        // Refused before the server is asked what it offers there, whatever the action.
+        CallToolResult acted = await Result(client, McpTools.ApplyCodeAction, new() { ["path"] = decompiled, ["line"] = declared + 1, ["column"] = column, ["title"] = "Generate overrides..." });
+        if (acted.IsError != true || !Text(acted).Contains($"'Generate overrides...' was not applied: {Path.GetFileName(decompiled)} is read-only", StringComparison.Ordinal))
+        {
+            answered.Add($"apply_code_action: {Text(acted)}");
+        }
+        Assert.True(answered.Count == 0, $"Refactorings, rename or a code action of the decompiled {Path.GetFileName(decompiled)} were not refused as read-only:\n{string.Join('\n', answered)}");
+        Assert.True(File.ReadAllText(decompiled) == written, "A refactoring, rename or code action wrote a decompiled C# file");
+
+        await Call(client, McpTools.Open, new() { ["path"] = decompiled });
+        foreach (string id in new[] { AppActions.Reformat, AppActions.CodeCleanup, AppActions.OptimizeUsings, AppActions.Rename, AppActions.ExtractMethod, AppActions.ChangeSignature,
+            EditorActions.Paste, EditorActions.Duplicate, EditorActions.JoinLines })
+        {
+            string action = Assert.Single((await Call(client, McpTools.IdeActions, new() { ["query"] = id })).EnumerateArray(),
+                a => a.GetString()!.StartsWith($"{id}:", StringComparison.Ordinal)).GetString()!;
+            Assert.True(action.EndsWith($" - cannot run: {Path.GetFileName(decompiled)} is read-only", StringComparison.Ordinal),
+                $"{id} could run on a decompiled C# file: {action}");
+        }
     }
 
     /// <summary>An agent's push in its own IDE to a remote that asks for a login is refused at once, saying so and that
@@ -1702,7 +2560,7 @@ public sealed class McpTests : McpRig, IClassFixture<RestoredFolders>
         string tools = Path.Combine(home, "tools");
         Directory.CreateDirectory(tools);
         string seen = Path.Combine(home, "git-environment");
-        Executable(Path.Combine(tools, "git"), $"#!/bin/sh\nenv > \"{seen}\"\nexec {(await global::Passenger.Core.Programs.GitAsync())!} \"$@\"\n");
+        await EnvironmentGitAsync(tools, seen);
         string skips = Path.Combine(home, "skips-while-read.sh");
         Executable(skips, "#!/bin/sh\nif [ \"$VSCODE_RESOLVING_ENVIRONMENT\" != 1 ] || [ \"$INTELLIJ_ENVIRONMENT_READER\" != 1 ]; then\n"
             + $"  echo 'open terminal failed: not a terminal' >&2\n  exit 1\nfi\nPATH=\"{tools}:$PATH\"; export PATH\nshift 3\nexec /bin/sh -c \"$1\"\n");
@@ -1736,7 +2594,7 @@ public sealed class McpTests : McpRig, IClassFixture<RestoredFolders>
         string tools = Path.Combine(home, "tools");
         Directory.CreateDirectory(tools);
         string seen = Path.Combine(home, "git-environment");
-        Executable(Path.Combine(tools, "git"), $"#!/bin/sh\nenv > \"{seen}\"\nexec {(await Programs.GitAsync())!} \"$@\"\n");
+        await EnvironmentGitAsync(tools, seen);
         // Each login profile names itself: sh reads .profile, bash its own before it, zsh .zprofile.
         foreach (string profile in (string[])[".profile", ".bash_profile", ".zprofile"])
         {
@@ -1840,7 +2698,10 @@ public sealed class McpTests : McpRig, IClassFixture<RestoredFolders>
         string restart = Assert.Single(listed, l => l.StartsWith($"{AppActions.RestartCSharpServer}: Restart C# Language Server [IDE]", StringComparison.Ordinal));
         Assert.Contains($" - cannot run: {Refusals.NoCSharp}", restart, StringComparison.Ordinal);
 
-        Assert.Equal($"Ran {AppActions.ShowLiveTree}", (await Call(client, McpTools.IdeAction, new() { ["action"] = AppActions.ShowLiveTree })).GetString());
+        Assert.Equal($"Ran {AppActions.ShowStructure}", (await Call(client, McpTools.IdeAction, new() { ["action"] = AppActions.ShowStructure })).GetString());
+        // A console app's folder holds no Godot project, which the Game window serves.
+        string game = Assert.Single(listed, l => l.StartsWith($"{AppActions.ShowGame}: ", StringComparison.Ordinal));
+        Assert.Contains($" - cannot run: {Refusals.NoGodotProject}", game, StringComparison.Ordinal);
     }
 
     /// <summary>debug_state of processes says each program's command line as Attach to Process shows it, its secrets masked:
@@ -1869,7 +2730,7 @@ public sealed class McpTests : McpRig, IClassFixture<RestoredFolders>
         }
         finally
         {
-            Processes.Kill(looping.Id);
+            ChildProcesses.Kill(looping);
         }
     }
 
@@ -1960,6 +2821,12 @@ public sealed class McpTests : McpRig, IClassFixture<RestoredFolders>
         File.WriteAllText(Path.Combine(home, ".profile"), $"export PATH=\"{tools}:$PATH\"\n{more}");
         return used;
     }
+
+    /// <summary>A git in <paramref name="tools"/> that writes the environment it was started with to <paramref name="seen"/>,
+    /// whole: beside it, then put in its place, so a read finds one git's whole environment while Passenger starts others.</summary>
+    [System.Runtime.Versioning.UnsupportedOSPlatform("windows")]
+    private static async Task EnvironmentGitAsync(string tools, string seen) =>
+        Executable(Path.Combine(tools, "git"), $"#!/bin/sh\nenv > \"{seen}.$$\" && mv -f \"{seen}.$$\" \"{seen}\"\nexec {(await Programs.GitAsync())!} \"$@\"\n");
 
     /// <summary>launchd's environment, as the Finder or the Dock start Passenger: the bare PATH, no terminal, no .NET or zsh
     /// settings of the person's, the home given.</summary>

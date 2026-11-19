@@ -229,7 +229,7 @@ public static class DockerFiles
     /// <summary>A path from the build's context, with '/' as the Dockerfile writes it.</summary>
     public static string Relative(string context, string path)
     {
-        string relative = System.IO.Path.GetRelativePath(context, path).Replace('\\', '/');
+        string relative = PathNames.Route(path, context);
         return relative == "." ? string.Empty : relative;
     }
 
@@ -351,7 +351,8 @@ public static class DockerFiles
         }
         try
         {
-            return new Regex(made.Append('$').ToString(), RegexOptions.CultureInvariant, TimeSpan.FromSeconds(1));
+            // The repository's text: on the linear engine, so no pattern holds a path's match past a moment.
+            return new Regex(made.Append('$').ToString(), RegexOptions.CultureInvariant | RegexOptions.NonBacktracking);
         }
         catch (ArgumentException)
         {

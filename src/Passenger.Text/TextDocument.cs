@@ -1,3 +1,5 @@
+using System.Diagnostics;
+
 namespace Passenger.Text;
 
 /// <summary>Where a document's text was saved: the text then and its place in the history.</summary>
@@ -10,6 +12,10 @@ public enum EditKind
     Typing,
     DeleteBackward,
     DeleteForward,
+
+    /// <summary>An edit of a run kept as one step of undo (Vim's insert session): it joins the step before while that is
+    /// one too and nothing broke the run (<see cref="TextDocument.BreakUndoGroup"/>), whatever it types and however late.</summary>
+    Joined,
 }
 
 public enum ChangeReason
@@ -166,7 +172,7 @@ public sealed class TextDocument
         TextSnapshot after = before.Apply(sorted);
 
         DropRedo();
-        long now = Environment.TickCount64;
+        long now = Stopwatch.GetTimestamp();
         if (undo.Count > 0 && Continues(undo[^1], kind, selectionsBefore, sorted, now))
         {
             UndoEntry last = undo[^1];
@@ -200,7 +206,7 @@ public sealed class TextDocument
         TextSnapshot before = Snapshot;
         string[] removed = Removed(before, sorted);
         DropRedo();
-        Keep(new UndoEntry(++lastId, EditKind.Other, Carried(selectionsBefore), selectionsAfter, Environment.TickCount64, sorted, removed)
+        Keep(new UndoEntry(++lastId, EditKind.Other, Carried(selectionsBefore), selectionsAfter, Stopwatch.GetTimestamp(), sorted, removed)
         {
             Undone = undone,
             Redone = redone,
@@ -269,6 +275,39 @@ public sealed class TextDocument
     /// <summary>Stops the next edit joining the current undo step: a caret move, a click, a focus
     /// change.</summary>
     public void BreakUndoGroup() => mergeBroken = true;
+
+    /// <summary>Where the history stands now, for <see cref="JoinUndoSince"/>: every step made later comes after it.</summary>
+    public long UndoPlace => lastId;
+
+    /// <summary>The steps made since a place (<see cref="UndoPlace"/>) and still to undo joined into one, which undoes them
+    /// all at once and redoes them all, as a command line of several commands is one change; not where fewer than two
+    /// are, or one runs something as it is undone (<see cref="Perform"/>).</summary>
+    public void JoinUndoSince(long place)
+    {
+        int first = undo.Count;
+        while (first > 0 && undo[first - 1].Id > place)
+        {
+            first--;
+        }
+        if (undo.Count - first < 2 || undo.Skip(first).Any(u => u.Undone is not null || u.Redone is not null))
+        {
+            return;
+        }
+        UndoEntry joined = undo[first];
+        long last = undo[^1].Id;
+        kept -= joined.Bytes;
+        for (int i = first + 1; i < undo.Count; i++)
+        {
+            UndoEntry next = undo[i];
+            kept -= next.Bytes;
+            joined.Continue(next.Edits, next.Removed, next.SelectionsAfter, next.Time);
+        }
+        kept += joined.Bytes;
+        // The text saved between two of the steps lies inside the one step now, where no undo or redo stops.
+        savedAt = savedAt == last ? joined.Id : undo.Skip(first).Any(u => u.Id == savedAt) ? Nowhere : savedAt;
+        undo.RemoveRange(first + 1, undo.Count - first - 1);
+        mergeBroken = true;
+    }
 
     /// <summary>Undoes the last step and returns the carets as they were before it, or null if there
     /// was nothing to undo or the text is read-only.</summary>
@@ -438,7 +477,7 @@ public sealed class TextDocument
 
     private bool Continues(UndoEntry last, EditKind kind, SelectionSet selectionsBefore, TextEdit[] edits, long now)
     {
-        if (mergeBroken || kind == EditKind.Other || last.Kind != kind || now - last.Time > MergeWindow.TotalMilliseconds)
+        if (mergeBroken || kind == EditKind.Other || last.Kind != kind || (kind != EditKind.Joined && Stopwatch.GetElapsedTime(last.Time, now) > MergeWindow))
         {
             return false;
         }

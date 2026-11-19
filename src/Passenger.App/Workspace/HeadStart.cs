@@ -55,7 +55,8 @@ public sealed class HeadStart
     public Task<ProjectBuildCache> Builds { get; private set; } = null!;
 
     /// <summary>Begins opening the folder or solution the command line names, with a C# language server when
-    /// <paramref name="languageServer"/>; null when it names none, or none that is there.</summary>
+    /// <paramref name="languageServer"/>; null when it names none, none that is there, or one not trusted
+    /// (<see cref="WorkspaceTrust"/>), whose code nothing runs before the session asks.</summary>
     public static HeadStart? Begin(LaunchOptions launch, bool languageServer)
     {
         if ((launch.Workspace ?? launch.Folder) is not { } given)
@@ -65,7 +66,7 @@ public sealed class HeadStart
         string full = PathNames.Canonical(given);
         bool fileNamed = File.Exists(full) && WorkspaceModel.Opens(full);
         string folder = fileNamed ? Path.GetDirectoryName(full)! : full;
-        if (!Directory.Exists(folder))
+        if (!Directory.Exists(folder) || !WorkspaceTrust.Trusts(folder))
         {
             return null;
         }
@@ -193,7 +194,7 @@ public sealed class HeadStart
         RoslynSession started = await RoslynSession.StartAsync(Folder, read.Solution?.Path, [.. read.Projects.Select(p => p.Path)], CSharpService.LogFolder, stop.Token,
             options, server => server.HoldSaid(), feed: new Feed(this), stateCache: CSharpService.ServerCache);
         IdeErrors.Write($"C# language server (process {started.Server.ProcessId}) started ahead for {Folder} "
-            + $"{Stopwatch.GetElapsedTime(began).TotalSeconds:0.00} s after the folder was named, loading its projects");
+            + $"{Durations.Said(Stopwatch.GetElapsedTime(began))} after the folder was named, loading its projects");
         return started;
     }
 

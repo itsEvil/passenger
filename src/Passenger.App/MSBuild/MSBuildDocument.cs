@@ -11,9 +11,9 @@ namespace Passenger.App.MSBuild;
 
 /// <summary>One open MSBuild file's code help. Completion reads its text as typed with the project's last evaluation;
 /// the project is evaluated again with the open files' unsaved text once typing pauses, so its errors and values are
-/// the screen's, and its errors and warnings in this file, with the advisories of the packages it references, are the
-/// file's markers. An evaluation that fails (XML that does not read, an unknown SDK) keeps the last one that did for
-/// names and values, and says why on its line.</summary>
+/// the screen's, and its errors and warnings in this file, with the advisories of the packages it references and the
+/// versions of them their owners deprecated, are the file's markers. An evaluation that fails (XML that does not read,
+/// an unknown SDK) keeps the last one that did for names and values, and says why on its line.</summary>
 public sealed class MSBuildDocument : IDisposable
 {
     /// <summary>How long typing pauses before the project is evaluated again with the text as typed.</summary>
@@ -26,6 +26,14 @@ public sealed class MSBuildDocument : IDisposable
     private readonly Debounce inspecting;
     private (int Version, XmlTree Tree)? parsed;
     private IReadOnlyList<InsightDiagnostic> diagnostics = [];
+
+    /// <summary>The deprecated versions of the packages the file references, by id and version as its marks read them,
+    /// for the card over one.</summary>
+    private IReadOnlyDictionary<(string Id, string Version), Deprecation> deprecated = new Dictionary<(string, string), Deprecation>();
+
+    /// <summary>The project's vulnerable versions it gets only through others, by package, as its marks read them.</summary>
+    private IReadOnlyDictionary<string, IReadOnlyList<TransitiveUse>> exposed = new Dictionary<string, IReadOnlyList<TransitiveUse>>();
+
     private bool disposed;
 
     internal MSBuildDocument(MSBuildService service, OpenDocument document)
@@ -51,7 +59,8 @@ public sealed class MSBuildDocument : IDisposable
     /// <summary>The file's first evaluation, which hover and Go to Declaration wait for.</summary>
     public Task First { get; }
 
-    /// <summary>The file's markup as it stands, parsed once a version.</summary>
+    /// <summary>The file's markup as it stands, parsed once a version: for an action that changes the text at once (a
+    /// completion's commit) or an agent's call; what each pause reads is parsed on a worker (<see cref="ParsedAsync"/>).</summary>
     public XmlTree Tree
     {
         get
@@ -67,12 +76,36 @@ public sealed class MSBuildDocument : IDisposable
         }
     }
 
+    /// <summary>The file's markup as it stands as this is asked, with that text: parsed once a version, on a worker.</summary>
+    private async Task<(TextSnapshot Text, XmlTree Tree)> ParsedAsync()
+    {
+        int version = Document.Text.Version;
+        TextSnapshot text = Document.Text.Snapshot;
+        if (parsed is { } kept && kept.Version == version)
+        {
+            return (text, kept.Tree);
+        }
+        XmlTree tree = await BackgroundWork.Run(() => XmlTree.Parse(text.ToString()));
+        if (Document.Text.Version == version)
+        {
+            parsed = (version, tree);
+        }
+        return (text, tree);
+    }
+
     /// <summary>Whether the last evaluation read one of these files, or the file is one of them; with files come or gone
     /// among them, whether one is in a folder its wildcards walked.</summary>
     internal bool Read(IReadOnlyCollection<string> paths, bool cameOrWent) =>
         paths.Any(p => PathNames.Same(p, Document.Path)) || Insight?.Raw.Inputs.Any(i => paths.Any(p => PathNames.Same(p, i.Path))) == true
             || (Project is { } project && paths.Any(p => PathNames.Same(p, project)))
             || (cameOrWent && Insight is { } last && paths.Any(last.Walked));
+
+    /// <summary>Whether the file is a project whose restore (its project.assets.json, as its evaluation names it) is among
+    /// those written.</summary>
+    internal bool Restores(IReadOnlySet<string> assets) =>
+        assets.Count > 0 && Project is { } own && PathNames.Same(own, Document.Path)
+        && (Insight?.Value(CarriedProperties.ProjectAssetsFile) is { Length: > 0 } named ? named : Passenger.Xaml.Projects.ProjectInputs.FindAssets(own)) is { } restore
+        && assets.Any(a => PathNames.Same(a, PathNames.Canonical(restore)));
 
     /// <summary>Whether the last evaluation walked folders, whose files coming or going would change what its items take in.</summary>
     internal bool Walks => Insight?.Raw.Folders.Count > 0;
@@ -82,13 +115,14 @@ public sealed class MSBuildDocument : IDisposable
 
     private async Task<MSBuildContext> ContextAsync()
     {
-        XmlTree tree = Tree;
+        (_, XmlTree tree) = await ParsedAsync();
         IReadOnlyList<string> sdks = await service.SdksAsync();
         MSBuildSchema schema = await BackgroundWork.Run(() => MSBuildSchema.Instance);
         return new MSBuildContext(Document.Path, tree, schema, Insight, sdks);
     }
 
-    /// <summary>What completion offers at a caret, for the text as it stands: package ids and versions asked of the feeds.</summary>
+    /// <summary>What completion offers at a caret, for the text as it stands: package ids and versions asked of the feeds, a
+    /// version marked where it is vulnerable or deprecated, its card saying the advisory and the deprecation in full.</summary>
     public async Task<MSBuildCompletionList?> CompleteAsync(int caret, CancellationToken cancel)
     {
         MSBuildContext context = await ContextAsync();
@@ -114,12 +148,26 @@ public sealed class MSBuildDocument : IDisposable
                 };
             }
             IReadOnlyList<string> versions = await feed.VersionsAsync(ask.Id, true, cancel);
-            VulnerabilityData known = await service.KnownVulnerabilitiesAsync();
+            Task<VulnerabilityData> auditing = service.KnownVulnerabilitiesAsync();
+            Task deprecating = service.DeprecationsAsync([.. versions.Select(v => (ask.Id, v))]);
+            await Task.WhenAll(auditing, deprecating);
+            VulnerabilityData known = await auditing;
             return list with
             {
-                Items = [.. versions.OrderByDescending(v => v, VersionOrder.Instance).Select((v, i) => new MSBuildItem(v, MSBuildItemKind.Version, v,
-                    known.Of(ask.Id, v) is [{ } gravest, ..] ? $"{gravest.Severity} severity vulnerability"
-                        : VersionOrder.IsPrerelease(v) ? "prerelease" : null) { SortText = $"{i:D4}" })],
+                Items = [.. versions.OrderByDescending(v => v, VersionOrder.Instance).Select((v, i) =>
+                {
+                    Deprecation? deprecation = service.Deprecated?.Invoke(ask.Id, v);
+                    // Both marks shortened to fit the width a list gives a detail; the card says them whole.
+                    string? detail = (known.Of(ask.Id, v), deprecation) switch
+                    {
+                        ([{ } gravest, ..], not null) => $"{gravest.Severity} vulnerability, deprecated",
+                        ([{ } gravest, ..], null) => $"{gravest.Severity} severity vulnerability",
+                        (_, not null) => "Deprecated",
+                        _ => VersionOrder.IsPrerelease(v) ? "prerelease" : null,
+                    };
+                    string said = string.Join("\n", new[] { Advise(known, ask.Id, v)?.Message, deprecation is null ? null : Told(ask.Id, v, deprecation) }.OfType<string>());
+                    return new MSBuildItem(v, MSBuildItemKind.Version, v, detail, said.Length > 0 ? said : null) { SortText = $"{i:D4}" };
+                })],
             };
         }
         catch (Exception failed) when (FeedSet.IsFeedFailure(failed) && !cancel.IsCancellationRequested)
@@ -147,8 +195,24 @@ public sealed class MSBuildDocument : IDisposable
         VulnerabilityData known = found.Symbol.Kind == MSBuildSymbolKind.Item && MSBuildSyntax.PackageItems.Contains(found.Symbol.Name)
             ? await service.KnownVulnerabilitiesAsync()
             : VulnerabilityData.None;
-        return await BackgroundWork.Run(() => MSBuildNavigation.Describe(found.Symbol, found.Context, (id, version) => Advise(known, id, version)?.Message));
+        IReadOnlyDictionary<(string Id, string Version), Deprecation> told = deprecated;
+        return await BackgroundWork.Run(() => MSBuildNavigation.Describe(found.Symbol, found.Context, (id, version) =>
+            string.Join("\n", new[] { Advise(known, id, version)?.Message, Told(told, id, version) }.OfType<string>()) is { Length: > 0 } said ? said : null));
     }
+
+    /// <summary>The card's words on a deprecated version: why and what to use instead, then its owner's own; null where
+    /// it is not deprecated.</summary>
+    private static string? Told(IReadOnlyDictionary<(string Id, string Version), Deprecation> told, string id, string version) =>
+        told.FirstOrDefault(t => t.Key.Id.Equals(id, StringComparison.OrdinalIgnoreCase) && t.Key.Version.Equals(version, StringComparison.OrdinalIgnoreCase)).Value
+            is { } deprecation ? Told(id, version, deprecation) : null;
+
+    /// <summary>The card's words on a version deprecated as given: why and what to use instead, then its owner's own.</summary>
+    private static string Told(string id, string version, Deprecation deprecation) =>
+        Deprecated(id, version, deprecation) + (deprecation.Message.Length > 0 ? $"\n{deprecation.Message}" : string.Empty);
+
+    /// <summary>The words on a deprecated package version: why, and the package its owner names to use instead.</summary>
+    private static string Deprecated(string id, string version, Deprecation deprecation) =>
+        $"Package '{id}' {version} is deprecated: {deprecation.Why}" + (deprecation.Instead is { } instead ? $"; use {instead} instead" : string.Empty);
 
     /// <summary>Where Go to Declaration may go from the name at an offset; each file gone into is evaluated through this
     /// file's project.</summary>
@@ -180,7 +244,7 @@ public sealed class MSBuildDocument : IDisposable
             return;
         }
         int version = Document.Text.Version;
-        Dictionary<string, string> texts = service.Texts();
+        Dictionary<string, TextSnapshot> texts = service.Texts();
         Dictionary<string, string> properties = service.Properties();
         MSBuildInsight insight;
         try
@@ -189,7 +253,7 @@ public sealed class MSBuildDocument : IDisposable
             {
                 return;
             }
-            insight = await BackgroundWork.Run(async () => new MSBuildInsight(await host.InspectAsync(project, properties, texts)));
+            insight = await BackgroundWork.Run(async () => new MSBuildInsight(await host.InspectAsync(project, properties, MSBuildService.TextsOf(texts))));
         }
         catch (ProjectHostFailed failed)
         {
@@ -210,13 +274,15 @@ public sealed class MSBuildDocument : IDisposable
 
     /// <summary>Another open file's evaluation of this file's project, taken up when it read this file's text as it stands
     /// (its unsaved text, or the disk's when it has none), so the project's files never ask again of each other.</summary>
-    internal async Task AdoptAsync(MSBuildInsight insight, IReadOnlyDictionary<string, string> texts)
+    internal async Task AdoptAsync(MSBuildInsight insight, IReadOnlyDictionary<string, TextSnapshot> texts)
     {
         using IDisposable held = BackgroundWork.Scope();
         using IDisposable checking = Document.Checking(Checker);
         int version = Document.Text.Version;
+        TextSnapshot now = Document.Text.Snapshot;
         bool same = Document.IsModified
-            ? texts.TryGetValue(Document.Path, out string? read) && read == Document.Text.Snapshot.ToString()
+            ? texts.TryGetValue(Document.Path, out TextSnapshot? read)
+                && (ReferenceEquals(read, now) || read.Length == now.Length && await BackgroundWork.Run(() => read.ToString() == now.ToString()))
             : !texts.ContainsKey(Document.Path);
         if (same && !disposed)
         {
@@ -244,14 +310,34 @@ public sealed class MSBuildDocument : IDisposable
         EvaluatedVersion = version;
         diagnostics = [.. insight.Raw.Diagnostics.Where(d => d.File.Length > 0 && PathNames.Same(PathNames.Canonical(d.File), Document.Path)
             || (d.File.Length == 0 && PathNames.Same(insight.Project, Document.Path)))];
-        Show(await AdvisoriesAsync(version));
+        (TextSnapshot text, XmlTree tree) = await ParsedAsync();
+        (IReadOnlyList<Marker> advisories, Task deprecating) = await AdvisoriesAsync(tree, version);
+        // Typed on meanwhile, the next pause evaluates the text as it stands and shows what that finds.
+        if (Document.Text.Version == version)
+        {
+            Show(text, tree, advisories);
+        }
+        if (deprecating.IsCompleted)
+        {
+            return;
+        }
+        // The file's own problems are shown before the feeds say which versions are deprecated.
+        await deprecating;
+        if (!disposed && Document.Text.Version == version)
+        {
+            (advisories, _) = await AdvisoriesAsync(tree, version);
+            if (Document.Text.Version == version)
+            {
+                Show(text, tree, advisories);
+            }
+        }
     }
 
-    /// <summary>The packages this file references or pins whose version a known advisory affects: NuGet's audit warning on
-    /// the version (or the id, when the version is the central one).</summary>
-    private async Task<IReadOnlyList<Marker>> AdvisoriesAsync(int version)
+    /// <summary>The packages this file references or pins whose version a known advisory affects, NuGet's audit warning on
+    /// the version (or the id, when the version is the central one), and whose version its owner deprecated, as far as
+    /// known; with the read of those not known yet.</summary>
+    private async Task<(IReadOnlyList<Marker> Marked, Task Deprecating)> AdvisoriesAsync(XmlTree tree, int version)
     {
-        XmlTree tree = Tree;
         List<(XmlElement Element, string Id, string Version, TextRange Range)> packages = [];
         IReadOnlyDictionary<string, (string Version, MSBuildPlace Place)> central = Insight?.CentralVersions() ?? new Dictionary<string, (string, MSBuildPlace)>();
         foreach (XmlElement element in tree.Elements.Where(e => MSBuildSyntax.PackageItems.Contains(e.LocalName) && MSBuildSyntax.RoleOf(e) == MSBuildRole.Item))
@@ -271,21 +357,90 @@ public sealed class MSBuildDocument : IDisposable
                 packages.Add((element, id, given.Version, include.ValueRange));
             }
         }
-        if (packages.Count == 0)
+        // A project file's own: the packages it gets only through others, which no reference of its marks.
+        IReadOnlyDictionary<string, IReadOnlyList<TransitiveUse>> brought = Project is { } own && PathNames.Same(own, Document.Path) && service.Brought is { } bringing
+            ? await bringing(own) : new Dictionary<string, IReadOnlyList<TransitiveUse>>();
+        if (packages.Count == 0 && brought.Count == 0)
         {
-            return [];
+            deprecated = new Dictionary<(string, string), Deprecation>();
+            exposed = new Dictionary<string, IReadOnlyList<TransitiveUse>>();
+            return ([], Task.CompletedTask);
         }
         VulnerabilityData known = await service.KnownVulnerabilitiesAsync();
         if (disposed || Document.Text.Version != version)
         {
+            return ([], Task.CompletedTask);
+        }
+        exposed = brought.Select(b => (b.Key, Uses: (IReadOnlyList<TransitiveUse>)[.. b.Value.Where(u => known.Of(b.Key, u.Version).Count > 0)]))
+            .Where(b => b.Uses.Count > 0).ToDictionary(b => b.Key, b => b.Uses, StringComparer.OrdinalIgnoreCase);
+        Task deprecating = service.DeprecationsAsync([.. packages.Select(p => (p.Id, p.Version)).Distinct()]);
+        Dictionary<(string Id, string Version), Deprecation> told = [];
+        foreach ((_, string id, string at, _) in packages)
+        {
+            if (service.Deprecated?.Invoke(id, at) is { } deprecation)
+            {
+                told.TryAdd((id, at), deprecation);
+            }
+        }
+        deprecated = told;
+        IEnumerable<Marker> vulnerable = packages.Select(p => (p.Range, Advice: Advise(known, p.Id, p.Version))).Where(p => p.Advice is not null)
+            .Select(p => Marker.Coded(p.Range, MarkerKind.Warning, p.Advice!.Value.Code, p.Advice.Value.Message));
+        IEnumerable<Marker> outdated = packages.Where(p => told.ContainsKey((p.Id, p.Version)))
+            .Select(p => new Marker(p.Range, MarkerKind.Warning, Deprecated(p.Id, p.Version, told[(p.Id, p.Version)])));
+        return ([.. vulnerable, .. outdated, .. Exposed(tree, exposed, known)], deprecating);
+    }
+
+    /// <summary>NuGet's audit warning on each vulnerable version the project gets only through others, on each reference of
+    /// the file that brings it in, else on the project's element: what brings it in, for which frameworks.</summary>
+    private static IEnumerable<Marker> Exposed(XmlTree tree, IReadOnlyDictionary<string, IReadOnlyList<TransitiveUse>> exposed, VulnerabilityData known)
+    {
+        foreach ((string id, IReadOnlyList<TransitiveUse> uses) in exposed)
+        {
+            foreach (IGrouping<(string By, string Version), TransitiveUse> each in uses.SelectMany(u => u.BroughtBy.Select(by => (By: by, Use: u)))
+                .GroupBy(b => (b.By, b.Use.Version), b => b.Use))
+            {
+                string[] frameworks = [.. each.Select(u => u.Framework).OfType<string>().Distinct(StringComparer.OrdinalIgnoreCase)];
+                string through = $", which {each.Key.By} brings in{(frameworks.Length > 0 ? $" for {Plural.Listed(frameworks)}" : string.Empty)},";
+                if ((BringerOf(tree, each.Key.By) ?? tree.Root?.NameRange) is { } at && Advise(known, id, each.Key.Version, through) is { } advice)
+                {
+                    yield return Marker.Coded(at, MarkerKind.Warning, advice.Code, advice.Message);
+                }
+            }
+        }
+    }
+
+    /// <summary>The include of the file's reference to a package or project that brings others in, by its name; null where
+    /// the file has none (another file's reference brings it in).</summary>
+    private static TextRange? BringerOf(XmlTree tree, string name) =>
+        tree.Elements.FirstOrDefault(e => MSBuildSyntax.RoleOf(e) == MSBuildRole.Item && e.Attribute("Include") is { HasValue: true } include
+            && ((e.LocalName == "PackageReference" && include.Value.Trim().Equals(name, StringComparison.OrdinalIgnoreCase))
+                || (e.LocalName == "ProjectReference" && Path.GetFileNameWithoutExtension(include.Value.Trim().Replace('\\', '/')).Equals(name, StringComparison.OrdinalIgnoreCase))))
+            ?.Attribute("Include")?.ValueRange;
+
+    /// <summary>The vulnerable versions the project gets only through others whose mark holds an offset of the file as it
+    /// stands, by package: those a reference there brings in, or on the project's element those no reference of the file
+    /// brings in; none in a file that is no project, or before its marks were read.</summary>
+    public IReadOnlyList<(string Id, IReadOnlyList<TransitiveUse> Uses)> ExposedAt(int offset)
+    {
+        if (exposed.Count == 0)
+        {
             return [];
         }
-        return [.. packages.Select(p => (p.Range, Advice: Advise(known, p.Id, p.Version))).Where(p => p.Advice is not null)
-            .Select(p => Marker.Coded(p.Range, MarkerKind.Warning, p.Advice!.Value.Code, p.Advice.Value.Message))];
+        XmlTree tree = Tree;
+        List<(string, IReadOnlyList<TransitiveUse>)> found = [];
+        foreach ((string id, IReadOnlyList<TransitiveUse> uses) in exposed)
+        {
+            TextRange?[] places = [.. uses.SelectMany(u => u.BroughtBy).Distinct(StringComparer.OrdinalIgnoreCase).Select(by => BringerOf(tree, by) ?? tree.Root?.NameRange)];
+            if (places.Any(p => p is { } at && offset >= at.Start && offset <= at.End))
+            {
+                found.Add((id, uses));
+            }
+        }
+        return found;
     }
 
     /// <summary>NuGet's audit words for a package version's gravest known advisory (NU1901 low to NU1904 critical).</summary>
-    private static (string Code, string Message)? Advise(VulnerabilityData known, string id, string version) =>
+    private static (string Code, string Message)? Advise(VulnerabilityData known, string id, string version, string through = "") =>
         known.Of(id, version) is [{ } gravest, ..]
             ? (gravest.Severity switch
             {
@@ -293,18 +448,17 @@ public sealed class MSBuildDocument : IDisposable
                 AdvisorySeverity.Moderate => "NU1902",
                 AdvisorySeverity.High => "NU1903",
                 _ => "NU1904",
-            }, $"Package '{id}' {version} has a known {gravest.Severity.ToString().ToLowerInvariant()} severity vulnerability, {gravest.Address}")
+            }, $"Package '{id}' {version}{through} has a known {gravest.Severity.ToString().ToLowerInvariant()} severity vulnerability, {gravest.Address}")
             : null;
 
-    /// <summary>The evaluation's problems in this file placed on its lines, with the advisories.</summary>
-    private void Show(IReadOnlyList<Marker> advisories)
+    /// <summary>The evaluation's problems in this file placed on its lines, with the advisories, in the text as it stands and
+    /// its markup.</summary>
+    private void Show(TextSnapshot text, XmlTree tree, IReadOnlyList<Marker> advisories)
     {
         if (disposed)
         {
             return;
         }
-        TextSnapshot text = Document.Text.Snapshot;
-        XmlTree tree = Tree;
         IEnumerable<Marker> found = diagnostics.Select(d => Marker.Coded(RangeOf(text, tree, d), d.Error ? MarkerKind.Error : MarkerKind.Warning, d.Code, Plain(d.Message)));
         // Text typed at a problem's start goes before it.
         Document.Markers = [.. found.Concat(advisories).Select(m => m with { Range = Clamped(m.Range, text.Length), StartGravity = AnchorGravity.After })];

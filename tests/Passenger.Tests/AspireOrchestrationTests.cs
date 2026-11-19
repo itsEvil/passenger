@@ -66,6 +66,59 @@ public sealed class AspireOrchestrationTests : IClassFixture<AspireOrchestration
         window.Close();
     }
 
+    /// <summary>The AppHost and ServiceDefaults orchestration makes join the solution's language server as soon as they are
+    /// written, restored: each one's code is answered for in its own project, the types and members its packages give
+    /// known there.</summary>
+    [AvaloniaFact]
+    public void The_language_server_loads_and_restores_the_projects_orchestration_makes_as_soon_as_they_are_written()
+    {
+        MainWindow window = Open();
+        Assert.Equal("Added Aspire orchestration", Add(window, "Api", existing: false));
+        string host = Assert.Single(Directory.EnumerateFiles(project.PathOf("Shop.AppHost"), "*.cs"),
+            path => File.ReadAllText(path).Contains("AddProject", StringComparison.Ordinal));
+        Known(window, host, "Shop.AppHost", "DistributedApplication.CreateBuilder", "T:Aspire.Hosting.DistributedApplication");
+        Known(window, project.PathOf("Shop.ServiceDefaults/Extensions.cs"), "Shop.ServiceDefaults", "AddServiceDiscovery();",
+            "M:Microsoft.Extensions.DependencyInjection.ServiceDiscoveryServiceCollectionExtensions.AddServiceDiscovery");
+        window.Close();
+    }
+
+    /// <summary>The language server a closed window leaves for the next test may still be restoring the projects
+    /// orchestration made, its restore working in their folders, which Windows will not remove meanwhile (#1488): the next
+    /// test's reset removes them all the same. Here the restore holds where it works in ServiceDefaults until let go.</summary>
+    [AvaloniaFact]
+    public void The_next_tests_reset_removes_the_projects_orchestration_made_while_the_language_server_left_for_it_restores_them()
+    {
+        string held = project.PathOf("restore-held");
+        string release = project.PathOf("restore-released");
+        project.Write("Directory.Build.targets", $$"""
+            <Project>
+              <Target Name="HoldRestore" BeforeTargets="_GenerateRestoreGraphProjectEntry" Condition="'$(MSBuildProjectName)' == 'Shop.ServiceDefaults' And !Exists('{{release}}')">
+                <Exec Condition="'$(OS)' == 'Windows_NT'" Timeout="120000" Command="powershell -NoProfile -Command &quot;Set-Content -Path '{{held}}' -Value held; while (-not (Test-Path '{{release}}')) { Start-Sleep -Milliseconds 100 }&quot;" />
+                <Exec Condition="'$(OS)' != 'Windows_NT'" Timeout="120000" Command="echo held &gt; '{{held}}'; while [ ! -f '{{release}}' ]; do sleep 0.1; done" />
+              </Target>
+            </Project>
+            """);
+        MainWindow window = Open();
+        try
+        {
+            AspireOrchestrationDialog dialog = Show(window, "Api");
+            // Pumped, not settled: the language server's load of what orchestration made ends only with its restore, which holds.
+            Ui.Click(dialog.Add, settle: false);
+            Ui.PumpUntil(() => window.AspireOrchestrationResult is { IsCompleted: true } && File.Exists(held),
+                "orchestration, and the language server's restore to work in the ServiceDefaults it made", TimeSpan.FromMinutes(2));
+            Assert.Equal("Added Aspire orchestration", Finished(window));
+            window.Close();
+            Ui.PumpUntil(() => window.Ended is { IsCompleted: true }, "the window's end");
+            project.Reset();
+            Assert.False(Directory.Exists(project.PathOf("Shop.ServiceDefaults")), "The reset left the ServiceDefaults orchestration made, which the next test's orchestration refuses to make again");
+            Assert.False(Directory.Exists(project.PathOf("Shop.AppHost")), "The reset left the AppHost orchestration made, which the next test's orchestration refuses to make again");
+        }
+        finally
+        {
+            File.WriteAllText(release, "go");
+        }
+    }
+
     /// <summary>The backing services a service's packages point to join the AppHost with it: a Postgres server and the
     /// database its connection string names, a Redis by its connection string's name, each referenced and waited for by
     /// the service under the name it reads, Aspire's hosting integrations referenced at the AppHost's own version; one
@@ -484,6 +537,53 @@ public sealed class AspireOrchestrationTests : IClassFixture<AspireOrchestration
         Ui.WaitFor(() => window.WorkspaceModel!.Projects.Where(p => p.Exists).All(p => p.TargetFrameworks.Count > 0),
             "the orchestration candidates to finish evaluation");
         return window;
+    }
+
+    /// <summary>Opens a C# file and waits for the language server to answer, in the file's project, that the name where
+    /// <paramref name="code"/> begins is the symbol of <paramref name="id"/>, which a package of that project gives: what
+    /// it says before it has loaded and restored that project names no project of it, or no symbol there.</summary>
+    private static void Known(MainWindow window, string path, string project, string code, string id)
+    {
+        window.OpenFile(path);
+        Passenger.App.Workspace.OpenDocument document = window.EditorArea.Active!;
+        int offset = document.Text.Snapshot.ToString().IndexOf(code, StringComparison.Ordinal);
+        Assert.True(offset >= 0, $"{Path.GetFileName(path)}, as orchestration made it, lacks {code}");
+        Task<Passenger.Roslyn.Extension.NamedSymbol?>? asked = null;
+        string said = "nothing";
+        Ui.WaitFor(() =>
+        {
+            if (asked is { IsCompleted: true } answered)
+            {
+                said = answered.IsCompletedSuccessfully ? answered.Result?.Id ?? "no symbol"
+                    : answered.Exception?.GetBaseException().Message ?? "nothing, the question cancelled";
+                asked = null;
+                if (said == id && document.ProjectContexts.Any(c => c.StartsWith($"{project} (", StringComparison.Ordinal)))
+                {
+                    return true;
+                }
+            }
+            if (asked is null && window.CSharpService?.For(document)?.Lsp is { } lsp)
+            {
+                asked = lsp.SymbolAtAsync(offset);
+            }
+            return false;
+        }, () => $"the language server to know {code} in {Path.GetFileName(path)} of {project}, which orchestration made, as the symbol its package gives "
+            + $"(it said {said}, the file in [{string.Join(", ", document.ProjectContexts)}]; {window.CSharpService?.State})");
+    }
+
+    /// <summary>Adds orchestration for <paramref name="services"/> through the dialog, into the AppHost and ServiceDefaults named,
+    /// and says what it came to.</summary>
+    internal static string Add(MainWindow window, IReadOnlyList<string> services, string host, string defaults)
+    {
+        AspireOrchestrationDialog dialog = Show(window, services[0]);
+        foreach (string service in services.Skip(1))
+        {
+            Ui.Click(Assert.Single(dialog.ServiceProjects.ItemsSource!.Cast<CheckBox>(), c => Equals(c.Content, service)));
+        }
+        Select(dialog, dialog.AppHost, host);
+        Select(dialog, dialog.ServiceDefaults, defaults);
+        Ui.Click(dialog.Add);
+        return Finished(window);
     }
 
     private static AspireOrchestrationDialog Show(MainWindow window, string service)

@@ -33,10 +33,12 @@ public abstract class IdeWindow : Window
         }
     }
 
-    /// <summary>Fits the window to the screen under its place when it keeps one, else the primary, before it is shown.</summary>
+    /// <summary>Fits the window to the screen most of it stands on when it keeps its place, else the primary, before it is
+    /// shown: a frame whose top-left edge lies over a neighbouring screen stays on its own.</summary>
     public void FitToScreen(bool keepPlace)
     {
-        Screen? screen = (keepPlace ? Screens.ScreenFromPoint(Position) : null) ?? Screens.Primary;
+        Screen? screen = (keepPlace ? Screens.ScreenFromBounds(new PixelRect(Position, PixelSize.FromSize(Asked(), Screens.ScreenFromPoint(Position)?.Scaling ?? 1))) : null)
+            ?? Screens.Primary;
         if (screen is not null)
         {
             FitWithin(screen.WorkingArea, screen.Scaling, keepPlace);
@@ -56,6 +58,61 @@ public abstract class IdeWindow : Window
         {
             Fit(screen.WorkingArea, screen.Scaling, FrameOf(over), null, Asked());
         }
+    }
+
+    /// <summary>The window's content now drawn <paramref name="ratio"/> times as large: it asks for its size grown by as much
+    /// (a side sized to its content grows with it), fitted to its screen by the one rule where it stands once shown, or as
+    /// it opens before.</summary>
+    public void Rescaled(double ratio)
+    {
+        if (opened)
+        {
+            Refit(new Size(ClientSize.Width * ratio, ClientSize.Height * ratio));
+            return;
+        }
+        if (double.IsFinite(Width))
+        {
+            Width *= ratio;
+        }
+        if (double.IsFinite(Height))
+        {
+            Height *= ratio;
+        }
+    }
+
+    /// <summary>The window's least size, as far as its screen's working area holds it inside the frame; shown, the window is
+    /// fitted to its screen again where it stands, at its size as it is, grown to the least where smaller.</summary>
+    public void HoldAtLeast(Size least)
+    {
+        Screen? screen = IsVisible ? ScreenOf(this) : Screens.ScreenFromPoint(Position) ?? Screens.Primary;
+        Size frame = Frame();
+        Size held = screen is null ? least : new Size(Math.Min(least.Width, Math.Floor((screen.WorkingArea.Width / screen.Scaling) - frame.Width)),
+            Math.Min(least.Height, Math.Floor((screen.WorkingArea.Height / screen.Scaling) - frame.Height)));
+        if (held == new Size(MinWidth, MinHeight))
+        {
+            return;
+        }
+        (MinWidth, MinHeight) = (held.Width, held.Height);
+        Refit(new Size(Math.Max(ClientSize.Width, MinWidth), Math.Max(ClientSize.Height, MinHeight)));
+    }
+
+    /// <summary>A shown window, neither maximized nor full screen, asking for a new size, kept where it stands but moved back
+    /// onto its screen's area; one not yet shown is fitted as it opens.</summary>
+    private void Refit(Size wanted)
+    {
+        if (!opened || WindowState != WindowState.Normal || ScreenOf(this) is not { } screen)
+        {
+            return;
+        }
+        if (!SizeToContent.HasFlag(SizeToContent.Width))
+        {
+            Width = wanted.Width;
+        }
+        if (!SizeToContent.HasFlag(SizeToContent.Height))
+        {
+            Height = wanted.Height;
+        }
+        Fit(screen.WorkingArea, screen.Scaling, screen.WorkingArea, Position, wanted);
     }
 
     /// <summary>An owner is given as the window shows, once its size is laid out (its content's, where it sizes to it) and
@@ -79,6 +136,11 @@ public abstract class IdeWindow : Window
     protected override void OnOpened(EventArgs e)
     {
         opened = true;
+        // Opened maximized or full screen, it keeps the bounds it was fitted to for when it is restored.
+        if (WindowState != WindowState.Normal)
+        {
+            following = null;
+        }
         if (following is { } fitting)
         {
             Fit(fitting, ClientSize);
@@ -86,6 +148,11 @@ public abstract class IdeWindow : Window
             following = FrameSize is null ? fitting : null;
         }
         base.OnOpened(e);
+        // A window that comes without the keys (a notification, an agent's question) is heard where the person is.
+        if (!ShowActivated)
+        {
+            Announcer.TellOpened(this);
+        }
     }
 
     /// <summary>The platform reports the frame of a window shown with none reported: the window is fitted again with

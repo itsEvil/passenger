@@ -42,20 +42,20 @@ public sealed class FindInFilesTests : IDisposable
         window.OpenFile(Path.Combine(folder, "Beta.cs"));
         window.EditorArea.CodeEditor.ApplyEdits([new TextEdit(0, 0, "// one more count\n")]);
         FindInFilesPopup popup = window.ShowFindInFiles(replace: false)!;
-        Search(popup, "count");
+        Ui.Search(popup, "count");
         Assert.Equal(4, popup.Matches.Count);
         Assert.DoesNotContain(popup.Matches, m => m.Path.Contains($"{Path.DirectorySeparatorChar}bin{Path.DirectorySeparatorChar}", StringComparison.Ordinal));
         Assert.Contains(popup.Matches, m => m.LineText == "// one more count");
         Assert.Equal("4 matches in 2 files", popup.Status);
 
         popup.MatchCase = true;
-        Search(popup, "Count");
+        Ui.Search(popup, "Count");
         Assert.Equal(["    void Count() { }"], popup.Matches.Select(m => m.LineText));
         popup.MatchCase = false;
         popup.Regex = true;
-        Search(popup, @"c\w+t\(");
+        Ui.Search(popup, @"c\w+t\(");
         Assert.Single(popup.Matches);
-        Search(popup, "count(");
+        Ui.Search(popup, "count(");
         Assert.Empty(popup.Matches);
         string? why = FileSearch.Problem(popup.Query);
         Assert.True(why is { Length: > 0 }, "A regex that does not read is not said to be wrong");
@@ -72,7 +72,7 @@ public sealed class FindInFilesTests : IDisposable
         Ui.Settle();
         FindInFilesPopup popup = window.ShowFindInFiles(replace: true)!;
         popup.Words = true;
-        Search(popup, "count");
+        Ui.Search(popup, "count");
         Assert.Equal(3, popup.Matches.Count);
 
         window.Confirm = (_, _, _) => Task.FromResult(true);
@@ -88,7 +88,7 @@ public sealed class FindInFilesTests : IDisposable
         Assert.Contains("// the count of things", beta.Text.Snapshot.ToString(), StringComparison.Ordinal);
 
         popup = window.ShowFindInFiles(replace: false)!;
-        Search(popup, "int total");
+        Ui.Search(popup, "int total");
         Assert.Single(popup.Matches);
         Ui.Press(window, "ENTER");
         Assert.Equal("Alpha.cs", window.EditorArea.Active?.Name);
@@ -106,7 +106,7 @@ public sealed class FindInFilesTests : IDisposable
         File.WriteAllText(gamma, "class Gamma\n{\n    int tally = tally + tally;\n    int other = tally;\n}\n");
         MainWindow window = Open();
         FindInFilesPopup popup = window.ShowFindInFiles(replace: true)!;
-        Search(popup, "tally");
+        Ui.Search(popup, "tally");
         Ui.Settle();
         Assert.Equal("4 matches in 1 file", popup.Status);
         Assert.True(popup.Lines.Select(l => (l.Line, l.Matches.Count)).SequenceEqual([(2, 3), (3, 1)]),
@@ -133,7 +133,7 @@ public sealed class FindInFilesTests : IDisposable
         Ui.Press(window, "ESCAPE");
 
         popup = window.ShowFindInFiles(replace: false)!;
-        Search(popup, "total");
+        Ui.Search(popup, "total");
         Ui.Settle();
         Ui.Press(window, "ENTER");
         Assert.Equal("Gamma.cs", window.EditorArea.Active?.Name);
@@ -154,7 +154,7 @@ public sealed class FindInFilesTests : IDisposable
         File.WriteAllBytes(path, System.Text.Encoding.Latin1.GetBytes("// Prix: 5 francs, déjà payés\nclass Gamma { }\n"));
         MainWindow window = Open();
         FindInFilesPopup popup = window.ShowFindInFiles(replace: true)!;
-        Search(popup, "francs");
+        Ui.Search(popup, "francs");
         Assert.Single(popup.Matches);
 
         window.Confirm = (_, _, _) => Task.FromResult(true);
@@ -178,7 +178,7 @@ public sealed class FindInFilesTests : IDisposable
         MainWindow window = Ui.OpenFolder(folder, languageServer: false);
         Ui.WaitFor(() => window.FileIndex.Count >= 112 && !window.FileIndex.IsWalking, "the folder's files indexed");
         FindInFilesPopup popup = window.ShowFindInFiles(replace: true)!;
-        Search(popup, "tally");
+        Ui.Search(popup, "tally");
         Assert.Equal(FileSearch.MostMatches, popup.Matches.Count);
 
         List<string> asked = [];
@@ -215,7 +215,7 @@ public sealed class FindInFilesTests : IDisposable
         {
             Ui.WaitFor(() => window.FileIndex.Count >= 112 && !window.FileIndex.IsWalking, "the folder's files indexed");
             FindInFilesPopup popup = window.ShowFindInFiles(replace: true)!;
-            Search(popup, "tally");
+            Ui.Search(popup, "tally");
             Assert.Equal(FileSearch.MostMatches, popup.Matches.Count);
             List<string> asked = [];
             window.Confirm = (_, question, _) =>
@@ -260,7 +260,7 @@ public sealed class FindInFilesTests : IDisposable
         MainWindow window = Open();
         FindInFilesPopup popup = window.ShowFindInFiles(replace: true)!;
         popup.Words = true;
-        Search(popup, "count");
+        Ui.Search(popup, "count");
         Assert.True(popup.Matches.Any(m => m.Name == "Wide.cs" && m.Line == 2 && m.Column == 8 && m.LineText == "    int count;"),
             $"Find in Files passed over a UTF-16 file the editor opens, or placed its match wrong: {string.Join("; ", popup.Matches.Select(m => $"{m.Name}:{m.Line + 1}:{m.Column + 1} {m.LineText}"))}");
         Assert.Contains(popup.Matches, m => m.Name == "WideBig.cs" && m.LineText == "// a count kept big-endian");
@@ -278,92 +278,6 @@ public sealed class FindInFilesTests : IDisposable
         window.Close();
     }
 
-    /// <summary>Find in Files reads as text only the files whose bytes may hold a match: over 2,000 files of 4 KB with a match
-    /// in a few, each search allocates (on every thread, the least of three) under 4 KB for each file more than over 20,
-    /// where reading one as text costs ten times that. It finds the same matches in UTF-8, UTF-8 with a BOM, UTF-16 and
-    /// 8-bit files, ignoring case as its regex does (a Kelvin sign is a k), matching case, by whole words and by regex.</summary>
-    [AvaloniaFact]
-    public void A_search_over_two_thousand_files_reads_as_text_only_those_whose_bytes_may_match()
-    {
-        (string Text, bool MatchCase, bool Words, bool Regex, string Found)[] queries =
-        [
-            ("needle", false, false, false, "Bom.cs:1:6, Found.cs:1:8, Latin.cs:1:13, Wide.cs:1:6"),
-            ("kelvin", false, false, false, "Kelvin.cs:1:4"),
-            ("Needle", true, false, false, "Found.cs:1:8"),
-            ("needle", false, true, false, "Bom.cs:1:6, Found.cs:1:8, Latin.cs:1:13, Wide.cs:1:6"),
-            (@"ne+dle\b", false, false, true, "Bom.cs:1:6, Found.cs:1:8, Latin.cs:1:13, Wide.cs:1:6"),
-        ];
-        string small = TestFolders.Create("find-few-");
-        string large = TestFolders.Create("find-many-");
-        try
-        {
-            Files(small, 20);
-            Files(large, 2000);
-            (long Bytes, string Found)[] few = Searches(small, queries);
-            (long Bytes, string Found)[] many = Searches(large, queries);
-            for (int i = 0; i < queries.Length; i++)
-            {
-                string asked = $"{queries[i].Text}{(queries[i].MatchCase ? " matching case" : string.Empty)}{(queries[i].Words ? " as a word" : string.Empty)}{(queries[i].Regex ? " as a regex" : string.Empty)}";
-                long each = (many[i].Bytes - few[i].Bytes) / 1980;
-                TestContext.Current.TestOutputHelper?.WriteLine($"{asked}: {few[i].Bytes / 1024:N0} KB over 20 files, {many[i].Bytes / 1024:N0} KB over 2,000, {each:N0} bytes a file more");
-                Assert.True(few[i].Found == queries[i].Found && many[i].Found == queries[i].Found,
-                    $"Find in Files for {asked} found [{few[i].Found}] over 20 files and [{many[i].Found}] over 2,000, not [{queries[i].Found}]");
-                Assert.True(each < 4096,
-                    $"Find in Files for {asked} allocated {many[i].Bytes / 1024:N0} KB over 2,000 files, {few[i].Bytes / 1024:N0} KB over 20: {each:N0} bytes for each file more, as if every file were read as text");
-            }
-        }
-        finally
-        {
-            TestFolders.Delete(small);
-            TestFolders.Delete(large);
-        }
-
-        // Files of code that hold no match, a hundred to a folder, and beside them a match in each encoding.
-        static void Files(string root, int count)
-        {
-            TestFolders.WriteAll(root, Enumerable.Range(0, count).Select(i => ($"src/Area{i / 100}/Filler{i}.cs",
-                $"class Filler{i}\n{{\n" + string.Concat(Enumerable.Range(0, 80).Select(j => $"    int field{j} = {j} * {i}; // a sum of the parts\n")) + "}\n")));
-            File.WriteAllText(Path.Combine(root, "Found.cs"), "// the Needle is here\nclass Found { }\n");
-            File.WriteAllText(Path.Combine(root, "Bom.cs"), "// a needle after a BOM\n", new System.Text.UTF8Encoding(true));
-            File.WriteAllText(Path.Combine(root, "Wide.cs"), "// a needle in UTF-16\n", System.Text.Encoding.Unicode);
-            File.WriteAllBytes(Path.Combine(root, "Latin.cs"), System.Text.Encoding.Latin1.GetBytes("// déjà une needle\n"));
-            File.WriteAllText(Path.Combine(root, "Kelvin.cs"), "// Kelvin's line\n");
-            File.WriteAllBytes(Path.Combine(root, "Blob.bin"), [.. System.Text.Encoding.ASCII.GetBytes("needle kelvin"), 0, 1, 2]);
-        }
-    }
-
-    /// <summary>What each search over a folder allocates on every thread from its query to its matches shown, the least of
-    /// three, as a test beside it may allocate meanwhile; and the matches as file:line:column, in order.</summary>
-    private static (long Bytes, string Found)[] Searches(string root, (string Text, bool MatchCase, bool Words, bool Regex, string Found)[] queries)
-    {
-        MainWindow window = Ui.OpenFolder(root, languageServer: false);
-        Ui.WaitFor(() => window.FileIndex.Count > 0 && !window.FileIndex.IsWalking, "the folder's files indexed");
-        FindInFilesPopup popup = window.ShowFindInFiles(replace: false)!;
-        List<(long Bytes, string Found)> searches = [];
-        foreach ((string text, bool matchCase, bool words, bool regex, _) in queries)
-        {
-            popup.MatchCase = matchCase;
-            popup.Words = words;
-            popup.Regex = regex;
-            long least = long.MaxValue;
-            for (int time = 0; time < 3; time++)
-            {
-                // The box tells of a new text after the frame, which puts the search off until a pause: told before searching now.
-                popup.Text = string.Empty;
-                Avalonia.Threading.Dispatcher.UIThread.RunJobs();
-                long before = GC.GetTotalAllocatedBytes(precise: true);
-                popup.Text = text;
-                Avalonia.Threading.Dispatcher.UIThread.RunJobs();
-                Task searching = popup.SearchAsync();
-                Ui.WaitFor(() => searching.IsCompleted, $"the search for {text}");
-                least = Math.Min(least, GC.GetTotalAllocatedBytes(precise: true) - before);
-            }
-            searches.Add((least, string.Join(", ", popup.Matches.Select(m => $"{m.Name}:{m.Line + 1}:{m.Column + 1}").Order(StringComparer.Ordinal))));
-        }
-        window.Close();
-        return [.. searches];
-    }
-
     [Gate]
     [AvaloniaFact]
     public void Replace_all_across_a_read_only_file_replaces_in_the_rest_and_says_which_file_it_left_and_why()
@@ -377,7 +291,7 @@ public sealed class FindInFilesTests : IDisposable
         Ui.Settle();
         FindInFilesPopup popup = window.ShowFindInFiles(replace: true)!;
         popup.Words = true;
-        Search(popup, "count");
+        Ui.Search(popup, "count");
         Assert.Equal(4, popup.Matches.Count);
 
         window.Confirm = (_, _, _) => Task.FromResult(true);
@@ -421,7 +335,7 @@ public sealed class FindInFilesTests : IDisposable
         };
         FindInFilesPopup popup = window.ShowFindInFiles(replace: true)!;
         popup.Words = true;
-        Search(popup, "count");
+        Ui.Search(popup, "count");
         popup.Replacement = "total";
         popup.RequestReplace();
         Ui.WaitFor(() => window.Status?.StartsWith("Replaced", StringComparison.Ordinal) == true, () => $"the replacement; the status says '{window.Status}'");
@@ -471,7 +385,7 @@ public sealed class FindInFilesTests : IDisposable
         Passenger.App.History.HistoryTab history = window.LocalHistoryWindow.Shown!;
         FindInFilesPopup popup = window.ShowFindInFiles(replace: true)!;
         popup.Words = true;
-        Search(popup, "count");
+        Ui.Search(popup, "count");
         popup.Replacement = "total";
         popup.RequestReplace();
         Ui.WaitFor(() => window.Status?.StartsWith("Replaced", StringComparison.Ordinal) == true, () => $"the replacement; the status says '{window.Status}'");
@@ -829,7 +743,7 @@ public sealed class FindInFilesTests : IDisposable
         MainWindow window = Open();
         FindInFilesPopup popup = window.ShowFindInFiles(replace: true)!;
         popup.Regex = true;
-        Search(popup, "(a+)+b|count");
+        Ui.Search(popup, "(a+)+b|count");
         Assert.True(popup.Status == "4 matches in 3 files; the regex took too long and stopped in Runs.txt", $"The popup says '{popup.Status}' of a regex that never ends in Runs.txt");
         Assert.Contains(popup.Matches, m => m is { Name: "Runs.txt", Line: 0, Column: 0, Length: 2 });
 
@@ -862,7 +776,7 @@ public sealed class FindInFilesTests : IDisposable
             MainWindow window = Open();
             FindInFilesPopup popup = window.ShowFindInFiles(replace: true)!;
             popup.Words = true;
-            Search(popup, "count");
+            Ui.Search(popup, "count");
             Assert.True(popup.Matches.Any(m => PathNames.Same(m.Path, target)), $"Find in Files did not list the match in profile.txt, through notes.txt: {string.Join(", ", popup.Matches.Select(m => m.Path))}");
 
             window.Confirm = (_, _, _) => Task.FromResult(true);
@@ -874,8 +788,9 @@ public sealed class FindInFilesTests : IDisposable
             Assert.Equal("class Alpha\n{\n    int total;\n}\n", File.ReadAllText(Path.Combine(folder, "Alpha.cs")));
 
             Task<string> replacing = new Passenger.App.Mcp.PassengerTools(window).ReplaceInFiles("count", "sum", wholeWords: true);
-            Exception refused = Assert.ThrowsAny<Exception>(() => Ui.Await(replacing, "replace_in_files' answer"));
-            Assert.Contains("profile.txt (outside the folder, where a link in it leads)", refused.Message, StringComparison.Ordinal);
+            string answer = Ui.Await(replacing, "replace_in_files' answer");
+            Assert.True(answer.Contains("not replaced: ", StringComparison.Ordinal) && answer.Contains("profile.txt", StringComparison.Ordinal),
+                $"replace_in_files did not say it left profile.txt, outside the folder through the link notes.txt: {answer}");
             Assert.True(File.ReadAllText(target) == kept, $"replace_in_files wrote profile.txt, outside the folder, through the link notes.txt: {File.ReadAllText(target)}");
             window.Close();
         }
@@ -898,7 +813,7 @@ public sealed class FindInFilesTests : IDisposable
         FindInFilesPopup popup = window.ShowFindInFiles(replace: true)!;
         popup.Regex = true;
         popup.FileMask = "*.txt";
-        Search(popup, @"\b");
+        Ui.Search(popup, @"\b");
         window.Confirm = (_, _, _) => Task.FromResult(true);
         popup.Replacement = "$_";
         popup.RequestReplace();
@@ -934,7 +849,7 @@ public sealed class FindInFilesTests : IDisposable
         FindInFilesPopup popup = window.ShowFindInFiles(replace: true)!;
         popup.MatchCase = true;
         popup.Words = true;
-        Search(popup, "count");
+        Ui.Search(popup, "count");
         window.Confirm = (_, _, _) => Task.FromResult(true);
         popup.Replacement = "amount";
         popup.RequestReplace();
@@ -968,7 +883,7 @@ public sealed class FindInFilesTests : IDisposable
         window.Confirm = (_, _, _) => Task.FromResult(true);
         FindInFilesPopup popup = window.ShowFindInFiles(replace: true)!;
         popup.Regex = true;
-        Search(popup, @"(\w+)(?=\()");
+        Ui.Search(popup, @"(\w+)(?=\()");
         Assert.Equal(2, popup.Matches.Count);
 
         popup.Replacement = "$1_";
@@ -978,7 +893,7 @@ public sealed class FindInFilesTests : IDisposable
         Assert.Contains("    void Count_() { }", beta.Text.Snapshot.ToString(), StringComparison.Ordinal);
 
         popup.Words = true;
-        Search(popup, "cat|dog");
+        Ui.Search(popup, "cat|dog");
         Assert.True(popup.Matches.Count == 2, $"cat|dog with Words found {popup.Matches.Count}: a word's part (catalog, hotdog) was taken for a whole word");
         popup.Replacement = "pet";
         popup.RequestReplace();
@@ -1000,7 +915,7 @@ public sealed class FindInFilesTests : IDisposable
         window.Confirm = (_, _, _) => Task.FromResult(true);
         FindInFilesPopup popup = window.ShowFindInFiles(replace: true)!;
         popup.Regex = true;
-        Search(popup, "^");
+        Ui.Search(popup, "^");
         // Every line's start, an empty line's too, but not the end after a file's last break.
         Assert.Equal((4, 5, 4), (popup.Matches.Count(m => m.Name == "Alpha.cs"), popup.Matches.Count(m => m.Name == "Beta.cs"), popup.Matches.Count(m => m.Name == "Gamma.cs")));
 
@@ -1178,7 +1093,7 @@ public sealed class FindInFilesTests : IDisposable
         {
             window.ApplySettings(window.Settings with { Ligatures = ligatures });
             FindInFilesPopup popup = window.ShowFindInFiles(replace: false)!;
-            Search(popup, "Twice");
+            Ui.Search(popup, "Twice");
             Ui.Settle();
             TextBlock line = popup.GetVisualDescendants().OfType<TextBlock>().Single(t => t.Inlines is { Count: > 0 } runs && runs.Text?.Contains("=>", StringComparison.Ordinal) == true);
             Assert.True(PlainArrow(line) != ligatures,
@@ -1230,7 +1145,7 @@ public sealed class FindInFilesTests : IDisposable
             Assert.True(!code.IsDimmed && dimmed.Length == 0, $"The Explorer dims [{string.Join(", ", dimmed)}] of a monorepo's packages, which are its source");
 
             FindInFilesPopup popup = window.ShowFindInFiles(replace: false)!;
-            Search(popup, "needle");
+            Ui.Search(popup, "needle");
             string[] found = [.. popup.Matches.Select(m => Path.GetRelativePath(root, m.Path)).Distinct()];
             Assert.True(found.SequenceEqual([source]), $"Find in Files found needle in [{string.Join(", ", found)}], where the monorepo's packages alone are the person's code");
             Ui.Press(window, "ESCAPE");
@@ -1270,7 +1185,7 @@ public sealed class FindInFilesTests : IDisposable
         try
         {
             FindInFilesPopup popup = window.ShowFindInFiles(replace: false)!;
-            Search(popup, "needle");
+            Ui.Search(popup, "needle");
             string[] found = Found(popup, root);
             Assert.True(found.SequenceEqual(expected), $"Find in Files found needle in [{string.Join(", ", found)}], where {(caseIgnored ? "Bin, Obj and Node_Modules are the build's own" : "Bin, Obj and Node_Modules are the person's folders")}");
             Ui.Press(window, "ESCAPE");
@@ -1304,7 +1219,7 @@ public sealed class FindInFilesTests : IDisposable
         try
         {
             FindInFilesPopup popup = window.ShowFindInFiles(replace: false)!;
-            Search(popup, "needle");
+            Ui.Search(popup, "needle");
             Assert.Equal([Path.Combine("src", "a.js")], Found(popup, root));
             Ui.Press(window, "ESCAPE");
 
@@ -1315,7 +1230,7 @@ public sealed class FindInFilesTests : IDisposable
             Ui.ChooseFromRowMenu(window, row, "Edit", "Find in Files…");
             popup = Assert.IsType<FindInFilesPopup>(window.Popup);
             Assert.Equal((SearchScopeKind.Directory, package), (popup.ScopeKind, popup.Directory));
-            Search(popup, "needle");
+            Ui.Search(popup, "needle");
             string[] found = Found(popup, root);
             Assert.True(found.SequenceEqual([Path.Combine("node_modules", "pkg", "index.js")]),
                 $"Find in Files on node_modules/pkg found [{string.Join(", ", found)}], where its index.js holds needle");
@@ -1325,7 +1240,7 @@ public sealed class FindInFilesTests : IDisposable
             popup = window.ShowFindInFiles(replace: true)!;
             popup.ScopeKind = SearchScopeKind.Directory;
             popup.Directory = output;
-            Search(popup, "needle");
+            Ui.Search(popup, "needle");
             found = Found(popup, root);
             Assert.True(found.SequenceEqual([Path.Combine("bin", "Debug", "out.txt")]),
                 $"Find in Files on bin/Debug found [{string.Join(", ", found)}], where its out.txt holds needle");
@@ -1373,7 +1288,7 @@ public sealed class FindInFilesTests : IDisposable
     private static WeakReference<FindInFilesPopup> SearchAndClose(MainWindow window)
     {
         FindInFilesPopup popup = window.ShowFindInFiles(replace: false)!;
-        Search(popup, "count");
+        Ui.Search(popup, "count");
         Ui.Settle();
         CodeEditor preview = popup.GetVisualDescendants().OfType<CodeEditor>().Single();
         Assert.True(preview.Document.Snapshot.ToString().Contains("count", StringComparison.Ordinal), "The preview shows no file with a match");
@@ -1384,13 +1299,98 @@ public sealed class FindInFilesTests : IDisposable
 
     /// <summary>Searches for a text and waits for the search in force to show its matches: the box tells of its new text
     /// after the frame, before the search begins; another change that lands meanwhile searches again, cancelling this one.</summary>
-    private static void Search(FindInFilesPopup popup, string text)
+    private MainWindow Open() => Ui.OpenFolder(folder);
+}
+
+/// <summary>What Find in Files allocates over many files against few, counted on every thread: the class runs alone, as
+/// whatever a class beside the window tests allocates meanwhile would count as the search's.</summary>
+[Collection(Alone.Name)]
+public sealed class FindInFilesBytesTests
+{
+    /// <summary>Find in Files reads as text only the files whose bytes may hold a match: over 2,000 files of 4 KB with a match
+    /// in a few, each search allocates (on every thread, the least of three) under 4 KB for each file more than over 20,
+    /// where reading one as text costs ten times that. It finds the same matches in UTF-8, UTF-8 with a BOM, UTF-16 and
+    /// 8-bit files, ignoring case as its regex does (a Kelvin sign is a k), matching case, by whole words and by regex.</summary>
+    [AvaloniaFact]
+    public void A_search_over_two_thousand_files_reads_as_text_only_those_whose_bytes_may_match()
     {
-        popup.Text = text;
-        Avalonia.Threading.Dispatcher.UIThread.RunJobs();
-        Task searching = popup.SearchAsync();
-        Ui.WaitFor(() => searching.IsCompleted && popup.Searching.IsCompleted && popup.Status != "Searching…", $"the search for {text}");
+        (string Text, bool MatchCase, bool Words, bool Regex, string Found)[] queries =
+        [
+            ("needle", false, false, false, "Bom.cs:1:6, Found.cs:1:8, Latin.cs:1:13, Wide.cs:1:6"),
+            ("kelvin", false, false, false, "Kelvin.cs:1:4"),
+            ("Needle", true, false, false, "Found.cs:1:8"),
+            ("needle", false, true, false, "Bom.cs:1:6, Found.cs:1:8, Latin.cs:1:13, Wide.cs:1:6"),
+            (@"ne+dle\b", false, false, true, "Bom.cs:1:6, Found.cs:1:8, Latin.cs:1:13, Wide.cs:1:6"),
+        ];
+        string small = TestFolders.Create("find-few-");
+        string large = TestFolders.Create("find-many-");
+        try
+        {
+            Files(small, 20);
+            Files(large, 2000);
+            (long Bytes, string Found)[] few = Searches(small, queries);
+            (long Bytes, string Found)[] many = Searches(large, queries);
+            for (int i = 0; i < queries.Length; i++)
+            {
+                string asked = $"{queries[i].Text}{(queries[i].MatchCase ? " matching case" : string.Empty)}{(queries[i].Words ? " as a word" : string.Empty)}{(queries[i].Regex ? " as a regex" : string.Empty)}";
+                long each = (many[i].Bytes - few[i].Bytes) / 1980;
+                TestContext.Current.TestOutputHelper?.WriteLine($"{asked}: {few[i].Bytes / 1024:N0} KB over 20 files, {many[i].Bytes / 1024:N0} KB over 2,000, {each:N0} bytes a file more");
+                Assert.True(few[i].Found == queries[i].Found && many[i].Found == queries[i].Found,
+                    $"Find in Files for {asked} found [{few[i].Found}] over 20 files and [{many[i].Found}] over 2,000, not [{queries[i].Found}]");
+                Assert.True(each < 4096,
+                    $"Find in Files for {asked} allocated {many[i].Bytes / 1024:N0} KB over 2,000 files, {few[i].Bytes / 1024:N0} KB over 20: {each:N0} bytes for each file more, as if every file were read as text");
+            }
+        }
+        finally
+        {
+            TestFolders.Delete(small);
+            TestFolders.Delete(large);
+        }
+
+        // Files of code that hold no match, a hundred to a folder, and beside them a match in each encoding.
+        static void Files(string root, int count)
+        {
+            TestFolders.WriteAll(root, Enumerable.Range(0, count).Select(i => ($"src/Area{i / 100}/Filler{i}.cs",
+                $"class Filler{i}\n{{\n" + string.Concat(Enumerable.Range(0, 80).Select(j => $"    int field{j} = {j} * {i}; // a sum of the parts\n")) + "}\n")));
+            File.WriteAllText(Path.Combine(root, "Found.cs"), "// the Needle is here\nclass Found { }\n");
+            File.WriteAllText(Path.Combine(root, "Bom.cs"), "// a needle after a BOM\n", new System.Text.UTF8Encoding(true));
+            File.WriteAllText(Path.Combine(root, "Wide.cs"), "// a needle in UTF-16\n", System.Text.Encoding.Unicode);
+            File.WriteAllBytes(Path.Combine(root, "Latin.cs"), System.Text.Encoding.Latin1.GetBytes("// déjà une needle\n"));
+            File.WriteAllText(Path.Combine(root, "Kelvin.cs"), "// Kelvin's line\n");
+            File.WriteAllBytes(Path.Combine(root, "Blob.bin"), [.. System.Text.Encoding.ASCII.GetBytes("needle kelvin"), 0, 1, 2]);
+        }
     }
 
-    private MainWindow Open() => Ui.OpenFolder(folder);
+    /// <summary>What each search over a folder allocates on every thread from its query to its matches shown, the least of
+    /// three, as a query's first search pays once for what the others reuse; and the matches as file:line:column, in
+    /// order.</summary>
+    private static (long Bytes, string Found)[] Searches(string root, (string Text, bool MatchCase, bool Words, bool Regex, string Found)[] queries)
+    {
+        MainWindow window = Ui.OpenFolder(root, languageServer: false);
+        Ui.WaitFor(() => window.FileIndex.Count > 0 && !window.FileIndex.IsWalking, "the folder's files indexed");
+        FindInFilesPopup popup = window.ShowFindInFiles(replace: false)!;
+        List<(long Bytes, string Found)> searches = [];
+        foreach ((string text, bool matchCase, bool words, bool regex, _) in queries)
+        {
+            popup.MatchCase = matchCase;
+            popup.Words = words;
+            popup.Regex = regex;
+            long least = long.MaxValue;
+            for (int time = 0; time < 3; time++)
+            {
+                // The box tells of a new text after the frame, which puts the search off until a pause: told before searching now.
+                popup.Text = string.Empty;
+                Avalonia.Threading.Dispatcher.UIThread.RunJobs();
+                long before = GC.GetTotalAllocatedBytes(precise: true);
+                popup.Text = text;
+                Avalonia.Threading.Dispatcher.UIThread.RunJobs();
+                Task searching = popup.SearchAsync();
+                Ui.WaitFor(() => searching.IsCompleted, $"the search for {text}");
+                least = Math.Min(least, GC.GetTotalAllocatedBytes(precise: true) - before);
+            }
+            searches.Add((least, string.Join(", ", popup.Matches.Select(m => $"{m.Name}:{m.Line + 1}:{m.Column + 1}").Order(StringComparer.Ordinal))));
+        }
+        window.Close();
+        return [.. searches];
+    }
 }

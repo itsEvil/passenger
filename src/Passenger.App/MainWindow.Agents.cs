@@ -9,9 +9,9 @@ namespace Passenger.App;
 
 /// <summary>Agents in the window: its own socket, open to them from its start (<c>--no-mcp</c> aside), on which an
 /// agent works once let in: by Enable MCP Server (turning it off shuts them out), by the folder's Always, or by the
-/// person's Allow when its first call comes; the person's leave before an agent's first use of a tool that changes
-/// something, and before it opens another folder here; and the status bar's word on who is on the window and what they
-/// run there.</summary>
+/// person's Allow when its first call comes; the person's leave before an agent's call of a tool that changes something,
+/// once or for the session, or for every tool at once at the agent's request, and before it opens another folder here; and
+/// the status bar's word on who is on the window and what they run there.</summary>
 public partial class MainWindow
 {
     private readonly List<string> agentWork = [];
@@ -114,7 +114,7 @@ public partial class MainWindow
             agentSocket.Describe(Folder);
         }
         System.Diagnostics.ProcessStartInfo start = Core.ChildProcesses.Command(command[0], command.Skip(1), Folder ?? Environment.CurrentDirectory);
-        start.Environment[AgentExecutableVariable] = Path.Combine(AppContext.BaseDirectory, OperatingSystem.IsWindows() ? "Passenger.exe" : "Passenger");
+        start.Environment[AgentExecutableVariable] = Core.Product.Program;
         start.Environment[AgentPidVariable] = Environment.ProcessId.ToString(System.Globalization.CultureInfo.InvariantCulture);
         return ShowInTerminal("Agent", start);
     }
@@ -160,7 +160,7 @@ public partial class MainWindow
     /// agent's call waits on goes, the call refused saying so (<see cref="Admission.FolderChanged"/>), so an answer only
     /// ever allows what it named where it named it; the agents let in on the folder it leaves are shut out, each asked again
     /// at its next call, unless the window lets agents in unasked where it goes; the agent whose own open it is
-    /// (<paramref name="opener"/>) stays. Those that stay are asked again before their first use of each tool there.</summary>
+    /// (<paramref name="opener"/>) stays. Those that stay are asked again for each tool there.</summary>
     private void AgentsGoTo(string? folder, Mcp.AgentConnection? opener)
     {
         foreach (Window asking in agentDialogs.Where(d => d.IsVisible).ToList())
@@ -209,28 +209,39 @@ public partial class MainWindow
         return await AskForAgentAsync(dialog, () => Answered(dialog.Answered), $"{agent} waits for you: open {name} here?", cancel);
     }
 
-    /// <summary>Asks the person whether an agent may use a tool that changes something, showing what it asked with: no
-    /// answer within <see cref="AgentAnswerLimit"/>, or every call waiting giving up, takes the question away.</summary>
-    internal async Task<Admission> AllowAgentAsync(string agent, string tool, string title, IReadOnlyList<(string Name, string Value)> arguments, CancellationToken cancel)
+    /// <summary>Asks the person whether an agent's call of a tool that changes something may go on, showing what it asked
+    /// with (<see cref="AgentToolDialog"/>): Allow Once, Allow for This Session, or Deny; no answer within
+    /// <see cref="AgentAnswerLimit"/>, or <paramref name="cancel"/>, takes the question away.</summary>
+    internal Task<Admission> AllowAgentAsync(string agent, string tool, string title, bool ownWindows, IReadOnlyList<(string Name, string Value)> arguments, CancellationToken cancel)
     {
         UiThread.Check();
         string what = char.ToLowerInvariant(title[0]) + title[1..];
-        ConfirmDialog dialog = new($"Allow {tool}?",
-            $"{agent}, connected through Passenger's MCP server, wants to {what} (its {tool} tool). Once allowed, it may use that tool again without asking in this folder until it disconnects.",
-            "Allow", "Deny", arguments.Count == 0 ? null : AgentArguments(arguments))
-        {
-            EnterAgrees = false,
-        };
-        IdeErrors.Write($"Agents: {agent} asks to use {tool} in the window on {Folder ?? "no folder"}");
+        return AllowAgentAsync(agent, ownWindows ? $"{tool} in Passenger's windows" : tool,
+            new AgentToolDialog(agent, tool, what, ownWindows, arguments.Count == 0 ? null : AgentBlock(Mcp.AskedArguments.Of(arguments))), cancel);
+    }
+
+    /// <summary>Asks the person whether an agent may use every tool that changes something, <paramref name="tools"/>, without
+    /// a question at each call for its session (<see cref="AgentToolDialog"/>): Allow for This Session or Deny; no answer
+    /// within <see cref="AgentAnswerLimit"/>, or <paramref name="cancel"/>, takes the question away.</summary>
+    internal Task<Admission> AllowAgentEveryToolAsync(string agent, IEnumerable<string> tools, CancellationToken cancel)
+    {
+        UiThread.Check();
+        return AllowAgentAsync(agent, "every tool", new AgentToolDialog(agent, AgentBlock(string.Join(", ", tools))), cancel);
+    }
+
+    private async Task<Admission> AllowAgentAsync(string agent, string named, AgentToolDialog dialog, CancellationToken cancel)
+    {
+        IdeErrors.Write($"Agents: {agent} asks to use {named} in the window on {Folder ?? "no folder"}");
         string? folder = Folder;
-        Admission said = await AskForAgentAsync(dialog, () => Answered(dialog.Answered), $"{agent} waits for you: allow {tool}?", cancel);
+        Admission said = await AskForAgentAsync(dialog, () => dialog.Answered, $"{agent} waits for you: allow {named}?", cancel);
         IdeErrors.Write($"Agents: {agent} {(said switch
         {
-            Admission.Allowed => "allowed",
-            Admission.NotAllowed => "not allowed",
-            Admission.FolderChanged => "not answered before the window left whether it may use",
-            _ => $"not answered within {AgentConnection.Limit(this)} whether it may use",
-        })} {tool} on {folder ?? "no folder"}");
+            Admission.Allowed => $"allowed {named} for the session",
+            Admission.AllowedOnce => $"allowed {named} once",
+            Admission.NotAllowed => $"not allowed {named}",
+            Admission.FolderChanged => $"not answered before the window left whether it may use {named}",
+            _ => $"not answered within {AgentConnection.Limit(this)} whether it may use {named}",
+        })} on {folder ?? "no folder"}");
         return said;
     }
 
@@ -290,8 +301,9 @@ public partial class MainWindow
     }
 
     /// <summary>Why an agent's input through the inspector (app_click, app_key, app_type and app_scroll on app ide) may not
-    /// reach one of Passenger's own top levels, else null: a question Passenger asks the person on an agent's behalf, or
-    /// Settings, where the person alone says what agents may do; a popup or dialog of either is it. The process's, as the
+    /// reach one of Passenger's own top levels, else null: a question Passenger asks the person on an agent's behalf, the
+    /// question whether to trust a folder, one whose answer only the person gives (<see cref="ConfirmDialog.PersonsAlone"/>),
+    /// or Settings, where the person alone says what agents may do; a popup or dialog of any is it. The process's, as the
     /// inspector loaded into it is (<see cref="LiveTree.LiveApp.Own"/>).</summary>
     internal static string? KeptFromAgents(object reached)
     {
@@ -302,12 +314,37 @@ public partial class MainWindow
             {
                 return "Settings is the person's alone: no agent's input reaches it (settings_set changes what an agent may)";
             }
+            if (at is WorkspaceTrustDialog)
+            {
+                return Refusals.TrustAnsweredByThePerson;
+            }
+            if (at is ConfirmDialog { PersonsAlone: { } persons })
+            {
+                return persons;
+            }
             if (at is Window asking && PassengerApp.Windows.Any(w => w.agentDialogs.Contains(asking)))
             {
                 return $"\"{asking.Title}\" is Passenger's question to the person on an agent's behalf: only they answer it, never an agent's input";
             }
         }
         return null;
+    }
+
+    /// <summary>Whether an agent asks for an action: its ide_action on a person's window (<see cref="ActionContext.ByAgent"/>), or
+    /// anything in its own Passenger, which nobody is at, whose ide_action runs as the window's own.</summary>
+    private bool AskedByAgent(ActionContext context) => context.ByAgent || AgentsOwn;
+
+    /// <summary>Whether what only the person does (trusting a folder, an install, a change of their shell) was asked for by
+    /// an agent's input into the window, or work it started (<see cref="AgentAsks.PersonsAlone"/>): refused, the agent and
+    /// the status bar told <paramref name="why"/>.</summary>
+    private bool RefusedToAgentsInput(string why)
+    {
+        if (!AgentAsks.PersonsAlone(why))
+        {
+            return false;
+        }
+        Refuse(why);
+        return true;
     }
 
     internal void AgentWorkStarted(string title)
@@ -348,14 +385,15 @@ public partial class MainWindow
         }
     }
 
-    private static Control AgentArguments(IReadOnlyList<(string Name, string Value)> arguments)
+    /// <summary>What an agent's question shows in code's type (a call's arguments, the tools it would allow), scrolling
+    /// past a height.</summary>
+    private static Control AgentBlock(string text)
     {
-        const int Longest = 400;
-        Border frame = CodeBlock.Of(string.Join('\n', arguments.Select(a => $"{a.Name}: {(a.Value.Length > Longest ? a.Value[..Longest] + "…" : a.Value)}")));
+        Border frame = CodeBlock.Of(text);
         frame.MaxHeight = 200;
-        Control text = frame.Child!;
+        Control shown = frame.Child!;
         frame.Child = null;
-        frame.Child = new ScrollViewer { Content = text, HorizontalScrollBarVisibility = Avalonia.Controls.Primitives.ScrollBarVisibility.Disabled };
+        frame.Child = new ScrollViewer { Content = shown, HorizontalScrollBarVisibility = Avalonia.Controls.Primitives.ScrollBarVisibility.Disabled };
         return frame;
     }
 }

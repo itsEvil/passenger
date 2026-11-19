@@ -40,13 +40,13 @@ public sealed record WebServerLost(string Said, Action? StartAgain);
 /// <summary>JavaScript, TypeScript, HTML, CSS, JSON, Dockerfiles, YAML and GDScript for the open folder: each kind's
 /// language server (the npm packages carried under <c>web/</c>, run on the machine's Node.js through ChildProcesses;
 /// GDScript's in Godot's editor, one for each Godot project a script is open in, the person's joined, a headless one started
-/// only when asked, <see cref="AskGodot"/>) started as the first file that needs it opens, every open file of its languages
-/// kept in step with it (a
-/// <see cref="WebDocument"/> each), and ended with the folder. Without a Node.js to run them (none found, or one too
-/// old), each file says why in its banner and the status bar, keeping its colours. A server that ends (as it starts too)
-/// or stops answering is started again with its files, a few times at most, then left stopped until a person starts it
-/// again. The project's own <c>node_modules/typescript</c> is the TypeScript server's when it has one. A UI-thread object:
-/// what a server says from its threads crosses through <see cref="UiThread"/>.</summary>
+/// only when asked, <see cref="AskGodot"/>, never in a folder not trusted) started as the first file that needs it opens,
+/// every open file of its languages kept in step with it (a <see cref="WebDocument"/> each), and ended with the folder.
+/// Without a Node.js to run them (none found, or one too old), each file says why in its banner and the status bar, keeping
+/// its colours. A server that ends (as it starts too) or stops answering is started again with its files, a few times at
+/// most, then left stopped until a person starts it again. The project's own <c>node_modules/typescript</c> is the
+/// TypeScript server's where it has one in the person's folders and the folder is trusted (<see cref="WorkspaceTrust"/>),
+/// else the carried one. A UI-thread object: what a server says from its threads crosses through <see cref="UiThread"/>.</summary>
 public sealed class WebLanguages : IAsyncDisposable
 {
     private readonly string folder;
@@ -76,6 +76,12 @@ public sealed class WebLanguages : IAsyncDisposable
     private bool asksDockerHub;
     private bool disposed;
 
+    /// <summary>Whether the folder is trusted as the servers know it, which its trust given or taken back later starts TypeScript's again for.</summary>
+    private bool trusted;
+
+    /// <summary>Whether TypeScript's server last started on the project's own TypeScript (<see cref="OwnTsserver"/>).</summary>
+    private bool ownTypeScript;
+
     /// <summary>The variable that shortens how long GDScript's server waits, no GDScript open, before it is let go.</summary>
     [IdentifierHome]
     public const string GDScriptIdleVariable = "PASSENGER_GDSCRIPT_IDLE_MS";
@@ -103,6 +109,7 @@ public sealed class WebLanguages : IAsyncDisposable
         configured = now.NodeInterpreter;
         linting = Linting(now);
         asksDockerHub = now.DockerHubTags;
+        trusted = WorkspaceTrust.Trusts(folder);
         Schemas = new JsonSchemas(() => settings().DownloadJsonSchemas);
         Eslint = new EslintService(folder, settings, FindNodeAsync);
         Prettier = new PrettierService(folder, settings, FindNodeAsync);
@@ -159,17 +166,39 @@ public sealed class WebLanguages : IAsyncDisposable
     /// <summary>The servers' packages, carried beside the app.</summary>
     public static string Modules => Path.Combine(Carried, "node_modules");
 
-    /// <summary>Where the servers, their schemas and Passenger's scripts for them are carried: beside the app, or in a
-    /// macOS bundle its Resources, since codesign takes a folder under Contents/MacOS named with a dot (a package's
-    /// .github, yaml's dist/schema/yaml-1.1) for a nested bundle and refuses to sign the app.</summary>
-    public static string Carried { get; } = CarriedFolder();
+    /// <summary>The carried TypeScript's server, which a folder not trusted is served by.</summary>
+    public static string CarriedTsserver => Path.Combine(Modules, "typescript", "lib", "tsserver.js");
 
-    private static string CarriedFolder()
+    /// <summary>The folders under a folder a project's own TypeScript is looked for in, in the order its server looks.</summary>
+    private static readonly string[] TypeScriptFolders =
+    [
+        Path.Combine("node_modules", "typescript", "lib"),
+        Path.Combine(".vscode", "pnpify", "typescript", "lib"),
+        Path.Combine(".yarn", "sdks", "typescript", "lib"),
+        Path.Combine(".pnpm", "sdks", "typescript", "lib"),
+    ];
+
+    /// <summary>The project's own tsserver.js, looked for from the folder up as TypeScript's server would, but in the person's
+    /// folders alone (<see cref="FoldersUp"/>), and named to it so it looks no further: the nearest folder's TypeScript, where
+    /// it has a tsserver.js and says its version; null where it has none or there is none, which the carried one serves.</summary>
+    internal static string? OwnTsserver(string folder)
     {
-        string beside = Path.Combine(AppContext.BaseDirectory, "web");
-        string resources = Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "..", "Resources", "web"));
-        return !Directory.Exists(beside) && Directory.Exists(resources) ? resources : beside;
+        foreach (string at in FoldersUp.From(folder))
+        {
+            if (TypeScriptFolders.FirstOrDefault(f => Directory.Exists(Path.Join(at, f))) is { } lib)
+            {
+                return FoldersUp.Found(at, Path.Combine(lib, "tsserver.js")) is { } server && File.Exists(server)
+                    && FoldersUp.Found(at, Path.Combine(Path.GetDirectoryName(lib)!, "package.json")) is { } package
+                    && ProjectPackages.Version(Path.GetDirectoryName(package)!) is not null
+                    ? server
+                    : null;
+            }
+        }
+        return null;
     }
+
+    /// <summary>Where the servers, their schemas and Passenger's scripts for them are carried.</summary>
+    public static string Carried { get; } = CarriedFiles.Folder("web");
 
     /// <summary>The Node.js found for the servers, once one has been looked for.</summary>
     public NodeRuntime? Node => finding is { IsCompletedSuccessfully: true } found ? found.Result : null;
@@ -302,7 +331,7 @@ public sealed class WebLanguages : IAsyncDisposable
                 gdscriptIdle.Remove(place);
                 IdeErrors.Observe(server.End());
                 godotAsked.Remove(place);
-                IdeErrors.Write($"GDScript's language server let go for {place.Project ?? folder}: no GDScript of it open for {GDScriptIdle.TotalSeconds:0} s");
+                IdeErrors.Write($"GDScript's language server let go for {place.Project ?? folder}: no GDScript of it open for {Durations.Said(GDScriptIdle)}");
                 StateChanged?.Invoke(this, EventArgs.Empty);
             });
         }));
@@ -498,7 +527,7 @@ public sealed class WebLanguages : IAsyncDisposable
     /// the project's own or, marked so, the one Passenger carries; null otherwise.</summary>
     public string? DetailOf(OpenDocument document) =>
         LanguageOf(document.Path) is { Kind: WebServerKind.TypeScript } && ServerOf(document)?.Session?.Server.TypeScript is { } typescript
-            ? $"TypeScript {typescript.Version}{(typescript.Source == "bundled" ? " (Passenger's)" : string.Empty)}"
+            ? $"TypeScript {typescript.Version}{(typescript.Source == "bundled" || !trusted || !ownTypeScript ? " (Passenger's)" : string.Empty)}"
             : null;
 
     /// <summary>Whether a file's server cannot start (no Node.js, one too old, a server missing), so none will answer for it.</summary>
@@ -546,6 +575,48 @@ public sealed class WebLanguages : IAsyncDisposable
         }
     }
 
+    /// <summary>The folder came to be trusted: TypeScript's server, running or starting, starts again on the project's own
+    /// TypeScript, and ESLint and Prettier check and format its files from now on.</summary>
+    public void Trust()
+    {
+        UiThread.Check();
+        if (disposed || trusted)
+        {
+            return;
+        }
+        trusted = true;
+        Eslint.Reset();
+        IdeErrors.Observe(Prettier.ResetAsync());
+        ServerPlace place = new(WebServerKind.TypeScript, null);
+        if (servers.TryGetValue(place, out NodeServer? server))
+        {
+            Replace(place, server);
+        }
+        Recheck();
+    }
+
+    /// <summary>The folder's trust was taken back: ESLint and Prettier end, TypeScript's server starts again on Passenger's
+    /// own TypeScript, and a GDScript server on a headless Godot editor, which loads the project's native extensions, ends
+    /// for one on the person's own editor where it runs.</summary>
+    public void Untrust()
+    {
+        UiThread.Check();
+        if (disposed || !trusted)
+        {
+            return;
+        }
+        trusted = false;
+        Eslint.Reset();
+        IdeErrors.Observe(Prettier.ResetAsync());
+        foreach ((ServerPlace place, NodeServer server) in servers.Where(s => s.Key.Kind == WebServerKind.TypeScript
+            || s.Key.Kind == WebServerKind.GDScript && (godotAsked.Contains(s.Key) || GodotHeadlessAtOpen)).ToList())
+        {
+            godotAsked.Remove(place);
+            Replace(place, server);
+        }
+        Recheck();
+    }
+
     /// <summary>Settings' Complete image tags from Docker Hub changed: the Dockerfile server, running or starting, starts
     /// again with its files, told whether to ask Docker Hub, which it learns only as it starts.</summary>
     public void UseDockerHub(bool asks)
@@ -576,6 +647,7 @@ public sealed class WebLanguages : IAsyncDisposable
         made = new NodeServer(Name(kind), place.Project ?? folder, NodeAsync, restarts ?? new ServerRestarts())
         {
             Package = Path.Combine(Modules, Package(kind), "package.json"),
+            PreloadNeeds = kind == WebServerKind.Yaml ? JsonSchemas.YamlPreloadNode : null,
             Missing = () => Missing(kind),
             Command = node => Starting(kind, node),
             Elsewhere = kind == WebServerKind.GDScript ? () => GodotStart(place) : null,
@@ -602,16 +674,18 @@ public sealed class WebLanguages : IAsyncDisposable
     private Func<CancellationToken, Task<LanguageSession>> GodotStart(ServerPlace place)
     {
         (string? setting, IReadOnlyDictionary<string, string> environment) = (settings().GodotExecutable, GodotEnvironment);
-        bool headless = godotAsked.Contains(place) || GodotHeadlessAtOpen;
+        bool headless = (godotAsked.Contains(place) || GodotHeadlessAtOpen) && WorkspaceTrust.Trusts(place.Project ?? folder);
         return cancel => Godot.GodotScripts.StartAsync(place.Project, setting, environment, LogFolder, headless, cancel);
     }
 
     /// <summary>Godot's server of a script's project asked for, for what Passenger's own reading of it has no answer for:
-    /// started, a headless editor where the person's own serves none, unless one serves, is starting or cannot start.</summary>
+    /// started, a headless editor where the person's own serves none, unless one serves, is starting or cannot start, or
+    /// the project is in a folder not trusted.</summary>
     public void AskGodot(OpenDocument document)
     {
         UiThread.Check();
-        if (disposed || !documents.TryGetValue(document, out WebDocument? features) || features.Kind != WebServerKind.GDScript)
+        if (disposed || !documents.TryGetValue(document, out WebDocument? features) || features.Kind != WebServerKind.GDScript
+            || !WorkspaceTrust.Trusts(features.GodotProject ?? folder))
         {
             return;
         }
@@ -644,13 +718,23 @@ public sealed class WebLanguages : IAsyncDisposable
         StateChanged?.Invoke(this, EventArgs.Empty);
     }
 
-    /// <summary>Why a server cannot start that this build is to blame for: its package, or the Dockerfile server's preload,
-    /// is not beside the app.</summary>
+    /// <summary>Why a server cannot start that this build is to blame for: its package, or Passenger's preload for the
+    /// Dockerfile or YAML server, is not beside the app.</summary>
     private static string? Missing(WebServerKind kind) =>
         kind == WebServerKind.GDScript ? null
         : !File.Exists(Script(kind)) ? $"its language server is missing from the app's folder ({Script(kind)})"
-        : kind == WebServerKind.Dockerfile && !File.Exists(DockerHubTags.Preload) ? $"Passenger's part of its language server is missing from the app's folder ({DockerHubTags.Preload})"
+        : Preload(kind) is { } preload && !File.Exists(preload) ? $"Passenger's part of its language server is missing from the app's folder ({preload})"
         : null;
+
+    /// <summary>Passenger's preload a server runs with, null for none: the Dockerfile server's, which keeps it from Docker Hub
+    /// unless Settings allows it (<see cref="DockerHubTags"/>), and the YAML server's, which has it ask Passenger for each
+    /// schema's file rather than read it itself (<see cref="JsonSchemas.YamlPreload"/>).</summary>
+    private static string? Preload(WebServerKind kind) => kind switch
+    {
+        WebServerKind.Dockerfile => DockerHubTags.Preload,
+        WebServerKind.Yaml => JsonSchemas.YamlPreload,
+        _ => null,
+    };
 
     /// <summary>A server that cannot run: its files keep their colours and say why in their banner, the status bar in a
     /// few words.</summary>
@@ -699,19 +783,28 @@ public sealed class WebLanguages : IAsyncDisposable
         _ => Path.Combine(Modules, "vscode-langservers-extracted", "lib", "json-language-server", "node", "jsonServerMain.js"),
     };
 
-    /// <summary>How a server starts: its script on Node.js in the folder, with the options its package documents. The
-    /// TypeScript server never installs type packages from npm (automatic type acquisition) behind the person's back, and
-    /// renames a name where it is declared and everywhere it is used from any of them (an import's too, which it would
-    /// otherwise rename alone, aliased), answering from its project once loaded rather than from the open files alone; nor
-    /// the Dockerfile server asks Docker Hub for image tags unless Settings allows it (its preload, <see cref="DockerHubTags"/>).</summary>
+    /// <summary>How a server starts: its script on Node.js in the folder, with the options its package documents and its
+    /// preload (<see cref="Preload"/>). The TypeScript server never installs type packages from npm (automatic type
+    /// acquisition) behind the person's back, and renames a name where it is declared and everywhere it is used from any of
+    /// them (an import's too, which it would otherwise rename alone, aliased), answering from its project once loaded rather
+    /// than from the open files alone.</summary>
     private ServerStart Starting(WebServerKind kind, string node)
     {
-        ProcessStartInfo process = ChildProcesses.Command(node, kind == WebServerKind.Dockerfile
-            ? ["--require", DockerHubTags.Preload, Script(kind), "--stdio"]
-            : [Script(kind), "--stdio"], folder);
+        ProcessStartInfo process = ChildProcesses.Command(node, kind switch
+        {
+            WebServerKind.Dockerfile => ["--require", DockerHubTags.Preload, Script(kind), "--stdio"],
+            // An ES module's preload, named by its URL, which --import takes where a Windows path is no specifier.
+            WebServerKind.Yaml => ["--import", new Uri(JsonSchemas.YamlPreload).AbsoluteUri, Script(kind), "--stdio"],
+            _ => [Script(kind), "--stdio"],
+        }, folder);
         if (kind == WebServerKind.Dockerfile && DockerHubTags.Told(asksDockerHub, DockerHub) is { } told)
         {
             process.Environment[DockerHubTags.Variable] = told;
+        }
+        string? own = kind == WebServerKind.TypeScript && trusted ? OwnTsserver(folder) : null;
+        if (kind == WebServerKind.TypeScript)
+        {
+            ownTypeScript = own is not null;
         }
         object? options = kind switch
         {
@@ -719,15 +812,16 @@ public sealed class WebLanguages : IAsyncDisposable
             {
                 hostInfo = "Passenger",
                 disableAutomaticTypingAcquisition = true,
-                // One tsserver: a second, for syntax, would answer a rename or usages from the open files while a project loads.
-                tsserver = new { logVerbosity = "off", useSyntaxServer = "never" },
+                // One tsserver (a second would answer from the open files alone), the project's own only in a folder trusted.
+                tsserver = new { logVerbosity = "off", useSyntaxServer = "never", path = own ?? CarriedTsserver },
                 preferences = new { includeCompletionsForModuleExports = true, includeCompletionsForImportStatements = true, providePrefixAndSuffixTextForRename = false },
             },
             WebServerKind.Html => new { provideFormatter = true, embeddedLanguages = new { css = true, javascript = true } },
             WebServerKind.Css => new { provideFormatter = true },
             // Both read their settings from workspace/configuration alone.
             WebServerKind.Dockerfile or WebServerKind.Yaml => null,
-            _ => new { provideFormatter = true, handledSchemaProtocols = new[] { "file" } },
+            // Every schema asked of Passenger, a file's too, so none is read from another machine.
+            _ => new { provideFormatter = true, handledSchemaProtocols = Array.Empty<string>() },
         };
         return new ServerStart(process, folder, LogFolder, ClientCapabilities.Web, options)
         {
@@ -759,9 +853,10 @@ public sealed class WebLanguages : IAsyncDisposable
     };
 
     /// <summary>The YAML server's settings: checks, completion, hover and formatting on; the Compose specification's schema,
-    /// carried and read from disk, for compose files; Compose's merge tags known; and nothing fetched by the server itself,
-    /// neither SchemaStore's catalogue nor Kubernetes' schemas (a schema a file names over HTTP is asked of
-    /// <see cref="JsonSchemas"/>, as the JSON server's are, once <c>yaml/registerContentRequest</c> has told it to).</summary>
+    /// carried, for compose files; Compose's merge tags known; and nothing fetched by the server itself, neither
+    /// SchemaStore's catalogue nor Kubernetes' schemas (a schema a file names over HTTP is asked of <see cref="JsonSchemas"/>,
+    /// as the JSON server's are, once <c>yaml/registerContentRequest</c> has told it to, and a schema's file through its
+    /// preload).</summary>
     private static readonly object YamlSettings = new
     {
         validate = true,

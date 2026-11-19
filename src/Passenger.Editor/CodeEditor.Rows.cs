@@ -157,7 +157,7 @@ public sealed partial class CodeEditor
         gutterLabels.Begin(now, keepFrom);
         gutterFrame?.Keep(now, keepFrom);
 
-        List<RowSpan> shown = RowsOnScreen(text, row, Math.Max(0, (int)((scroll.Y + size.Height) / lineHeight)));
+        List<RowSpan> shown = RowsOnScreen(text, row, Math.Max(0, (int)((scroll.Y + size.Height) / lineHeight)), rowsShown);
         int first = shown.Count > 0 ? shown[0].Line : 0;
         int last = shown.Count > 0 ? shown[^1].Line : -1;
         LineView[] lineViews = ViewsOf(text, shown, scroll.X - TextPadLeft, Math.Max(0, size.Width - gutter));
@@ -520,7 +520,7 @@ public sealed partial class CodeEditor
         IReadOnlyList<Selection> items = selections.Items;
         for (int i = FirstSelectionEndingFrom(start); i < items.Count && items[i].Start < span.EndIncludingBreak; i++)
         {
-            key.Add(new TextRange(items[i].Start, items[i].End), start, end);
+            key.Add(items[i].Range, start, end);
             key.Add(items[i].End > end);
         }
         IReadOnlyList<TextRange> found = Highlights;
@@ -540,12 +540,16 @@ public sealed partial class CodeEditor
                 }
             }
         }
-        if (links is not null)
+        if (decorations.Links is { } links)
         {
             foreach (TextLink link in links(frameText!, line))
             {
                 key.Add(link.Range, start, end);
             }
+        }
+        if (pointed.Link is { } reach && reach.Range.Start < end && reach.Range.End > start)
+        {
+            key.Add(reach.Range, start, end);
         }
         MarkerList markers = decorations.Markers;
         for (int i = markers.FirstReaching(start); i < markers.Count && markers[i].Range.Start <= end; i++)

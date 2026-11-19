@@ -5,6 +5,7 @@ using Avalonia.Controls;
 using Avalonia.Headless;
 using Avalonia.Headless.XUnit;
 using Avalonia.Input;
+using Avalonia.VisualTree;
 using Passenger.App;
 using Passenger.App.Explorer;
 using Passenger.App.Vcs;
@@ -17,8 +18,10 @@ namespace Passenger.Tests;
 /// folder it opens, and a start that names nothing reopens the last unless Settings says not to. The Welcome screen
 /// lists them newest first, narrowed as a search is typed, opened by Up, Down and Enter, removed for good by Delete; one
 /// gone from disk is marked and refused with why. Clone Repository clones and opens, says why it could not, and stops
-/// when canceled; File, Recent Solutions opens one with its recent files. File, Open takes the solution or project chosen
-/// as the workspace, of a folder's several, kept and reopened as itself, and refuses anything else with why.</summary>
+/// when canceled; File, Recent Solutions opens one with its recent files. The window's Open takes the solution or project
+/// chosen as the workspace, of a folder's several, kept and reopened as itself, and refuses anything else with why; File
+/// and the Welcome screen's Open Solution, Open Folder and Open File ask the system's panel (a stand-in here) and open a
+/// workspace, a folder, and a file in the editor.</summary>
 public sealed class WelcomeTests : IClassFixture<WelcomeTests.Workspaces>, IDisposable
 {
     private readonly Workspaces workspaces;
@@ -69,6 +72,23 @@ public sealed class WelcomeTests : IClassFixture<WelcomeTests.Workspaces>, IDisp
     }
 
     [AvaloniaFact]
+    public void A_start_asking_for_a_new_window_reopens_nothing_and_shows_the_Welcome_screen()
+    {
+        using IDisposable theme = TestsTheme();
+        MainWindow first = Started(LaunchOptions.Empty);
+        first.OpenFolder(alpha);
+        Ui.Settle();
+        first.Close();
+
+        MainWindow window = Started(LaunchOptions.Parse([LaunchOptions.NewWindowFlag]));
+
+        Assert.True(window.Folder is null && Shown(window),
+            $"The taskbar's New Window, starting Passenger, was to show a window with nothing open; it opened {window.Folder ?? "nothing"}, the Welcome screen {(Shown(window) ? "shown" : "not shown")}");
+        Assert.Equal([Name(alpha)], window.Welcome.Rows.Select(r => r.Name));
+        window.Close();
+    }
+
+    [AvaloniaFact]
     public void With_reopening_off_the_Welcome_screen_lists_the_recent_ones_newest_first_narrowed_by_a_search_and_opens_one_by_its_keys()
     {
         using IDisposable theme = TestsTheme();
@@ -93,9 +113,47 @@ public sealed class WelcomeTests : IClassFixture<WelcomeTests.Workspaces>, IDisp
         Ui.Press(window, "UP");
         Assert.Equal(Name(beta), window.Welcome.Selected?.Name);
         Ui.Press(window, "DOWN");
+        Assert.Equal(Name(alpha), window.Welcome.Selected?.Name);
+        // Enter on the row a click gave the keys opens it, as Enter in the search does.
+        ListBox list = window.Welcome.GetVisualDescendants().OfType<ListBox>().Single();
+        Ui.Click(Ui.Row(list, window.Welcome.Selected!));
         Ui.Press(window, "ENTER");
-        Assert.True(window.Folder == PathNames.Canonical(alpha), $"Down and Enter on {Name(alpha)} opened {window.Folder ?? "nothing"}");
+        Assert.True(window.Folder == PathNames.Canonical(alpha), $"Down and Enter on {Name(alpha)}'s row opened {window.Folder ?? "nothing"}");
         window.Close();
+    }
+
+    /// <summary>The Welcome screen is let go of while a folder is open, and made again as the folder closes, the folder
+    /// among its recent ones.</summary>
+    [AvaloniaFact]
+    public void The_Welcome_screen_is_let_go_while_a_folder_is_open_and_made_again_with_the_recent_ones_as_it_closes()
+    {
+        MainWindow window = Started(LaunchOptions.Empty);
+        try
+        {
+            Ui.Collected(HiddenByFolder(window, alpha), "the Welcome screen to be let go while a folder is open: hidden behind the folder, "
+                + "it would keep its rows and controls for as long as the folder stays open");
+            Assert.Null(window.CloseSolution());
+            Ui.Settle();
+            Assert.True(TopLevel.GetTopLevel(window.Welcome) == window, "Closing the folder showed no Welcome screen");
+            Assert.True(window.Welcome.Rows.Any(r => r.Name == Name(alpha)),
+                $"The Welcome screen made again lists [{string.Join(", ", window.Welcome.Rows.Select(r => r.Name))}], not the folder just closed");
+        }
+        finally
+        {
+            window.Close();
+        }
+    }
+
+    /// <summary>The Welcome screen shown, then a folder opened over it: the screen held only weakly here.</summary>
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
+    private static WeakReference<WelcomeView> HiddenByFolder(MainWindow window, string folder)
+    {
+        WeakReference<WelcomeView> shown = new(window.Welcome);
+        Assert.True(TopLevel.GetTopLevel(window.Welcome) == window, "The window started on nothing shows no Welcome screen");
+        window.OpenFolder(folder);
+        Ui.Settle();
+        Assert.Equal(PathNames.Canonical(folder), window.Folder);
+        return shown;
     }
 
     [AvaloniaFact]
@@ -255,6 +313,141 @@ public sealed class WelcomeTests : IClassFixture<WelcomeTests.Workspaces>, IDisp
             $"Gone.sln, which is not there, was to be refused with the reason; Open said '{why}' and opened {window.Folder ?? "nothing"}");
         Assert.True(window.Status == why && window.Welcome.Notice == why, $"The status bar says '{window.Status}' and the Welcome screen '{window.Welcome.Notice}', not why");
         window.Close();
+    }
+
+    /// <summary>File lists Open Solution, Open Folder and Open File in that order after New Solution, as the project
+    /// widget's menu does and Find Action finds them. Open Solution's panel offers the solutions and projects alone and
+    /// opens the one chosen as the workspace; Open Folder's takes a folder, which opens; Open File's offers every file and
+    /// opens the one chosen in the editor, a file of the folder where it lies inside it, a project outside it as its text,
+    /// the folder staying the workspace.</summary>
+    [AvaloniaFact]
+    public void File_Open_Solution_Open_Folder_and_Open_File_ask_their_panels_and_open_a_workspace_a_folder_and_a_file()
+    {
+        using IDisposable theme = TestsTheme();
+        string folder = Solutions();
+        string b = PathNames.Canonical(Path.Combine(folder, "B.slnx"));
+        string tool = PathNames.Canonical(Path.Combine(folder, "Tool.csproj"));
+        string notes = Path.Combine(beta, "notes.txt");
+        File.WriteAllText(notes, "Notes\n");
+        MainWindow window = Started(LaunchOptions.Empty, workspaces.Server);
+        Panels panels = new(window);
+        try
+        {
+            string[] menu = [.. Ui.Submenu(window.MenuBar, "File").Items.OfType<NativeMenuItem>().Select(i => i.Header ?? string.Empty)];
+            Assert.True(menu.Take(5).SequenceEqual(["New Solution…", "Open Solution…", "Open Folder…", "Open File…", "Clone Repository…"]),
+                $"The File menu begins [{string.Join(", ", menu)}]");
+            ContextMenu widget = window.ShowProjectMenu();
+            string[] widgets = [.. widget.Items.OfType<Avalonia.Controls.MenuItem>().Select(i => i.Header as string ?? string.Empty)];
+            widget.Close();
+            Assert.True(widgets.Take(5).SequenceEqual(["New Solution…", "Open Solution…", "Open Folder…", "Open File…", "Clone Repository…"]),
+                $"The project widget's menu begins [{string.Join(", ", widgets)}]");
+            foreach (IReadOnlyList<IdeAction> found in (IReadOnlyList<IdeAction>[])[window.Actions.All, window.Actions.Find("open"), window.Actions.Find("open f")])
+            {
+                string[] opens = [.. found.Select(a => a.Id).Where(id => id is AppActions.OpenSolution or AppActions.OpenFolder or AppActions.OpenFile)];
+                string[] expected = [.. ((string[])[AppActions.OpenSolution, AppActions.OpenFolder, AppActions.OpenFile]).Where(opens.Contains)];
+                Assert.True(opens.Length >= 2 && opens.SequenceEqual(expected), $"Find Action lists the open actions as [{string.Join(", ", opens)}]");
+            }
+
+            panels.Next = b;
+            MenuItem(window, "File", "Open Solution…").Command!.Execute(null);
+            Ui.Settle();
+            Assert.Equal(("file", "Open Solution", "Solutions and Projects: *.sln *.slnx *.slnf *.csproj"), panels.Asked[^1]);
+            OpenedAs(window, b, "B", ["AppB"]);
+
+            panels.Next = beta;
+            MenuItem(window, "File", "Open Folder…").Command!.Execute(null);
+            Ui.Settle();
+            Assert.Equal(("folder", "Open Folder", ""), panels.Asked[^1]);
+            InThisWindow(window);
+            Ui.Settle();
+            Assert.Equal(PathNames.Canonical(beta), window.Folder);
+
+            panels.Next = notes;
+            MenuItem(window, "File", "Open File…").Command!.Execute(null);
+            Ui.Settle();
+            Assert.Equal(("file", "Open File", ""), panels.Asked[^1]);
+            Assert.True(window.EditorArea.Active?.Path == PathNames.Canonical(notes) && window.Folder == PathNames.Canonical(beta),
+                $"notes.txt was to open in the editor in the folder it lies in; the editor shows {window.EditorArea.Active?.Path ?? "nothing"} and the folder open is {window.Folder}");
+
+            panels.Next = tool;
+            MenuItem(window, "File", "Open File…").Command!.Execute(null);
+            Ui.Settle();
+            Assert.True(window.EditorArea.Active?.Path == tool && window.Folder == PathNames.Canonical(beta) && window.Asking is null && window.WorkspaceModel?.ProjectFile is null,
+                $"Tool.csproj, outside the folder, was to open in the editor as its text; the editor shows {window.EditorArea.Active?.Path ?? "nothing"}, the folder open is "
+                + $"{window.Folder}, {(window.Asking is null ? "nothing asked where" : "asked where to open it")}");
+        }
+        finally
+        {
+            window.Close();
+        }
+    }
+
+    /// <summary>The Welcome screen's tiles are New Solution, Open Solution, Open Folder, Open File and Clone Repository; with
+    /// nothing open, Open Solution's opens the solution its panel takes, Open Folder's the folder, and Open File's a project
+    /// as a file in the editor on its own, opening no workspace.</summary>
+    [AvaloniaFact]
+    public void The_Welcome_screens_Open_Solution_Open_Folder_and_Open_File_open_a_workspace_a_folder_and_a_file_on_its_own()
+    {
+        using IDisposable theme = TestsTheme();
+        string folder = Solutions();
+        string a = PathNames.Canonical(Path.Combine(folder, "A.sln"));
+        string tool = PathNames.Canonical(Path.Combine(folder, "Tool.csproj"));
+        File.WriteAllText(Path.Combine(alpha, "One.cs"), "class One { }\n");
+        (string Tile, string Panel, string Title, string Types, string Picked, Action<MainWindow> Opened)[] tiles =
+        [
+            ("Open Solution", "file", "Open Solution", "Solutions and Projects: *.sln *.slnx *.slnf *.csproj", a, w => OpenedAs(w, a, "A", ["AppA"])),
+            ("Open Folder", "folder", "Open Folder", "", alpha, w => Assert.Equal(PathNames.Canonical(alpha), w.Folder)),
+            ("Open File", "file", "Open File", "", tool, w => Assert.True(w.EditorArea.Active?.Path == tool && w.Folder is null,
+                $"Tool.csproj was to open in the editor on its own; the editor shows {w.EditorArea.Active?.Path ?? "nothing"}, the folder open is {w.Folder ?? "none"}")),
+        ];
+        foreach ((string tile, string panel, string title, string types, string picked, Action<MainWindow> opened) in tiles)
+        {
+            // A new window's start, so it reopens nothing the window before it opened.
+            MainWindow window = Started(LaunchOptions.Parse([LaunchOptions.NewWindowFlag]), workspaces.Server);
+            Panels panels = new(window) { Next = picked };
+            try
+            {
+                Button[] shown = [.. window.Welcome.GetVisualDescendants().OfType<Button>().Where(b => b.Classes.Contains(StyleClasses.WelcomeAction))];
+                Assert.Equal(["New Solution", "Open Solution", "Open Folder", "Open File", "Clone Repository"], shown.Select(TileName));
+                Ui.Click(shown.Single(b => TileName(b) == tile));
+                Ui.Settle();
+                Assert.Equal((panel, title, types), Assert.Single(panels.Asked));
+                opened(window);
+            }
+            finally
+            {
+                window.Close();
+            }
+        }
+
+        static string TileName(Button tile) =>
+            tile.GetVisualDescendants().OfType<TextBlock>().Single(t => t.Classes.Contains(StyleClasses.WelcomeActionTitle)).Text ?? string.Empty;
+    }
+
+    /// <summary>A shortcut a person kept for Open, the id Open Solution had, opens Open Solution's panel; an agent's
+    /// ide_action naming it reaches Open Solution, which leaves the system's panels to the person.</summary>
+    [AvaloniaFact]
+    public void A_shortcut_kept_for_Open_opens_Open_Solutions_panel_and_its_id_names_Open_Solution()
+    {
+        string former = AppActions.Formerly.Single(f => f.Value == AppActions.OpenSolution).Key;
+        const string Key = "control alt shift F11";
+        File.WriteAllText(Path.Combine(settings, "settings.json"),
+            $"{{\n  \"version\": {Passenger.App.Settings.AppSettings.Upgrades.Count},\n  \"shortcuts\": {{ \"{former}\": [\"{Key}\"] }}\n}}\n");
+        MainWindow window = Started(LaunchOptions.Empty);
+        Panels panels = new(window);
+        try
+        {
+            Ui.Press(window, Key);
+            Assert.Equal(("file", "Open Solution", "Solutions and Projects: *.sln *.slnx *.slnf *.csproj"), Assert.Single(panels.Asked));
+            Assert.Equal(AppActions.OpenSolution, window.Actions[former]?.Id);
+            Assert.Equal(Refusals.AsksThePerson, window.Actions.WhyNot(former, window.Actions.Context().ForAgent()));
+        }
+        finally
+        {
+            // The keymap in force is the process's; the next test starts on the platform's own.
+            window.ApplySettings(new Passenger.App.Settings.AppSettings());
+            window.Close();
+        }
     }
 
     [AvaloniaFact]
@@ -438,7 +631,7 @@ public sealed class WelcomeTests : IClassFixture<WelcomeTests.Workspaces>, IDisp
         string solution = PathNames.Canonical(Path.Combine(alpha, "App.slnx"));
         File.WriteAllText(solution, "<Solution>\n  <Project Path=\"App/App.csproj\" />\n</Solution>\n");
         MainWindow window = Started(LaunchOptions.Empty with { Workspace = solution });
-        int step = 0;
+        OwnProcess step = default;
         try
         {
             window.OpenFile(program);
@@ -447,7 +640,7 @@ public sealed class WelcomeTests : IClassFixture<WelcomeTests.Workspaces>, IDisp
 
             // A build under way, and an edit made since it saved the files.
             window.Perform(AppActions.Build);
-            step = Processes.WrittenId(Path.Combine(app, "build.pid"), "the build's step to start");
+            step = OwnProcess.Of(Processes.WrittenId(Path.Combine(app, "build.pid"), "the build's step to start"));
             window.KeyTextInput("// edited ");
             Assert.True(window.EditorArea.Active!.IsModified, "The edit typed did not reach the file");
 
@@ -463,7 +656,7 @@ public sealed class WelcomeTests : IClassFixture<WelcomeTests.Workspaces>, IDisp
             Assert.Empty(window.ExplorerView.Tree.Rows);
             Assert.Equal("// edited Console.WriteLine(\"Hello\");\n", File.ReadAllText(program));
             Assert.False(window.IsBuilding, "The build still runs once its solution is closed");
-            Assert.True(Processes.Gone(step), $"The build's step went on running once its solution was closed: {Processes.Describe(step)}");
+            Assert.True(Processes.Gone(step.Id), $"The build's step went on running once its solution was closed: {Processes.Describe(step.Id)}");
             Assert.Null(window.CSharpService);
             Assert.True(Processes.Gone(server), "The language server went on running once its solution was closed");
             Assert.False(MenuItem(window, "File", "Close Solution").IsEnabled, "Close Solution can still run with nothing open");
@@ -477,7 +670,7 @@ public sealed class WelcomeTests : IClassFixture<WelcomeTests.Workspaces>, IDisp
         }
         finally
         {
-            Processes.Kill(step);
+            step.Kill();
             window.Close();
         }
     }
@@ -563,6 +756,30 @@ public sealed class WelcomeTests : IClassFixture<WelcomeTests.Workspaces>, IDisp
     {
         window.KeyTextInput(text);
         Ui.Settle();
+    }
+
+    /// <summary>The system's file and folder panels a window asks, answered for the person: each ask kept as the panel's
+    /// kind, its title and the types it offers ("" for every file), and <see cref="Next"/> given as chosen.</summary>
+    private sealed class Panels
+    {
+        public Panels(MainWindow window)
+        {
+            window.PickFiles = (title, types, _) =>
+            {
+                Asked.Add(("file", title, string.Join("; ", (types ?? []).Select(t => $"{t.Name}: {string.Join(" ", t.Patterns ?? [])}"))));
+                return Task.FromResult<IReadOnlyList<string>>(Next is { } next ? [next] : []);
+            };
+            window.PickFolder = title =>
+            {
+                Asked.Add(("folder", title, string.Empty));
+                return Task.FromResult(Next);
+            };
+        }
+
+        public List<(string Panel, string Title, string Types)> Asked { get; } = [];
+
+        /// <summary>What the person chooses in the next panel, or null to cancel it.</summary>
+        public string? Next { get; set; }
     }
 
     /// <summary>Puts the tests' theme back once a window that keeps its settings has put the person's in force.</summary>

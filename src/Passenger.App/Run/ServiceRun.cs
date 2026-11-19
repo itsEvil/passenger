@@ -56,7 +56,7 @@ public sealed record ServiceProgram(int Id, AdapterPlace? Place, Profiler.Profil
 /// process), said as the service's action's failure.</summary>
 public sealed class ServiceUnreachedException(string message, Exception? inner = null) : Exception(message, inner);
 
-/// <summary>A .NET service of a run named where it is written (a compose file's service, an AppHost's <c>AddProject</c>,
+/// <summary>A .NET service of a run named where it is written (a compose file's service, an AppHost's <c>AddProject</c> or <c>AddDotnetProject</c>,
 /// whose gutter icon names it), which the service actions act on: its run and its name there, whether it runs now or not.</summary>
 public sealed record ChosenService(ServiceRun Run, string Name);
 
@@ -321,6 +321,10 @@ public abstract class ServiceRun : Telemetry.ITelemetryRun
     /// <summary>Whether its services' projects are built here before an edit Hot Reload cannot apply restarts them (their
     /// program reads the build here), rather than by their restart.</summary>
     public abstract bool BuildsBeforeRestart { get; }
+
+    /// <summary>The workspace whose build configuration those builds are given, its configuration's own where it names one
+    /// (<see cref="ProjectSession.WorkspaceOfAsync"/>); null for the folder's.</summary>
+    public virtual Passenger.Workspace.WorkspaceModel? Workspace => null;
 
     /// <summary>Whether a restart with no build of its own runs a service on the build its program runs now, none made
     /// since, so its next session takes the ended one's edits as still to apply.</summary>

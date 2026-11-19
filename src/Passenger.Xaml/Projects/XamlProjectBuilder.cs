@@ -13,7 +13,8 @@ namespace Passenger.Xaml.Projects;
 public sealed class XamlProjectBuilder
 {
     private readonly object gate = new();
-    private readonly string? dotnetRoot;
+    /// <summary>Where the .NET that builds the projects keeps its packs; null for none found.</summary>
+    private readonly WorkloadFolders? dotnet;
 
     /// <summary>What MSBuild's evaluation says of where a project's restore and build put things and what its C# is parsed
     /// with, by its path; any thread asks it.</summary>
@@ -25,6 +26,10 @@ public sealed class XamlProjectBuilder
     private readonly Action<Exception>? failed;
     private readonly Dictionary<string, SourceTypes> sources = new(StringComparer.Ordinal);
     private readonly Dictionary<string, XamlFileSummary> files = new(StringComparer.Ordinal);
+
+    /// <summary>What the language server's source generators add to the C#'s types, by each type's full name, as last told
+    /// (<see cref="Generated"/>).</summary>
+    private Dictionary<string, GeneratedPart> generated = new(StringComparer.Ordinal);
     private ProjectInputs inputs;
     private List<(ProjectInputs Inputs, List<string> Files)> referenced = [];
     private IReadOnlyList<AssemblyTypes> assemblies = [];
@@ -36,12 +41,12 @@ public sealed class XamlProjectBuilder
     /// declares none anew keeps it.</summary>
     private string classes = string.Empty;
 
-    private XamlProjectBuilder(ProjectInputs inputs, XamlDialect dialect, string? dotnetRoot, CSharpParseOptions unevaluated, Action<Exception>? failed,
+    private XamlProjectBuilder(ProjectInputs inputs, XamlDialect dialect, WorkloadFolders? dotnet, CSharpParseOptions unevaluated, Action<Exception>? failed,
         Func<string, ProjectEvaluation?>? evaluations)
     {
         this.inputs = inputs;
         Dialect = dialect;
-        this.dotnetRoot = dotnetRoot;
+        this.dotnet = dotnet;
         this.unevaluated = unevaluated;
         this.failed = failed;
         this.evaluations = evaluations;
@@ -53,22 +58,28 @@ public sealed class XamlProjectBuilder
 
     public string Folder => inputs.Folder;
 
-    /// <summary>A builder for a project whose XAML Passenger reads (an Avalonia or WPF project), or null for another;
+    /// <summary>A builder for a project whose XAML Passenger reads (an Avalonia, WPF or MAUI project), or null for another;
+    /// <paramref name="dotnet"/> is where the .NET that builds it keeps its packs (<see cref="ProjectInputs.Read"/>),
     /// <paramref name="failed"/> hears of a file a load could not read, which it leaves out, <paramref name="evaluations"/>
     /// answers what MSBuild's evaluation says of a project (where its restore and build put things, what its C# is parsed
     /// with), from any thread, and a project it says nothing of has its C# parsed with <paramref name="unevaluated"/>.</summary>
-    public static XamlProjectBuilder? For(string projectPath, string? dotnetRoot, CSharpParseOptions unevaluated, Action<Exception>? failed = null,
+    public static XamlProjectBuilder? For(string projectPath, WorkloadFolders? dotnet, CSharpParseOptions unevaluated, Action<Exception>? failed = null,
         Func<string, ProjectEvaluation?>? evaluations = null)
     {
-        ProjectInputs inputs = ProjectInputs.Read(projectPath, dotnetRoot, evaluations?.Invoke(projectPath));
-        return DialectOf(inputs) is { } dialect ? new XamlProjectBuilder(inputs, dialect, dotnetRoot, unevaluated, failed, evaluations) : null;
+        ProjectInputs inputs = ProjectInputs.Read(projectPath, dotnet, evaluations?.Invoke(projectPath));
+        return DialectOf(inputs) is { } dialect ? new XamlProjectBuilder(inputs, dialect, dotnet, unevaluated, failed, evaluations) : null;
     }
 
-    /// <summary>The dialect a project's XAML is in, by the framework it references: Avalonia's for a project that references
-    /// its package, WPF's for one whose restore references WPF's shared framework (<c>UseWPF</c>, which the project file
-    /// says before a restore); null for any other (MAUI, WinUI), whose XAML Passenger does not read.</summary>
+    /// <summary>The dialect a project's XAML is in, by the framework it references: MAUI's for a project that says
+    /// <c>UseMaui</c> or references MAUI's controls (whose Avalonia handlers bring Avalonia's package too), Avalonia's for
+    /// one that references its package, WPF's for one whose restore references WPF's shared framework (<c>UseWPF</c>, which
+    /// the project file says before a restore); null for any other (WinUI), whose XAML Passenger does not read.</summary>
     public static XamlDialect? DialectOf(ProjectInputs inputs)
     {
+        if (inputs.Uses("Microsoft.Maui.Controls") || string.Equals(inputs.PropertyValue("UseMaui"), "true", StringComparison.OrdinalIgnoreCase))
+        {
+            return MauiDialect.Instance;
+        }
         if (inputs.Uses("Avalonia"))
         {
             return AvaloniaDialect.Instance;
@@ -80,7 +91,8 @@ public sealed class XamlProjectBuilder
 
     /// <summary>Whether a file is one of the project's XAML files.</summary>
     public bool Owns(string path) =>
-        Dialect.Extensions.Contains(Path.GetExtension(path).ToLowerInvariant()) && ProjectFolders.Holds(Folder, path);
+        Dialect.Extensions.Contains(Path.GetExtension(path).ToLowerInvariant()) && ProjectFolders.Holds(Folder, path)
+        && (PathNames.Relative(path, Folder) is not { } within || !Dialect.LeavesOut(within));
 
     /// <summary>Reads everything: the assemblies, every C# and XAML file (an open file's text from <paramref name="open"/>
     /// rather than disk), the assets.</summary>
@@ -88,11 +100,11 @@ public sealed class XamlProjectBuilder
     {
         lock (gate)
         {
-            inputs = ProjectInputs.Read(inputs.ProjectPath, dotnetRoot, evaluations?.Invoke(inputs.ProjectPath));
+            inputs = ProjectInputs.Read(inputs.ProjectPath, dotnet, evaluations?.Invoke(inputs.ProjectPath));
             assemblies = [.. inputs.References.AsParallel().AsOrdered().Select(AssemblyTypes.Get).OfType<AssemblyTypes>()];
             themeKeys = ThemeKeys(assemblies);
             referenced = [];
-            CollectReferences(inputs, new HashSet<string>(StringComparer.Ordinal) { inputs.ProjectPath });
+            CollectReferences(inputs, new HashSet<string>(PathNames.Comparer) { inputs.ProjectPath });
             sources.Clear();
             List<(string Path, ProjectInputs Project)> cs = [.. inputs.SourceFiles.Select(f => (f, inputs))];
             cs.AddRange(referenced.SelectMany(r => r.Inputs.SourceFiles.Select(f => (f, r.Inputs))));
@@ -167,6 +179,40 @@ public sealed class XamlProjectBuilder
         }
     }
 
+    /// <summary>The project file and those of the projects it references, whose C# its XAML reads.</summary>
+    public IReadOnlyList<string> ProjectFiles
+    {
+        get
+        {
+            lock (gate)
+            {
+                return [inputs.ProjectPath, .. referenced.Select(r => r.Inputs.ProjectPath)];
+            }
+        }
+    }
+
+    /// <summary>What the language server's source generators add to the C#'s types, as its compilation has it now: in place
+    /// of all that was known where <paramref name="files"/> is null (the projects' every type asked), else of what was known
+    /// of the types those C# files declare. Null where it says nothing new.</summary>
+    public XamlProject? Generated(IReadOnlyList<GeneratedPart> found, IReadOnlyCollection<string>? files)
+    {
+        lock (gate)
+        {
+            Dictionary<string, GeneratedPart> now = files is null ? new(StringComparer.Ordinal)
+                : new(generated.Where(g => !g.Value.Files.Any(f => files.Contains(f, PathNames.Comparer))), StringComparer.Ordinal);
+            foreach (GeneratedPart part in found)
+            {
+                now[part.FullName] = part;
+            }
+            if (now.Count == generated.Count && now.All(g => generated.TryGetValue(g.Key, out GeneratedPart? known) && known.Signature == g.Value.Signature))
+            {
+                return null;
+            }
+            generated = now;
+            return built = Make();
+        }
+    }
+
     /// <summary>A XAML file's text changed: its summary is made again; a file deleted goes.</summary>
     public XamlProject XamlChanged(string path, string? text, XmlTree? tree = null)
     {
@@ -211,10 +257,12 @@ public sealed class XamlProjectBuilder
 
     private XamlProject Make()
     {
-        TypeSystem types = new(assemblies, [.. sources.Values], inputs.AssemblyName, inputs.ImplicitUsings);
+        IReadOnlyList<XmlnsDefinition> implied = Dialect.ImpliedDefinitions(inputs.AssemblyName);
+        IReadOnlyList<GeneratedPart> made = [.. generated.Values];
+        TypeSystem types = new(assemblies, [.. sources.Values], inputs.AssemblyName, inputs.ImplicitUsings, implied, made);
         if (XamlClasses(types) is { Count: > 0 } declared)
         {
-            types = new TypeSystem(assemblies, [.. sources.Values, .. declared], inputs.AssemblyName, inputs.ImplicitUsings);
+            types = new TypeSystem(assemblies, [.. sources.Values, .. declared], inputs.AssemblyName, inputs.ImplicitUsings, implied, made);
         }
         classes = ClassesSaid();
         return With(types);
@@ -243,7 +291,7 @@ public sealed class XamlProjectBuilder
         foreach (XamlFileSummary file in files.Values)
         {
             if (file.Class is not { Length: > 0 } name || file.ClassPlace is not { } place || types.Find(name) is not null
-                || !name.Split('.').All(part => part.Length > 0 && part.All(c => char.IsLetterOrDigit(c) || c == '_')))
+                || !name.Split('.').All(SyntaxFacts.IsValidIdentifier))
             {
                 continue;
             }
@@ -267,7 +315,7 @@ public sealed class XamlProjectBuilder
             {
                 continue;
             }
-            ProjectInputs read = ProjectInputs.Read(project, dotnetRoot, evaluations?.Invoke(project));
+            ProjectInputs read = ProjectInputs.Read(project, dotnet, evaluations?.Invoke(project));
             referenced.Add((read, [.. XamlFilesUnder(read.Folder)]));
             CollectReferences(read, seen);
         }
@@ -327,7 +375,8 @@ public sealed class XamlProjectBuilder
 
     /// <summary>The project's own XAML files: those in its own folders (<see cref="ProjectFolders.Under"/>).</summary>
     private IEnumerable<string> XamlFilesUnder(string folder) =>
-        ProjectFolders.Under(folder).SelectMany(f => ProjectInputs.FilesIn(f, "*")).Where(f => Dialect.Extensions.Contains(Path.GetExtension(f).ToLowerInvariant()));
+        ProjectFolders.Under(folder).SelectMany(f => ProjectInputs.FilesIn(f, "*")).Where(f => Dialect.Extensions.Contains(Path.GetExtension(f).ToLowerInvariant())
+            && (PathNames.Relative(f, folder) is not { } within || !Dialect.LeavesOut(within)));
 
     private static string ReadText(string path)
     {

@@ -140,7 +140,7 @@ public sealed class McpDebuggingTests : McpRig, IClassFixture<RestoredFolders>
             }
             finally
             {
-                Processes.Kill(looping.Id);
+                ChildProcesses.Kill(looping);
             }
         }
 
@@ -170,7 +170,8 @@ public sealed class McpDebuggingTests : McpRig, IClassFixture<RestoredFolders>
         Process passenger = LastPassenger();
         string? own = DotnetProcesses.RuntimeFolder(passenger.Id);
         Assert.True(own is not null, $"Passenger's own runtime (process {passenger.Id}) could not be read.{Said()}");
-        IReadOnlyList<DotnetProcess> under = DotnetProcesses.Under(passenger.Id);
+        // As the system lists what it started: no debugger lists Roslyn's server on Linux, its runtime's pipes in its own TMPDIR.
+        IReadOnlyList<DotnetProcess> under = [.. Processes.Descendants(passenger.Id).Select(DotnetProcesses.Describe).OfType<DotnetProcess>()];
         foreach ((string helper, string assembly) in new[]
         {
             ("Roslyn's server", RoslynServerFolder.Assembly), ("The project host", "Passenger.Host.dll"), ("The debug adapter", "Passenger.DebugAdapter.dll"),
@@ -281,14 +282,14 @@ public sealed class McpDebuggingTests : McpRig, IClassFixture<RestoredFolders>
         await using McpClient client = await Start(["--mcp", Folder], languageServer: false);
         Task<int> held = hold.Held(TimeSpan.FromMinutes(3));
         Task<CallToolResult> debugging = Result(client, McpTools.DebugStart, new() { ["configuration"] = "Sum: Held" });
-        int program = 0;
+        OwnProcess program = default;
         try
         {
             if (await Task.WhenAny(held, debugging) == debugging)
             {
                 Assert.Fail($"debug_start answered before the program came to the hold: {Text(await debugging)}{Said()}");
             }
-            program = await held;
+            program = OwnProcess.Of(await held);
 
             Assert.Equal("Stopped", (await Call(client, McpTools.Stop)).GetString());
             Assert.True(await Waiting.Within(debugging, TimeSpan.FromSeconds(15), TestContext.Current.CancellationToken),
@@ -296,12 +297,12 @@ public sealed class McpDebuggingTests : McpRig, IClassFixture<RestoredFolders>
             CallToolResult stopped = await debugging;
             Assert.True(stopped.IsError == true && Text(stopped).Contains("Debugging Sum: Held was stopped as it started", StringComparison.Ordinal),
                 $"debug_start, stopped as it started, answered: {Text(stopped)}");
-            Assert.True(Processes.Gone(program), $"The agent's stop left the program running: {Processes.Describe(program)}");
+            Assert.True(Processes.Gone(program.Id), $"The agent's stop left the program running: {Processes.Describe(program.Id)}");
             Assert.Equal("not debugging", (await Call(client, McpTools.DebugState)).GetProperty("state").GetString());
         }
         finally
         {
-            Processes.Kill(program);
+            program.Kill();
         }
     }
 
@@ -422,14 +423,7 @@ public sealed class McpDebuggingTests : McpRig, IClassFixture<RestoredFolders>
     [Fact]
     public async Task An_agents_debug_start_of_a_web_app_answers_once_it_serves_saying_where_it_listens()
     {
-        string folder = PathNames.Canonical(TestFolders.Create("mcp-web-"));
-        DeleteAtEnd(folder);
-        TestFolders.Write(folder, "Web.csproj", TestProjects.Web("<ImplicitUsings>enable</ImplicitUsings>"));
-        TestFolders.Write(folder, "Program.cs", "WebApplication app = WebApplication.Create(args);\napp.MapGet(\"/\", () => \"served\");\napp.Run();\n");
-        // Port 0: where it listens is the port the app took, which only its own words tell.
-        TestFolders.Write(folder, "Properties/launchSettings.json",
-            "{\n  \"profiles\": {\n    \"Serve\": { \"commandName\": \"Project\", \"applicationUrl\": \"http://127.0.0.1:0\" }\n  }\n}\n");
-        await Restore.RunAsync(Path.Combine(folder, "Web.csproj"));
+        string folder = await WebAppAsync();
         await using McpClient client = await Start(["--mcp", folder], languageServer: false);
         // Far longer than the app takes to start, which the answer is not to wait out.
         JsonElement started = await Call(client, McpTools.DebugStart, new() { ["configuration"] = "Web: Serve", ["waitSeconds"] = 600 });
@@ -440,6 +434,40 @@ public sealed class McpDebuggingTests : McpRig, IClassFixture<RestoredFolders>
             Assert.Equal("served", await http.GetStringAsync(new Uri(listening.Groups[1].Value), TestContext.Current.CancellationToken));
         }
         await Call(client, McpTools.Stop);
+    }
+
+    /// <summary>An agent's debug_start of a web app whose debugging the runtime gives up for good as it starts, as it once did
+    /// under load, holding the app where it stood, answers once the app is ended, saying its debugging failed and why,
+    /// rather than waiting out its whole time for an app that will never serve; its console says so too.</summary>
+    [Fact]
+    public async Task An_agents_debug_start_whose_debugging_the_runtime_gives_up_answers_that_it_failed_and_the_app_is_ended()
+    {
+        string folder = await WebAppAsync();
+        // The engine takes the load of the app's hosting as the runtime's word that its debugging failed.
+        await using McpClient client = await Start(["--mcp", folder],
+            environment: new() { [global::Passenger.Dap.AdapterEnvironment.FailAtModuleVariable] = "Microsoft.AspNetCore.Hosting.dll" }, languageServer: false);
+        // Far longer than the call's own limit: only the app's end can answer it.
+        JsonElement started = await Call(client, McpTools.DebugStart, new() { ["configuration"] = "Web: Serve", ["waitSeconds"] = 600 });
+        Assert.True(started.GetProperty("state").GetString() == "not debugging"
+            && started.GetProperty("status").GetString() == "Debugging Web: Serve ended: the runtime's debugging of the program failed (0x80004005), so it can be debugged no further",
+            $"debug_start of a web app whose debugging failed as it started answered: {started.GetRawText()}");
+        string console = (await Call(client, McpTools.Output, new() { ["of"] = "debug" })).GetString()!;
+        Assert.True(console.Contains("The runtime's debugging of the program failed (0x80004005): it can be debugged no further, so it is ended.", StringComparison.Ordinal),
+            $"The Debug console of a program whose debugging failed reads:\n{console}");
+    }
+
+    /// <summary>A web app that answers "served" at its root, restored, in a folder of the test's own; its launch profile Serve
+    /// listens at port 0, the port it took said only in its own words.</summary>
+    private async Task<string> WebAppAsync()
+    {
+        string folder = PathNames.Canonical(TestFolders.Create("mcp-web-"));
+        DeleteAtEnd(folder);
+        TestFolders.Write(folder, "Web.csproj", TestProjects.Web("<ImplicitUsings>enable</ImplicitUsings>"));
+        TestFolders.Write(folder, "Program.cs", "WebApplication app = WebApplication.Create(args);\napp.MapGet(\"/\", () => \"served\");\napp.Run();\n");
+        TestFolders.Write(folder, "Properties/launchSettings.json",
+            "{\n  \"profiles\": {\n    \"Serve\": { \"commandName\": \"Project\", \"applicationUrl\": \"http://127.0.0.1:0\" }\n  }\n}\n");
+        await Restore.RunAsync(Path.Combine(folder, "Web.csproj"));
+        return folder;
     }
 
     /// <summary>A call that takes a while tells an agent that asked for progress what it is doing as it goes (the run's
@@ -461,7 +489,7 @@ public sealed class McpDebuggingTests : McpRig, IClassFixture<RestoredFolders>
         Assert.True(told.Any(t => t.Message?.StartsWith("Running Sum: waiting up to 4 s for it to end", StringComparison.Ordinal) == true),
             $"The agent was never told the run waits for its program: {heard}");
         // Each word says how long the call has taken so far.
-        Assert.Matches(@"\(\d+\.\d s\)$", told[^1].Message ?? string.Empty);
+        Assert.Matches($@"\({SaidWhile.Pattern}\)$", told[^1].Message ?? string.Empty);
         await Call(client, McpTools.Stop);
         Assert.True(Errors().Length == 0, $"The agent's Passenger wrote to its standard error, which an agent may never read:\n{string.Join('\n', Errors())}");
     }

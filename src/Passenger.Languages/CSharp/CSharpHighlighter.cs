@@ -18,7 +18,6 @@ public sealed class CSharpHighlighter : IHighlighter, IBraceMatcher, IFoldFinder
 {
     private readonly TextDocument document;
     private CSharpParseOptions options;
-    private readonly SynchronizationContext? ui = SynchronizationContext.Current;
     private readonly List<(int Version, IReadOnlyList<TextEdit> Edits)> sinceTree = [];
     private SnapshotText text;
     private SyntaxTree? tree;
@@ -35,6 +34,9 @@ public sealed class CSharpHighlighter : IHighlighter, IBraceMatcher, IFoldFinder
     private int parsingVersion = -1;
     private bool parsing;
     private bool disposed;
+
+    /// <summary>The parse under way's hold on the IDE's quiet, let go as it lands or as the highlighter is let go.</summary>
+    private IDisposable? parseHold;
 
     /// <summary>The parse under way, which a caller asking for the syntax before the first has landed waits for.</summary>
     private Task<(SyntaxTree Tree, FoldRegions Folds, Dictionary<int, (int Length, SyntaxSpan[] Spans)> Lines)>? running;
@@ -59,6 +61,9 @@ public sealed class CSharpHighlighter : IHighlighter, IBraceMatcher, IFoldFinder
     private Dictionary<int, (int Length, SyntaxSpan[] Spans)> lines = [];
     private Dictionary<int, (int Length, SyntaxSpan[] Spans)> spareLines = [];
     private int linesVersion = -1;
+
+    /// <summary>The rainbow brace levels the colours given and kept were classified with.</summary>
+    private int braceLevels = BraceLevels.InForce;
     private long classified;
 
     /// <summary>Whether <see cref="lines"/> still holds every line's colours given since the last parse landed: none let go
@@ -160,6 +165,7 @@ public sealed class CSharpHighlighter : IHighlighter, IBraceMatcher, IFoldFinder
 
     public IReadOnlyList<SyntaxSpan> GetSpans(TextSnapshot snapshot, int start, int length)
     {
+        FollowBraceLevels();
         if (tree is null)
         {
             // No colours yet, which the lines kept do not hold.
@@ -179,6 +185,20 @@ public sealed class CSharpHighlighter : IHighlighter, IBraceMatcher, IFoldFinder
         }
         cached[(start, length)] = result;
         return result;
+    }
+
+    /// <summary>Takes the brace levels in force where a theme laid since gave another count: every colour kept is let go,
+    /// read again as it is asked.</summary>
+    private void FollowBraceLevels()
+    {
+        int inForce = BraceLevels.InForce;
+        if (inForce != braceLevels)
+        {
+            braceLevels = inForce;
+            lines.Clear();
+            cached.Clear();
+            linesWhole = false;
+        }
     }
 
     public void Showing(TextSnapshot snapshot, int start, int length)
@@ -222,7 +242,7 @@ public sealed class CSharpHighlighter : IHighlighter, IBraceMatcher, IFoldFinder
         // One character to the left, so a word being typed at its end is found and its colour carried over the new letters.
         from = sinceTree.Count > 0 ? from - 1 : from;
         TextSpan range = TextSpan.FromBounds(Math.Clamp(from, 0, root.FullSpan.End), Math.Clamp(to, 0, root.FullSpan.End));
-        List<SyntaxSpan> spans = CSharpClassifier.Classify(root, range);
+        List<SyntaxSpan> spans = CSharpClassifier.Classify(root, range, braceLevels);
         Interlocked.Add(ref classified, range.Length);
         foreach ((_, IReadOnlyList<TextEdit> batch) in sinceTree)
         {
@@ -383,7 +403,7 @@ public sealed class CSharpHighlighter : IHighlighter, IBraceMatcher, IFoldFinder
     /// <summary>The colours of the lines asked of the text before a parse, read from the parse on its worker, by where each
     /// line starts in the parsed text, as <see cref="lines"/> keeps them: what its landing hands the screen's next frame,
     /// which then classifies nothing again. A worker's.</summary>
-    private static Dictionary<int, (int Length, SyntaxSpan[] Spans)> Read(SyntaxNode root, TextSnapshot text, (int First, int Last)[] warm)
+    private static Dictionary<int, (int Length, SyntaxSpan[] Spans)> Read(SyntaxNode root, TextSnapshot text, (int First, int Last)[] warm, int levels)
     {
         Dictionary<int, (int Length, SyntaxSpan[] Spans)> read = [];
         int lineCount = text.LineCount;
@@ -397,7 +417,7 @@ public sealed class CSharpHighlighter : IHighlighter, IBraceMatcher, IFoldFinder
             }
             LineSpan top = text.GetLine(first);
             LineSpan bottom = text.GetLine(last);
-            List<SyntaxSpan> found = CSharpClassifier.Classify(root, TextSpan.FromBounds(top.Start, Math.Min(bottom.EndIncludingBreak, root.FullSpan.End)));
+            List<SyntaxSpan> found = CSharpClassifier.Classify(root, TextSpan.FromBounds(top.Start, Math.Min(bottom.EndIncludingBreak, root.FullSpan.End)), levels);
             for (int line = first; line <= last; line++)
             {
                 LineSpan of = text.GetLine(line);
@@ -424,6 +444,8 @@ public sealed class CSharpHighlighter : IHighlighter, IBraceMatcher, IFoldFinder
     {
         disposed = true;
         document.Changed -= OnChanged;
+        // What a parse under way finds lands nowhere now, so nothing waits for it.
+        parseHold?.Dispose();
     }
 
     private void OnChanged(object? sender, DocumentChangedEventArgs e)
@@ -445,6 +467,8 @@ public sealed class CSharpHighlighter : IHighlighter, IBraceMatcher, IFoldFinder
             return;
         }
         parsing = true;
+        FollowBraceLevels();
+        int levels = braceLevels;
         SnapshotText parsedText = text;
         CSharpParseOptions parsedWith = options;
         // A tree of other symbols reads its directives otherwise, so the text is parsed whole.
@@ -454,8 +478,9 @@ public sealed class CSharpHighlighter : IHighlighter, IBraceMatcher, IFoldFinder
         parsingVersion = parsedVersion;
         (int First, int Last)[] warm = [.. asked];
         Task? held = HeldParses;
-        // Held from here, the parse's own start holding nothing, until what it parsed lands on the UI thread.
-        BackgroundWork.Begin();
+        SynchronizationContext? landing = SynchronizationContext.Current;
+        // Held from here, the parse's own start holding nothing, until what it parsed lands on the UI thread that asked.
+        IDisposable hold = parseHold = BackgroundWork.Scope();
         Task<(SyntaxTree Tree, FoldRegions Folds, Dictionary<int, (int Length, SyntaxSpan[] Spans)> Lines)> parse = BackgroundWork.Unheld(async () =>
         {
             if (held is not null)
@@ -465,14 +490,14 @@ public sealed class CSharpHighlighter : IHighlighter, IBraceMatcher, IFoldFinder
             long allocated = GC.GetAllocatedBytesForCurrentThread() + DeepText.ReadBytes;
             SyntaxTree parsed = previous is null ? CSharpParsing.Parse(parsedText, parsedWith) : CSharpParsing.Changed(previous, parsedText);
             // The screen's lines classified here build the tree's nodes off the UI thread, which classifies them no more.
-            Dictionary<int, (int Length, SyntaxSpan[] Spans)> read = Read(parsed.GetRoot(), parsedText.Snapshot, warm);
+            Dictionary<int, (int Length, SyntaxSpan[] Spans)> read = Read(parsed.GetRoot(), parsedText.Snapshot, warm, levels);
             FoldRegions folds = FoldRegions.Of(new ParsedText(parsed, parsedText.Snapshot), previousFolds);
             Interlocked.Add(ref parseBytes, GC.GetAllocatedBytesForCurrentThread() + DeepText.ReadBytes - allocated);
             Interlocked.Increment(ref parses);
             return (Tree: parsed, Folds: folds, Lines: read);
         });
         running = parse;
-        UnawaitedWork.Observe(parse.ContinueWith(done => OnUi(() =>
+        UnawaitedWork.Observe(parse.ContinueWith(done => OnUi(landing, () =>
         {
             try
             {
@@ -490,7 +515,16 @@ public sealed class CSharpHighlighter : IHighlighter, IBraceMatcher, IFoldFinder
                     {
                         current = null;
                     }
-                    KeptColours = TakeLines(done.Result.Lines);
+                    if (levels == braceLevels)
+                    {
+                        KeptColours = TakeLines(done.Result.Lines);
+                    }
+                    else
+                    {
+                        // Lines read with brace levels since changed are classified again as they are asked.
+                        ChangedWithin = null;
+                        KeptColours = false;
+                    }
                     Changed?.Invoke(this, EventArgs.Empty);
                     ChangedWithin = null;
                     if (parsedVersion == version)
@@ -507,7 +541,7 @@ public sealed class CSharpHighlighter : IHighlighter, IBraceMatcher, IFoldFinder
             }
             finally
             {
-                BackgroundWork.End();
+                hold.Dispose();
             }
         }), TaskScheduler.Default));
     }
@@ -568,21 +602,23 @@ public sealed class CSharpHighlighter : IHighlighter, IBraceMatcher, IFoldFinder
         if (basis is null && running is { } first)
         {
             firstParseWaits += first.IsCompleted ? 0 : 1;
-            ((IAsyncResult)first).AsyncWaitHandle.WaitOne();
+            // Synchronous as Current's getter is: the parse runs to its end on the pool, never on the thread held here.
+            Blocking.Until(first);
             basis = first.IsCompletedSuccessfully ? first.Result.Tree : null;
         }
         return basis is null ? CSharpParsing.Parse(text, options) : CSharpParsing.Changed(basis, text);
     }
 
-    private void OnUi(Action action)
+    /// <summary>Runs work where a parse was asked for: on the UI thread that asked, else at once.</summary>
+    private static void OnUi(SynchronizationContext? landing, Action action)
     {
-        if (ui is null)
+        if (landing is null)
         {
             action();
         }
         else
         {
-            ui.Post(_ => action(), null);
+            landing.Post(_ => action(), null);
         }
     }
 

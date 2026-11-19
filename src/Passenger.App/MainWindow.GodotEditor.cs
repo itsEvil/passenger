@@ -74,7 +74,7 @@ public partial class MainWindow
         string? setting = settings.GodotExecutable;
         bool scripts = !Projects.Any(p => p.GodotFolder is not null);
         IReadOnlyDictionary<string, string>? folders = GodotFolders;
-        IReadOnlyList<KeyValuePair<string, object>> values = GodotEditorSettings.ForPassenger(ScriptEditor);
+        IReadOnlyList<KeyValuePair<string, object>> values = GodotEditorSettings.ForPassenger(Product.Program);
         GodotSetUp found = await BackgroundWork.Run(() => GodotSetUp.Of(GodotLaunch.Found(setting), scripts, folders));
         if (Folder != folder || godotEditorOffered || found.Problem is not null
             || found.Values is { } now && values.All(v => now.TryGetValue(v.Key, out object? had) && Equals(had, v.Value)))
@@ -83,9 +83,6 @@ public partial class MainWindow
         }
         GodotBanner.Say($"Godot {found.Version}'s editor can open this project's scripts in Passenger, at their line");
     }
-
-    /// <summary>The program Godot's editor is told to open its scripts in: this Passenger.</summary>
-    private static string ScriptEditor => Environment.ProcessPath ?? Path.Combine(AppContext.BaseDirectory, OperatingSystem.IsWindows() ? "Passenger.exe" : "Passenger");
 
     /// <summary>The open folder's Godot projects: those its projects build on Godot.NET.Sdk, those of GDScript alone, else the
     /// folder itself holding a project.godot.</summary>
@@ -118,7 +115,7 @@ public partial class MainWindow
         }
         using (work)
         {
-            IReadOnlyList<KeyValuePair<string, object>> values = GodotEditorSettings.ForPassenger(ScriptEditor);
+            IReadOnlyList<KeyValuePair<string, object>> values = GodotEditorSettings.ForPassenger(Product.Program);
             string? setting = settings.GodotExecutable;
             // A Godot project of GDScript alone takes any Godot 4, .NET or not.
             bool scripts = !Projects.Any(p => p.GodotFolder is not null);
@@ -147,7 +144,7 @@ public partial class MainWindow
                     + "Godot's Play then builds here, and this Passenger debugs what it plays",
                 IsChecked = false,
             };
-            StackPanel detail = new() { Spacing = 8, Children = { Copyable(listed), addon } };
+            StackPanel detail = new() { Spacing = Gaps.Normal, Children = { Copyable(listed), addon } };
             if (!await ConfirmAsync("Make Passenger Godot's Script Editor?",
                 $"Godot {found.Version}'s editor will open its C# scripts and its other scripts in Passenger, at their line, in the window on their project. "
                 + $"Passenger writes these into {PathNames.Shown(found.Written!, null)}, keeping the rest; Godot's editor takes them as it next starts.",

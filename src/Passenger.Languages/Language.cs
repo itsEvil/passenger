@@ -168,7 +168,8 @@ public sealed class Language
     /// <summary>XAML, MSBuild's files and the rest of XML are one markup to the editor, each named and answered as its own.</summary>
     public static readonly Language Xaml = XmlKind("xaml", "XAML", ["*.axaml", "*.paml", "*.xaml"], LanguageService.Xaml);
 
-    public static readonly Language MSBuild = XmlKind("msbuild", "MSBuild", ["*.csproj", "*.fsproj", "*.vbproj", "*.proj", "*.props", "*.targets"], LanguageService.MSBuild);
+    public static readonly Language MSBuild = XmlKind("msbuild", "MSBuild", ["*.csproj", "*.fsproj", "*.vbproj", "*.proj", "*.props", "*.targets", "*.dcproj", "*.shproj", "*.projitems"],
+        LanguageService.MSBuild);
 
     public static readonly Language Xml = XmlKind("xml", "XML",
         ["*.xml", "*.slnx", "*.resx", "*.config", "*.nuspec", "*.manifest", "*.runsettings", "*.xsd", "*.xslt", "*.xsl", "*.svg", "*.plist", "*.storyboard"],
@@ -176,13 +177,15 @@ public sealed class Language
 
     /// <summary>JSON, told to its server as JSON with comments where the file's reader takes them: the files VS Code reads
     /// so (its json, configuration-editing and typescript-basics extensions' jsonc names, and every JSON file under
-    /// .vscode), and .NET's (ASP.NET Core's settings and launch profiles, the SDK's global.json, a solution filter).</summary>
+    /// .vscode), and .NET's (ASP.NET Core's settings and launch profiles, the SDK's global.json, a solution filter, a solution's
+/// multi-project launch profiles).</summary>
     public static readonly Language Json = new("json", "JSON",
         [.. ((string[])["*.jsonc", "*.eslintrc", "*.eslintrc.json", "*.jsfmtrc", "*.jshintrc", "*.swcrc", "*.hintrc", "*.babelrc", "*.toolset.jsonc",
             "babel.config.json", "bun.lock", ".babelrc.json", ".ember-cli", "typedoc.json", ".github/hooks/*.json",
             "*.code-workspace", "*language-configuration.json", "*icon-theme.json", "*color-theme.json", "settings.json", "launch.json", "tasks.json",
             "mcp.json", "keybindings.json", "extensions.json", "argv.json", "profiles.json", "devcontainer.json", ".devcontainer.json", ".vscode/*.json",
-            "tsconfig*.json", "jsconfig*.json", "appsettings*.json", "launchSettings.json", "global.json", "*.slnf"]).Select(glob => new FilePattern(glob, "jsonc")),
+            "tsconfig*.json", "jsconfig*.json", "appsettings*.json", "launchSettings.json", "global.json", "*.slnf", "*.slnLaunch", "*.slnLaunch.user"])
+            .Select(glob => new FilePattern(glob, "jsonc")),
             "*.json"],
         line: "//", block: ("/*", "*/"), indent: 2, grammar: new("source.json", "JSON.tmLanguage.json"), folds: FoldScan.Json, service: LanguageService.Json);
 
@@ -243,6 +246,11 @@ public sealed class Language
         blockWords: ["async", "case", "class", "def", "elif", "else", "except", "finally", "for", "if", "match", "try", "while", "with"],
         continued: ContinuedLines.Python, blockless: ContinuedLines.PythonBlockless);
 
+    /// <summary>Gherkin's .feature files, Reqnroll's and SpecFlow's tests, folded by Gherkin's own reading of them, their doc
+    /// strings' whitespace kept.</summary>
+    public static readonly Language Gherkin = new("gherkin", "Gherkin", ["*.feature"], line: "#", indent: 2,
+        grammar: new("text.gherkin.feature", "feature.tmLanguage.json"), folds: FoldScan.Gherkin, literals: Passenger.Workspace.Gherkin.FeatureReading.DocStringLines);
+
     /// <summary>Languages with no grammar here, commented as C's are or as scripts are.</summary>
     public static readonly Language Code = new("code", "Code", ["*.rs", "*.go", "*.java", "*.kt", "*.swift", "*.c", "*.h", "*.cpp"],
         line: "//", block: ("/*", "*/"));
@@ -297,6 +305,12 @@ public sealed class Language
 
     /// <summary>Whether the language is coloured and folded by its own parse in-process (C#'s) rather than by its grammar.</summary>
     internal bool Parsed { get; }
+
+    /// <summary>The file names it claims, though a language declared before it may claim a file first.</summary>
+    public IReadOnlyList<FilePattern> Patterns => patterns;
+
+    /// <summary>Every language's id, in the order declared, as a theme names a language it colours.</summary>
+    public static IEnumerable<string> Ids => All.Select(l => l.Id);
 
     /// <summary>The language a file is in, by its name (and its folders, where a pattern names them).</summary>
     public static Language ForPath(string path)

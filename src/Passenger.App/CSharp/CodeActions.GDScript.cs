@@ -284,7 +284,7 @@ internal sealed partial class CodeActions
             string found = read.Text;
             changes.Add(new XamlFileChange(path, text => text == found ? edits.Edits : []));
             TextSnapshot before = TextSnapshot.From(found);
-            files.Add(new RefactoredFile(path, "changed", [.. edits.Edits.Select(e => before.GetLineFromOffset(e.Start) + 1).Distinct()]));
+            files.Add(new RefactoredFile(path, RefactoredChange.Changed, [.. edits.Edits.Select(e => before.GetLineFromOffset(e.Start) + 1).Distinct()]));
         }
         foreach (IGrouping<string, PlacedEdits> file in beside.GroupBy(b => b.Path, PathNames.Comparer))
         {
@@ -295,7 +295,7 @@ internal sealed partial class CodeActions
                 ServerLines lines = ServerLines.Of(TextSnapshot.From(text));
                 return [.. edits.Select(e => new TextEdit(lines.OffsetOf(e.Range.Start), lines.OffsetOf(e.Range.End) - lines.OffsetOf(e.Range.Start), e.NewText)).OrderBy(e => e.Start)];
             }));
-            files.Add(new RefactoredFile(path, "changed", [.. edits.Select(e => e.Range.Start.Line + 1).Distinct()]));
+            files.Add(new RefactoredFile(path, RefactoredChange.Changed, [.. edits.Select(e => e.Range.Start.Line + 1).Distinct()]));
         }
         if (await ApplyFileChangesAsync(command, changes) is { } failed)
         {
@@ -416,8 +416,8 @@ internal sealed partial class CodeActions
             TextSnapshot text = TextSnapshot.From(read.Text);
             foreach ((_, int start, int end) in script)
             {
-                LspPosition from = ServerPlaces.ServerPositionOf(text, PositionOf(text, start));
-                LspPosition to = ServerPlaces.ServerPositionOf(text, PositionOf(text, end));
+                LspPosition from = ServerPlaces.ServerPositionOf(text, text.GetPosition(Math.Clamp(start, 0, text.Length)));
+                LspPosition to = ServerPlaces.ServerPositionOf(text, text.GetPosition(Math.Clamp(end, 0, text.Length)));
                 places.Add(new LspLocation(DocumentUris.FromPath(path), new LspRange(from, to)));
             }
         }
@@ -426,12 +426,6 @@ internal sealed partial class CodeActions
             places.AddRange(await BesideAsync(document, folder, target, d => context.Languages.CSharp.GodotScriptUsesOfAsync(d, target.Start)));
         }
         return (places, found.Unsure);
-    }
-
-    private static TextPosition PositionOf(TextSnapshot text, int offset)
-    {
-        int line = text.GetLineFromOffset(Math.Clamp(offset, 0, text.Length));
-        return new TextPosition(line, Math.Clamp(offset, 0, text.Length) - text.GetLineStart(line));
     }
 
     /// <summary>Rename at the caret of a GDScript: its box, the name renamed by Passenger's reading where it is a member or
@@ -444,7 +438,7 @@ internal sealed partial class CodeActions
         }
         TextSnapshot text = Editor.Document.Snapshot;
         TextRange word = TextNavigation.WordAt(text, Editor.Selections.Primary.Caret);
-        if (word.Length == 0 || !TextNavigation.IsWordChar(text[word.Start]))
+        if (word.Length == 0 || !WordCharacters.IsWord(text[word.Start]))
         {
             return;
         }
@@ -454,7 +448,7 @@ internal sealed partial class CodeActions
     /// <summary>A selection taken to the whole lines it touches, as Extract Function takes statements.</summary>
     private static TextRange Lines(string text, TextRange selection)
     {
-        int start = selection.Start <= 0 ? 0 : text.LastIndexOf('\n', selection.Start - 1) + 1;
+        int start = TextNavigation.LineStart(text, selection.Start);
         int end = selection.End;
         if (end > start && end <= text.Length && (end == text.Length || text[end - 1] == '\n'))
         {

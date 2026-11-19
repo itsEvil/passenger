@@ -16,15 +16,21 @@ namespace Passenger.App.Settings;
 /// Shortcuts; Find Actions by Shortcut keeps only the actions a keystroke or chord pressed into it starts.</summary>
 public sealed partial class SettingsDialog
 {
+    /// <summary>What the keymap in force does with a keystroke, as Settings names it beside Vim mode's Ctrl keys: the
+    /// action's title, the chords it begins, or nothing.</summary>
+    public static string KeymapDoes(ActionRegistry actions, Keystroke stroke) =>
+        actions.Keymap.ActionFor(new Shortcut(stroke)) is { } id ? actions[id]?.Title ?? id
+            : actions.Keymap.StartsChord(stroke) ? "the chords it begins" : "nothing";
+
     private const string ConflictWarning = "This shortcut is already assigned to other actions. Do you want to remove the other assignments?";
 
     private readonly Dictionary<string, ActionRow> keymapRows = [];
-    private readonly DockPanel keymapHeader = new() { Margin = new Thickness(0, 0, 0, 10) };
+    private readonly DockPanel keymapHeader = new() { Margin = new Thickness(0, 0, 0, Gaps.Wide) };
     private readonly TextBlock keymapNote = new() { TextWrapping = TextWrapping.Wrap, IsVisible = false, Classes = { StyleClasses.Muted } };
     private readonly ShortcutPanel filterKeys = new("Second stroke");
     private readonly Popup findPopup = new() { Placement = PlacementMode.BottomEdgeAlignedRight, IsLightDismissEnabled = true };
     private readonly TextBlock filterText = new() { VerticalAlignment = VerticalAlignment.Center, FontSize = 12 };
-    private readonly Border filterChip = new() { IsVisible = false, Classes = { StyleClasses.Tag }, Padding = new Thickness(8, 2, 4, 2), VerticalAlignment = VerticalAlignment.Center };
+    private readonly Border filterChip = new() { IsVisible = false, Classes = { StyleClasses.Tag }, Padding = new Thickness(Gaps.Normal, Gaps.Hair, Gaps.Tight, Gaps.Hair), VerticalAlignment = VerticalAlignment.Center };
     private readonly Dictionary<KeymapPreset, Keymap> defaults = [];
     private Shortcut? shortcutFilter;
 
@@ -45,7 +51,7 @@ public sealed partial class SettingsDialog
     public ShortcutPanel FindShortcut => filterKeys;
 
     /// <summary>The x on the shortcut the page is narrowed to (Clear Filtering).</summary>
-    public Button ClearFiltering { get; } = new() { Classes = { StyleClasses.TabPin }, Margin = new Thickness(6, 0, 0, 0) };
+    public Button ClearFiltering { get; } = new() { Classes = { StyleClasses.TabPin }, Margin = new Thickness(Gaps.Small, 0, 0, 0) };
 
     /// <summary>The shortcut the Keymap page is narrowed to, or null while it lists every action.</summary>
     public Shortcut? ShortcutFilter => shortcutFilter;
@@ -155,9 +161,9 @@ public sealed partial class SettingsDialog
         Keymap current = Current;
         foreach (IdeAction action in actions.All.OrderBy(a => a.Title, StringComparer.Ordinal))
         {
-            WrapPanel keys = new() { Width = 300, VerticalAlignment = VerticalAlignment.Center };
+            WrapPanel keys = new() { VerticalAlignment = VerticalAlignment.Center };
             Button edit = ToolButtons.Of(IconKeys.More, "Edit Shortcuts");
-            StackPanel editor = new() { Orientation = Orientation.Horizontal, Spacing = 6, Children = { keys, edit } };
+            NarrowingField editor = new(keys, edit) { MaxWidth = OptionRow.EditorWidth };
             Panel row = (Panel)Add(KeymapPage, action.Title, editor, RowWords(action, ShownOf(current, action.Id)), action: action.Id);
             // Transparent so a click anywhere along the row is the row's.
             row.Background = Brushes.Transparent;
@@ -228,9 +234,9 @@ public sealed partial class SettingsDialog
         Border popup = new()
         {
             Width = 320,
-            Padding = new Thickness(12, 10, 12, 12),
+            Padding = new Thickness(Gaps.Wide),
             Classes = { StyleClasses.Popup },
-            Child = new StackPanel { Spacing = 8, Children = { title, filterKeys } },
+            Child = new StackPanel { Spacing = Gaps.Normal, Children = { title, filterKeys } },
         };
         // Tab goes round the popup's own fields, never on to the page under it.
         KeyboardNavigation.SetTabNavigation(popup, KeyboardNavigationMode.Cycle);
@@ -248,10 +254,10 @@ public sealed partial class SettingsDialog
         findPopup.Opened += (_, _) => Dispatcher.UIThread.Post(() => filterKeys.First.Focus(), DispatcherPriority.Loaded);
         filterKeys.Changed += (_, _) => FilterByShortcut(filterKeys.Shortcut);
 
-        StackPanel tools = new() { Orientation = Orientation.Horizontal, Spacing = 6, VerticalAlignment = VerticalAlignment.Top, Children = { filterChip, FindByShortcut } };
+        StackPanel tools = new() { Orientation = Orientation.Horizontal, Spacing = Gaps.Small, VerticalAlignment = VerticalAlignment.Top, Children = { filterChip, FindByShortcut } };
         StackPanel named = new()
         {
-            Spacing = 4,
+            Spacing = Gaps.Tight,
             VerticalAlignment = VerticalAlignment.Center,
             Children = { KeymapChoice, keymapNote },
         };
@@ -384,7 +390,7 @@ public sealed partial class SettingsDialog
                 row.Keys.Children.Clear();
                 foreach (string keys in shown)
                 {
-                    Border box = new() { Classes = { StyleClasses.Box }, Padding = new Thickness(6, 1), Margin = new Thickness(0, 2, 4, 2), Child = new TextBlock { Text = keys, FontSize = 12 } };
+                    Border box = new() { Classes = { StyleClasses.Box }, Padding = new Thickness(Gaps.Small, 0), Margin = new Thickness(0, Gaps.Hair, Gaps.Tight, Gaps.Hair), Child = new TextBlock { Text = keys, FontSize = 12, VerticalAlignment = VerticalAlignment.Center } };
                     box.Bind(Border.BackgroundProperty, box.GetResourceObservable(TokenKeys.Selected));
                     row.Keys.Children.Add(box);
                 }
@@ -422,7 +428,8 @@ public sealed partial class SettingsDialog
         FilterByShortcut(null);
     }
 
-    /// <summary>Which options a shortcut filter keeps: every one but the Keymap page's actions it does not start.</summary>
+    /// <summary>Which options a shortcut filter keeps: every one but the Keymap page's actions it does not start and its own
+    /// settings, which no keystroke starts.</summary>
     private Func<Option, bool> ShortcutFiltered()
     {
         if (shortcutFilter is not { } filter)
@@ -430,7 +437,7 @@ public sealed partial class SettingsDialog
             return _ => true;
         }
         Keymap current = Current;
-        return option => option.Action is null || current.ShortcutsFor(option.Action).Any(s => s.StartsWith(filter));
+        return option => option.Action is null ? option.Page != KeymapPage : current.ShortcutsFor(option.Action).Any(s => s.StartsWith(filter));
     }
 
     /// <summary>Where an action is listed: its main menu's path, Editor Actions for the editor's own (its mouse's too),

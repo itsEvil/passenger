@@ -2,12 +2,14 @@ using Avalonia.Platform.Storage;
 using Passenger.App.Run;
 using Passenger.App.ToolWindows;
 using Passenger.Core;
+using Passenger.Editor;
+using Passenger.Text;
 
 namespace Passenger.App;
 
 /// <summary>Links: the Run, Debug, Build and Unit Tests consoles' stack frames, compiler messages, web addresses and the
 /// folder a publish landed in (a click opens the file at its line, the folder in the file manager, or the address in the
-/// browser) and the terminal's (its file paths on Cmd+click, Ctrl+click elsewhere); and Open browser after launch, which
+/// browser) and the terminal's (its file paths on Cmd+click, Ctrl+click elsewhere, and its programs' own links); and Open browser after launch, which
 /// opens a web project's launch URL once its program listens.</summary>
 public partial class MainWindow
 {
@@ -19,6 +21,12 @@ public partial class MainWindow
     /// <summary>Every address the window opened in the person's browser, in order, kept since the headless platform's
     /// launcher opens nothing.</summary>
     public IReadOnlyList<Uri> Browsed => browsed;
+
+    private readonly List<string> browsersStarted = [];
+
+    /// <summary>Every browser program the window started to open a page in (<see cref="PageBrowsers"/>), as its command line,
+    /// in order, or would have where nobody sees it.</summary>
+    public IReadOnlyList<string> BrowsersStarted => browsersStarted;
 
     private void AddLinks()
     {
@@ -38,15 +46,22 @@ public partial class MainWindow
         Bottom.Tests.Links.Folders = () => LinkFolders(null);
     }
 
+    /// <summary>What the terminal's lines link, found as they are drawn; none until the Terminal window is first made.</summary>
+    public ConsoleLinks? TerminalLinks { get; private set; }
+
     /// <summary>The terminal's links: web addresses and stack frames as the consoles find them, and any path to a file,
-    /// a relative one under the folder the shell said it is in, then the open folder's. A line's links are given as the
-    /// view takes them once for each time they are found, so a frame drawing the line again makes nothing.</summary>
+    /// a relative one under the folder the shell said it is in, then the open folder's, each asked of the disk off the
+    /// window's thread. A line's links are given as the view takes them once for each time they are found, so a frame
+    /// drawing the line again makes nothing.</summary>
     private void AddTerminalLinks(ToolWindows.TerminalPanel terminal)
     {
         ConsoleLinks links = new() { FilePaths = true };
+        TerminalLinks = links;
         System.Runtime.CompilerServices.ConditionalWeakTable<FoundLink[], (int Start, int Length, object Target, bool Hidden)[]> given = [];
         string? shellFolder = null;
         links.Folders = () => LinkFolders(shellFolder);
+        // Drawn again in a frame of its own: a change of the shell's folder forgets what was found while a frame is drawn.
+        links.Changed += (_, _) => UiThread.Post(terminal.View.InvalidateVisual);
         terminal.View.Links = text =>
         {
             string? at = terminal.Active?.Screen.WorkingDirectory;
@@ -71,7 +86,53 @@ public partial class MainWindow
             }
             return each;
         };
+        terminal.View.LinkTo = ProgramLink;
         terminal.View.LinkClicked += (_, target) => OpenLink((LinkTarget)target);
+    }
+
+    /// <summary>What a link a program made in the terminal opens (OSC 8, as Spectre.Console's link markup writes): a web
+    /// address in the browser, a file address on this machine its file or folder once clicked; null for any other, which
+    /// stays text. The view asks it as it draws, so it asks nothing of the disk, and an address naming another host, a
+    /// share, a device or an automount root is never a link (<see cref="FoundPaths.OfFileAddress"/>): drawing a line reaches
+    /// no other machine, nor mounts anything.</summary>
+    public static LinkTarget? ProgramLink(string address)
+    {
+        if (!Uri.TryCreate(address, UriKind.Absolute, out Uri? uri))
+        {
+            return null;
+        }
+        if (uri.Scheme == Uri.UriSchemeHttp || uri.Scheme == Uri.UriSchemeHttps)
+        {
+            return new WebLink(uri);
+        }
+        return FoundPaths.OfFileAddress(uri) is { } path ? new ProgramFileLink(path) : null;
+    }
+
+    /// <summary>What an address written in a file's comment or string opens (<see cref="DocumentDecorations.Addresses"/>), its
+    /// editor's Go to Declaration following it: a web address in the browser, a file address on this machine its file or
+    /// folder once followed, as a program's link in the terminal (<see cref="ProgramLink"/>), so drawing it asks nothing of
+    /// the disk; null for any other, which stays text.</summary>
+    public static readonly Func<string, object?> WrittenLink = address => WebAddresses.Parse(address) is not { } uri ? null
+        : uri.IsFile ? (FoundPaths.OfFileAddress(uri) is { } path ? new ProgramFileLink(path) : null)
+        : new WebLink(uri);
+
+    /// <summary>Opens a path a program linked, once clicked: its file in the editor, else its folder in the file manager,
+    /// as the disk has them, asked off the window's thread; one that is neither is said in the status bar.</summary>
+    private async Task OpenProgramFileAsync(string path)
+    {
+        (string? file, bool folder) = await BackgroundWork.Run(() => File.Exists(path) ? (PathNames.Canonical(path), false) : ((string?)null, Directory.Exists(path)));
+        if (file is not null)
+        {
+            OpenLink(new FileLink(file, default));
+        }
+        else if (folder)
+        {
+            ShowInFileManager(path);
+        }
+        else
+        {
+            Say($"The program's link names {path}, which is not there");
+        }
     }
 
     /// <summary>Where a relative path in a console is looked for: the project its output came from, the open folder, then
@@ -119,16 +180,63 @@ public partial class MainWindow
             case WebLink web:
                 Browse(web.Address);
                 break;
+            case ProgramFileLink named:
+                IdeErrors.Observe(OpenProgramFileAsync(named.Path));
+                break;
         }
     }
 
-    /// <summary>Opens an address in the person's browser, through the system's launcher as every link the IDE opens is:
-    /// the browser is the person's, never ended with the IDE.</summary>
-    public void Browse(Uri address)
+    /// <summary>Opens an address in the person's browser, through the system's launcher as every link the IDE opens is: the
+    /// browser is the person's, never ended with the IDE.</summary>
+    public void Browse(Uri address) => Browse(address, null);
+
+    /// <summary>Opens a page a run serves (a resource's endpoint, a container's port) in the browser Settings names, else the
+    /// system's default.</summary>
+    private void BrowsePage(Uri page) => Browse(page, PageBrowsers.Of(settings.Browser));
+
+    /// <summary>Opens an address in the person's browser: through the system's launcher as every link the IDE opens is, or
+    /// in the browser program a run names (<paramref name="browser"/>), started apart, which a window nobody sees never
+    /// starts. The browser is the person's, never ended with the IDE.</summary>
+    public void Browse(Uri address, PageBrowser? browser)
     {
         UiThread.Check();
         browsed.Add(address);
-        IdeErrors.Observe(Launcher.LaunchUriAsync(address));
+        IdeErrors.Observe(browser is null ? Launcher.LaunchUriAsync(address) : BrowseInAsync(address, browser));
+    }
+
+    /// <summary>Opens an address in a browser program, its command found off the window's thread (a name on the PATH as
+    /// the login shell has it); what fails is said in the status bar.</summary>
+    private async Task BrowseInAsync(Uri address, PageBrowser browser)
+    {
+        (System.Diagnostics.ProcessStartInfo? start, bool bundle, string? whyNot) = await BackgroundWork.Run(() => PageBrowsers.Opening(browser, address));
+        if (start is null)
+        {
+            status.Text = PageBrowsers.NotOpened(address, whyNot!);
+            return;
+        }
+        browsersStarted.Add(ChildProcesses.Display(start));
+        if (Unseen)
+        {
+            return;
+        }
+        try
+        {
+            if (bundle)
+            {
+                // The system's open ends once the app has the page.
+                ChildResult opened = await ChildProcesses.RunAsync(start, limit: TimeSpan.FromSeconds(30));
+                if (!opened.Succeeded)
+                {
+                    status.Text = PageBrowsers.NotOpened(address, $"{browser.Where} names {browser.Line}, which did not open it: {opened.Said}");
+                }
+                return;
+            }
+            ChildProcesses.StartApart(start);
+        }
+        catch (Exception failed) when (ChildFailures.Of(failed))
+        {
+            status.Text = PageBrowsers.NotOpened(address, $"{browser.Where} names {browser.Line}, which did not start: {failed.Message}");
+        }
     }
 
     private readonly List<string> played = [];
@@ -180,7 +288,9 @@ public partial class MainWindow
     }
 
     /// <summary>Open browser after launch: the plan's browser URL opens once its program listens there (its port takes
-    /// a connection); never once the program ended, nor for a launch that came after it.</summary>
+    /// a connection), or a container's service answers HTTP there, the status adding to what it says meanwhile that it
+    /// waits, and saying what it said alone once the page opens; never once the program ended, nor for a launch that came
+    /// after it.</summary>
     private void OpenBrowserOnceListening(LaunchPlan plan, Task ended)
     {
         browserWait?.Cancel();
@@ -191,27 +301,36 @@ public partial class MainWindow
         }
         CancellationTokenSource waiting = browserWait = new CancellationTokenSource();
         IdeErrors.Observe(ended.ContinueWith(_ => waiting.Cancel(), CancellationToken.None, TaskContinuationOptions.None, TaskScheduler.Default));
+        string? service = plan.BrowserService;
+        TimeSpan limit = Waits.Of(BrowserLaunch.AnswerLimit);
+        (string? Text, ProblemSeverity? Severity, StatusPlace? Place) before = status.Said;
+        string? saying = service is null ? null : BrowserLaunch.Waiting(before.Text, service, address);
+        if (saying is not null)
+        {
+            status.Say(saying, before.Severity, before.Place);
+        }
         // Not background work: it lasts as long as the program takes to listen, which no screenshot or settling test waits for.
         IdeErrors.Observe(BackgroundWork.Unheld(async () =>
         {
-            bool? listening = await BrowserLaunch.ListeningAsync(address, waiting.Token);
-            if (listening is null)
-            {
-                return;
-            }
+            bool? up = service is null ? await BrowserLaunch.ListeningAsync(address, waiting.Token) : await BrowserLaunch.AnsweringAsync(address, limit, waiting.Token);
             UiThread.Post(() =>
             {
-                if (waiting.IsCancellationRequested)
+                // The wait's words give way to those before, unless anything since (a later launch's wait too) took their place.
+                if (saying is not null && ReferenceEquals(browserWait, waiting) && status.Text == saying && up != false)
+                {
+                    status.SayAgain(before);
+                }
+                if (up is null || waiting.IsCancellationRequested)
                 {
                     return;
                 }
-                if (listening == true)
+                if (up == true)
                 {
-                    Browse(address);
+                    Browse(address, PageBrowsers.Of(plan.BrowserLine, plan.Name, settings.Browser));
                 }
                 else
                 {
-                    status.Text = BrowserLaunch.NotResponding(address);
+                    status.Text = service is null ? BrowserLaunch.NotResponding(address) : BrowserLaunch.NotAnswered(service, address, limit);
                 }
             });
         }));

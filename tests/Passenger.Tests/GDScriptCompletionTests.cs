@@ -76,6 +76,75 @@ public sealed class GDScriptCompletionTests
         }
     }
 
+    /// <summary>What is typed after an annotation's @ while its list's first rows are still being made, as a loaded machine's
+    /// thread pool leaves them, narrows the list as it shows, and an Escape pressed then dismisses the list before it shows.</summary>
+    [AvaloniaFact]
+    public void Keys_typed_while_a_lists_first_rows_are_made_narrow_the_list_or_dismiss_it()
+    {
+        (MainWindow window, OpenDocument document, TaskCompletionSource release) = Open();
+        TaskCompletionSource made = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        TaskCompletionSource dismissed = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        try
+        {
+            CodeEditor editor = window.EditorArea.CodeEditor;
+            NewLineAfter(window, editor, "var counter := 0");
+            ClearLine(window, editor);
+            Task held = window.Assist.HoldNextCompletionRows(made.Task);
+            window.KeyTextInput("@");
+            Ui.AwaitPumped(held, "the annotations' first rows held as their list opened", TimeSpan.FromSeconds(60));
+            window.KeyTextInput("export_r");
+            made.SetResult();
+            First(window, "@export_range", "a member's annotation narrowed by what was typed as its list was made");
+            Assert.Equal("@export_r", window.Assist.CompletionNarrowedBy);
+
+            Ui.Press(window, "ESCAPE", settle: false);
+            ClearLine(window, editor);
+            held = window.Assist.HoldNextCompletionRows(dismissed.Task);
+            window.KeyTextInput("@");
+            Ui.AwaitPumped(held, "the annotations' first rows held as their list opened again", TimeSpan.FromSeconds(60));
+            Ui.Press(window, "ESCAPE", settle: false);
+            dismissed.SetResult();
+            Ui.Hold(TimeSpan.FromMilliseconds(200), "the held rows landing, which must not show the list Escape dismissed");
+            Assert.False(window.Assist.IsCompletionOpen,
+                $"The list Escape dismissed as its rows were made showed once they came: {string.Join(", ", window.Assist.CompletionLabels.Take(5))}");
+        }
+        finally
+        {
+            made.TrySetResult();
+            dismissed.TrySetResult();
+            window.Close();
+            release.SetResult();
+        }
+    }
+
+    /// <summary>An Escape pressed after an annotation's @ while the script is still being read for its list lets the list
+    /// go: once the reading lands, nothing opens.</summary>
+    [AvaloniaFact]
+    public void An_escape_pressed_while_an_annotations_list_is_asked_for_lets_it_go()
+    {
+        (MainWindow window, OpenDocument document, TaskCompletionSource release) = Open();
+        TaskCompletionSource read = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        try
+        {
+            CodeEditor editor = window.EditorArea.CodeEditor;
+            NewLineAfter(window, editor, "var counter := 0");
+            ClearLine(window, editor);
+            Task held = window.Session.HoldNextScriptReading(read.Task);
+            window.KeyTextInput("@");
+            Ui.AwaitPumped(held, "the script's reading for the annotations' list held", TimeSpan.FromSeconds(60));
+            Ui.Press(window, "ESCAPE", settle: false);
+            read.SetResult();
+            Assert.False(Ui.Pumped(() => window.Assist.IsCompletionOpen, TimeSpan.FromSeconds(2)),
+                $"The annotations' list Escape let go as it was asked for opened once the script was read: {string.Join(", ", window.Assist.CompletionLabels.Take(5))}");
+        }
+        finally
+        {
+            read.TrySetResult();
+            window.Close();
+            release.SetResult();
+        }
+    }
+
     /// <summary>After self's dot, and among the names in scope, the script's own members come before those its engine class
     /// gives it, however their names sort; a function returning nothing says void.</summary>
     [AvaloniaFact]
@@ -481,6 +550,41 @@ public sealed class GDScriptCompletionTests
             First(window, "counter", "the script's counter for what was typed");
             bool described = Ui.Pumped(() => window.Assist.ItemDocumentation?.Contains("var counter", StringComparison.Ordinal) == true, TimeSpan.FromSeconds(30));
             Assert.True(described, $"The list opened on counte shows no card for its first item, counter, until another is chosen: {window.Assist.ItemDocumentation}");
+        }
+        finally
+        {
+            window.Close();
+            release.SetResult();
+        }
+    }
+
+    /// <summary>A name holding marks (नमस्ते's virama and vowel sign), one name to Godot, is narrowed by and replaced whole:
+    /// a list asked for after it is typed, and one opened by its first letter that its marks typed on narrow.</summary>
+    [AvaloniaFact]
+    public void A_name_holding_marks_is_narrowed_by_and_replaced_whole()
+    {
+        (MainWindow window, OpenDocument document, TaskCompletionSource release) = Open();
+        try
+        {
+            CodeEditor editor = window.EditorArea.CodeEditor;
+            NewLineAfter(window, editor, "var counter := 0");
+            window.KeyTextInput("var नमस्ते := 1");
+            NewLineAfter(window, editor, "\tcounter += 1");
+            window.KeyTextInput("नमस्त");
+            Ui.Press(window, "control SPACE", settle: false);
+            First(window, "नमस्ते", "नमस्ते for नमस्त asked for after it was typed");
+            Assert.Equal("नमस्त", window.Assist.CompletionNarrowedBy);
+            Ui.Press(window, "ENTER", settle: false);
+            bool whole = Ui.Pumped(() => document.Text.Snapshot.ToString().Contains("\tcounter += 1\n\tनमस्ते\n", StringComparison.Ordinal), TimeSpan.FromSeconds(10));
+            Assert.True(whole, $"नमस्ते was not put in place of नमस्त whole: the line reads {editor.Document.Snapshot.GetLineText(editor.CaretPosition.Line)}");
+
+            Ui.Press(window, "ENTER", settle: false);
+            TypeName(window, "नमस्त");
+            First(window, "नमस्ते", "नमस्ते in the list its first letter opened, narrowed through its virama");
+            Assert.Equal("नमस्त", window.Assist.CompletionNarrowedBy);
+            Ui.Press(window, "ENTER", settle: false);
+            whole = Ui.Pumped(() => document.Text.Snapshot.ToString().Contains("\tनमस्ते\n\tनमस्ते\n", StringComparison.Ordinal), TimeSpan.FromSeconds(10));
+            Assert.True(whole, $"नमस्ते was not put in place of what was typed: the line reads {editor.Document.Snapshot.GetLineText(editor.CaretPosition.Line)}");
         }
         finally
         {

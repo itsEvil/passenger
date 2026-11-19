@@ -59,6 +59,13 @@ public partial class MainWindow
     /// <summary>A new C# service follows the window's analysis setting and reports to Problems.</summary>
     private void WatchProblems(CSharpService service)
     {
+        service.AnalysingChanged += (_, _) =>
+        {
+            if (session.CSharp == service)
+            {
+                ShowAnalysis();
+            }
+        };
         service.SolutionWide = settings.SolutionWideAnalysis;
         service.SolutionProblemsChanged += (_, files) =>
         {
@@ -121,19 +128,35 @@ public partial class MainWindow
     /// <summary>The version of the file's text the File tab last listed problems for.</summary>
     private int problemsShownAt = -1;
 
+    /// <summary>The File tab's problems as last listed, in the order of their markers, and the file they are of, by its name then.</summary>
+    private Problem[] fileProblems = [];
+    private OpenDocument? fileProblemsOf;
+    private string? fileProblemsName;
+
+    /// <summary>Lists the file's problems from its markers: one listed before, saying the same in the same place, is listed
+    /// as it was, so a pause that moved or found a few of thousands makes those alone, and one that changed none lists none.</summary>
     private void ShowFileProblems()
     {
         if (problemsFile is not { } file)
         {
+            fileProblems = [];
+            fileProblemsOf = null;
+            fileProblemsName = null;
             Bottom.Problems.ShowFile(null, []);
             return;
         }
         TextSnapshot text = file.Text.Snapshot;
         problemsShownAt = file.Text.Version;
-        List<Problem> problems = [];
-        string? project = null;
-        foreach (Marker marker in file.Markers)
+        IReadOnlyList<Marker> markers = file.Markers;
+        bool again = fileProblemsOf == file && fileProblemsName == file.Name;
+        Problem[] before = again ? fileProblems : [];
+        List<Problem> problems = new(Math.Min(markers.Count, before.Length + 16));
+        string? project = markers.Count > 0 ? ProjectNameOf(file.Path) : null;
+        int next = 0;
+        bool same = again;
+        for (int i = 0; i < markers.Count; i++)
         {
+            Marker marker = markers[i];
             ProblemSeverity? severity = marker.Kind switch
             {
                 MarkerKind.Error => ProblemSeverity.Error,
@@ -145,11 +168,34 @@ public partial class MainWindow
             {
                 continue;
             }
-            int start = Math.Min(marker.Range.Start, text.Length);
-            problems.Add(new Problem(severity.Value, marker.Message, null,
-                file.Path, text.GetPosition(start), project ??= ProjectNameOf(file.Path)) { Link = marker.Link, LinkText = marker.LinkText });
+            TextPosition at = text.GetPosition(Math.Min(marker.Range.Start, text.Length));
+            // The markers and the problems listed from them are both in order of place: those before this one's are gone.
+            while (next < before.Length && before[next].Position.CompareTo(at) < 0)
+            {
+                next++;
+            }
+            Problem? kept = null;
+            for (int k = next; k < before.Length && before[k].Position == at; k++)
+            {
+                Problem listed = before[k];
+                if (listed.Severity == severity && listed.Message == marker.Message && listed.Link == marker.Link && listed.LinkText == marker.LinkText
+                    && listed.Path == file.Path && listed.Project == project)
+                {
+                    kept = listed;
+                    break;
+                }
+            }
+            same &= kept is not null && problems.Count < before.Length && ReferenceEquals(before[problems.Count], kept);
+            problems.Add(kept ?? new Problem(severity.Value, marker.Message, null, file.Path, at, project) { Link = marker.Link, LinkText = marker.LinkText });
         }
-        Bottom.Problems.ShowFile(file.Name, problems);
+        if (same && problems.Count == before.Length)
+        {
+            return;
+        }
+        fileProblems = [.. problems];
+        fileProblemsOf = file;
+        fileProblemsName = file.Name;
+        Bottom.Problems.ShowFile(file.Name, fileProblems);
     }
 
     /// <summary>Problems' Solution tab made to list the solution's problems: every file's, or only those of the files named,
@@ -188,17 +234,25 @@ public partial class MainWindow
         problem.At,
         project);
 
-    /// <summary>The status bar's analysis icon: grey and off, a green tick, or the solution's error count in red.</summary>
+    /// <summary>The status bar's analysis icon: grey and off, a turning ring while its first round is under way, with the
+    /// errors found so far, then a green tick or the solution's error count in red.</summary>
     private void ShowAnalysis()
     {
-        int errors = Bottom.Problems.SolutionErrors;
+        int errors = Bottom.Problems.ListsSolution ? Bottom.Problems.SolutionErrors : 0;
+        bool analysing = settings.SolutionWideAnalysis && session.CSharp is { IsAnalysing: true };
         (string icon, string brush, string text, string tip) = !settings.SolutionWideAnalysis
             ? (IconKeys.Problems, TokenKeys.TextMuted, string.Empty, "Solution-wide analysis is off: click to analyse every file of the solution")
-            : !Bottom.Problems.ListsSolution || errors == 0
+            : analysing
+                ? (IconKeys.Check, TokenKeys.Test_Passed, errors > 0 ? errors.ToString() : string.Empty, errors > 0
+                    ? $"Solution-wide analysis is under way, {Plural.Of(errors, "error")} so far: Problems lists them as it finds them. Click to turn it off"
+                    : "Solution-wide analysis is under way: Problems lists what it finds as it goes. Click to turn it off")
+            : errors == 0
                 ? (IconKeys.Check, TokenKeys.Test_Passed, string.Empty, "Solution-wide analysis: no errors. Click to turn it off")
                 : (IconKeys.Error, TokenKeys.Error, errors.ToString(), $"Solution-wide analysis: {Plural.Of(errors, "error")}; Problems lists them. Click to turn it off");
         AnalysisIcon.Bind(PathIcon.DataProperty, AnalysisIcon.GetResourceObservable(icon));
         AnalysisIcon.Bind(PathIcon.ForegroundProperty, AnalysisIcon.GetResourceObservable(brush));
+        AnalysisIcon.IsVisible = !analysing;
+        AnalysisWorking.IsVisible = analysing;
         AnalysisText.Text = text;
         AnalysisText.IsVisible = text.Length > 0;
         ToolButtons.Tip(AnalysisButton, tip);

@@ -24,6 +24,7 @@ public sealed class ProjectBuilds
     private readonly List<string> queued = [];
     private readonly Func<Task<(IReadOnlyList<string> First, IReadOnlyList<string> All)>> projects;
     private readonly Func<IReadOnlyDictionary<string, string>> solution;
+    private readonly Func<WorkspaceModel?> workspace;
     private StateDocument<ProjectBuildCache>? kept;
     private string? folder;
     private string? sdk;
@@ -31,6 +32,10 @@ public sealed class ProjectBuilds
     /// <summary>The solution the builds known were made under (its global properties), which a build under another does
     /// not stand for.</summary>
     private string? builtUnder;
+
+    /// <summary>The build configuration the builds known were made under (<see cref="BuildConfiguration.Key"/>), null for the
+    /// one MSBuild takes given none: under another, none stands.</summary>
+    private string? builtConfigured;
     private int generation;
     private bool building;
 
@@ -51,13 +56,18 @@ public sealed class ProjectBuilds
     /// for on Windows (<see cref="HoldOff"/>).</summary>
     private DesignTimeRound? running;
 
+    /// <summary>The project whose next builds the server asks for are held for a test (<see cref="HoldNextAsked"/>).</summary>
+    private (string Project, Task Until, TaskCompletionSource Reached)? asked;
+
     /// <param name="projects">The open workspace's projects to load, those of the file shown (and those it references)
     /// apart, asked on the UI thread as the server is ready for them.</param>
-    /// <param name="solution">The global properties the open solution gives its projects, as a build of it would.</param>
-    public ProjectBuilds(Func<Task<(IReadOnlyList<string> First, IReadOnlyList<string> All)>> projects, Func<IReadOnlyDictionary<string, string>> solution)
+    /// <param name="workspace">The open workspace, whose solution's global properties and build configuration chosen
+    /// (<see cref="WorkspaceModel.Build"/>) each project is built with, as a build of it would.</param>
+    public ProjectBuilds(Func<Task<(IReadOnlyList<string> First, IReadOnlyList<string> All)>> projects, Func<WorkspaceModel?> workspace)
     {
         this.projects = projects;
-        this.solution = solution;
+        this.workspace = workspace;
+        solution = () => workspace() is { } open ? ProjectModels.Properties(open) : new Dictionary<string, string>();
         Feed = new Crossing(this);
     }
 
@@ -99,6 +109,12 @@ public sealed class ProjectBuilds
         reading = null;
         sdk = value.Sdk;
         builtUnder = value.Solution;
+        builtConfigured = workspace()?.Build?.Chosen.Key;
+        if (value.Configured != builtConfigured)
+        {
+            // Made under another build configuration (begun ahead of the window, or kept before a choice): none stands.
+            return;
+        }
         foreach ((string path, KeptBuild build) in value.Projects)
         {
             known[path] = build;
@@ -119,6 +135,7 @@ public sealed class ProjectBuilds
         kept = null;
         sdk = null;
         builtUnder = null;
+        builtConfigured = null;
         known.Clear();
         queued.Clear();
         building = false;
@@ -167,6 +184,15 @@ public sealed class ProjectBuilds
         holding = null;
     }
 
+    /// <summary>The build configuration chosen changed: no build known stands, so each project the server asks for next is
+    /// built anew under it.</summary>
+    public void Reconfigured()
+    {
+        UiThread.Check();
+        known.Clear();
+        builtConfigured = workspace()?.Build?.Chosen.Key;
+    }
+
     /// <summary>The projects the server is to load: each with its builds when they stand, the rest built now, those the
     /// server opens first first; none to give when the host will not start for the folder.</summary>
     private async Task<FedProjects?> ProjectsAsync()
@@ -185,12 +211,14 @@ public sealed class ProjectBuilds
             return null;
         }
         string? under = Under();
-        if (sdk is null || !PathNames.Same(sdk, host) || under != builtUnder)
+        string? configured = workspace()?.Build?.Chosen.Key;
+        if (sdk is null || !PathNames.Same(sdk, host) || under != builtUnder || configured != builtConfigured)
         {
-            // Built with another SDK's MSBuild, or under another solution's properties: none of it stands.
+            // Built with another SDK's MSBuild, or under another solution's properties or configuration: none of it stands.
             known.Clear();
             sdk = host;
             builtUnder = under;
+            builtConfigured = configured;
         }
         Dictionary<string, KeptBuild> held = new(known, StringComparer.Ordinal);
         DateTime looked = DateTime.UtcNow;
@@ -243,10 +271,25 @@ public sealed class ProjectBuilds
         }
     }
 
+    /// <summary>The next builds of a project the server asks for wait until <paramref name="until"/> has ended before they
+    /// are looked for, as a slow host keeps the server's load of it meanwhile, for a test: done once they wait.</summary>
+    public Task HoldNextAsked(string project, Task until)
+    {
+        TaskCompletionSource reached = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        asked = (project, until, reached);
+        return reached.Task;
+    }
+
     /// <summary>One project's builds as the server asks for them: those kept when they stand, else built now, with what
     /// they read that changed as they were made.</summary>
     private async Task<FedProject> InfoAsync(string path)
     {
+        if (asked is { } hold && PathNames.Same(hold.Project, path))
+        {
+            asked = null;
+            hold.Reached.TrySetResult();
+            await hold.Until;
+        }
         await TakeCacheAsync();
         if (!waiting.ContainsKey(path) && known.TryGetValue(path, out KeptBuild? held) && await BackgroundWork.Run(() => held.Inputs.All(Stamps.Holds)))
         {
@@ -373,10 +416,11 @@ public sealed class ProjectBuilds
         List<string> round = [.. queued.Where(p => !heldOff.Any(h => PathNames.Within(p, h)))];
         queued.RemoveAll(round.Contains);
         Dictionary<string, string> properties = Properties(solution());
+        IReadOnlyDictionary<string, IReadOnlyDictionary<string, string>>? each = ProjectModels.Each(workspace());
         TaskCompletionSource ended = new(TaskCreationOptions.RunContinuationsAsynchronously);
         running = new DesignTimeRound(round, ended.Task);
         // Not background work: only the language server's load waits on it, and a large solution's round takes minutes.
-        IdeErrors.Observe(RoundAsync(generation, folder, round, properties, ended, ending.Token));
+        IdeErrors.Observe(RoundAsync(generation, folder, round, properties, each, ended, ending.Token));
     }
 
     /// <summary>The global properties the projects are built with at design time under a solution's.</summary>
@@ -391,9 +435,10 @@ public sealed class ProjectBuilds
 
     /// <summary>Builds a round in the host, <paramref name="over"/> once the host has answered for all of it, which it does
     /// only once its build session has ended, or once the folder is let go.</summary>
-    private async Task RoundAsync(int mine, string following, List<string> round, Dictionary<string, string> properties, TaskCompletionSource over,
-        CancellationToken cancel)
+    private async Task RoundAsync(int mine, string following, List<string> round, Dictionary<string, string> properties,
+        IReadOnlyDictionary<string, IReadOnlyDictionary<string, string>>? each, TaskCompletionSource over, CancellationToken cancel)
     {
+        string? configured = workspace()?.Build?.Chosen.Key;
         long began = Stopwatch.GetTimestamp();
         HashSet<string> landed = new(StringComparer.Ordinal);
         try
@@ -416,7 +461,7 @@ public sealed class ProjectBuilds
             }
             if (mine == generation)
             {
-                IdeErrors.Write($"Project host (process {host.ProcessId}) built {done.Built} projects of {following} at design time in {done.Seconds:0.00} s, {Stopwatch.GetElapsedTime(began).TotalSeconds:0.00} s after they were asked for");
+                IdeErrors.Write($"Project host (process {host.ProcessId}) built {done.Built} projects of {following} at design time in {Durations.Said(TimeSpan.FromSeconds(done.Seconds))}, {Durations.Said(Stopwatch.GetElapsedTime(began))} after they were asked for");
                 Keep();
             }
         }
@@ -432,7 +477,7 @@ public sealed class ProjectBuilds
                 IdeErrors.Write($"The project host could not build the projects of {following}: {why}");
                 foreach (string path in Left())
                 {
-                    Land(mine, new BuiltProject(path, RawJson.EmptyArray, [], why));
+                    Land(mine, new BuiltProject(path, RawJson.EmptyArray, [], why), configured);
                 }
             }
         }
@@ -460,8 +505,8 @@ public sealed class ProjectBuilds
                 {
                     landed.Add(built.Path);
                 }
-                UiThread.Post(() => Land(mine, built));
-            }, cancel);
+                UiThread.Post(() => Land(mine, built, configured));
+            }, cancel, each);
         }
 
         List<string> Left()
@@ -473,13 +518,14 @@ public sealed class ProjectBuilds
         }
     }
 
-    private void Land(int mine, BuiltProject built)
+    /// <summary>A project's builds landed, kept only where made under the configuration chosen now (<paramref name="configured"/>).</summary>
+    private void Land(int mine, BuiltProject built, string? configured)
     {
         if (mine != generation)
         {
             return;
         }
-        if (built.Problem is null)
+        if (built.Problem is null && configured == builtConfigured)
         {
             known[built.Path] = KeptBuild.Of(built);
             Builds++;
@@ -499,7 +545,7 @@ public sealed class ProjectBuilds
     {
         if (kept is not null && sdk is not null)
         {
-            kept.Set(new ProjectBuildCache { Sdk = sdk, Solution = builtUnder, Projects = new(known, StringComparer.Ordinal) });
+            kept.Set(new ProjectBuildCache { Sdk = sdk, Solution = builtUnder, Configured = builtConfigured, Projects = new(known, StringComparer.Ordinal) });
         }
     }
 
@@ -522,9 +568,16 @@ public sealed record ProjectBuildCache : IStateDocument<ProjectBuildCache>
     /// <summary>The solution they were built under, whose global properties a project's build may read.</summary>
     public string? Solution { get; init; }
 
+    /// <summary>The build configuration they were built under (Release|Any CPU), null for the one MSBuild takes given none.</summary>
+    public string? Configured { get; init; }
+
     public Dictionary<string, KeptBuild> Projects { get; init; } = [];
 
-    public static IReadOnlyList<Action<JsonObject>> Upgrades { get; } = [StateStore.Unversioned, ForgetWindowsTargeting, ForgetAll, ForgetUnrestored];
+    public static IReadOnlyList<Action<JsonObject>> Upgrades { get; } = [StateStore.Unversioned, ForgetWindowsTargeting, ForgetAll, ForgetUnrestored, ForgetUnconfigured];
+
+    /// <summary>Every build, kept before they stamped the .editorconfig and .globalconfig files looked for over a project's
+    /// sources, whose coming or going since would go unseen, the server given the analyzer configs that were there.</summary>
+    private static void ForgetUnconfigured(JsonObject document) => document.Remove("projects");
 
     /// <summary>Builds kept before restore outputs were stamped before the build may lack package references even though
     /// their stamps still hold.</summary>

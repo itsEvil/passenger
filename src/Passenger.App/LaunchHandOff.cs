@@ -24,7 +24,7 @@ public static partial class LaunchHandOff
         && !Mcp.McpProxy.StartedForAgent;
 
     /// <summary>The launch the options name.</summary>
-    public static HandedLaunch Of(LaunchOptions options) => new(options.Folder, options.Workspace, options.Files, options.Caret);
+    public static HandedLaunch Of(LaunchOptions options) => new(options.Folder, options.Workspace, options.Files, options.Caret) { NewWindow = options.NewWindow };
 
     /// <summary>Hands a launch to the Passengers running in this state, the newest first: true once one took it, false
     /// when none runs or none would, so the launch starts a Passenger of its own.</summary>
@@ -86,13 +86,11 @@ public static partial class LaunchHandOff
     private static async Task ActivateAsync(int running, CancellationToken cancel)
     {
         string? executable = Libc.ExecutableOf(running);
-        int end = executable?.IndexOf(".app/Contents/MacOS/", StringComparison.Ordinal) ?? -1;
-        if (executable is null || end < 0)
+        if (MacBundles.Of(executable) is not { } bundle)
         {
             IdeErrors.Write($"Launch: the Passenger that took it (process {running}) is in no app bundle, so it comes in front by itself");
             return;
         }
-        string bundle = executable[..(end + ".app".Length)];
         try
         {
             ChildResult opened = await ChildProcesses.RunAsync(ChildProcesses.Command("/usr/bin/open", ["-a", bundle]), limit: Waits.Of(ActivateLimit), cancel: cancel);

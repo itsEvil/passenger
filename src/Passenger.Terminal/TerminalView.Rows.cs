@@ -25,6 +25,9 @@ public sealed partial class TerminalView
     /// <summary>Links found before, given again while they are where they were rather than made anew.</summary>
     private readonly List<TerminalLink> knownLinks = [];
 
+    /// <summary>What the host said each address a program linked opens (<see cref="LinkTo"/>), asked once for each.</summary>
+    private readonly Dictionary<string, object?> programTargets = new(StringComparer.Ordinal);
+
     /// <summary>A line's text as its links are looked for in it, and the row (from the line's first) and column of
     /// the cell each of its characters came from.</summary>
     private char[] linkText = new char[512];
@@ -57,7 +60,15 @@ public sealed partial class TerminalView
             DrawHiddenLink(context, line, y, screen.Columns);
         }
         drawings.EndFrame();
-        if (first == screen.ScreenTop && screen.CursorVisible)
+        if (first != screen.ScreenTop)
+        {
+            return;
+        }
+        if (Composing)
+        {
+            DrawComposition(context, screen);
+        }
+        else if (screen.CursorVisible)
         {
             DrawCursor(context, screen, plain);
         }
@@ -69,6 +80,7 @@ public sealed partial class TerminalView
         drawings.Clear();
         cursorText?.Text?.Dispose();
         cursorText = null;
+        ForgetComposed();
     }
 
     private void DrawLine(DrawingContext context, TerminalLine line, long index, double y, Typeface plain,
@@ -86,7 +98,7 @@ public sealed partial class TerminalView
         {
             if (part.Fill is { } fill)
             {
-                context.FillRectangle(fill, new Rect(part.Area.X, y, part.Area.Width, part.Area.Height));
+                context.FillRectangle(fill, new Rect(part.Area.X, y + part.Area.Y, part.Area.Width, part.Area.Height));
             }
             if (part.Text is null)
             {
@@ -94,7 +106,7 @@ public sealed partial class TerminalView
             }
             if (part.Dim)
             {
-                using (context.PushOpacity(0.6))
+                using (context.PushOpacity(TerminalColours.Faint))
                 {
                     DrawInk(context, part, y);
                 }
@@ -146,7 +158,7 @@ public sealed partial class TerminalView
 
     /// <summary>A line cut into runs, each shaped: cells drawn alike in the terminal's font, every glyph of which is a
     /// column wide so it stays on the grid; a wide character, a letter with its marks or one another font draws alone,
-    /// fitted to its cells.</summary>
+    /// fitted to its cells, an emoji with its skin tone or the emoji joined to it over theirs too.</summary>
     private void Shape(Drawn drawn, TerminalLine line, Typeface plain)
     {
         Cell[] cells = line.Cells;
@@ -157,10 +169,23 @@ public sealed partial class TerminalView
             bool chosen = drawn.IsChosen(column);
             bool isLink = Linked(column);
             int end = column + 1;
-            bool alone = !InRun(head);
+            if (IsBlock(line, column))
+            {
+                // A run of one element filling its cells' width is one rectangle, with no seam between them.
+                while (BlockElements.Spans(head.Rune) && end < cells.Length && cells[end].Rune == head.Rune && IsBlock(line, end) && cells[end].Style == head.Style
+                    && drawn.IsChosen(end) == chosen)
+                {
+                    end++;
+                }
+                ShapeBlocks(drawn, line, column, end, chosen);
+                column = end;
+                continue;
+            }
+            bool alone = !InRun(line, column);
             if (!alone)
             {
-                while (end < cells.Length && InRun(cells[end]) && cells[end].Style == head.Style && drawn.IsChosen(end) == chosen && Linked(end) == isLink)
+                while (end < cells.Length && InRun(line, end) && !IsBlock(line, end) && cells[end].Style == head.Style && drawn.IsChosen(end) == chosen
+                    && Linked(end) == isLink)
                 {
                     end++;
                 }
@@ -177,9 +202,63 @@ public sealed partial class TerminalView
                 {
                     end++;
                 }
+                // A skin tone or a joined emoji has the columns the shell counts, but is one glyph with the emoji before it.
+                for (int last = column; end < cells.Length && cells[end].Style == head.Style && drawn.IsChosen(end) == chosen && GoesOnEmoji(line, last, end);)
+                {
+                    last = end;
+                    end = Math.Min(cells.Length, end + Math.Max(1, (int)cells[end].Width));
+                }
             }
             ShapeRun(drawn, line, column, end, plain, chosen, alone, isLink);
             column = end;
+        }
+    }
+
+    /// <summary>Whether the cell at a column goes on the emoji whose last part is at <paramref name="last"/> as one glyph: a
+    /// skin tone after an emoji, or any character after a joiner the emoji's grapheme ends with (a woman, a laptop).</summary>
+    private static bool GoesOnEmoji(TerminalLine line, int last, int column)
+    {
+        Cell cell = line.Cells[column];
+        if (cell.Width == 0 || cell.Rune == 0)
+        {
+            return false;
+        }
+        Span<char> scratch = stackalloc char[2];
+        ReadOnlySpan<char> before = line.TextOf(last, scratch);
+        return before is [.., '\u200D'] || (cell.Rune is >= 0x1F3FB and <= 0x1F3FF && new Avalonia.Media.TextFormatting.Unicode.Codepoint((uint)line.Cells[last].Rune).IsEmoji);
+    }
+
+    /// <summary>Whether a line's cell is a block element alone, drawn as the share of its cell it fills.</summary>
+    private static bool IsBlock(TerminalLine line, int column) =>
+        line.Cells[column] is { Width: 1 } cell && BlockElements.Of(cell.Rune).Length > 0 && line.IsOneCodePoint(column);
+
+    /// <summary>A run of one block element, a cell long unless the element spans its cell's width: its share filled in the
+    /// text's colour over the cells' background.</summary>
+    private void ShapeBlocks(Drawn drawn, TerminalLine line, int from, int to, bool chosen)
+    {
+        Cell head = line.Cells[from];
+        CellStyle style = head.Style;
+        bool inverse = style.Flags.HasFlag(CellFlags.Inverse);
+        IBrush fore = Colour(style.Fore, foreground);
+        IBrush back = Colour(style.Back, background);
+        if (inverse)
+        {
+            (fore, back) = (back, fore);
+        }
+        double x = Pad + (from * cellWidth);
+        Rect area = new(x, 0, (to - from) * cellWidth, cellHeight);
+        IBrush? fill = chosen ? selection : style.Back != CellStyle.Default || inverse ? back : null;
+        if (fill is not null)
+        {
+            drawn.Parts.Add(new Part(area, fill));
+        }
+        if (style.Flags.HasFlag(CellFlags.Hidden))
+        {
+            return;
+        }
+        foreach (Rect share in BlockElements.Of(head.Rune))
+        {
+            drawn.Parts.Add(new Part(new Rect(x + (share.X * area.Width), share.Y * cellHeight, share.Width * area.Width, share.Height * cellHeight), fore));
         }
     }
 
@@ -312,10 +391,12 @@ public sealed partial class TerminalView
         switch (screen.RequestedCursorShape ?? CursorStyle)
         {
             case CursorShape.Bar:
-                context.FillRectangle(cursor, new Rect(x, y, 2, cellHeight));
+                // On a whole unit, as the editor's caret is, so the line is as broad as set and as sharp.
+                context.FillRectangle(cursor, new Rect(Math.Round(x), y, Math.Min(CursorWidth, width), cellHeight));
                 break;
             case CursorShape.Underline:
-                context.FillRectangle(cursor, new Rect(x, y + cellHeight - 2, width, 2));
+                double thickness = Math.Min(CursorWidth, cellHeight);
+                context.FillRectangle(cursor, new Rect(x, y + cellHeight - thickness, width, thickness));
                 break;
             default:
                 context.FillRectangle(cursor, new Rect(x, y, width, cellHeight));
@@ -351,7 +432,7 @@ public sealed partial class TerminalView
     private void FindShownLinks(TerminalScreen screen, long first)
     {
         shownLinks.Clear();
-        if (Links is null)
+        if (Links is null && LinkTo is null)
         {
             return;
         }
@@ -431,7 +512,12 @@ public sealed partial class TerminalView
         {
             return;
         }
-        IReadOnlyList<(int Start, int Length, object Target, bool Hidden)> found = Links!(linkText.AsSpan(0, length));
+        ProgramLinks(screen, first, end);
+        if (Links is null)
+        {
+            return;
+        }
+        IReadOnlyList<(int Start, int Length, object Target, bool Hidden)> found = Links(linkText.AsSpan(0, length));
         for (int i = 0; i < found.Count; i++)
         {
             (int start, int count, object target, bool hidden) = found[i];
@@ -444,6 +530,69 @@ public sealed partial class TerminalView
                 foundLinks.Add(Known(first + linkRows[start], linkColumns[start], toLine, toColumn, target, hidden));
             }
         }
+    }
+
+    /// <summary>The links a program made on the rows of one line (OSC 8), into <see cref="foundLinks"/>: each run of cells
+    /// linked to one address, across the rows it wraps over, that the host opens something for.</summary>
+    private void ProgramLinks(TerminalScreen screen, long first, long end)
+    {
+        if (LinkTo is null)
+        {
+            return;
+        }
+        string? open = null;
+        (long Line, int Column) from = default;
+        (long Line, int Column) to = default;
+        for (long each = first; each <= end; each++)
+        {
+            TerminalLine shown = screen.LineAt(each);
+            if (!shown.Linked)
+            {
+                Close();
+                continue;
+            }
+            Cell[] cells = shown.Cells;
+            for (int c = 0; c < cells.Length; c++)
+            {
+                if (cells[c].Width == 0)
+                {
+                    continue;
+                }
+                string? link = shown.LinkOf(c);
+                if (link != open)
+                {
+                    Close();
+                    open = link;
+                    from = (each, c);
+                }
+                to = (each, Math.Min(c + cells[c].Width - 1, cells.Length - 1));
+            }
+        }
+        Close();
+
+        void Close()
+        {
+            if (open is not null && TargetOf(open) is { } target)
+            {
+                foundLinks.Add(Known(from.Line, from.Column, to.Line, to.Column, target, hidden: false));
+            }
+            open = null;
+        }
+    }
+
+    /// <summary>What a program's link opens, as the host said the first time it was asked.</summary>
+    private object? TargetOf(string address)
+    {
+        if (!programTargets.TryGetValue(address, out object? target))
+        {
+            if (programTargets.Count >= 256)
+            {
+                programTargets.Clear();
+            }
+            target = LinkTo!(address);
+            programTargets[address] = target;
+        }
+        return target;
     }
 
     /// <summary>A link found where one was before: that one, so finding it again in every frame makes nothing.</summary>

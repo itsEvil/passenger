@@ -198,7 +198,7 @@ public sealed partial class PassengerTools
         ContainerRun run = Builds.Containers ?? throw new InvalidOperationException($"The container run that runs {service} has ended");
         AgentCall.Say($"Waiting up to {Math.Max(0, waitSeconds)} s for {service} to be up");
         IReadOnlyList<ServiceState> states = await ComposeStatesAsync(run, now => now.FirstOrDefault(s => s.Service == service) is { } it
-            && (Standing.Of(it).IsUp || Standing.Of(it).HasEnded), TimeSpan.FromSeconds(Math.Max(0, waitSeconds)), cancel);
+            && (it.IsUp || it.HasEnded), TimeSpan.FromSeconds(Math.Max(0, waitSeconds)), cancel);
         string output = await ComposeLogAsync(run, service, 200, cancel);
         if (Builds.Containers != run)
         {
@@ -213,7 +213,7 @@ public sealed partial class PassengerTools
     private async Task<IReadOnlyList<ServiceState>> ComposeStatesAsync(ContainerRun run, Func<IReadOnlyList<ServiceState>, bool> done, TimeSpan limit,
         CancellationToken cancel)
     {
-        DateTime until = DateTime.UtcNow + limit;
+        Deadline until = Deadline.In(limit);
         using SemaphoreSlim changed = new(0, 1);
         using IDisposable following = run.Engine.Follow(seen =>
         {
@@ -240,7 +240,7 @@ public sealed partial class PassengerTools
             {
                 throw new InvalidOperationException($"The container engine's answer could not be read: {unread.Message}", unread);
             }
-            TimeSpan left = until - DateTime.UtcNow;
+            TimeSpan left = until.Left;
             if (done(states) || left <= TimeSpan.Zero || run.IsStopped)
             {
                 return states;
@@ -249,14 +249,14 @@ public sealed partial class PassengerTools
         }
     }
 
-    /// <summary>A compose service's log, its last lines, as <c>compose logs</c> gives them without their prefix.</summary>
-    private static async Task<string> ComposeLogAsync(ContainerRun run, string service, int lines, CancellationToken cancel)
+    /// <summary>A compose service's log, its last lines, as <c>compose logs</c> gives them without their prefix, masked.</summary>
+    private async Task<string> ComposeLogAsync(ContainerRun run, string service, int lines, CancellationToken cancel)
     {
         IReadOnlyList<string> words = [.. run.Plan.Compose, "logs", "--no-color", "--no-log-prefix", "--tail",
             Math.Clamp(lines, 1, 10_000).ToString(CultureInfo.InvariantCulture), "--", service];
         // Not held: the agent's answer, which its call waits for; nothing drawn changes.
         ChildResult result = await BackgroundWork.Unheld(() => run.Engine.RunAsync(words, ContainerEngine.AskLimit, cancel), cancel);
-        return result.Succeeded ? result.Output.TrimEnd('\n')
+        return result.Succeeded ? Masked(result.Output.TrimEnd('\n'))
             : throw new InvalidOperationException($"{service}'s log could not be read: {ContainerEngine.Said(result)}");
     }
 
@@ -363,35 +363,43 @@ public sealed partial class PassengerTools
             : unstarted is not null ? $"{name} of {run}: {unstarted}"
             : resource.IsUp ? $"{name} of {run} is up"
             : resource.HasEnded ? $"{name} of {run} ended: {resource.State}{(resource.ExitCode is { } code ? $" ({ExitCodes.Said(code)})" : string.Empty)}"
+            : resource.Failed ? $"{name} of {run} failed: {resource.State}"
             : $"{name} of {run} is not up within {Math.Max(0, waitSeconds)} s: {resource.State ?? "Unknown"}{(resource.Health is { } said ? $" ({said})" : string.Empty)}";
         status += $"\n{listed} of {run}:\n{string.Join('\n', all.Select(s => $"  {s}"))}" + string.Concat(notes.Select(note => $"\nNote: {note}"));
-        return new RunResult(resource is not null && !resource.HasEnded, resource is { HasEnded: true } ? resource.ExitCode : null, status, output);
+        return new RunResult(resource is not null && !resource.HasEnded && !resource.Failed, resource is { HasEnded: true } ? resource.ExitCode : null, status, output);
     }
 
     /// <summary>A resource of a run of services as its run's answer says it: its state (<see cref="Shown"/> where the window
-    /// words it otherwise than its kind does), health and exit code, and what follows them on its line.</summary>
+    /// words it otherwise than its kind does), health and exit code, and what follows them on its line; how it stands read
+    /// by its kind's own rule, an AppHost's resource's (<see cref="StandingOf"/>) or a service's container's
+    /// (<see cref="Of"/>).</summary>
     private sealed record Standing(string Name, string? State, string? Health, int? ExitCode)
     {
         public string? Shown { get; init; }
 
         public string Detail { get; init; } = string.Empty;
 
-        /// <summary>Running, and not unhealthy where it reports its health, nor still starting its health check.</summary>
-        public bool IsUp => string.Equals(State, "Running", StringComparison.OrdinalIgnoreCase)
-            && !(Health is { } health && (health.Equals("Unhealthy", StringComparison.OrdinalIgnoreCase) || health.Equals("Starting", StringComparison.OrdinalIgnoreCase)));
+        /// <summary>Whether it runs, its health then said beside its state.</summary>
+        public bool Runs { get; init; }
 
-        /// <summary>Exited, finished, failed to start or dead: it runs no more.</summary>
-        public bool HasEnded => State is { } state && Ended.Any(ended => ended.Equals(state, StringComparison.OrdinalIgnoreCase));
+        /// <summary>Running, and not unhealthy where it reports its health.</summary>
+        public bool IsUp { get; init; }
 
-        private static readonly string[] Ended = ["Exited", "Finished", "FailedToStart", "Dead"];
+        /// <summary>It runs no more.</summary>
+        public bool HasEnded { get; init; }
+
+        /// <summary>It could not start, or cannot where it is.</summary>
+        public bool Failed { get; init; }
 
         public static Standing Of(ServiceState state) => new(state.Service, state.State, state.Health, state.ExitCode)
         {
+            Runs = state.Runs,
+            IsUp = state.IsUp,
+            HasEnded = state.HasEnded,
             Detail = state.Ports.Length > 0 ? $", ports {state.Ports}" : string.Empty,
         };
 
-        public override string ToString() => $"{Name}: {Shown ?? State ?? "Unknown"}"
-            + $"{(Health is { } health && string.Equals(State, "Running", StringComparison.OrdinalIgnoreCase) ? $" ({health})" : string.Empty)}{Detail}";
+        public override string ToString() => $"{Name}: {Shown ?? State ?? "Unknown"}{(Runs && Health is { } health ? $" ({health})" : string.Empty)}{Detail}";
     }
 }
 

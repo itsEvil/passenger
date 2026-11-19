@@ -70,6 +70,10 @@ public sealed record LaunchArguments
     /// <summary>Passenger's own: how the values of types that carry no debugger attributes of their own are shown.</summary>
     public IReadOnlyList<DapTypePresentation>? Presentations { get; init; }
 
+    /// <summary>Passenger's own: the assemblies, by name, that Passenger carries into the program (its inspectors, its Hot
+    /// Reload and test hooks), which the debugger never takes for the user's code, however they were built.</summary>
+    public IReadOnlyList<string>? Carried { get; init; }
+
     /// <summary>Passenger's own: no one is to see the program's windows (an agent's Godot game, drawn for its frames, or a
     /// desktop app a Passenger nobody sees runs): on Windows it runs on a desktop of its own, which nobody switches to.</summary>
     public bool? Unseen { get; init; }
@@ -86,6 +90,21 @@ public sealed record AttachArguments
 
     /// <summary>Passenger's own: how the values of types that carry no debugger attributes of their own are shown.</summary>
     public IReadOnlyList<DapTypePresentation>? Presentations { get; init; }
+
+    /// <summary>Passenger's own: the assemblies, by name, that Passenger carries into the program (its inspectors, its Hot
+    /// Reload and test hooks), which the debugger never takes for the user's code, however they were built.</summary>
+    public IReadOnlyList<string>? Carried { get; init; }
+
+    /// <summary>Passenger's own: an app on a device or simulator, reached through Passenger's relay inside it at this
+    /// host:port, in place of <see cref="ProcessId"/>.</summary>
+    public string? Relay { get; init; }
+
+    /// <summary>Passenger's own: the host's folder of the assemblies (and their PDBs) the app on the device loads.</summary>
+    public string? RelayModules { get; init; }
+
+    /// <summary>Passenger's own: the token the relay at <see cref="Relay"/> takes a client by, which the app's environment
+    /// gave it.</summary>
+    public string? RelayToken { get; init; }
 }
 
 /// <summary>Passenger's own: how the debugger shows the values of a type (<see cref="Type"/>, its full name, declared in
@@ -122,8 +141,10 @@ public sealed record DapSource
 
 /// <summary>A line breakpoint as asked for. <c>Suspend</c> is Passenger's own: whether a hit stops the program, so a
 /// breakpoint can log and stop, or neither stop nor log a message of its own ("Breakpoint reached"); without it,
-/// a log message alone means no stop, as the protocol has it.</summary>
-public sealed record DapSourceBreakpoint(int Line, int? Column = null, string? Condition = null, string? HitCondition = null, string? LogMessage = null, bool? Suspend = null);
+/// a log message alone means no stop, as the protocol has it. <c>RunTo</c> is Passenger's own too: Run to Cursor's line,
+/// whose next hit stops whatever the condition, hit count and Suspend say, tried as the breakpoint's own hit all the same.</summary>
+public sealed record DapSourceBreakpoint(int Line, int? Column = null, string? Condition = null, string? HitCondition = null, string? LogMessage = null, bool? Suspend = null,
+    bool? RunTo = null) : IAskedBreakpoint;
 
 public sealed record SetBreakpointsArguments(DapSource Source, IReadOnlyList<DapSourceBreakpoint>? Breakpoints);
 
@@ -187,7 +208,7 @@ public sealed record SetDataBreakpointsResponse(IReadOnlyList<DapBreakpoint> Bre
 public sealed record SetExceptionBreakpointsArguments(
     IReadOnlyList<string>? Filters, IReadOnlyList<DapExceptionFilterOptions>? FilterOptions = null, IReadOnlyList<DapExceptionOptions>? ExceptionOptions = null);
 
-public sealed record DapExceptionFilterOptions(string FilterId, string? Condition = null)
+public sealed record DapExceptionFilterOptions(string FilterId, string? Condition = null) : IAskedBreakpoint
 {
     /// <summary>Passenger's own: a hit count, a message logged at each hit, and whether a hit stops, as a line breakpoint has.</summary>
     public string? HitCondition { get; init; }
@@ -491,7 +512,9 @@ public sealed record StoppedEvent
 
 public sealed record ExitedEvent(int ExitCode);
 
-public sealed record TerminatedEvent(bool? Restart = null);
+/// <summary>The debugging ended; this debugger's own <paramref name="Failure"/> says why where nothing the client did and
+/// no end of the program did it (the runtime's debugging of the program failed).</summary>
+public sealed record TerminatedEvent(bool? Restart = null, string? Failure = null);
 
 /// <summary>The program went on from a stop that no continue or step of the client's left.</summary>
 public sealed record ContinuedEvent(int ThreadId, bool? AllThreadsContinued = null);

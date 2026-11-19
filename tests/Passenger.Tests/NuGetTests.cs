@@ -1,7 +1,11 @@
+using Avalonia;
 using Avalonia.Controls;
+using Avalonia.Controls.Primitives;
 using Avalonia.Headless.XUnit;
 using Avalonia.LogicalTree;
+using Avalonia.VisualTree;
 using Passenger.App;
+using Passenger.App.Explorer;
 using Passenger.App.Packages;
 using Passenger.App.ToolWindows;
 using Passenger.Workspace;
@@ -12,12 +16,16 @@ namespace Passenger.Tests;
 /// reaches nuget.org: a package is shown, compared and audited at each of a project's frameworks' versions, a range at the
 /// version its restore resolved, else its least, and a change of a pinned version keeps it pinned; a change runs one at a
 /// time, the projects' actions disabled meanwhile, one refused says why, and one that failed says so until the person
-/// next asks for a list.</summary>
+/// next asks for a list; a version its owner deprecated is marked with why and what to use instead.</summary>
 public sealed class NuGetTests : IDisposable
 {
     private const string Id = "Passenger.Vulnerable";
 
     private const string Advisory = "https://github.com/advisories/GHSA-pass-nuget-test";
+
+    /// <summary>The framework of the SDK the tests run on, whose targeting pack it carries, so a project of it restores
+    /// from the stand-in alone.</summary>
+    private const string Restorable = "net11.0";
 
     private readonly string folder = TestFolders.Create("nuget-");
     private readonly StandInFeed feed = new();
@@ -54,6 +62,542 @@ public sealed class NuGetTests : IDisposable
     {
         feed.Dispose();
         TestFolders.Delete(folder);
+    }
+
+    [AvaloniaFact]
+    public void Updates_checks_on_entry_filters_locally_and_selects_the_latest_version()
+    {
+        const string Other = "Passenger.Current";
+        feed.Add(Other, "2.0.0");
+        feed.Add(Id, "2.0.0-preview.1");
+        Project("Lib", TestProjects.Framework, $"<ItemGroup><PackageReference Include=\"{Id}\" Version=\"1.0.0\" /><PackageReference Include=\"{Other}\" Version=\"2.0.0\" /></ItemGroup>");
+        MainWindow window = Open();
+        NuGetView nuget = window.NuGet;
+        Assert.DoesNotContain(feed.Requests, r => r.Path == "/flat/passenger.vulnerable/index.json");
+        Ui.Click(nuget.Tabs.GetLogicalDescendants().OfType<ToggleButton>().SingleOrDefault(b => Equals(b.Content, "Updates"))
+            ?? throw new Xunit.Sdk.XunitException("NuGet has no Updates tab"));
+        Assert.True(nuget.Rows is [{ Id: Id }] && nuget.ChosenVersion == "1.1.0",
+            $"Updates lists [{string.Join(", ", nuget.Rows.Select(r => r.Id))}] and selects {nuget.ChosenVersion}, rather than the latest stable update");
+        int asked = feed.Requests.Count;
+        nuget.Query = "no-match";
+        Ui.Settle();
+        Assert.Empty(nuget.Rows);
+        Assert.Equal(asked, feed.Requests.Count);
+        nuget.Query = string.Empty;
+        Ui.Settle();
+        Assert.Single(nuget.Rows);
+        CheckBox preview = nuget.GetLogicalDescendants().OfType<CheckBox>().Single(b => Equals(b.Content, "Prerelease"));
+        Ui.Click(preview);
+        Assert.Equal("2.0.0-preview.1", nuget.ChosenVersion);
+        window.Close();
+    }
+
+    /// <summary>The solution's row offers Manage NuGet Packages for Solution, which a project's row does not: it shows the
+    /// NuGet window over every project, a project it was narrowed to let go.</summary>
+    [AvaloniaFact]
+    public void The_solution_rows_menu_manages_the_solutions_packages_across_every_project()
+    {
+        const string Other = "Passenger.Other";
+        feed.Add(Other, "1.0.0");
+        Project("Lib", TestProjects.Framework, $"<ItemGroup><PackageReference Include=\"{Id}\" Version=\"1.1.0\" /></ItemGroup>");
+        Project("App", TestProjects.Framework, $"<ItemGroup><PackageReference Include=\"{Other}\" Version=\"1.0.0\" /></ItemGroup>");
+        File.WriteAllText(Path.Combine(folder, "Shop.slnx"), "<Solution>\n  <Project Path=\"App/App.csproj\" />\n  <Project Path=\"Lib/Lib.csproj\" />\n</Solution>\n");
+        MainWindow window = Ui.OpenFolder(Path.Combine(folder, "Shop.slnx"), languageServer: false);
+        ExplorerNode solution = window.ExplorerView.Tree.Rows.First(r => r.Kind == NodeKind.Solution);
+        ExplorerNode project = window.ExplorerView.Tree.Rows.First(r => r.Kind == NodeKind.Project && r.Name == "Lib");
+        Ui.RightClick(Ui.Row(window.ExplorerView, project));
+        string[] offered = [.. window.ExplorerView.OpenMenu!.Items.OfType<MenuItem>().Select(i => i.Header).OfType<string>()];
+        window.ExplorerView.OpenMenu.Close();
+        Assert.Contains("Manage NuGet Packages", offered);
+        Assert.DoesNotContain("Manage NuGet Packages for Solution", offered);
+        Ui.ChooseFromRowMenu(window, solution, "Manage NuGet Packages for Solution");
+        NuGetView nuget = window.NuGet;
+        Assert.True(nuget.IsShown, "Manage NuGet Packages for Solution left the NuGet window hidden");
+        Assert.Equal([Other, Id], nuget.Rows.Select(r => r.Id));
+        nuget.UsedBy = Named(window, "Lib").Path;
+        Ui.Settle();
+        Assert.Equal([Id], nuget.Rows.Select(r => r.Id));
+        Ui.ChooseFromRowMenu(window, solution, "Manage NuGet Packages for Solution");
+        Assert.True(nuget.UsedBy is null && nuget.Rows.Select(r => r.Id).SequenceEqual([Other, Id]),
+            $"The solution's packages are [{string.Join(", ", nuget.Rows.Select(r => r.Id))}], narrowed to {nuget.UsedBy}, rather than every project's");
+        window.Close();
+    }
+
+    /// <summary>The package list's Sort and Filter, over two restored projects whose restore brought in packages neither
+    /// names: App references Lib and Passenger.Other, Lib references Passenger.Charts, which depends on a vulnerable
+    /// Passenger.Vulnerable. Transitive packages are listed only when asked, tagged, with what brings each in for each
+    /// project, audited as referenced ones are; a project's alone, the vulnerable alone and the order narrow what the
+    /// list holds without asking the feed again, and are kept as another package is chosen.</summary>
+    [AvaloniaFact]
+    public void The_package_list_sorts_and_filters_and_lists_transitive_packages_with_what_brings_them_in()
+    {
+        const string Charts = "Passenger.Charts";
+        const string Other = "Passenger.Other";
+        feed.Add(Charts, "1.0.0", (Id, "1.0.0"));
+        feed.Add(Other, "1.0.0");
+        Project("Lib", Restorable, $"<ItemGroup><PackageReference Include=\"{Charts}\" Version=\"1.0.0\" /></ItemGroup>");
+        string app = Project("App", Restorable,
+            $"<ItemGroup><PackageReference Include=\"{Other}\" Version=\"1.0.0\" /><ProjectReference Include=\"../Lib/Lib.csproj\" /></ItemGroup>");
+        Restore.Run(Passenger.Core.PathNames.Canonical(app));
+        MainWindow window = Open();
+        NuGetView nuget = window.NuGet;
+        string libPath = Named(window, "Lib").Path;
+        string appPath = Named(window, "App").Path;
+        Assert.Equal([Charts, Other], nuget.Rows.Select(r => r.Id));
+        int asked = feed.Requests.Count;
+
+        Ui.Click(nuget.Filters.Button);
+        Ui.Choose(nuget.Filters.OpenMenu, "Referenced and Transitive Packages");
+        Assert.Equal([Charts, Other, Id], nuget.Rows.Select(r => r.Id));
+        PackageRow brought = nuget.Rows.Single(r => r.Id == Id);
+        Assert.True(brought.IsTransitive, $"{Id} was listed as referenced, though only Passenger.Charts brings it in");
+        Assert.Equal(["Passenger.Charts"], Assert.Single(brought.Transitive[libPath]).BroughtBy);
+        Assert.Equal(["Lib"], Assert.Single(brought.Transitive[appPath]).BroughtBy);
+        Assert.Equal("1.0.0", brought.Transitive[appPath][0].Version);
+        Assert.True(brought.IsVulnerable, $"The transitive {Id} 1.0.0 was not audited: {nuget.Status}");
+        Assert.True(nuget.Filters.Button.IsChecked == true, "The Sort and Filter button does not show the list narrowed");
+        Assert.Contains("1 transitive", nuget.Status, StringComparison.Ordinal);
+
+        Ui.Click(nuget.Filters.Button);
+        Ui.Choose(nuget.Filters.OpenMenu, "Vulnerable Only");
+        Assert.Equal([Id], nuget.Rows.Select(r => r.Id));
+        Assert.Contains("1 of 3 shown: vulnerable", nuget.Status, StringComparison.Ordinal);
+        Ui.Click(nuget.Filters.Button);
+        Ui.Choose(nuget.Filters.OpenMenu, "Vulnerable Only");
+        Ui.Click(nuget.Filters.Button);
+        Ui.Choose(nuget.Filters.OpenMenu, "Used By", "App");
+        Assert.Equal([Charts, Other, Id], nuget.Rows.Select(r => r.Id));
+        Ui.Click(nuget.Filters.Button);
+        Ui.Choose(nuget.Filters.OpenMenu, "Sort by Name, Z to A");
+        Assert.Equal([Id, Other, Charts], nuget.Rows.Select(r => r.Id));
+        Ui.Click(nuget.Filters.Button);
+        Ui.Choose(nuget.Filters.OpenMenu, "Transitive Packages Only");
+        Assert.Equal([Id], nuget.Rows.Select(r => r.Id));
+        Ui.Click(nuget.Filters.Button);
+        Ui.Choose(nuget.Filters.OpenMenu, "Referenced Packages");
+        Assert.Equal([Other], nuget.Rows.Select(r => r.Id));
+        Assert.Contains("used by App", nuget.Status, StringComparison.Ordinal);
+        Assert.DoesNotContain(feed.Requests.Skip(asked), r => r.Path.StartsWith("/query", StringComparison.Ordinal) || r.Path.StartsWith("/vulnerabilities", StringComparison.Ordinal));
+
+        Ui.Click(nuget.Filters.Button);
+        Ui.Choose(nuget.Filters.OpenMenu, "Clear Filters");
+        Assert.Equal([Charts, Other], nuget.Rows.Select(r => r.Id));
+        Assert.False(nuget.Filters.Button.IsChecked == true, "Clear Filters left the Sort and Filter button pressed");
+        window.Close();
+    }
+
+    /// <summary>The chosen package's projects narrowed by name and by whether they reference it, and sorted, the choices kept
+    /// as another package is chosen; a project that gets the package only through another is tagged so and offers Install,
+    /// which references it directly.</summary>
+    [AvaloniaFact]
+    public void The_projects_pane_sorts_and_filters_and_keeps_its_choices_across_packages()
+    {
+        const string Charts = "Passenger.Charts";
+        feed.Add(Charts, "1.0.0", (Id, "1.0.0"));
+        Project("Lib", Restorable, $"<ItemGroup><PackageReference Include=\"{Charts}\" Version=\"1.0.0\" /><PackageReference Include=\"{Id}\" Version=\"1.0.1\" /></ItemGroup>");
+        string app = Project("App", Restorable, "<ItemGroup><ProjectReference Include=\"../Lib/Lib.csproj\" /></ItemGroup>");
+        Project("Tools", Restorable, string.Empty);
+        // By its real path, as the window reads it: a restore through TMPDIR's /var link loses App's reference to Lib.
+        Restore.Run(Passenger.Core.PathNames.Canonical(app));
+        MainWindow window = Open();
+        NuGetView nuget = window.NuGet;
+        ChoosePackage(nuget, Charts);
+        Assert.Equal(["App", "Lib", "Tools"], nuget.ProjectNames);
+        Assert.Contains(Line(nuget, "App")!.Children.OfType<Border>(), b => b.Child is TextBlock { Text: "transitive" });
+        Assert.Equal(["Install"], Labels(nuget, "App"));
+        Assert.Equal(["Install"], Labels(nuget, "Tools"));
+        Assert.Equal(["Remove"], Labels(nuget, "Lib"));
+
+        Ui.Click(nuget.ProjectFilters.Button);
+        Ui.Choose(nuget.ProjectFilters.OpenMenu, "Sort Installed First");
+        Assert.Equal(["Lib", "App", "Tools"], nuget.ProjectNames);
+        Ui.Click(nuget.ProjectFilters.Button);
+        Ui.Choose(nuget.ProjectFilters.OpenMenu, "Sort by Name, Z to A");
+        Assert.Equal(["Tools", "Lib", "App"], nuget.ProjectNames);
+        Ui.Click(nuget.ProjectFilters.Button);
+        Ui.Choose(nuget.ProjectFilters.OpenMenu, "Not Installed");
+        Assert.Equal(["Tools", "App"], nuget.ProjectNames);
+        nuget.ProjectQuery = "too";
+        Ui.Settle();
+        Assert.Equal(["Tools"], nuget.ProjectNames);
+
+        ChoosePackage(nuget, Id);
+        Assert.True(nuget.ProjectNames.SequenceEqual(["Tools"]) && nuget.ProjectQuery == "too" && nuget.ProjectsShown == ProjectsShown.NotInstalled,
+            $"Choosing another package left [{string.Join(", ", nuget.ProjectNames)}] listed, filtered by '{nuget.ProjectQuery}' and {nuget.ProjectsShown}");
+        nuget.ProjectQuery = string.Empty;
+        Ui.Click(nuget.ProjectFilters.Button);
+        Ui.Choose(nuget.ProjectFilters.OpenMenu, "With an Update");
+        Assert.Equal(["Lib"], nuget.ProjectNames);
+        Ui.Click(nuget.ProjectFilters.Button);
+        Ui.Choose(nuget.ProjectFilters.OpenMenu, "Installed");
+        Assert.Equal(["Lib"], nuget.ProjectNames);
+        window.Close();
+    }
+
+    /// <summary>A package of the list chosen as a person clicks its row, its versions and projects shown.</summary>
+    private static void ChoosePackage(NuGetView nuget, PackageRow row)
+    {
+        Ui.Click(Ui.Row(nuget.PackageList, row));
+        Ui.Settle();
+        Assert.Equal(row.Id, nuget.Selected?.Id);
+    }
+
+    private static void ChoosePackage(NuGetView nuget, string id) =>
+        ChoosePackage(nuget, nuget.Rows.FirstOrDefault(r => r.Id == id) ?? throw new Xunit.Sdk.XunitException($"NuGet lists no {id}: [{string.Join(", ", nuget.Rows.Select(r => r.Id))}]"));
+
+    [AvaloniaFact]
+    public void Update_all_updates_every_project_even_when_search_hides_results_and_one_undo_restores_them()
+    {
+        const string Other = "Passenger.Other";
+        feed.Add(Other, "1.0.0");
+        feed.Add(Other, "1.2.0");
+        Project("Lib", TestProjects.Framework, $"<ItemGroup><PackageReference Include=\"{Id}\" Version=\"[1.0.0]\" /></ItemGroup>");
+        string app = Project("App", TestProjects.Framework, $"<ItemGroup><PackageReference Include=\"{Other}\" Version=\"1.0.0\" /></ItemGroup>");
+        string beforeLib = File.ReadAllText(lib);
+        string beforeApp = File.ReadAllText(app);
+        MainWindow window = Open();
+        NuGetView nuget = window.NuGet;
+        Ui.Click(nuget.Tabs.GetLogicalDescendants().OfType<ToggleButton>().SingleOrDefault(b => Equals(b.Content, "Updates"))
+            ?? throw new Xunit.Sdk.XunitException("NuGet has no Updates tab"));
+        Assert.Equal(2, nuget.Rows.Count);
+        nuget.Query = "vulnerable";
+        Ui.Settle();
+        Assert.Single(nuget.Rows);
+        Ui.Click(nuget.GetLogicalDescendants().OfType<Button>().SingleOrDefault(b => Equals(b.Content, "Update All"))
+            ?? throw new Xunit.Sdk.XunitException("Updates has no Update All button"));
+        Ui.Landed(() => !nuget.IsBusy && nuget.Rows.Count == 0, $"all packages updated: {nuget.Status}\n{nuget.Log}");
+        Assert.True(File.ReadAllText(lib).Contains("[1.1.0]", StringComparison.Ordinal), $"Lib was not updated: {nuget.Status}\n{nuget.Log}");
+        Assert.Contains("1.2.0", File.ReadAllText(app), StringComparison.Ordinal);
+        MigrationsTests.UndoFromExplorer(window, lib);
+        Assert.Equal(beforeLib, File.ReadAllText(lib));
+        Assert.Equal(beforeApp, File.ReadAllText(app));
+        window.Close();
+    }
+
+    [AvaloniaFact]
+    public void Updates_reports_partial_feed_failure_instead_of_claiming_every_package_is_current()
+    {
+        Project("Lib", TestProjects.Framework, $"<ItemGroup><PackageReference Include=\"{Id}\" Version=\"1.1.0\" /></ItemGroup>");
+        string config = Path.Combine(folder, "nuget.config");
+        File.WriteAllText(config, File.ReadAllText(config).Replace("</packageSources>",
+            "<add key=\"unavailable\" value=\"http://127.0.0.1:1/v3/index.json\" allowInsecureConnections=\"true\" /></packageSources>", StringComparison.Ordinal));
+        MainWindow window = Open();
+        NuGetView nuget = window.NuGet;
+        Ui.Click(nuget.Tabs.GetLogicalDescendants().OfType<ToggleButton>().SingleOrDefault(b => Equals(b.Content, "Updates"))
+            ?? throw new Xunit.Sdk.XunitException("NuGet has no Updates tab"));
+        Assert.Empty(nuget.Rows);
+        Assert.Contains("unavailable", nuget.Status, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("No updates found", nuget.Status, StringComparison.OrdinalIgnoreCase);
+        window.Close();
+    }
+
+    [AvaloniaFact]
+    public void Update_all_rechecks_shared_central_versions_and_preserves_one_undo()
+    {
+        File.WriteAllText(Path.Combine(folder, "Directory.Packages.props"), $"<Project><PropertyGroup><ManagePackageVersionsCentrally>true</ManagePackageVersionsCentrally></PropertyGroup><ItemGroup><PackageVersion Include=\"{Id}\" Version=\"[1.0.0]\" /></ItemGroup></Project>");
+        Project("Lib", TestProjects.Framework, $"<ItemGroup><PackageReference Include=\"{Id}\" /></ItemGroup>");
+        Project("App", TestProjects.Framework, $"<ItemGroup><PackageReference Include=\"{Id}\" /></ItemGroup>");
+        string props = Path.Combine(folder, "Directory.Packages.props");
+        string original = File.ReadAllText(props);
+        MainWindow window = Open();
+        NuGetView nuget = window.NuGet;
+        Ui.Click(nuget.Tabs.GetLogicalDescendants().OfType<ToggleButton>().Single(b => Equals(b.Content, "Updates")));
+        Ui.Click(nuget.GetLogicalDescendants().OfType<Button>().Single(b => Equals(b.Content, "Update All")));
+        Assert.True(File.ReadAllText(props).Contains("[1.1.0]", StringComparison.Ordinal), $"Central version was not updated: {nuget.Status}\n{nuget.Log}\n{File.ReadAllText(props)}");
+        Assert.Empty(nuget.Rows);
+        MigrationsTests.UndoFromExplorer(window, lib);
+        Assert.Equal(original, File.ReadAllText(props));
+        window.Close();
+    }
+
+    [AvaloniaFact]
+    public void Update_all_stops_on_a_refused_project_and_undo_restores_the_earlier_success()
+    {
+        Project("Lib", TestProjects.Framework, $"<ItemGroup><PackageReference Include=\"{Id}\" Version=\"1.0.0\" /></ItemGroup>");
+        string app = Project("App", TestProjects.Framework, $"<ItemGroup><PackageReference Include=\"{Id}\" Version=\"1.0.0\" /></ItemGroup>");
+        string originalLib = File.ReadAllText(lib);
+        string originalApp = File.ReadAllText(app);
+        MainWindow window = Open();
+        NuGetView nuget = window.NuGet;
+        Ui.Click(nuget.Tabs.GetLogicalDescendants().OfType<ToggleButton>().Single(b => Equals(b.Content, "Updates")));
+        int saves = 0;
+        nuget.Packages.SaveFirst = (_, _) => Task.FromResult<string?>(++saves == 3 ? "Lib could not be saved" : null);
+        Ui.Click(nuget.GetLogicalDescendants().OfType<Button>().Single(b => Equals(b.Content, "Update All")));
+        Assert.True(File.ReadAllText(app).Contains("1.1.0", StringComparison.Ordinal), $"App was not updated: {nuget.Status}\n{nuget.Log}");
+        Assert.Equal(originalLib, File.ReadAllText(lib));
+        Assert.Contains("Lib could not be saved", nuget.Status, StringComparison.Ordinal);
+        MigrationsTests.UndoFromExplorer(window, app);
+        Assert.Equal(originalApp, File.ReadAllText(app));
+        window.Close();
+    }
+
+    [AvaloniaFact]
+    public void Stopping_update_all_prevents_the_held_package_commands_from_starting()
+    {
+        Project("Lib", TestProjects.Framework, $"<ItemGroup><PackageReference Include=\"{Id}\" Version=\"1.0.0\" /></ItemGroup>");
+        string original = File.ReadAllText(lib);
+        MainWindow window = Open();
+        NuGetView nuget = window.NuGet;
+        Ui.Click(nuget.Tabs.GetLogicalDescendants().OfType<ToggleButton>().Single(b => Equals(b.Content, "Updates")));
+        TaskCompletionSource release = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        Task reached = nuget.Packages.HoldNextChange(release.Task);
+        Button all = nuget.GetLogicalDescendants().OfType<Button>().Single(b => Equals(b.Content, "Update All"));
+        Ui.Click(all, settle: false);
+        try
+        {
+            Ui.PumpUntil(() => reached.IsCompleted, "Update All waiting before its first command");
+            Assert.False(all.IsEnabled);
+            window.Perform(AppActions.Stop);
+        }
+        finally
+        {
+            release.TrySetResult();
+        }
+        Ui.Settle();
+        Assert.Equal(original, File.ReadAllText(lib));
+        Assert.Contains("Stopped", nuget.Status, StringComparison.OrdinalIgnoreCase);
+        window.Close();
+    }
+
+    [AvaloniaFact]
+    public void Update_all_stops_when_a_provider_check_handles_an_update_that_fails()
+    {
+        Project("Lib", TestProjects.Framework, $"<ItemGroup><PackageReference Include=\"{Id}\" Version=\"1.0.0\" /></ItemGroup>");
+        Project("App", TestProjects.Framework, $"<ItemGroup><PackageReference Include=\"{Id}\" Version=\"1.0.0\" /></ItemGroup>");
+        string original = File.ReadAllText(lib);
+        MainWindow window = Open();
+        NuGetView nuget = window.NuGet;
+        Ui.Click(nuget.Tabs.GetLogicalDescendants().OfType<ToggleButton>().Single(b => Equals(b.Content, "Updates")));
+        nuget.BeforeInstall = async (project, id, version, recording, _) =>
+        {
+            await nuget.Packages.InstallSetAsync(project, [(id, version), ("Passenger.Missing", "1.0.0")], recording);
+            return false;
+        };
+        Ui.Click(nuget.GetLogicalDescendants().OfType<Button>().Single(b => Equals(b.Content, "Update All")));
+        Assert.Equal(original, File.ReadAllText(lib));
+        Assert.Contains("failed", nuget.Status, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("Lib…", nuget.Log, StringComparison.Ordinal);
+        window.Close();
+    }
+
+    [AvaloniaTheory]
+    [InlineData("9.0.0")]
+    [InlineData("[9.0.0,10.0.0)")]
+    public void Update_all_does_not_downgrade_a_reference_changed_by_the_final_save(string changedVersion)
+    {
+        Project("Lib", TestProjects.Framework, $"<ItemGroup><PackageReference Include=\"{Id}\" Version=\"1.0.0\" /></ItemGroup>");
+        Restore.Run(lib);
+        Project("App", TestProjects.Framework, $"<ItemGroup><PackageReference Include=\"{Id}\" Version=\"1.0.0\" /></ItemGroup>");
+        MainWindow window = Open();
+        NuGetView nuget = window.NuGet;
+        Ui.Click(nuget.Tabs.GetLogicalDescendants().OfType<ToggleButton>().Single(b => Equals(b.Content, "Updates")));
+        int saves = 0;
+        nuget.Packages.SaveFirst = (_, _) =>
+        {
+            if (++saves == 3)
+            {
+                File.WriteAllText(lib, File.ReadAllText(lib).Replace("1.0.0", changedVersion, StringComparison.Ordinal));
+            }
+            return Task.FromResult<string?>(null);
+        };
+        Ui.Click(nuget.GetLogicalDescendants().OfType<Button>().Single(b => Equals(b.Content, "Update All")));
+        Assert.True(File.ReadAllText(lib).Contains(changedVersion, StringComparison.Ordinal), $"The final save's newer version was overwritten: {nuget.Status}\n{nuget.Log}");
+        window.Close();
+    }
+
+    [AvaloniaFact]
+    public void Update_all_stops_before_absorbing_a_user_edit_to_an_open_central_file()
+    {
+        const string Other = "Passenger.Other";
+        feed.Add(Other, "1.0.0");
+        feed.Add(Other, "1.2.0");
+        string props = Path.Combine(folder, "Directory.Packages.props");
+        File.WriteAllText(props, $"<Project><PropertyGroup><ManagePackageVersionsCentrally>true</ManagePackageVersionsCentrally><Description>Before</Description></PropertyGroup><ItemGroup><PackageVersion Include=\"{Id}\" Version=\"1.0.0\" /><PackageVersion Include=\"{Other}\" Version=\"1.0.0\" /></ItemGroup></Project>");
+        Project("App", TestProjects.Framework, $"<ItemGroup><PackageReference Include=\"{Id}\" /></ItemGroup>");
+        Project("Lib", TestProjects.Framework, $"<ItemGroup><PackageReference Include=\"{Other}\" /></ItemGroup>");
+        MainWindow window = Open();
+        Assert.Null(window.OpenFile(props));
+        Ui.Settle();
+        NuGetView nuget = window.NuGet;
+        Ui.Click(nuget.Tabs.GetLogicalDescendants().OfType<ToggleButton>().Single(b => Equals(b.Content, "Updates")));
+        int saves = 0;
+        nuget.Packages.SaveFirst = async (working, cancel) =>
+        {
+            if (++saves == 3)
+            {
+                Passenger.Editor.CodeEditor editor = window.EditorArea.CodeEditor;
+                editor.Focus();
+                editor.Select(new Passenger.Text.TextRange(editor.Document.Snapshot.ToString().IndexOf("Before", StringComparison.Ordinal), "Before".Length));
+                Avalonia.Headless.HeadlessWindowExtensions.KeyTextInput(window, "Kept");
+            }
+            return await window.EditorArea.SaveAllLandedAsync(working, cancel);
+        };
+        Ui.Click(nuget.GetLogicalDescendants().OfType<Button>().Single(b => Equals(b.Content, "Update All")));
+        Assert.Contains("<Description>Kept</Description>", File.ReadAllText(props), StringComparison.Ordinal);
+        Assert.Contains("changed during Update All", nuget.Status, StringComparison.Ordinal);
+        Assert.Contains($"Include=\"{Other}\" Version=\"1.0.0\"", File.ReadAllText(props), StringComparison.Ordinal);
+        window.Close();
+    }
+
+    [AvaloniaFact]
+    public void Update_all_undo_does_not_absorb_a_later_user_save_to_a_shared_central_file()
+    {
+        string props = Path.Combine(folder, "Directory.Packages.props");
+        File.WriteAllText(props, $"<Project><PropertyGroup><ManagePackageVersionsCentrally>true</ManagePackageVersionsCentrally></PropertyGroup><ItemGroup><PackageVersion Include=\"{Id}\" Version=\"1.0.0\" /></ItemGroup></Project>");
+        Project("Lib", TestProjects.Framework, $"<ItemGroup><PackageReference Include=\"{Id}\" /></ItemGroup>");
+        Project("App", TestProjects.Framework, $"<ItemGroup><PackageReference Include=\"{Id}\" /></ItemGroup>");
+        MainWindow window = Open();
+        NuGetView nuget = window.NuGet;
+        Ui.Click(nuget.Tabs.GetLogicalDescendants().OfType<ToggleButton>().Single(b => Equals(b.Content, "Updates")));
+        int saves = 0;
+        nuget.Packages.SaveFirst = (_, _) =>
+        {
+            if (++saves == 3)
+            {
+                File.WriteAllText(props, File.ReadAllText(props).Replace("1.1.0", "9.0.0", StringComparison.Ordinal));
+            }
+            return Task.FromResult<string?>(null);
+        };
+        Ui.Click(nuget.GetLogicalDescendants().OfType<Button>().Single(b => Equals(b.Content, "Update All")));
+        Assert.Contains("9.0.0", File.ReadAllText(props), StringComparison.Ordinal);
+        Passenger.App.Editors.CommandHistory.Command command = window.EditorArea.Commands.ToUndo(null)
+            ?? throw new Xunit.Sdk.XunitException("Update All recorded no Undo command");
+        string? blocked = Ui.Landed(window.EditorArea.Commands.BlockedAsync(command, redo: false), "whether Undo preserves the later user save");
+        Assert.NotNull(blocked);
+        window.Close();
+    }
+
+    /// <summary>Update All over a folder whose examples keep a Directory.Packages.props of their own importing the root's
+    /// (<see cref="Nested"/>): a project under the examples' file moves versions the root's holds, which never stops the run
+    /// as an edit of the person's; a version kept in a property moves the property, so the packages sharing it move with
+    /// it; each file is as it was but for the versions moved, its blank lines and final newline kept; and Lib, whose
+    /// versions App's change moved, is restored with them as the run reaches it.</summary>
+    [AvaloniaFact]
+    public void Update_all_over_nested_central_files_moves_every_package_through_its_property_and_keeps_the_files_text()
+    {
+        (string root, string examples) = Nested();
+        string rootBefore = File.ReadAllText(root);
+        string examplesBefore = File.ReadAllText(examples);
+        MainWindow window = Open();
+        NuGetView nuget = window.NuGet;
+        Ui.Click(nuget.Tabs.GetLogicalDescendants().OfType<ToggleButton>().Single(b => Equals(b.Content, "Updates")));
+        Ui.Click(nuget.GetLogicalDescendants().OfType<Button>().Single(b => Equals(b.Content, "Update All")));
+        Assert.True(!nuget.Status.Contains("changed during Update All", StringComparison.Ordinal) && nuget.Rows.Count == 0,
+            $"Update All stopped on a file it wrote itself, or left updates behind ({nuget.Rows.Count} listed): {nuget.Status}\n{nuget.Log}");
+        Assert.True(File.ReadAllText(root) == Moved(rootBefore, ($"\"{Id}\" Version=\"1.0.0\"", $"\"{Id}\" Version=\"1.1.0\""), ("10.0.0", "11.0.0")),
+            $"The root's Directory.Packages.props is not as it was but for its versions moved:\n{File.ReadAllText(root)}");
+        Assert.True(File.ReadAllText(examples) == Moved(examplesBefore, (">1.0.0<", ">1.1.0<"), ("\"Passenger.Other\" Version=\"1.0.0\"", "\"Passenger.Other\" Version=\"1.2.0\"")),
+            $"The examples' Directory.Packages.props is not as it was but for Linq2DbVersion and Passenger.Other moved:\n{File.ReadAllText(examples)}");
+        string assets = Path.Combine(folder, "Lib", "obj", "project.assets.json");
+        Assert.True(File.Exists(assets) && File.ReadAllText(assets).Contains("Microsoft.EntityFrameworkCore.Relational/11.0.0", StringComparison.Ordinal),
+            $"Lib, whose EF Core packages App's change moved, was {(File.Exists(assets) ? "restored, but not with them" : "never restored")}, so a break would show only at the next build:\n{nuget.Log}");
+        MigrationsTests.UndoFromExplorer(window, lib);
+        Assert.True(File.ReadAllText(root) == rootBefore && File.ReadAllText(examples) == examplesBefore,
+            $"One Undo of Update All left the central files as:\n{File.ReadAllText(root)}\n{File.ReadAllText(examples)}");
+        window.Close();
+    }
+
+    /// <summary>The person's edit of a central file Update All wrote stops the run before the next project, naming that
+    /// file among the folder's two of the name; EF Core's packages moved before it are the whole set, those of a project the
+    /// run never reached among them, never half at the new version.</summary>
+    [AvaloniaFact]
+    public void Update_all_stopped_by_an_edit_to_a_central_file_names_it_and_leaves_ef_cores_set_whole()
+    {
+        (string root, string examples) = Nested();
+        string unwritten = File.ReadAllText(examples);
+        const string Edit = "  <!-- the person's -->\r\n</Project>";
+        MainWindow window = Open();
+        NuGetView nuget = window.NuGet;
+        Ui.Click(nuget.Tabs.GetLogicalDescendants().OfType<ToggleButton>().Single(b => Equals(b.Content, "Updates")));
+        bool edited = false;
+        Func<Passenger.App.Working?, CancellationToken, Task<string?>>? save = nuget.Packages.SaveFirst;
+        nuget.Packages.SaveFirst = (working, cancel) =>
+        {
+            // The next project's save once the run wrote the examples' file: an edit before that is the file it starts from.
+            string now = File.ReadAllText(examples);
+            if (!edited && now != unwritten)
+            {
+                edited = true;
+                File.WriteAllText(examples, now.Replace("</Project>", Edit, StringComparison.Ordinal));
+            }
+            return save!(working, cancel);
+        };
+        Ui.Click(nuget.GetLogicalDescendants().OfType<Button>().Single(b => Equals(b.Content, "Update All")));
+        string named = Path.Combine("Examples", "Directory.Packages.props");
+        Assert.True(nuget.Status.Contains($"{named} changed during Update All", StringComparison.Ordinal),
+            $"Update All, the examples' central file edited as it ran, says \"{nuget.Status}\", not that {named} changed:\n{nuget.Log}");
+        Assert.Contains(Edit, File.ReadAllText(examples), StringComparison.Ordinal);
+        Assert.True(nuget.Status.Contains("Lib not restored", StringComparison.Ordinal),
+            $"Update All reached Lib before the edit stopped it, so nothing shows EF Core's set moved whole for a project it never reached: {nuget.Status}\n{nuget.Log}");
+        string[] ef = [.. System.Xml.Linq.XDocument.Load(root).Descendants("PackageVersion")
+            .Where(v => ((string?)v.Attribute("Include"))!.StartsWith("Microsoft.EntityFrameworkCore", StringComparison.Ordinal))
+            .Select(v => $"{(string?)v.Attribute("Include")} {(string?)v.Attribute("Version")}")];
+        Assert.True(ef.Length == 4 && ef.All(v => v.EndsWith(" 11.0.0", StringComparison.Ordinal)),
+            $"Stopped before Lib, EF Core's packages are [{string.Join(", ", ef)}], a set half moved that does not build: {nuget.Status}\n{nuget.Log}");
+        window.Close();
+    }
+
+    /// <summary>A single package's update, of one whose version the examples' file keeps in a property, moves the property,
+    /// so the package sharing it moves too, and leaves every other byte of the file as it was.</summary>
+    [AvaloniaFact]
+    public void Updating_a_package_whose_central_version_is_a_property_moves_the_property_and_keeps_the_files_text()
+    {
+        (string root, string examples) = Nested();
+        string rootBefore = File.ReadAllText(root);
+        string examplesBefore = File.ReadAllText(examples);
+        MainWindow window = Open();
+        NuGetView nuget = window.NuGet;
+        PackageOutcome outcome = Ui.Landed(nuget.Packages.InstallAsync(Named(window, "One"), "Passenger.Linq2Db.ClickHouse", "1.1.0"), "One's update of Passenger.Linq2Db.ClickHouse");
+        Assert.True(outcome.Done, $"The update failed: {outcome.Failure("failed")}\n{nuget.Log}");
+        Assert.True(File.ReadAllText(examples) == Moved(examplesBefore, (">1.0.0<", ">1.1.0<")),
+            $"The update did not move Linq2DbVersion alone, leaving the examples' Directory.Packages.props as:\n{File.ReadAllText(examples)}");
+        Assert.Equal(rootBefore, File.ReadAllText(root));
+        window.Close();
+    }
+
+    /// <summary>Update All moving Linq2DbVersion, which Examples/Three's only package shares at a version no feed holds,
+    /// restores Three at the run's end though no update names it, and says it does not restore, rather than leave that
+    /// for the next build.</summary>
+    [AvaloniaFact]
+    public void Update_all_restores_a_project_whose_versions_it_moved_and_says_when_it_does_not_restore()
+    {
+        (_, string examples) = Nested();
+        feed.Add("Passenger.Linq2Db.SqlServer", "1.0.0");
+        File.WriteAllText(examples, File.ReadAllText(examples).Replace("    <PackageVersion Include=\"Passenger.Other\"",
+            "    <PackageVersion Include=\"Passenger.Linq2Db.SqlServer\" Version=\"$(Linq2DbVersion)\" />\r\n    <PackageVersion Include=\"Passenger.Other\"", StringComparison.Ordinal));
+        Project(Path.Combine("Examples", "Three"), "net11.0", "  <ItemGroup>\n    <PackageReference Include=\"Passenger.Linq2Db.SqlServer\" />\n  </ItemGroup>\n");
+        MainWindow window = Open();
+        NuGetView nuget = window.NuGet;
+        Ui.Click(nuget.Tabs.GetLogicalDescendants().OfType<ToggleButton>().Single(b => Equals(b.Content, "Updates")));
+        Ui.Click(nuget.GetLogicalDescendants().OfType<Button>().Single(b => Equals(b.Content, "Update All")));
+        Assert.True(nuget.Status.Contains("Three does not restore with the versions the run moved", StringComparison.Ordinal),
+            $"Update All, having moved Linq2DbVersion to a version Passenger.Linq2Db.SqlServer lacks, says \"{nuget.Status}\", not that Three does not restore:\n{nuget.Log}");
+        window.Close();
+    }
+
+    /// <summary>Without central package management, an update of a package whose reference's version is a property of
+    /// Directory.Build.props moves the property where it is set, never writing a version into the project, so the other
+    /// project's package sharing it moves too; every other character of both files is as it was.</summary>
+    [AvaloniaFact]
+    public void Updating_a_reference_whose_version_is_a_property_moves_the_property_and_leaves_the_project_as_it_was()
+    {
+        const string Other = "Passenger.Other";
+        feed.Add(Other, "1.0.0");
+        feed.Add(Other, "1.1.0");
+        string build = Path.Combine(folder, "Directory.Build.props");
+        File.WriteAllText(build, "<Project>\r\n\r\n  <PropertyGroup>\r\n    <SharedVersion>1.0.0</SharedVersion>\r\n  </PropertyGroup>\r\n\r\n</Project>\r\n");
+        Project("Lib", "net11.0", $"\n  <ItemGroup>\n    <PackageReference Include=\"{Id}\" Version=\"$(SharedVersion)\" />\n  </ItemGroup>\n\n");
+        Project("App", "net11.0", $"  <ItemGroup>\n    <PackageReference Include=\"{Other}\" Version=\"$(SharedVersion)\" />\n  </ItemGroup>\n");
+        string buildBefore = File.ReadAllText(build);
+        string libBefore = File.ReadAllText(lib);
+        MainWindow window = Open();
+        NuGetView nuget = window.NuGet;
+        PackageOutcome outcome = Ui.Landed(nuget.Packages.InstallAsync(Named(window, "Lib"), Id, "1.1.0"), $"Lib's update of {Id}");
+        Assert.True(outcome.Done, $"The update failed: {outcome.Failure("failed")}\n{nuget.Log}");
+        Assert.True(File.ReadAllText(lib) == libBefore, $"The update wrote into Lib.csproj, where its version is $(SharedVersion):\n{File.ReadAllText(lib)}");
+        Assert.True(File.ReadAllText(build) == Moved(buildBefore, (">1.0.0<", ">1.1.0<")),
+            $"The update did not move SharedVersion alone, leaving Directory.Build.props as:\n{File.ReadAllText(build)}");
+        window.Close();
     }
 
     /// <summary>A project pinning the vulnerable 1.0.0 ("[1.0.0]") has it shown as 1.0.0 and marked, is offered the fix as
@@ -198,6 +742,89 @@ public sealed class NuGetTests : IDisposable
         window.Close();
     }
 
+    /// <summary>An install under central package management, which Passenger writes into the project and its
+    /// Directory.Packages.props and then restores, is one change set of Local History named as the install, holding both
+    /// files, as Undo takes it back as one.</summary>
+    [AvaloniaFact]
+    public void An_install_under_central_management_is_one_change_set_of_local_history_named_as_the_install()
+    {
+        Project("Lib", Restorable, string.Empty);
+        Project("App", Restorable, string.Empty);
+        File.WriteAllText(Path.Combine(folder, "Directory.Packages.props"),
+            "<Project>\n  <PropertyGroup>\n    <ManagePackageVersionsCentrally>true</ManagePackageVersionsCentrally>\n  </PropertyGroup>\n  <ItemGroup>\n  </ItemGroup>\n</Project>\n");
+        MainWindow window = Open();
+        NuGetView nuget = window.NuGet;
+        Search(nuget);
+        Choose(nuget, "1.1.0");
+        Ui.Click(Action(nuget, "Lib", "Install") ?? throw new Xunit.Sdk.XunitException("The NuGet window offers no Install on Lib's line"));
+        Ui.Landed(() => !nuget.IsBusy, "Lib's install");
+        DateTimeOffset installed = DateTimeOffset.Now;
+        Assert.True(File.ReadAllText(lib).Contains(Id, StringComparison.Ordinal), $"The install left Lib.csproj without {Id}: {nuget.Status}\n{nuget.Log}");
+
+        string install = $"Install {Id} 1.1.0 in Lib";
+        Passenger.App.History.HistoryTab history = window.ShowLocalHistory(folder) ?? throw new Xunit.Sdk.XunitException($"No history of the folder: {window.Status}");
+        Ui.WaitFor(() => history.Rows.Any(r => r.Title == install), () => $"the install in the folder's history, which keeps:\n{Kept(window, installed)}");
+        Assert.True(history.Rows.Select(r => r.Title).SequenceEqual([install]),
+            $"The folder's history lists [{string.Join(", ", history.Rows.Select(r => r.Title))}], not the install as one change set; it keeps:\n{Kept(window, installed)}");
+        history.Select(history.Rows[0]);
+        Ui.Settle();
+        Assert.Equal(["Directory.Packages.props", "Lib.csproj"], history.Files.Select(f => Path.GetFileName(f.Path)).Order(StringComparer.Ordinal));
+        window.Close();
+    }
+
+    /// <summary>What a window's Local History keeps of its folder, a line a change: its set's name, what it did to which file,
+    /// and when it was heard against a moment the test saw.</summary>
+    private string Kept(MainWindow window, DateTimeOffset against)
+    {
+        string root = Passenger.Core.PathNames.Canonical(folder);
+        return string.Join("\n", window.LocalHistory!.Snapshot().Events.Select(e => $"  set {e.Set} {e.Name ?? "(no name)"}: {e.Kind} {Path.GetRelativePath(root, e.Path ?? root)}"
+            + $"{(e.To is { } to ? $" to {Path.GetRelativePath(root, to)}" : string.Empty)}, heard {(e.Time - against).TotalMilliseconds:+0;-0} ms from {against:HH:mm:ss.fff}"));
+    }
+
+    /// <summary>An install dotnet add package writes, of a project open in the editor, is named as the install in the
+    /// project's Local History, while a save the person makes of another file as it runs stays their own change.</summary>
+    [AvaloniaFact]
+    public void An_install_dotnet_writes_is_named_in_local_history_and_a_save_made_as_it_runs_stays_the_persons()
+    {
+        Project("Lib", Restorable, string.Empty);
+        Project("App", Restorable, string.Empty);
+        string notes = Path.Combine(folder, "Notes.txt");
+        File.WriteAllText(notes, "a note\n");
+        MainWindow window = Open();
+        NuGetView nuget = window.NuGet;
+        Assert.Null(window.OpenFile(lib));
+        Assert.Null(window.OpenFile(notes));
+        Ui.Settle();
+        TaskCompletionSource release = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        Task reached = nuget.Packages.HoldNextChange(release.Task);
+        Task<PackageOutcome> change = nuget.Packages.InstallAsync(Named(window, "Lib"), Id, "1.1.0");
+        try
+        {
+            // Pumped, not settled: the held change keeps the window's work from landing.
+            Ui.PumpUntil(() => reached.IsCompleted, "Lib's install to be under way");
+            Passenger.Editor.CodeEditor editor = window.EditorArea.CodeEditor;
+            Ui.PumpUntil(() => window.EditorArea.Active?.Path == Passenger.Core.PathNames.Canonical(notes), "Notes.txt in front");
+            editor.Focus();
+            Avalonia.Headless.HeadlessWindowExtensions.KeyTextInput(window, "saved meanwhile, ");
+            Ui.Run(window, AppActions.Save, settle: false);
+            Ui.PumpUntil(() => File.ReadAllText(notes).StartsWith("saved meanwhile, ", StringComparison.Ordinal), "the edit to Notes.txt saved");
+        }
+        finally
+        {
+            release.TrySetResult();
+        }
+        PackageOutcome outcome = Ui.Landed(change, "Lib's install");
+        Assert.True(outcome.Done, $"The install failed: {outcome.Failure("failed")}\n{nuget.Log}");
+
+        Passenger.App.History.HistoryTab project = window.ShowLocalHistory(lib) ?? throw new Xunit.Sdk.XunitException($"No history of Lib.csproj: {window.Status}");
+        Ui.Landed(() => project.Rows.Count > 0, "the install in Lib.csproj's history");
+        Assert.True(project.Rows[0].Title == $"Install {Id} 1.1.0 in Lib", $"dotnet's write of Lib.csproj is kept as \"{project.Rows[0].Title}\", not as the install");
+        Passenger.App.History.HistoryTab saved = window.ShowLocalHistory(notes) ?? throw new Xunit.Sdk.XunitException($"No history of Notes.txt: {window.Status}");
+        Ui.Landed(() => saved.Rows.Count > 0, "the save of Notes.txt");
+        Assert.True(saved.Rows[0].Title == "Change", $"The save of Notes.txt made as the install ran is kept as \"{saved.Rows[0].Title}\", not as the person's own change");
+        window.Close();
+    }
+
     /// <summary>Another folder opened in the window while the NuGet window is shown has that folder's packages listed in
     /// place of the last folder's, whose rows never stay to be acted on against the new folder's projects.</summary>
     [AvaloniaFact]
@@ -281,6 +908,32 @@ public sealed class NuGetTests : IDisposable
         window.Close();
     }
 
+    /// <summary>A change whose restore fails says so in dotnet's last line even where the window fell behind as dotnet
+    /// ended, as a loaded machine's does: the lines dotnet printed meanwhile are the change's words before it is over,
+    /// however late the window runs them, never left to the log alone.</summary>
+    [AvaloniaFact]
+    public void A_failed_changes_words_are_dotnets_last_line_even_where_the_window_fell_behind_as_dotnet_ended()
+    {
+        Project("Lib", TestProjects.Framework, $"  <ItemGroup>\n    <PackageReference Include=\"{Id}\" Version=\"1.0.0\" />\n  </ItemGroup>\n");
+        MainWindow window = Open();
+        NuGetView nuget = window.NuGet;
+        bool behind = false;
+        nuget.Packages.Line += (_, line) =>
+        {
+            if (!behind && line.Contains("error NU1101", StringComparison.Ordinal) && line.Contains("Passenger.Missing", StringComparison.Ordinal))
+            {
+                behind = true;
+                // A job of the window's own, as a heavy frame is, run after the lines already posted.
+                UiThread.Post(() => Ui.Stall(TimeSpan.FromSeconds(2), "the window behind as the restore says its last line and ends"));
+            }
+        };
+        PackageOutcome outcome = Ui.Landed(nuget.Packages.InstallSetAsync(Named(window, "Lib"), [(Id, "1.0.1"), ("Passenger.Missing", "1.0.0")]), "the moves whose restore fails");
+        Assert.True(behind, $"The restore never said it found no Passenger.Missing (NU1101), so the window never fell behind as it ended:\n{nuget.Log}");
+        Assert.True(outcome.Failure("failed")?.StartsWith("Failed to restore", StringComparison.Ordinal) == true,
+            $"The failed change said \"{outcome.Failure("failed")}\", not dotnet's last line that the restore failed: what dotnet printed as the window fell behind was left out of its words\n{nuget.Log}");
+        window.Close();
+    }
+
     /// <summary>A feed whose VulnerabilityInfo lists a page of advisories it answers 404 for has its audit read as failed,
     /// never as no advisories: the window's status says the vulnerabilities are unknown, naming the feed, rather than count
     /// the vulnerable 1.0.0 as safe.</summary>
@@ -299,15 +952,492 @@ public sealed class NuGetTests : IDisposable
         window.Close();
     }
 
-    /// <summary>A project of the folder's own for its frameworks, with the item groups given.</summary>
+    /// <summary>A version its owner deprecated, as the stand-in's registration says, is marked so in the list, on the line of
+    /// the project that has it (never of one with a later version) and in the package's details, with why, the owner's
+    /// words and the package to use instead, which a click searches for; Deprecated Only lists it alone. Nothing asks the
+    /// registrations before the window is shown.</summary>
+    [AvaloniaFact]
+    public void A_deprecated_version_is_marked_with_why_and_what_to_use_instead_and_found_by_its_filter()
+    {
+        const string Legacy = "Passenger.Legacy";
+        const string Modern = "Passenger.Modern";
+        const string Words = "Kept no more: Passenger.Modern does all it did.";
+        feed.Add(Legacy, "1.0.0");
+        feed.Add(Legacy, "2.0.0");
+        feed.Add(Modern, "2.0.0");
+        feed.Deprecate(Legacy, "1.0.0", ["Legacy", "CriticalBugs"], Words, Modern, "[2.0.0, )");
+        Project("Lib", TestProjects.Framework, $"<ItemGroup><PackageReference Include=\"{Legacy}\" Version=\"1.0.0\" /></ItemGroup>");
+        Project("App", TestProjects.Framework, $"<ItemGroup><PackageReference Include=\"{Legacy}\" Version=\"2.0.0\" /><PackageReference Include=\"{Modern}\" Version=\"2.0.0\" /></ItemGroup>");
+        MainWindow window = Ui.OpenFolder(folder, languageServer: false);
+        Assert.DoesNotContain(feed.Requests, r => r.Path.StartsWith("/registrations/", StringComparison.Ordinal));
+        window.Perform(AppActions.ShowNuGet);
+        Ui.Settle();
+        NuGetView nuget = window.NuGet;
+        const string Why = "1.0.0 is deprecated: legacy, no longer maintained, critical bugs";
+        string told = $"{Why}\nUse {Modern} 2.0.0 or later instead\n{Words}";
+
+        PackageRow legacy = nuget.Rows.Single(r => r.Id == Legacy);
+        Border? tag = Tag(Ui.Row(nuget.PackageList, legacy), "deprecated");
+        Assert.True(tag is { IsVisible: true } && ToolTip.GetTip(tag) as string == told,
+            $"{Legacy}'s row is {(tag?.IsVisible == true ? $"tagged deprecated, telling \"{ToolTip.GetTip(tag)}\"" : "not tagged deprecated")}: {nuget.Status}");
+        Assert.False(Tag(Ui.Row(nuget.PackageList, nuget.Rows.Single(r => r.Id == Modern)), "deprecated")?.IsVisible == true, $"{Modern}, which nothing deprecates, is tagged deprecated");
+        Assert.Equal("2 packages installed, 1 deprecated", nuget.Status);
+
+        ChoosePackage(nuget, legacy);
+        Border? onLib = Line(nuget, "Lib")?.Children.OfType<Border>().FirstOrDefault(b => b.Child is TextBlock { Text: "deprecated" });
+        Assert.True(onLib is not null && ToolTip.GetTip(onLib) as string == told, $"Lib's line for its deprecated 1.0.0 is {(onLib is null ? "untagged" : $"tagged telling \"{ToolTip.GetTip(onLib)}\"")}");
+        Assert.DoesNotContain(Line(nuget, "App")!.Children.OfType<Border>(), b => b.Child is TextBlock { Text: "deprecated" });
+        string[] words = [.. Said(nuget).GetLogicalDescendants().OfType<TextBlock>().Select(t => t.Text).OfType<string>()];
+        Assert.True(words.Contains($"{Why}.") && words.Contains(Words) && words.Contains("2.0.0 or later"),
+            $"{Legacy}'s details say [{string.Join(" | ", words)}], not why it is deprecated, its owner's words and the versions of {Modern} to use");
+
+        Ui.Click(nuget.Filters.Button);
+        Ui.Choose(nuget.Filters.OpenMenu, "Deprecated Only");
+        Assert.Equal([Legacy], nuget.Rows.Select(r => r.Id));
+        Assert.Contains("1 of 2 shown: deprecated", nuget.Status, StringComparison.Ordinal);
+        Ui.Click(nuget.Filters.Button);
+        Ui.Choose(nuget.Filters.OpenMenu, "Deprecated Only");
+        Assert.Equal([Legacy, Modern], nuget.Rows.Select(r => r.Id));
+
+        Ui.Click(Said(nuget).GetLogicalDescendants().OfType<Button>().Single(b => b.Name == "Alternative"));
+        Ui.Landed(() => nuget.Query == Modern && nuget.Rows.Any(r => r.Id == Modern && r.Feeds.Contains("stand-in")), $"{Modern} searched for: {nuget.Status}");
+        window.Close();
+
+        static Border Said(NuGetView nuget) => nuget.GetLogicalDescendants().OfType<Border>().SingleOrDefault(b => b.Name == "Deprecation")
+            ?? throw new Xunit.Sdk.XunitException($"{nuget.Selected?.Id}'s details say nothing of a deprecated version");
+    }
+
+    /// <summary>At the smallest window, a deprecated package's row cuts its long id, its version and its deprecated tag kept
+    /// whole after it, where the row was cut inside its version; the bar's words take a row of their own, where they had
+    /// none; and the details put the version picker under the id inside the pane, where it ran under the pane's scroll
+    /// bar. At a wide window the id is whole and the picker beside it.</summary>
+    [AvaloniaFact]
+    public void At_the_smallest_window_a_rows_id_gives_way_to_its_version_and_mark_and_the_details_version_picker_wraps_under_it()
+    {
+        const string Legacy = "Passenger.Legacy.Storage.Client.Extensions";
+        feed.Add(Legacy, "9.3.3");
+        feed.Deprecate(Legacy, "9.3.3", ["Legacy"], "Kept no more.");
+        Project("Lib", TestProjects.Framework, $"<ItemGroup><PackageReference Include=\"{Legacy}\" Version=\"9.3.3\" /></ItemGroup>");
+        MainWindow window = Ui.OpenFolder(folder, width: MainWindow.SmallestWidth, height: MainWindow.SmallestHeight, languageServer: false);
+        try
+        {
+            window.Perform(AppActions.ShowNuGet);
+            Ui.Settle();
+            NuGetView nuget = window.NuGet;
+            Ui.WaitFor(() => nuget.Status == "1 package installed, 1 deprecated", () => $"{Legacy} listed deprecated: {nuget.Status}");
+            PackageRow row = nuget.Rows.Single(r => r.Id == Legacy);
+            Control line = Ui.Row(nuget.PackageList, row);
+            Rect list = Placed(window, nuget.PackageList);
+            TextBlock id = line.GetLogicalDescendants().OfType<TextBlock>().Single(t => t.Text == Legacy);
+            TextBlock version = line.GetLogicalDescendants().OfType<TextBlock>().Single(t => t.Text == "9.3.3");
+            Border tag = Tag(line, "deprecated") ?? throw new Xunit.Sdk.XunitException($"{Legacy}'s row has no deprecated tag");
+            foreach (Control kept in (Control[])[version, tag])
+            {
+                TextBlock words = kept as TextBlock ?? (TextBlock)((Border)kept).Child!;
+                Assert.True(kept.IsEffectivelyVisible && Placed(window, kept).Right <= list.Right + 0.5 && words.TextLayout.TextLines.All(l => !l.HasCollapsed),
+                    $"{Legacy}'s {(kept == tag ? "deprecated tag" : "version")} stands at {Placed(window, kept)} in a list ending at {list.Right:0.#}: the row is cut there");
+            }
+            Assert.True(id.TextLayout.TextLines is [{ HasCollapsed: true }], $"{Legacy}'s id, {id.Bounds.Width:0.#} wide, is not cut with an ellipsis before its version");
+            TextBlock status = nuget.GetVisualDescendants().OfType<TextBlock>().Single(t => t.Text == nuget.Status);
+            Assert.True(status.IsEffectivelyVisible && status.TextLayout.TextLines.All(l => !l.HasCollapsed) && status.Bounds.Width >= status.TextLayout.Width - 0.5,
+                $"The bar's \"{nuget.Status}\" is given {status.Bounds.Width:0.#} units: it is out of sight at the smallest window");
+
+            ChoosePackage(nuget, row);
+            ComboBox picker = nuget.GetLogicalDescendants().OfType<ComboBox>().Single(c => c.Name == "Versions");
+            Control details = (Control)picker.FindLogicalAncestorOfType<ScrollViewer>()!.Content!;
+            TextBlock heading = details.GetLogicalDescendants().OfType<TextBlock>().First(t => t.Text == Legacy);
+            Assert.True(Placed(window, picker).Right <= Placed(window, details).Right + 0.5 && Placed(window, picker).Top >= Placed(window, heading).Bottom - 0.5,
+                $"The version picker stands at {Placed(window, picker)}, past the details' edge at {Placed(window, details).Right:0.#} or beside the id at {Placed(window, heading)}");
+
+            window.Width = 1600;
+            Ui.Settle();
+            Assert.True(id.TextLayout.TextLines is [{ HasCollapsed: false }] && Math.Abs(Placed(window, picker).Center.Y - Placed(window, heading).Center.Y) < 4,
+                $"At a wide window the id is {(id.TextLayout.TextLines[0].HasCollapsed ? "cut" : "whole")} and the picker at {Placed(window, picker)} beside the id at {Placed(window, heading)}");
+        }
+        finally
+        {
+            window.Close();
+        }
+    }
+
+    /// <summary>The version chosen in a package's details is said deprecated there before it is put in, as the stand-in's
+    /// registration says: in the word on the version a project has where their owner says the same of both, in a word of
+    /// its own where they say otherwise, and not at all where it is not deprecated.</summary>
+    [AvaloniaFact]
+    public void A_deprecated_version_chosen_before_install_is_said_in_the_details()
+    {
+        const string Legacy = "Passenger.Legacy";
+        const string Modern = "Passenger.Modern";
+        const string Words = "Broken past repair.";
+        foreach (string version in new[] { "1.0.0", "1.2.0", "1.5.0", "2.0.0" })
+        {
+            feed.Add(Legacy, version);
+        }
+        feed.Add(Modern, "2.0.0");
+        feed.Deprecate(Legacy, "1.0.0", ["CriticalBugs"], Words, Modern);
+        feed.Deprecate(Legacy, "1.5.0", ["CriticalBugs"], Words, Modern);
+        feed.Deprecate(Legacy, "2.0.0", ["Legacy"], "Kept no more.", Modern, "[2.0.0, )");
+        Project("Lib", TestProjects.Framework, $"<ItemGroup><PackageReference Include=\"{Legacy}\" Version=\"1.0.0\" /></ItemGroup>");
+        MainWindow window = Open();
+        NuGetView nuget = window.NuGet;
+        ChoosePackage(nuget, Legacy);
+        Ui.WaitFor(() => nuget.Versions.Count == 4 && Said(nuget).Count == 2, () => $"{Legacy}'s details to say its two deprecations: [{string.Join(" | ", Said(nuget))}]");
+        Assert.Equal("2.0.0", nuget.ChosenVersion);
+        Assert.Equal(["1.0.0 is deprecated: critical bugs.", "2.0.0 is deprecated: legacy, no longer maintained."], Said(nuget));
+        Assert.Contains(Line(nuget, "App")!.Children.OfType<Button>(), b => b.Content as string == "Install");
+
+        Choose(nuget, "1.5.0");
+        Ui.WaitFor(() => Said(nuget).Count == 1 && Said(nuget)[0].Contains("1.5.0", StringComparison.Ordinal),
+            () => $"1.5.0, deprecated as Lib's 1.0.0 is, to be said with it: [{string.Join(" | ", Said(nuget))}]");
+        Assert.Equal(["1.0.0 and 1.5.0 are deprecated: critical bugs."], Said(nuget));
+
+        Choose(nuget, "1.2.0");
+        Ui.WaitFor(() => Said(nuget) is ["1.0.0 is deprecated: critical bugs."], () => $"1.2.0, not deprecated, said as [{string.Join(" | ", Said(nuget))}]");
+        window.Close();
+
+        // The first line of each word the details say on deprecated versions.
+        static List<string> Said(NuGetView nuget) =>
+            [.. nuget.GetLogicalDescendants().OfType<Border>().Where(b => b.Name is "Deprecation" or "ChosenDeprecation")
+                .Select(b => b.GetLogicalDescendants().OfType<TextBlock>().First().Text ?? string.Empty)];
+    }
+
+    /// <summary>The version chosen in a package's details is said vulnerable there before it is put in, as the stand-in's
+    /// audit says, with its advisories, the gravest first and each linked, and the version that fixes them: of a package no
+    /// project has, the audit read as the details ask, nothing listed having asked for it; of one a project has, in the
+    /// word on its vulnerable version where the same advisories affect both, in a word of its own where others do, and not
+    /// at all where none does.</summary>
+    [AvaloniaFact]
+    public void A_vulnerable_version_chosen_before_install_is_said_in_the_details()
+    {
+        const string Leaky = "Passenger.Leaky";
+        const string Moderate = "https://github.com/advisories/GHSA-pass-leak-mild";
+        const string Critical = "https://github.com/advisories/GHSA-pass-leak-grave";
+        const string Low = "https://github.com/advisories/GHSA-pass-leak-slight";
+        const string Known = "Known security vulnerability in";
+        const string Details = "It could be exploited in certain scenarios. See the advisories below for details.";
+        foreach (string version in new[] { "1.0.0", "1.2.0", "1.5.0", "2.0.0" })
+        {
+            feed.Add(Leaky, version);
+        }
+        feed.Advise(Leaky, 1, Moderate, "[1.0.0, 1.5.0)");
+        feed.Advise(Leaky, 0, Low, "[2.0.0, )");
+        feed.Advise(Leaky, 3, Critical, "[2.0.0, )");
+        MainWindow window = Open();
+        NuGetView nuget = window.NuGet;
+        Search(nuget);
+        Assert.Equal("1.1.0", nuget.ChosenVersion);
+        Assert.Empty(Said(nuget));
+        Choose(nuget, "1.0.0");
+        Ui.WaitFor(() => Said(nuget).Count == 1, () => $"{Id}'s chosen 1.0.0, which no project has, to be said vulnerable: [{string.Join(" | ", Said(nuget))}]");
+        Assert.Equal([$"{Known} 1.0.0. {Details}"], Said(nuget));
+        Assert.Equal("Fixed in 1.0.1", Fix(nuget, "Vulnerability"));
+        Assert.Contains(Line(nuget, "Lib")!.Children.OfType<Button>(), b => b.Content as string == "Install");
+        Choose(nuget, "1.1.0");
+        Assert.Empty(Said(nuget));
+
+        // Lib takes Leaky's vulnerable 1.0.0, as a person edits the project.
+        Project("Lib", TestProjects.Framework, $"<ItemGroup><PackageReference Include=\"{Leaky}\" Version=\"1.0.0\" /></ItemGroup>");
+        nuget.Query = string.Empty;
+        Ui.WaitFor(() => nuget.Rows.Any(r => r.Id == Leaky && r.IsVulnerable), () => $"Lib's {Leaky} listed as vulnerable: {nuget.Status}");
+        ChoosePackage(nuget, Leaky);
+        Ui.WaitFor(() => nuget.Versions.Count == 4 && Said(nuget).Count == 1, () => $"{Leaky}'s details to say Lib's vulnerable 1.0.0: [{string.Join(" | ", Said(nuget))}]");
+        Assert.Equal("1.5.0", nuget.ChosenVersion);
+        Assert.Equal([$"{Known} 1.0.0. {Details}"], Said(nuget));
+        Assert.Equal("Fixed in 1.5.0", Fix(nuget, "Vulnerability"));
+
+        Choose(nuget, "1.2.0");
+        Assert.Equal([$"{Known} 1.0.0 and 1.2.0. {Details}"], Said(nuget));
+        Assert.Equal("Fixed in 1.5.0", Fix(nuget, "Vulnerability"));
+
+        Choose(nuget, "2.0.0");
+        Assert.Equal([$"{Known} 1.0.0. {Details}", $"{Known} 2.0.0. {Details}"], Said(nuget));
+        Border chosen = nuget.GetLogicalDescendants().OfType<Border>().Single(b => b.Name == "ChosenVulnerability");
+        Assert.Equal([Critical, Low], chosen.GetLogicalDescendants().OfType<Button>().Select(b => b.Content as string));
+        Assert.Equal(["(Severity: Critical)", "(Severity: Low)"],
+            chosen.GetLogicalDescendants().OfType<TextBlock>().Select(t => t.Text).Where(t => t?.StartsWith("(Severity", StringComparison.Ordinal) == true));
+        Assert.Equal("No version without a known vulnerability is offered", Fix(nuget, "ChosenVulnerability"));
+        Assert.Contains(Line(nuget, "App")!.Children.OfType<Button>(), b => b.Content as string == "Install");
+        Ui.Click(chosen.GetLogicalDescendants().OfType<Button>().First(), settle: false);
+        Assert.True(window.Browsed.Contains(new Uri(Critical)), $"The chosen version's gravest advisory's link opened [{string.Join(", ", window.Browsed)}]");
+
+        Choose(nuget, "1.5.0");
+        Assert.Equal([$"{Known} 1.0.0. {Details}"], Said(nuget));
+        window.Close();
+
+        // The first line of each word the details say on vulnerable versions.
+        static List<string> Said(NuGetView nuget) =>
+            [.. nuget.GetLogicalDescendants().OfType<Border>().Where(b => b.Name is "Vulnerability" or "ChosenVulnerability")
+                .Select(b => b.GetLogicalDescendants().OfType<TextBlock>().First().Text ?? string.Empty)];
+
+        // The last line of a word, the version that fixes what it names.
+        static string? Fix(NuGetView nuget, string word) =>
+            nuget.GetLogicalDescendants().OfType<Border>().Single(b => b.Name == word).GetLogicalDescendants().OfType<TextBlock>().Last().Text;
+    }
+
+    /// <summary>A project built for two frameworks that references the package at the safe 1.0.1 in one and gets the
+    /// vulnerable, deprecated 1.0.0 through Passenger.Charts in the other has that 1.0.0 audited and its deprecation read:
+    /// the package's row is marked and tagged, the status counts it, the project's line shows both versions, its mark naming
+    /// the framework and what brings 1.0.0 in, and the details say the advisory and the version that fixes it, chosen.</summary>
+    [AvaloniaFact]
+    public void A_version_one_framework_gets_through_another_package_is_audited_though_the_project_references_it_in_another()
+    {
+        const string Charts = "Passenger.Charts";
+        const string Known = "Known security vulnerability in 1.0.0. It could be exploited in certain scenarios. See the advisories below for details.";
+        feed.Add(Charts, "1.0.0", (Id, "1.0.0"));
+        feed.Deprecate(Id, "1.0.0", ["CriticalBugs"], "Take 1.0.1.");
+        Project("Lib", $"{Restorable};{TestProjects.Framework}",
+            $"  <ItemGroup>\n    <PackageReference Include=\"{Charts}\" Version=\"1.0.0\" />\n  </ItemGroup>\n"
+            + $"  <ItemGroup Condition=\"'$(TargetFramework)' == '{Restorable}'\">\n    <PackageReference Include=\"{Id}\" Version=\"1.0.1\" />\n  </ItemGroup>\n");
+        // By its real path, as the window reads it: a restore through TMPDIR's /var link writes another assets file.
+        Restore.Run(Passenger.Core.PathNames.Canonical(lib));
+        MainWindow window = Open();
+        NuGetView nuget = window.NuGet;
+        ChoosePackage(nuget, Id);
+        Ui.WaitFor(() => nuget.Versions.Count == 3, () => $"{Id}'s versions: {nuget.Status}");
+        PackageRow row = nuget.Selected!;
+        Assert.True(row.IsVulnerable && row.Deprecated?.Version == "1.0.0" && nuget.Status == "2 packages installed, 1 vulnerable, 1 deprecated",
+            $"With {TestProjects.Framework}'s 1.0.0 brought in by {Charts}, {Id}'s row is {(row.IsVulnerable ? "marked" : "unmarked")}, "
+            + $"{(row.IsDeprecated ? $"tagged deprecated at {row.Deprecated?.Version}" : "untagged")}, and the status says \"{nuget.Status}\"");
+        Assert.True(ShownVersion(nuget, "Lib") == "1.0.1, 1.0.0", $"Lib's line shows {ShownVersion(nuget, "Lib")}, not {Restorable}'s 1.0.1 and {TestProjects.Framework}'s 1.0.0");
+        string? marked = Line(nuget, "Lib")!.Children.OfType<Panel>().SelectMany(p => p.Children).OfType<RowIcon>().Select(i => ToolTip.GetTip(i) as string).FirstOrDefault();
+        Assert.True(marked == $"Known security vulnerability in 1.0.0 for {TestProjects.Framework}, brought in by {Charts}: Moderate severity ({Advisory})",
+            $"Lib's line is marked \"{marked}\", not with {TestProjects.Framework}'s vulnerable 1.0.0 and what brings it in");
+
+        Border? said = nuget.GetLogicalDescendants().OfType<Border>().FirstOrDefault(b => b.Name == "Vulnerability");
+        string[] words = [.. said?.GetLogicalDescendants().OfType<TextBlock>().Select(t => t.Text).OfType<string>() ?? []];
+        Assert.True(words.Length > 0 && words[0] == Known && words[^1] == "Fixed in 1.0.1" && nuget.ChosenVersion == "1.0.1",
+            $"{Id}'s details say [{string.Join(" | ", words)}] with {nuget.ChosenVersion} chosen, not the advisory on 1.0.0 and 1.0.1, which fixes it");
+        window.Close();
+    }
+
+    /// <summary>While the audit's feed has not answered, no version is offered to put in as though it were known safe: App's
+    /// Install and Lib's Update are greyed, each saying why, Lib's Remove is not, the details say the feed is being asked,
+    /// and the window's own install is refused saying why; once the feed answers, Lib's 1.0.0 is marked, the 1.0.1 that
+    /// fixes it chosen, and Install and Update act again.</summary>
+    [AvaloniaFact]
+    public void While_the_audit_is_unanswered_install_and_update_are_greyed_saying_why_until_it_answers()
+    {
+        Project("Lib", TestProjects.Framework, $"<ItemGroup><PackageReference Include=\"{Id}\" Version=\"1.0.0\" /></ItemGroup>");
+        string app = File.ReadAllText(Path.Combine(folder, "App", "App.csproj"));
+        TaskCompletionSource answer = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        feed.HoldAdvisories(answer.Task);
+        MainWindow window = Ui.OpenFolder(folder, languageServer: false);
+        window.Perform(AppActions.ShowNuGet);
+        NuGetView nuget = window.NuGet;
+        try
+        {
+            Ui.PumpUntil(() => nuget.Selected?.Id == Id && nuget.Versions.Count == 3 && Action(nuget, "App", "Install") is not null,
+                $"{Id} listed, chosen and its projects shown while the feed holds its advisories: {nuget.Status}");
+            Button install = Action(nuget, "App", "Install")!;
+            Button? update = Action(nuget, "Lib", "Update");
+            Assert.True(!install.IsEnabled && ToolTip.GetTip(install) as string == Refusals.VulnerabilitiesUnread,
+                $"With the audit unanswered, App's Install is {(install.IsEnabled ? "enabled" : "greyed")}, telling \"{ToolTip.GetTip(install)}\"");
+            Assert.True(update is { IsEnabled: false } && ToolTip.GetTip(update) as string == Refusals.VulnerabilitiesUnread,
+                $"With the audit unanswered, Lib's line offers [{string.Join(", ", Labels(nuget, "Lib"))}], its Update {(update?.IsEnabled == true ? "enabled" : "greyed")}");
+            Assert.True(Action(nuget, "Lib", "Remove") is { IsEnabled: true }, "Lib's Remove, which puts no version in, is greyed while the audit is unanswered");
+            TextBlock? asking = nuget.GetLogicalDescendants().OfType<TextBlock>().FirstOrDefault(t => t.Name == "Auditing");
+            Assert.True(asking is { IsEffectivelyVisible: true, Text: "Asking stand-in which versions have known vulnerabilities…" },
+                $"With the audit unanswered, {Id}'s details say \"{asking?.Text}\", not that the feed is being asked");
+            Assert.False(Ui.AwaitPumped(nuget.InstallAsync(Named(window, "App")), "the window's install asked meanwhile"), "The window's install ran with the audit unanswered");
+            Assert.True(nuget.Status == Refusals.VulnerabilitiesUnread && File.ReadAllText(Path.Combine(folder, "App", "App.csproj")) == app,
+                $"The window's install refused with the audit unanswered says \"{nuget.Status}\"");
+        }
+        finally
+        {
+            answer.TrySetResult();
+        }
+        Ui.WaitFor(() => nuget.Selected is { IsVulnerable: true } && Action(nuget, "App", "Install") is { IsEnabled: true },
+            () => $"{Id} marked vulnerable and App's Install enabled once the feed answered: {nuget.Status}");
+        Assert.True(nuget.ChosenVersion == "1.0.1" && Action(nuget, "Lib", "Update") is { IsEnabled: true },
+            $"Once the feed answered, the window offers {nuget.ChosenVersion} as [{string.Join(", ", Labels(nuget, "Lib"))}], not 1.0.1, which fixes Lib's 1.0.0, as an Update");
+        Assert.DoesNotContain(nuget.GetLogicalDescendants().OfType<TextBlock>(), t => t.Name == "Auditing");
+        window.Close();
+    }
+
+    /// <summary>A project built for two frameworks that references the package at 1.1.0 in net11.0 and gets the vulnerable
+    /// 1.0.0 through Passenger.Charts in the other has Fix on its line beside the mark: one click references 1.0.1, which
+    /// fixes it, in that framework alone, where Downgrade would move net11.0's reference, and the restore it ends with
+    /// resolves 1.0.1 there, net11.0's 1.1.0 and its reference as they were; the package is no longer marked.</summary>
+    [AvaloniaFact]
+    public void Fix_on_a_projects_line_references_the_fixed_version_in_the_framework_that_gets_the_vulnerable_one_alone()
+    {
+        const string Charts = "Passenger.Charts";
+        feed.Add(Charts, "1.0.0", (Id, "1.0.0"));
+        string own = $"  <ItemGroup Condition=\"'$(TargetFramework)' == '{Restorable}'\">\n    <PackageReference Include=\"{Id}\" Version=\"1.1.0\" />\n  </ItemGroup>\n";
+        Project("Lib", $"{Restorable};{TestProjects.Framework}", $"  <ItemGroup>\n    <PackageReference Include=\"{Charts}\" Version=\"1.0.0\" />\n  </ItemGroup>\n" + own);
+        // By its real path, as the window reads it: a restore through TMPDIR's /var link writes another assets file.
+        Restore.Run(Passenger.Core.PathNames.Canonical(lib));
+        MainWindow window = Open();
+        NuGetView nuget = window.NuGet;
+        ChoosePackage(nuget, Id);
+        Ui.WaitFor(() => nuget.Versions.Count == 3 && Action(nuget, "Lib", "Fix") is { IsEnabled: true },
+            () => $"Lib's line to offer Fix for {TestProjects.Framework}'s 1.0.0 once the audit answered: [{string.Join(", ", Labels(nuget, "Lib"))}], {nuget.Status}");
+        Button fix = Action(nuget, "Lib", "Fix")!;
+        Assert.True(Labels(nuget, "Lib").SequenceEqual(["Fix", "Downgrade", "Remove"])
+            && ToolTip.GetTip(fix) as string == $"References 1.0.1 for {TestProjects.Framework}, in place of the vulnerable 1.0.0 brought in by {Charts}",
+            $"Lib's line offers [{string.Join(", ", Labels(nuget, "Lib"))}], its Fix telling \"{ToolTip.GetTip(fix)}\"");
+
+        Ui.Click(fix, settle: false);
+        Ui.Landed(() => !nuget.IsBusy, "Lib's fix");
+        string text = File.ReadAllText(lib);
+        Assert.True(text.Contains(own, StringComparison.Ordinal)
+            && text.Contains($"  <ItemGroup Condition=\"'$(TargetFramework)' == '{TestProjects.Framework}'\">\n    <PackageReference Include=\"{Id}\" Version=\"1.0.1\" />\n  </ItemGroup>\n", StringComparison.Ordinal),
+            $"The fix left Lib.csproj without a reference at 1.0.1 for {TestProjects.Framework} alone, or moved {Restorable}'s ({nuget.Status}):\n{text}\n{nuget.Log}");
+        Passenger.Packages.RestoredVersions restored = Assets("Lib");
+        Assert.True(restored.Of(TestProjects.Framework, Id) == "1.0.1" && restored.Of(Restorable, Id) == "1.1.0",
+            $"The fix's restore resolved {restored.Of(TestProjects.Framework, Id)} for {TestProjects.Framework} and {restored.Of(Restorable, Id)} for {Restorable}, "
+            + "not 1.0.1 and the 1.1.0 it had");
+        Ui.WaitFor(() => nuget.Selected is { Id: Id, IsVulnerable: false } && Action(nuget, "Lib", "Fix") is null,
+            () => $"{Id} no longer marked, and Fix gone from Lib's line, once fixed: [{string.Join(", ", Labels(nuget, "Lib"))}], {nuget.Status}");
+        window.Close();
+    }
+
+    /// <summary>Under central package management, a project built for two frameworks that gets the vulnerable 1.0.0 through
+    /// Passenger.Charts in the one that references Charts is marked on that reference in its file, and the code action there
+    /// references the package in that framework alone, its 1.0.1 a PackageVersion in Directory.Packages.props; the restore
+    /// resolves 1.0.1 there, the other framework getting none, and the mark goes.</summary>
+    [AvaloniaFact]
+    public void Under_central_management_the_fix_at_a_project_files_mark_puts_the_central_version_in_and_references_it_in_that_framework_alone()
+    {
+        const string Charts = "Passenger.Charts";
+        feed.Add(Charts, "1.0.0", (Id, "1.0.0"));
+        string props = Path.Combine(folder, "Directory.Packages.props");
+        File.WriteAllText(props, "<Project>\n  <PropertyGroup>\n    <ManagePackageVersionsCentrally>true</ManagePackageVersionsCentrally>\n  </PropertyGroup>\n"
+            + $"  <ItemGroup>\n    <PackageVersion Include=\"{Charts}\" Version=\"1.0.0\" />\n  </ItemGroup>\n</Project>\n");
+        string charted = $"  <ItemGroup Condition=\"'$(TargetFramework)' == '{TestProjects.Framework}'\">\n    <PackageReference Include=\"{Charts}\" />\n  </ItemGroup>\n";
+        Project("Lib", $"{Restorable};{TestProjects.Framework}", charted);
+        Project("App", Restorable, string.Empty);
+        Restore.Run(Passenger.Core.PathNames.Canonical(lib));
+        MainWindow window = Open();
+        window.OpenFile(lib);
+        Ui.Settle();
+        Passenger.App.Workspace.OpenDocument document = window.EditorArea.Active!;
+        string said = $"NU1902: Package '{Id}' 1.0.0, which {Charts} brings in for {TestProjects.Framework}, has a known moderate severity vulnerability, {Advisory}";
+        Ui.WaitFor(() => document.Markers.Any(m => m.Message == said),
+            () => $"the vulnerable version {Charts} brings in marked on its reference: [{string.Join("; ", document.Markers.Select(m => m.Message))}]");
+        Assert.Equal(Charts, document.Text.Snapshot.ToString().Substring(document.Markers.First(m => m.Message == said).Range.Start, Charts.Length));
+
+        string fix = $"Reference {Id}'s fixed version for {TestProjects.Framework}";
+        Ui.PlaceAfter(window.EditorArea.CodeEditor, $"Include=\"{Charts[..4]}");
+        Ui.Run(window, AppActions.QuickFix);
+        Ui.WaitFor(() => window.Assist.Offered.Contains(fix), () => $"\"{fix}\" offered at the mark: [{string.Join("; ", window.Assist.Offered)}]");
+        int index = window.Assist.Offered.ToList().IndexOf(fix);
+        for (int i = 0; i < index; i++)
+        {
+            Ui.Press(window, "DOWN");
+        }
+        Ui.Press(window, "ENTER");
+        NuGetView nuget = window.NuGet;
+        Ui.WaitFor(() => File.ReadAllText(props).Contains($"Include=\"{Id}\"", StringComparison.Ordinal), () => $"the fix to write {Id}'s central version: {window.Status}\n{nuget.Log}");
+        Ui.Landed(() => !nuget.IsBusy, "the fix's restore");
+        Assert.True(File.ReadAllText(props).Contains($"<PackageVersion Include=\"{Id}\" Version=\"1.0.1\" />", StringComparison.Ordinal),
+            $"The fix wrote no PackageVersion of {Id} at 1.0.1:\n{File.ReadAllText(props)}");
+        string text = File.ReadAllText(lib);
+        Assert.True(text.Contains(charted.Replace($"<PackageReference Include=\"{Charts}\" />\n", $"<PackageReference Include=\"{Charts}\" />\n    <PackageReference Include=\"{Id}\" />\n",
+            StringComparison.Ordinal), StringComparison.Ordinal), $"The fix left Lib.csproj without a reference of {Id} for {TestProjects.Framework} alone, under its central version:\n{text}");
+        Passenger.Packages.RestoredVersions restored = Assets("Lib");
+        Assert.True(restored.Of(TestProjects.Framework, Id) == "1.0.1" && restored.Of(Restorable, Id) is null,
+            $"The fix's restore resolved {restored.Of(TestProjects.Framework, Id)} for {TestProjects.Framework} and {restored.Of(Restorable, Id) ?? "none"} for {Restorable}, not 1.0.1 and none");
+        Ui.WaitFor(() => !document.Markers.Any(m => m.Message.StartsWith("NU1902", StringComparison.Ordinal)),
+            () => $"the mark gone once fixed: [{string.Join("; ", document.Markers.Select(m => m.Message))}]");
+        window.Close();
+    }
+
+    /// <summary>The Updates tab lists a vulnerable version a project's framework gets only through another package beside the
+    /// updates, with the version that fixes it, though the project's own references are current; Update All references it
+    /// there, and the tab then lists no fix, the reference made at 1.0.1 at most an update to 1.1.0 like any other.</summary>
+    [AvaloniaFact]
+    public void The_updates_tab_lists_a_vulnerable_version_brought_in_with_its_fix_and_update_all_makes_the_fix()
+    {
+        const string Charts = "Passenger.Charts";
+        feed.Add(Charts, "1.0.0", (Id, "1.0.0"));
+        Project("Lib", $"{Restorable};{TestProjects.Framework}", $"  <ItemGroup>\n    <PackageReference Include=\"{Charts}\" Version=\"1.0.0\" />\n  </ItemGroup>\n"
+            + $"  <ItemGroup Condition=\"'$(TargetFramework)' == '{Restorable}'\">\n    <PackageReference Include=\"{Id}\" Version=\"1.1.0\" />\n  </ItemGroup>\n");
+        Restore.Run(Passenger.Core.PathNames.Canonical(lib));
+        MainWindow window = Open();
+        NuGetView nuget = window.NuGet;
+        Ui.Click(nuget.Tabs.GetLogicalDescendants().OfType<ToggleButton>().Single(b => Equals(b.Content, "Updates")));
+        Ui.WaitFor(() => nuget.Status == "1 vulnerable transitive version to fix", () => $"the Updates tab's check: {nuget.Status}");
+        PackageRow row = Assert.Single(nuget.Rows);
+        Assert.True(row is { Id: Id, Version: "1.0.0", MovesTo: "1.0.1", IsVulnerable: true } && row.Fixes.Single().Value.Frameworks.SequenceEqual([TestProjects.Framework]),
+            $"Updates lists {row.Id} {row.Version} → {row.MovesTo} ({(row.IsVulnerable ? "marked" : "unmarked")}), not {TestProjects.Framework}'s 1.0.0 brought in, fixed by 1.0.1 there");
+        Assert.Equal("1.0.1", nuget.ChosenVersion);
+
+        Ui.Click(nuget.GetLogicalDescendants().OfType<Button>().Single(b => Equals(b.Content, "Update All")));
+        Ui.Landed(() => !nuget.IsBusy && nuget.Rows.All(r => r.Fixes.Count == 0 && r.UpdateVersion == "1.1.0"),
+            $"the fix made and no fix left to list: {nuget.Status}\n{nuget.Log}");
+        Assert.True(nuget.Status == "Updated 1 package reference" && Assets("Lib").Of(TestProjects.Framework, Id) == "1.0.1" && Assets("Lib").Of(Restorable, Id) == "1.1.0",
+            $"Update All says \"{nuget.Status}\", {TestProjects.Framework} resolving {Assets("Lib").Of(TestProjects.Framework, Id)} and {Restorable} "
+            + $"{Assets("Lib").Of(Restorable, Id)}:\n{File.ReadAllText(lib)}\n{nuget.Log}");
+        window.Close();
+    }
+
+    /// <summary>What a project of the folder's last restore resolved, read from its project.assets.json.</summary>
+    private Passenger.Packages.RestoredVersions Assets(string project)
+    {
+        using FileStream stream = File.OpenRead(Path.Combine(folder, project, "obj", "project.assets.json"));
+        return Passenger.Packages.RestoredVersions.Read(stream);
+    }
+
+    /// <summary>A tag of a package's row shown in the list, by its words.</summary>
+    private static Rect Placed(Visual window, Visual control) => new(control.TranslatePoint(default, window)!.Value, control.Bounds.Size);
+
+    private static Border? Tag(Control row, string words) =>
+        row.GetLogicalDescendants().OfType<Border>().FirstOrDefault(b => b.Child is TextBlock { Text: { } text } && text == words);
+
+    /// <summary>A project of the folder's own for its frameworks, with the item groups given, in the folder of its path from
+    /// the folder's, named as that folder is.</summary>
     private string Project(string name, string frameworks, string items)
     {
         Directory.CreateDirectory(Path.Combine(folder, name));
-        string path = Path.Combine(folder, name, $"{name}.csproj");
+        string path = Path.Combine(folder, name, $"{Path.GetFileName(name)}.csproj");
         string property = frameworks.Contains(';', StringComparison.Ordinal) ? "TargetFrameworks" : "TargetFramework";
         File.WriteAllText(path, $"<Project Sdk=\"Microsoft.NET.Sdk\">\n  <PropertyGroup>\n    <{property}>{frameworks}</{property}>\n  </PropertyGroup>\n{items}</Project>\n");
         return path;
     }
+
+    /// <summary>Central package management in two files, as a repository whose examples keep their own: the root's holds
+    /// the stand-in and EF Core's four packages; the examples', importing it, a property two packages share and
+    /// Passenger.Other, its lines ending in CRLF, each file with blank lines and a final newline. App takes two of EF Core's
+    /// packages, Examples/One a package of the property and the root's stand-in, Examples/Two Passenger.Other and the
+    /// property's other package, Lib the other two, in that order of their paths whether case counts or not.</summary>
+    private (string Root, string Examples) Nested()
+    {
+        (string Id, string From, string To)[] versions = [.. new[] { "InMemory", "Relational", "Sqlite", "SqlServer" }.Select(e => ($"Microsoft.EntityFrameworkCore.{e}", "10.0.0", "11.0.0")),
+            ("Passenger.Linq2Db.ClickHouse", "1.0.0", "1.1.0"), ("Passenger.Linq2Db.PostgreSQL", "1.0.0", "1.1.0"), ("Passenger.Other", "1.0.0", "1.2.0")];
+        foreach ((string id, string from, string to) in versions)
+        {
+            feed.Add(id, from);
+            feed.Add(id, to);
+        }
+        // The framework of the SDK the build runs on, whose targeting pack is there to restore with, which the feed lacks.
+        const string Built = "net11.0";
+        string root = Path.Combine(folder, "Directory.Packages.props");
+        File.WriteAllText(root, "<Project>\n\n  <PropertyGroup>\n    <ManagePackageVersionsCentrally>true</ManagePackageVersionsCentrally>\n  </PropertyGroup>\n\n"
+            + $"  <ItemGroup>\n    <PackageVersion Include=\"{Id}\" Version=\"1.0.0\" />\n\n"
+            + "    <PackageVersion Include=\"Microsoft.EntityFrameworkCore.InMemory\" Version=\"10.0.0\" />\n"
+            + "    <PackageVersion Include=\"Microsoft.EntityFrameworkCore.Relational\" Version=\"10.0.0\" />\n"
+            + "    <PackageVersion Include=\"Microsoft.EntityFrameworkCore.Sqlite\" Version=\"10.0.0\" />\n"
+            + "    <PackageVersion Include=\"Microsoft.EntityFrameworkCore.SqlServer\" Version=\"10.0.0\" />\n  </ItemGroup>\n\n</Project>\n");
+        string examples = Path.Combine(Directory.CreateDirectory(Path.Combine(folder, "Examples")).FullName, "Directory.Packages.props");
+        File.WriteAllText(examples, "<Project>\r\n\r\n"
+            + "  <Import Project=\"$([MSBuild]::GetPathOfFileAbove(Directory.Packages.props, $(MSBuildThisFileDirectory)..))\" />\r\n\r\n"
+            + "  <PropertyGroup>\r\n    <Linq2DbVersion>1.0.0</Linq2DbVersion>\r\n  </PropertyGroup>\r\n\r\n"
+            + "  <ItemGroup>\r\n    <PackageVersion Include=\"Passenger.Linq2Db.ClickHouse\" Version=\"$(Linq2DbVersion)\" />\r\n"
+            + "    <PackageVersion Include=\"Passenger.Linq2Db.PostgreSQL\" Version=\"$(Linq2DbVersion)\" />\r\n\r\n"
+            + "    <PackageVersion Include=\"Passenger.Other\" Version=\"1.0.0\" />\r\n  </ItemGroup>\r\n\r\n</Project>\r\n");
+        Project("App", Built, References("Microsoft.EntityFrameworkCore.InMemory", "Microsoft.EntityFrameworkCore.Sqlite"));
+        Project(Path.Combine("Examples", "One"), Built, References("Passenger.Linq2Db.ClickHouse", Id));
+        Project(Path.Combine("Examples", "Two"), Built, References("Passenger.Other", "Passenger.Linq2Db.PostgreSQL"));
+        Project("Lib", Built, References("Microsoft.EntityFrameworkCore.Relational", "Microsoft.EntityFrameworkCore.SqlServer"));
+        return (root, examples);
+
+        static string References(params string[] ids) => $"  <ItemGroup>\n{string.Concat(ids.Select(id => $"    <PackageReference Include=\"{id}\" />\n"))}  </ItemGroup>\n";
+    }
+
+    /// <summary>A file's text with each of its versions moved, every other character as it was.</summary>
+    private static string Moved(string text, params (string From, string To)[] moves) =>
+        moves.Aggregate(text, (moved, move) => moved.Replace(move.From, move.To, StringComparison.Ordinal));
 
     /// <summary>A window on the folder with the NuGet window shown; without the C# language server, which nothing here asks
     /// of, so none starts and restores the projects.</summary>
@@ -328,7 +1458,7 @@ public sealed class NuGetTests : IDisposable
     }
 
     /// <summary>A version chosen in the package's version picker, as a person picks it.</summary>
-    private static void Choose(NuGetView nuget, string version)
+    internal static void Choose(NuGetView nuget, string version)
     {
         ComboBox picker = nuget.GetLogicalDescendants().OfType<ComboBox>().Single(c => c.Name == "Versions");
         picker.SelectedItem = version;
@@ -338,11 +1468,11 @@ public sealed class NuGetTests : IDisposable
     private static ProjectModel Named(MainWindow window, string name) => window.Projects.Single(p => p.Name == name);
 
     /// <summary>A project's line among the chosen package's projects.</summary>
-    private static StackPanel? Line(NuGetView nuget, string project) => nuget.GetLogicalDescendants().OfType<StackPanel>()
+    internal static Panel? Line(NuGetView nuget, string project) => nuget.GetLogicalDescendants().OfType<Panel>()
         .FirstOrDefault(line => line.Children.FirstOrDefault() is TextBlock { Text: { } text } && text == project);
 
     /// <summary>The button of a label on a project's line.</summary>
-    private static Button? Action(NuGetView nuget, string project, string label) =>
+    internal static Button? Action(NuGetView nuget, string project, string label) =>
         Line(nuget, project)?.Children.OfType<Button>().FirstOrDefault(button => (string?)button.Content == label);
 
     /// <summary>The words on a project's line's buttons.</summary>

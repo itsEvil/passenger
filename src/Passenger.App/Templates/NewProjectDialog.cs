@@ -5,6 +5,7 @@ using Avalonia.Media;
 using Avalonia.Platform.Storage;
 using Avalonia.Threading;
 using Passenger.App.MSBuild;
+using Passenger.App.Mobile;
 using Passenger.App.Run;
 using Passenger.App.ToolWindows;
 using Passenger.Core;
@@ -49,6 +50,11 @@ public enum ProjectSetup
     Aspire,
 }
 
+/// <summary>The window's one install of .NET workloads (<see cref="MainWindow.InstallWorkloadsAsync(IReadOnlyList{string}, bool,
+/// Action{string}, Action{string}, CancellationToken)"/>): given their ids, what takes its stages and the lines dotnet
+/// writes, and what stops it; whether they were installed, what it came to, and any command left the person to run.</summary>
+public delegate Task<(bool Installed, string Said, string? ToRun)> WorkloadInstall(IReadOnlyList<string> ids, Action<string> stages, Action<string> lines, CancellationToken stop);
+
 /// <summary>The New Project dialog, for New Solution and Add, New Project: the template families read ahead down the
 /// left (<see cref="TemplateFamilies"/>) under a search; on the right the names, where it goes, the family's Type, the
 /// framework, the language and the Type's options (a value set kept by a Type that has it), or a Type's package to
@@ -63,14 +69,14 @@ public sealed class NewProjectDialog : IdeWindow
     /// runs there and its global.json decides what it can make.</summary>
     private string readFrom;
     private readonly Passenger.Editor.Debounce followFolder;
-    private readonly TextBox search = new() { Classes = { StyleClasses.Search }, PlaceholderText = "Search", Margin = new Thickness(8, 8, 8, 6) };
+    private readonly TextBox search = new() { Classes = { StyleClasses.Search }, PlaceholderText = "Search", Margin = new Thickness(Gaps.Normal, Gaps.Normal, Gaps.Normal, Gaps.Small) };
     private readonly ListBox list;
     private readonly TextBlock loading;
     private readonly ComboBox typeChooser = new() { Classes = { StyleClasses.Form } };
     private readonly Control typeRow;
     private readonly TextBlock heading;
     private readonly TextBlock description;
-    private readonly TextBlock windowsNote = new() { TextWrapping = TextWrapping.Wrap, Margin = new Thickness(0, 6, 0, 0), IsVisible = false };
+    private readonly TextBlock windowsNote = new() { TextWrapping = TextWrapping.Wrap, Margin = new Thickness(0, Gaps.Tight, 0, 0), IsVisible = false };
     private readonly TextBox solutionName = new() { Classes = { StyleClasses.Search } };
     private readonly TextBox projectName = new() { Classes = { StyleClasses.Search } };
     private readonly TextBox directory = new() { Classes = { StyleClasses.Search } };
@@ -85,6 +91,11 @@ public sealed class NewProjectDialog : IdeWindow
     private readonly Control? formatRow;
     private readonly TextBlock where = new() { Classes = { StyleClasses.Muted }, FontSize = 12, TextWrapping = TextWrapping.Wrap };
     private readonly ComboBox framework = new() { Classes = { StyleClasses.Form } };
+    private readonly TextBlock frameworkNote = new() { Classes = { StyleClasses.Muted }, FontSize = 12, TextWrapping = TextWrapping.Wrap };
+    private readonly Control frameworkNoteRow;
+
+    /// <summary>The framework the person picked for the template chosen, which a Godot game listed again keeps; null for none.</summary>
+    private string? picked;
     private readonly ComboBox language = new() { Classes = { StyleClasses.Form } };
     private readonly Control languageRow;
     private readonly TemplateOptions options = new();
@@ -99,8 +110,11 @@ public sealed class NewProjectDialog : IdeWindow
     private readonly TextBlock progress = new() { Classes = { StyleClasses.Muted }, TextTrimming = TextTrimming.CharacterEllipsis, VerticalAlignment = VerticalAlignment.Center };
     private readonly StackPanel working;
     private readonly TextBlock problem = new() { TextWrapping = TextWrapping.Wrap, IsVisible = false, VerticalAlignment = VerticalAlignment.Center };
+
+    /// <summary>Copies the command the problem shown asks the person to run themselves, shown while there is one.</summary>
+    private readonly CopyButton copyCommand = new("Copy Command") { IsVisible = false, VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(Gaps.Normal, 0, 0, 0) };
     private readonly Button create = DialogFooter.Default("Create");
-    private readonly Button browse = new() { Content = "Browse…", Margin = new Thickness(8, 0, 0, 0) };
+    private readonly Button browse = new() { Content = "Browse…", Margin = new Thickness(Gaps.Normal, 0, 0, 0) };
     private readonly ComboBox setup = new() { Classes = { StyleClasses.Form } };
     private readonly ComboBoxItem[] setups = [.. Enum.GetValues<ProjectSetup>().Select(s => new ComboBoxItem { Content = SetupName(s) })];
     private readonly TextBlock setupNote = new() { Classes = { StyleClasses.Muted }, FontSize = 12, TextWrapping = TextWrapping.Wrap };
@@ -109,6 +123,15 @@ public sealed class NewProjectDialog : IdeWindow
 
     /// <summary>The set-up chosen last, in any dialog, which the next service made offers.</summary>
     public static ProjectSetup Remembered { get; set; }
+
+    /// <summary>What Install runs for a template a .NET workload brings: the window's one install of workloads.</summary>
+    public required WorkloadInstall Workloads { get; init; }
+
+    /// <summary>Where that install puts a workload (<see cref="MainWindow.WorkloadFoldersAsync"/>), asked as the dialog opens.</summary>
+    public required Func<Task<WorkloadFolders>> WorkloadPlace { get; init; }
+
+    /// <summary>Where Install puts a workload, as the offer of one says it; null until known.</summary>
+    private WorkloadFolders? workloadsInto;
 
     /// <summary>Why no container can be set up here (no container engine's command), once asked; null while it can.</summary>
     private string? noEngine;
@@ -137,6 +160,10 @@ public sealed class NewProjectDialog : IdeWindow
     /// framework is chosen by (<see cref="GodotGames.Runnable"/>).</summary>
     private readonly Task<IReadOnlyList<string>> runtimes;
 
+    /// <summary>What a C# Godot game can target for the Godot found to build and run it, read off the window's thread as the
+    /// dialog opens (<see cref="GodotEditorDotnet.TargetsOf"/>); null where nothing here says.</summary>
+    private readonly Task<GodotEditorDotnet.GameTargets?> targets;
+
     /// <summary>A test's hold of the next Create once dotnet new has made its project: what ends it, and what is told it is held.</summary>
     private (Task Release, TaskCompletionSource Reached)? madeHold;
 
@@ -161,6 +188,7 @@ public sealed class NewProjectDialog : IdeWindow
         followFolder = new Passenger.Editor.Debounce(TimeSpan.FromMilliseconds(400), FollowFolderAsync);
         godotFound = BackgroundWork.Run(() => GodotLaunch.Found(godot));
         runtimes = BackgroundWork.Run(() => DotnetMachine.Read().Installation?.Runtimes ?? []);
+        targets = BackgroundWork.Run(async () => await godotFound is { } found ? GodotEditorDotnet.TargetsOf(found, folder) : null);
         create.IsEnabled = false;
         FormRows.Scope(this);
         this.target = target;
@@ -175,7 +203,7 @@ public sealed class NewProjectDialog : IdeWindow
         {
             Classes = { StyleClasses.Tree },
             // The chosen family's band as wide as the search field above, its name where the field's text starts.
-            Padding = new Thickness(8, 0),
+            Padding = new Thickness(Gaps.Normal, 0),
         };
         ReusedRows.Use(list, Item);
         list.SelectionChanged += (_, _) =>
@@ -187,12 +215,12 @@ public sealed class NewProjectDialog : IdeWindow
         };
         search.TextChanged += (_, _) => Filter(searched: true);
         ListKeys.Search(search, list);
-        loading = new TextBlock { Classes = { StyleClasses.Muted }, Text = "Loading templates…", TextWrapping = TextWrapping.Wrap, Margin = new Thickness(12) };
+        loading = new TextBlock { Classes = { StyleClasses.Muted }, Text = "Loading templates…", TextWrapping = TextWrapping.Wrap, Margin = new Thickness(Gaps.Wide) };
         DockPanel leftPanel = new();
         DockPanel.SetDock(search, Dock.Top);
         leftPanel.Children.Add(search);
         leftPanel.Children.Add(new Panel { Children = { list, loading } });
-        Border left = new() { Width = 260, BorderThickness = new Thickness(0, 0, 1, 0), Child = leftPanel };
+        Border left = new() { Width = 260, BorderThickness = Hairlines.After, Child = leftPanel };
         left.Bind(Border.BorderBrushProperty, left.GetResourceObservable(TokenKeys.Divider));
         ReusedRows.Use(typeChooser, TypeItem);
         typeChooser.SelectionChanged += (_, _) =>
@@ -205,7 +233,7 @@ public sealed class NewProjectDialog : IdeWindow
         typeRow = Row("Type:", typeChooser);
 
         heading = new TextBlock { FontSize = 16, FontWeight = FontWeight.SemiBold };
-        description = new TextBlock { Classes = { StyleClasses.Muted }, TextWrapping = TextWrapping.Wrap, Margin = new Thickness(0, 4, 0, 0) };
+        description = new TextBlock { Classes = { StyleClasses.Muted }, TextWrapping = TextWrapping.Wrap, Margin = new Thickness(0, Gaps.Tight, 0, 0) };
         directory.Text = folder;
         browse.Click += (_, _) => IdeErrors.Observe(BrowseAsync());
         Grid folderRow = BrowseRow.Of(directory, browse);
@@ -222,16 +250,23 @@ public sealed class NewProjectDialog : IdeWindow
             ShowWhere();
         };
         format.SelectionChanged += (_, _) => ShowWhere();
-        framework.SelectionChanged += (_, _) => Retarget();
+        framework.SelectionChanged += (_, _) =>
+        {
+            if (!setting)
+            {
+                picked = Framework;
+            }
+            Retarget();
+        };
         language.SelectionChanged += (_, _) => Retarget();
 
-        StackPanel fields = new() { Spacing = 10 };
+        StackPanel fields = new() { Spacing = FormRows.Between };
         projectRow = Row("Project name:", projectName);
         sameRow = Row(null, sameDirectory);
         if (target is null)
         {
             format.HorizontalAlignment = HorizontalAlignment.Left;
-            formatRow = Row("Solution format:", new StackPanel { Spacing = 6, Children = { format, formatNote } });
+            formatRow = Row("Solution format:", new StackPanel { Spacing = Gaps.Small, Children = { format, formatNote } });
             fields.Children.Add(Row("Solution name:", solutionName));
             fields.Children.Add(projectRow);
             fields.Children.Add(Row("Solution directory:", folderRow));
@@ -255,10 +290,12 @@ public sealed class NewProjectDialog : IdeWindow
             }
         };
         setupRow = Row("Set up:", setup);
+        frameworkNoteRow = Row(null, frameworkNote);
+        frameworkNoteRow.IsVisible = false;
         details = new StackPanel
         {
-            Spacing = 10,
-            Children = { Row("Target framework:", framework), languageRow, options.Panel, setupRow, Row(null, new StackPanel { Spacing = 4, Children = { setupNote, installSetup } }), options.Folded, Row(null, command) },
+            Spacing = FormRows.Between,
+            Children = { Row("Target framework:", framework), frameworkNoteRow, languageRow, options.Panel, setupRow, Row(null, new StackPanel { Spacing = Gaps.Tight, Children = { setupNote, installSetup } }), options.Folded, Row(null, command) },
         };
         options.Changed += ShowCommand;
         install.Click += (_, _) => IdeErrors.Observe(InstallAsync());
@@ -271,21 +308,21 @@ public sealed class NewProjectDialog : IdeWindow
         };
         offer = new StackPanel
         {
-            Spacing = 10,
+            Spacing = FormRows.Between,
             IsVisible = false,
             Children = { offerText, offerCommand, install },
         };
         StackPanel right = new()
         {
-            Margin = new Thickness(24, 18, 24, 18),
-            Spacing = 10,
-            Children = { new StackPanel { Children = { heading, description, windowsNote }, Margin = new Thickness(0, 0, 0, 8) }, fields, Rule(), typeRow, details, offer, installOutput },
+            [DialogFooter.InsetProperty] = true,
+            Spacing = FormRows.Between,
+            Children = { new StackPanel { Children = { heading, description, windowsNote }, Margin = new Thickness(0, 0, 0, Gaps.Normal) }, fields, Rule(), typeRow, details, offer, installOutput },
         };
         Border rightPane = new() { Child = new ScrollViewer { Content = right } };
 
         problem.Classes.Add(StyleClasses.Error);
         windowsNote.Bind(TextBlock.ForegroundProperty, windowsNote.GetResourceObservable(TokenKeys.Warning));
-        working = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 10, IsVisible = false, Children = { bar, progress } };
+        working = new StackPanel { Orientation = Orientation.Horizontal, Spacing = Gaps.Normal, IsVisible = false, Children = { bar, progress } };
         create.Click += (_, _) => IdeErrors.Observe(CreateAsync());
         Closing += (_, _) =>
         {
@@ -295,13 +332,17 @@ public sealed class NewProjectDialog : IdeWindow
         // What a read brings while the dialog is open (an install, another SDK) fills it in.
         Action changed = () => IdeErrors.Observe(RefreshAsync());
         ProjectTemplates.Changed += changed;
+        // A person back from a terminal's install comes to the dialog, not the window under it.
+        Activated += (_, _) => ProjectTemplates.LookAgain();
         Closed += (_, _) =>
         {
             ProjectTemplates.Changed -= changed;
             followFolder.Stop();
         };
         DockPanel.SetDock(left, Dock.Left);
-        Content = DialogFooter.Page(new DockPanel { Children = { left, rightPane } }, DialogFooter.OkCancel(create, Cancel, new Panel { Children = { problem, working } }));
+        DockPanel.SetDock(copyCommand, Dock.Right);
+        Content = DialogFooter.Page(new DockPanel { Children = { left, rightPane } },
+            DialogFooter.OkCancel(create, Cancel, new Panel { Children = { new DockPanel { Children = { copyCommand, problem } }, working } }));
         ShowTemplate(null);
         typeRow.IsVisible = false;
         readFrom = target is null ? folder : Path.GetDirectoryName(target.Solution)!;
@@ -327,7 +368,26 @@ public sealed class NewProjectDialog : IdeWindow
         {
             FocusName();
             Dispatcher.UIThread.Post(FocusName, DispatcherPriority.Loaded);
+            IdeErrors.Observe(AskWorkloadPlaceAsync());
         };
+    }
+
+    /// <summary>Where Install puts a workload, said in the offer of one shown once known.</summary>
+    private async Task AskWorkloadPlaceAsync()
+    {
+        try
+        {
+            workloadsInto = await WorkloadPlace();
+        }
+        catch (FileNotFoundException)
+        {
+            // No .NET: the offer names no place, and Install says what is missing.
+            return;
+        }
+        if (template is { Pack: { IsWorkload: true } pack } shown && pack.WhyNotFor(shown.Name) is null)
+        {
+            offerCommand.Text = Offered(pack);
+        }
     }
 
     /// <summary>The read of the folder's templates, done once they are listed or the dialog says why they could not be.</summary>
@@ -478,6 +538,9 @@ public sealed class NewProjectDialog : IdeWindow
     /// null when none.</summary>
     public string? Problem => problem.IsVisible ? problem.Text : null;
 
+    /// <summary>Copy Command, shown beside a problem that asks the person to run a command themselves.</summary>
+    public CopyButton CopyCommandButton => copyCommand;
+
     private bool SolutionNamed => SolutionName.Length > 0 && SolutionName != solutionGiven;
 
     private bool ProjectNamed => ProjectName.Length > 0 && ProjectName != projectGiven;
@@ -492,8 +555,12 @@ public sealed class NewProjectDialog : IdeWindow
     public Button CreateButton => create;
 
     /// <summary>What the dialog notes of the template chosen before Create: a Windows-only app's off Windows, a Godot game's
-    /// without the Godot it needs; null for any other.</summary>
+    /// without the Godot it needs or on a framework that Godot's editor builds or runs no game of here; null for any other.</summary>
     public string? WindowsNote => windowsNote.IsVisible ? windowsNote.Text : null;
+
+    /// <summary>What the dialog says under the framework: a C# Godot game's newest .NET that its Godot builds and runs here,
+    /// where older than Passenger's; null where it says nothing.</summary>
+    public string? FrameworkNote => frameworkNoteRow.IsVisible ? frameworkNote.Text : null;
 
     /// <summary>What Create made, once it closed the dialog; null until then, and when given up.</summary>
     public CreatedProjects? Created { get; private set; }
@@ -536,6 +603,11 @@ public sealed class NewProjectDialog : IdeWindow
             {
                 Directory.CreateDirectory(plan.Root);
                 writes.Made(plan.Root);
+            }
+            // A new solution's folder is the person's own code from its first file, trusted before anything is restored.
+            if (target is null && WorkspaceTrust.TrustsAlone(PathNames.Canonical(plan.Root)) && !AgentAsks.PersonsAlone(Refusals.TrustIsThePersons))
+            {
+                WorkspaceTrust.Trust(PathNames.Canonical(plan.Root));
             }
             if (plan.Solution is not null && !template.IsSolution)
             {
@@ -702,24 +774,40 @@ public sealed class NewProjectDialog : IdeWindow
         : GodotGames.WhyNot(godotFound.Result, ScriptGame, GodotLaunch.NotFound);
 
     /// <summary>Passenger's own Godot game beside dotnet new's templates, its C# project on those frameworks the console app
-    /// offers that Godot runs, as far as the runtimes are read yet.</summary>
+    /// offers that Godot runs, as far as the runtimes are read yet, by default the newest the Godot found's editor builds and
+    /// runs here (<see cref="GodotGames.Default"/>), once read.</summary>
     private TemplateFamily GodotFamily(TemplateCatalog read)
     {
         TemplateVariant? console = read.Templates.FirstOrDefault(t => t.Pack is null && t.ShortNames.Contains("console"))?.Variant("C#", null);
         IReadOnlyList<string> offered = console?.Frameworks ?? [];
         IReadOnlyList<string> runs = runtimes.IsCompletedSuccessfully ? GodotGames.Runnable(offered, runtimes.Result) : offered;
-        ProjectTemplate game = OwnTemplates.GodotGame(runs, runs.FirstOrDefault(), scripts: target is null);
+        ProjectTemplate game = OwnTemplates.GodotGame(runs, GodotGames.Default(runs, GodotTargets?.Newest?.Major), scripts: target is null);
         return new TemplateFamily(game.Name, [game]);
     }
 
-    /// <summary>Once the Godot is found and the runtimes read, the Godot game listed again on the frameworks Godot runs, and
-    /// the template chosen shown again for a Godot game's words.</summary>
+    /// <summary>What a C# Godot game can target for the Godot found, once read; null before, or where nothing here says.</summary>
+    private GodotEditorDotnet.GameTargets? GodotTargets => targets.IsCompletedSuccessfully ? targets.Result : null;
+
+    /// <summary>What the dialog says under a C# Godot game's framework: the newest .NET whose game the Godot found's editor
+    /// builds and runs here, where older than Passenger's own; null for any other.</summary>
+    private string? GodotDotnetSaid()
+    {
+        if (template is not { GodotGame: true } || ScriptGame || GodotTargets is not { Newest: { } newest } godot || !runtimes.IsCompletedSuccessfully
+            || runtimes.Result.Where(r => !VersionOrder.IsPrerelease(r)).Select(VersionOrder.Major).Max() is not int own || own <= newest.Major)
+        {
+            return null;
+        }
+        return $"{godot.Editor} builds and runs a game here on .NET {newest.Major} at most, that of {PathNames.Shown(newest.Root, null)}, older than Passenger's .NET {own}";
+    }
+
+    /// <summary>Once the Godot is found, the runtimes read and what it builds and runs, the Godot game listed again on the
+    /// frameworks Godot runs, and the template chosen shown again for a Godot game's words.</summary>
     private async Task ShowGodotAsync()
     {
-        await Task.WhenAll(godotFound, runtimes);
+        await Task.WhenAll(godotFound, runtimes, targets);
         if (catalog is not null && creating is null)
         {
-            families = [.. families.Where(f => !f.Types.Any(t => t.GodotGame)), GodotFamily(catalog)];
+            families = TemplateFamilies.With([.. families.Where(f => !f.Types.Any(t => t.GodotGame))], GodotFamily(catalog));
             Filter(searched: false);
         }
         if (template is { GodotGame: true })
@@ -748,13 +836,14 @@ public sealed class NewProjectDialog : IdeWindow
         return reached.Task;
     }
 
-    /// <summary>Install, as its button does: dotnet new install of the chosen template's package, its output shown as it
+    /// <summary>Install, as its button does: the chosen template's package or workload installed, its output shown as it
     /// comes, then the templates read again and the one installed chosen, with its options.</summary>
-    public Task InstallAsync() => template is { Pack: { } pack } wanted ? InstallAsync(pack, wanted) : Task.CompletedTask;
+    public Task InstallAsync() => template is { Pack: { Unbuilt: null } pack } wanted ? InstallAsync(pack, wanted) : Task.CompletedTask;
 
-    /// <summary>dotnet new install of a package, its output shown as it comes, then the templates read again: for the
-    /// template chosen (<paramref name="wanted"/>), which the one installed takes the place of, else for a set-up the
-    /// package's templates make, offered once they are read. Output of a failure stays shown.</summary>
+    /// <summary>dotnet new install of a package, or a workload through the window's one install of them (<see cref="Workloads"/>),
+    /// its output shown as it comes, then the templates read again: for the template chosen (<paramref name="wanted"/>),
+    /// which the one installed takes the place of, else for a set-up the package's templates make, offered once they are
+    /// read. Output of a failure stays shown.</summary>
     private async Task InstallAsync(TemplatePack pack, ProjectTemplate? wanted)
     {
         if (installing is not null || creating is not null)
@@ -764,31 +853,20 @@ public sealed class NewProjectDialog : IdeWindow
         using CancellationTokenSource cancel = new();
         installing = cancel;
         Fail(null);
-        progress.Text = $"Installing {pack.Id} (dotnet new install {pack.Id})…";
+        progress.Text = $"Installing {pack.Named} ({pack.Command})…";
         Busy(true);
         installOutput.Clear();
         installOutput.IsVisible = true;
-        using ProcessRunner runner = new(installOutput);
         try
         {
-            if (runner.StartDotnet(ProjectTemplates.New(["install", pack.Id]), InstallFolder()) is { } refused)
-            {
-                Fail($"Installation of {pack.Id} has failed: {refused}");
-                return;
-            }
-            BackgroundWork.Track(runner.Ended);
-            int code;
-            using (cancel.Token.Register(runner.Stop))
-            {
-                code = await runner.Ended;
-            }
+            (string? failed, string? run) = pack.IsWorkload ? await InstallWorkloadAsync(pack, cancel.Token) : (await InstallPackageAsync(pack, cancel.Token), null);
             if (cancel.IsCancellationRequested)
             {
                 return;
             }
-            if (code != 0)
+            if (failed is not null)
             {
-                Fail($"Installation of {pack.Id} has failed ({ExitCodes.Said(code)}): its output says why");
+                Fail(failed, run);
                 return;
             }
             ProjectTemplates.Forget();
@@ -797,7 +875,7 @@ public sealed class NewProjectDialog : IdeWindow
             await RefreshAsync();
             if (wanted is not null && template is { Pack: not null })
             {
-                Fail($"{pack.Id} is installed, but dotnet new has no {wanted.Name} ({wanted.ShortName}) from it");
+                Fail($"{pack.Named} is installed, but dotnet new has no {wanted.Name} ({wanted.ShortName}) from it");
             }
             else if (wanted is null && AspireMissing() is not null)
             {
@@ -813,6 +891,31 @@ public sealed class NewProjectDialog : IdeWindow
             installing = null;
             Busy(false);
         }
+    }
+
+    /// <summary>dotnet new install of a package, its output shown as it comes: null once installed, else why not.</summary>
+    private async Task<string?> InstallPackageAsync(TemplatePack pack, CancellationToken cancel)
+    {
+        using ProcessRunner runner = new(installOutput);
+        if (runner.StartDotnet(ProjectTemplates.New(["install", pack.Id]), InstallFolder()) is { } refused)
+        {
+            return $"Installation of {pack.Named} has failed: {refused}";
+        }
+        BackgroundWork.Track(runner.Ended);
+        int code;
+        using (cancel.Register(runner.Stop))
+        {
+            code = await runner.Ended;
+        }
+        return code == 0 ? null : $"Installation of {pack.Named} has failed ({ExitCodes.Said(code)}): its output says why";
+    }
+
+    /// <summary>A workload installed through the window's one install of them, its stages said under the dialog and the
+    /// lines dotnet writes shown as they come: null once installed, else what it came to and any command left the person to run.</summary>
+    private async Task<(string? Failed, string? ToRun)> InstallWorkloadAsync(TemplatePack pack, CancellationToken cancel)
+    {
+        (bool installed, string said, string? run) = await Workloads([pack.Id], stage => progress.Text = $"{stage}…", line => installOutput.Sink.Write($"{line}\n"), cancel);
+        return installed ? (null, null) : (said, run);
     }
 
     /// <summary>Where dotnet new install runs, whose NuGet configuration says where the package comes from: the directory
@@ -861,7 +964,7 @@ public sealed class NewProjectDialog : IdeWindow
         }
         if (template.Pack is { } pack)
         {
-            return $"{template.Name} comes with {pack.Id}, which is not installed: Install it first";
+            return pack.WhyNotFor(template.Name) ?? $"{template.Name} comes with {pack.Named}, which is not installed: Install it first";
         }
         if (template.GodotGame && GodotWhyNot() is { } godot)
         {
@@ -896,6 +999,11 @@ public sealed class NewProjectDialog : IdeWindow
         if (Directory.Exists(root) && Directory.EnumerateFileSystemEntries(root).Any())
         {
             return $"{what} already exists in this location: {root} is not empty";
+        }
+        // A folder not trusted (a new solution's an agent's input makes too) takes no restore, which a template that cannot skip it would run.
+        if (Variant() is { Restores: true, SkipRestoreOption: null } && !WorkspaceTrust.Trusts(root) && (target is not null || AgentAsks.Inputting || !WorkspaceTrust.TrustsAlone(PathNames.Canonical(root))))
+        {
+            return Refusals.RestoresUntrusted(template.Name);
         }
         return options.WhyNot();
     }
@@ -1163,7 +1271,7 @@ public sealed class NewProjectDialog : IdeWindow
             return;
         }
         catalog = read;
-        families = [.. read.Families.Select(f => target is null ? f : f.Projects()).OfType<TemplateFamily>(), GodotFamily(read)];
+        families = TemplateFamilies.With([.. read.Families.Select(f => target is null ? f : f.Projects()).OfType<TemplateFamily>()], GodotFamily(read));
         setting = true;
         string? formatWas = format.SelectedItem as string;
         List<string> formats = [.. read.SolutionFormats.Select(f => $".{f}")];
@@ -1264,6 +1372,10 @@ public sealed class NewProjectDialog : IdeWindow
         {
             return;
         }
+        if (lastChosen is null || KnownBy(lastChosen) != KnownBy(chosen))
+        {
+            picked = null;
+        }
         lastChosen = chosen;
         typeOf[chosen.Family] = KnownBy(chosen);
         if (!sameChosen)
@@ -1308,15 +1420,19 @@ public sealed class NewProjectDialog : IdeWindow
         string? was = Framework;
         framework.ItemsSource = frameworks;
         TemplateVariant newest = template.Variant(Language, null);
-        framework.SelectedItem = was is not null && frameworks.Contains(was) ? was : newest.DefaultFramework ?? frameworks.FirstOrDefault();
+        // A Godot game's default is what its Godot builds and runs, read later, so only a framework the person picked stays.
+        bool kept = was is not null && frameworks.Contains(was) && (!template.GodotGame || was == picked);
+        framework.SelectedItem = kept ? was : newest.DefaultFramework ?? frameworks.FirstOrDefault();
         setting = false;
         framework.IsEnabled = frameworks.Count > 1;
         languageRow.IsVisible = template.Languages.Count > 1;
         heading.Text = template.Name;
         description.Text = Variant().Description;
         windowsNote.Text = template.WindowsOnly is { } desktop ? $"{desktop} runs only on Windows: Passenger builds the project here for its code help, and Run, Debug and Profile need Windows"
-            : GodotWhyNot();
+            : GodotWhyNot() ?? (template.GodotGame && !ScriptGame ? GodotTargets?.WhyNot(Framework) : null);
         windowsNote.IsVisible = windowsNote.Text is not null;
+        frameworkNote.Text = GodotDotnetSaid();
+        frameworkNoteRow.IsVisible = frameworkNote.Text is not null;
         // A GDScript game is its folder alone: no project to name, nor a solution's format.
         projectRow.IsVisible = !template.IsSolution && !ScriptGame;
         sameRow.IsVisible = target is null && !template.IsSolution && !ScriptGame;
@@ -1331,7 +1447,7 @@ public sealed class NewProjectDialog : IdeWindow
     /// the link under the note installs. A greyed set-up says why on hover too.</summary>
     private void ShowSetup()
     {
-        string? why = template is null ? null : NotAService(template);
+        string? why = template is null ? null : NotAService(template, Variant());
         string? noContainers = noEngine is { } none ? $"{none}: Docker and Docker Compose are not offered" : null;
         foreach (ProjectSetup kind in (ProjectSetup[])[ProjectSetup.Dockerfile, ProjectSetup.SdkContainer, ProjectSetup.Compose])
         {
@@ -1389,17 +1505,23 @@ public sealed class NewProjectDialog : IdeWindow
         _ => "None",
     };
 
-    /// <summary>Why a template's project is set up to run no other way: it is no service (web, API, worker, Blazor, gRPC), or
-    /// it runs in the browser (<see cref="InBrowser"/>); null for one that is a service.</summary>
-    private static string? NotAService(ProjectTemplate template)
+    /// <summary>Why a template's project is set up to run no other way: it is no service (web, API, worker, Blazor, gRPC), it
+    /// makes a library whatever it is tagged (<see cref="TemplateVariant.OutputType"/>), or it runs in the browser (<see
+    /// cref="InBrowser"/>); null for one that is a service.</summary>
+    private static string? NotAService(ProjectTemplate template, TemplateVariant variant)
     {
         HashSet<string> kinds = new(template.Classifications, StringComparer.OrdinalIgnoreCase);
         if (InBrowser(template))
         {
             return $"{template.Name} runs in the browser, served by its development server: containers and Aspire are set up for services, which run on a server";
         }
-        return !template.IsSolution && (kinds.Contains("Web") || kinds.Contains("Worker")) && !kinds.Overlaps(["Test", "Library", "Desktop"]) ? null
-            : $"{template.Name} is not a service: containers and Aspire are set up for web, API, worker, Blazor and gRPC projects";
+        if (template.IsSolution || !(kinds.Contains("Web") || kinds.Contains("Worker")) || kinds.Overlaps(["Test", "Library", "Desktop"]))
+        {
+            return $"{template.Name} is not a service: containers and Aspire are set up for web, API, worker, Blazor and gRPC projects";
+        }
+        return string.Equals(variant.OutputType, TemplateProjects.Library, StringComparison.OrdinalIgnoreCase)
+            ? $"{template.Name} is not a service: its project is a class library, which makes no program to run in a container or under Aspire"
+            : null;
     }
 
     /// <summary>Whether a template's project runs wholly in the browser on .NET's WebAssembly runtime: Blazor's standalone
@@ -1465,8 +1587,11 @@ public sealed class NewProjectDialog : IdeWindow
         formatRow?.IsVisible = !solution;
         if (chosen is { Pack: { } pack })
         {
-            offerText.Text = pack.Offer;
-            offerCommand.Text = $"{pack.Id} is not installed. Install runs dotnet new install {pack.Id}, which takes it from the NuGet feeds this directory uses.";
+            string? whyNot = pack.WhyNotFor(chosen.Name);
+            offerText.Text = whyNot ?? pack.Offer;
+            offerCommand.Text = whyNot is not null ? $"{char.ToUpperInvariant(pack.Named[0])}{pack.Named[1..]} is not installed, and Passenger offers no install of it here."
+                : Offered(pack);
+            install.IsVisible = whyNot is null;
             installOutput.IsVisible = false;
         }
         if (chosen is null)
@@ -1476,6 +1601,13 @@ public sealed class NewProjectDialog : IdeWindow
             windowsNote.IsVisible = false;
         }
     }
+
+    /// <summary>What the offer of a package not installed says Install does: where a workload goes once that is known
+    /// (<see cref="WorkloadInstalls.Into"/>), the feeds a package comes from.</summary>
+    private string Offered(TemplatePack pack) => pack.IsWorkload
+        ? $"{char.ToUpperInvariant(pack.Named[0])}{pack.Named[1..]} is not installed. Install runs {pack.Command}, which installs it from NuGet"
+            + $"{(workloadsInto is { } into ? $" {WorkloadInstalls.Into(into)}" : string.Empty)}."
+        : $"{pack.Id} is not installed. Install runs {pack.Command}, which takes it from the NuGet feeds this directory uses.";
 
     /// <summary>Puts the dialog's own name in a box; one with the keys keeps it chosen, so what is typed replaces it.</summary>
     private void Set(TextBox box, string text)
@@ -1507,11 +1639,18 @@ public sealed class NewProjectDialog : IdeWindow
         }
     }
 
-    private void Fail(string? why) => TemplateList.Fail(problem, why);
+    /// <summary>Shows why the dialog can't go on, or nothing; with the command the person is to run, offering to copy it.</summary>
+    private void Fail(string? why, string? run = null)
+    {
+        TemplateList.Fail(problem, why);
+        copyCommand.Text = why is null ? null : run;
+        copyCommand.IsVisible = copyCommand.Text is not null;
+    }
 
     private void Busy(bool busy)
     {
         TemplateList.Busy(problem, working, busy);
+        copyCommand.IsVisible = !busy && copyCommand.Text is not null;
         create.IsEnabled = !busy && template is { Pack: null };
         install.IsEnabled = !busy;
         installSetup.IsEnabled = !busy;
@@ -1537,7 +1676,7 @@ public sealed class NewProjectDialog : IdeWindow
         {
             string types = row.Types.Count > 1 ? $": {string.Join(", ", row.Types.Select(t => t.TypeName))}" : row.Name == row.Types[0].Name ? string.Empty : $": {row.Types[0].Name}";
             bool windows = row.Types.All(t => t.WindowsOnly is not null);
-            ToolTip.SetTip(item, row.NotInstalled ? $"{row.Name}{types}, from {row.Types[0].Pack!.Id}, which is not installed"
+            ToolTip.SetTip(item, row.NotInstalled ? $"{row.Name}{types}, from {row.Types[0].Pack!.Named}, which is not installed"
                 : windows ? $"{row.Name}{types}: they build here but run only on Windows" : $"{row.Name}{types}");
             name.Text = row.Name;
             Mark(mark, row.NotInstalled ? NotInstalled : windows ? WindowsOnly : null);
@@ -1571,7 +1710,7 @@ public sealed class NewProjectDialog : IdeWindow
     /// shown only where it says something.</summary>
     private Control Rule()
     {
-        Border rule = new() { Height = 1, Margin = new Thickness(0, 6) };
+        Border rule = new() { Height = 1, Margin = new Thickness(0, Gaps.Small) };
         rule.Bind(Border.BackgroundProperty, rule.GetResourceObservable(TokenKeys.Separator));
         return rule;
     }

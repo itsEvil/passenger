@@ -223,6 +223,139 @@ public sealed class BranchesTests : IDisposable
         window.Close();
     }
 
+    /// <summary>The panel's side buttons act only where they can, each greyed elsewhere with a tip saying why after its name:
+    /// Update Selected on a local branch tracking a remote's (which it updates), never a remote's branch (Fetch's), a tag,
+    /// HEAD or a group; Delete on any branch or tag but the one checked out; New Branch… and Navigate on any, Navigate in a
+    /// log filtered to a branch lacking the head too; Mark/Unmark As Favorite on a branch. The menu and Delete key agree.</summary>
+    [AvaloniaFact]
+    public void Each_side_button_is_greyed_with_why_where_the_chosen_row_gives_it_nothing_to_act_on()
+    {
+        MainWindow window = Open();
+        BranchesPanel panel = window.GitBranches;
+        ListBox rows = List(panel);
+        string[] nothing = [$"New Branch…: {Refusals.NoRefChosen}", $"Update Selected: {Refusals.NoLocalBranchChosen}", $"Delete: {Refusals.NoRefChosen}",
+            $"Mark/Unmark As Favorite: {Refusals.NoBranchChosen}", $"Navigate Log to Selected Branch Head: {Refusals.NoRefChosen}"];
+        string[] all = ["New Branch…", "Update Selected", "Delete", "Mark/Unmark As Favorite", "Navigate Log to Selected Branch Head"];
+        Assert.Null(panel.Selected);
+        Assert.Equal(nothing, Tools(panel));
+        panel.Toggle(panel.Rows.Single(r => r.Key == "tags"));
+        Ui.Settle();
+        foreach ((string key, string[] tools) in (ReadOnlySpan<(string, string[])>)[
+            ("head", nothing),
+            ("local", nothing),
+            ("refs/heads/main", [all[0], all[1], $"Delete: {Refusals.CheckedOut("main")}", all[3], all[4]]),
+            ("local/team/", nothing),
+            ("refs/heads/team/login", [all[0], $"Update Selected: {Refusals.Untracked("team/login")}", all[2], all[3], all[4]]),
+            ("refs/heads/feature", all),
+            ("remote", nothing),
+            ("remote/origin", nothing),
+            ("refs/remotes/origin/main", [all[0], $"Update Selected: {Refusals.FetchedNotUpdated("origin/main")}", all[2], all[3], all[4]]),
+            ("tags", nothing),
+            ("refs/tags/v1.0", [all[0], $"Update Selected: {Refusals.NoLocalBranchChosen}", all[2], $"Mark/Unmark As Favorite: {Refusals.NoBranchChosen}", all[4]])])
+        {
+            BranchNode row = panel.Rows.Single(r => r.Key == key);
+            Ui.Click(Ui.Row(rows, row));
+            Assert.Same(row, panel.Selected);
+            Assert.Equal(tools, Tools(panel));
+            if (row.Branch is not { } branch)
+            {
+                continue;
+            }
+            // The row's menu offers what the buttons do where they do it, its Update greyed with the same why.
+            MenuItem[] menu = MenuOf(rows);
+            Assert.Equal(SideButton(panel, "New Branch…").IsEnabled, menu.Any(i => i.Header as string == $"New Branch from '{branch.Name}'…"));
+            Assert.Equal(SideButton(panel, "Delete").IsEnabled, menu.Any(i => i.Header as string == "Delete"));
+            if (menu.FirstOrDefault(i => i.Header as string == "Update") is { } update)
+            {
+                Assert.Equal(SideButton(panel, "Update Selected").IsEnabled, update.IsEnabled);
+                Assert.Equal(update.IsEnabled ? null : Refusals.Untracked(branch.Name), ToolTip.GetTip(update));
+            }
+            else
+            {
+                Assert.True(branch.Kind != RefKind.Local, $"{branch.Name}'s menu has no Update");
+            }
+        }
+
+        // Navigate keeps a branch filter holding the head, and shows every branch again where the filter's history lacks it.
+        GitLogView log = window.GitLog;
+        Assert.True(panel.Select("feature"));
+        panel.Activate(panel.Selected!);
+        Assert.True(panel.Select("main"));
+        Ui.Click(SideButton(panel, "Navigate Log to Selected Branch Head"));
+        Ui.Landed(() => log.Selected?.Hash == Git("rev-parse", "main").Trim(), "main's head chosen in the log filtered to feature");
+        Assert.Equal("refs/heads/feature", log.BranchFilter);
+        panel.Activate(panel.Selected!);
+        Assert.True(panel.Select("feature"));
+        Ui.Click(SideButton(panel, "Navigate Log to Selected Branch Head"));
+        Ui.Landed(() => log.Selected?.Hash == Git("rev-parse", "feature").Trim(), "feature's head chosen in the log once filtered to main");
+        Assert.Null(log.BranchFilter);
+
+        // The Delete key leaves the branch checked out, as the greyed Delete does.
+        window.Confirm = (_, _, _) => throw new InvalidOperationException("Delete on the branch checked out asked to delete it");
+        Assert.True(panel.Select("main"));
+        panel.FocusRows();
+        Ui.Press(window, "Delete");
+        Assert.Contains("main", LocalBranches());
+
+        // Update Selected on feature brings it up to the commit pushed to origin's since, fetched by the update itself.
+        string clone = TestFolders.Create("branches-clone-");
+        TestGit.Run(clone, "clone", "-q", "-b", "feature", origin, ".");
+        TestGit.Run(clone, "config", GitConfigKeys.UserEmail, "tests@passenger.invalid");
+        TestGit.Run(clone, "config", "user.name", "Passenger Tests");
+        File.WriteAllText(Path.Combine(clone, "Feature.cs"), "class Feature { int more; }\n");
+        TestGit.Run(clone, "commit", "-q", "-am", "More");
+        TestGit.Run(clone, "push", "-q", "origin", "feature");
+        string pushed = TestGit.Run(clone, "rev-parse", "HEAD").Trim();
+        TestFolders.Delete(clone);
+        Assert.True(panel.Select("feature"));
+        Ui.Click(SideButton(panel, "Update Selected"));
+        Ui.Landed(() => Git("rev-parse", "feature").Trim() == pushed, "feature updated to the commit pushed to origin");
+        Assert.Equal("Updated feature", window.Status);
+        window.Close();
+    }
+
+    /// <summary>A side button pressed as the branches are listed again (the log reading its history afresh, its filter's
+    /// branch with it) acts on its release: the panel keeps its choice through the listing, so its buttons never grey for
+    /// that moment, which let go of the press and lost the click.</summary>
+    [AvaloniaFact]
+    public void Navigate_pressed_as_the_branches_are_listed_again_chooses_the_head_on_its_release()
+    {
+        MainWindow window = Open();
+        BranchesPanel panel = window.GitBranches;
+        GitLogView log = window.GitLog;
+        Assert.True(panel.Select("feature"));
+        panel.Activate(panel.Selected!);
+        Ui.Settle();
+        Assert.True(panel.Select("main"));
+        Ui.ClickAcross(SideButton(panel, "Navigate Log to Selected Branch Head"), () => Ui.Await(log.LoadAsync(), "the log and its branches read again"));
+        Ui.Landed(() => log.Selected?.Hash == Git("rev-parse", "main").Trim(), "main's head chosen in the log filtered to feature, Navigate pressed as the branches were listed again");
+        Assert.Equal("refs/heads/feature", log.BranchFilter);
+        window.Close();
+    }
+
+    /// <summary>Navigate asked while the log still reads the history of the branch it was just filtered to decides on that
+    /// history, not the rows listed before it: feature's head, which main's history lacks, is chosen with every branch shown
+    /// again, where it was chosen among the rows of every branch and then lost as main's landed.</summary>
+    [AvaloniaFact]
+    public void Navigate_asked_as_the_log_reads_a_filter_lacking_the_head_shows_every_branch_and_chooses_it()
+    {
+        MainWindow window = Open();
+        BranchesPanel panel = window.GitBranches;
+        GitLogView log = window.GitLog;
+        Ui.Landed(() => log.Rows.Count == 3, "every branch's three commits");
+        TaskCompletionSource release = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        Task held = log.HoldNextRead(release.Task);
+        Assert.True(panel.Select("main"));
+        panel.Activate(panel.Selected!);
+        Ui.AwaitPumped(held, "the log's read of main's history, held once git answered");
+        Assert.True(panel.Select("feature"));
+        Ui.Click(SideButton(panel, "Navigate Log to Selected Branch Head"));
+        release.SetResult();
+        Ui.Landed(() => log.Selected?.Hash == Git("rev-parse", "feature").Trim(), "feature's head chosen in the log asked while main's history was read");
+        Assert.Null(log.BranchFilter);
+        window.Close();
+    }
+
     [Gate]
     [AvaloniaFact]
     public void Merge_into_rebase_onto_and_checkout_and_rebase_onto_current_move_the_branches_as_git_would()
@@ -266,7 +399,7 @@ public sealed class BranchesTests : IDisposable
 
         Choose(panel, rows, "feature", "Compare with 'main'");
         Assert.Equal(["Log", "Compare main and feature"], window.GitWindow.Titles);
-        GitLogView feature = window.GitWindow.Shown;
+        GitLogView feature = Assert.IsType<GitLogView>(window.GitWindow.Shown);
         Ui.Settle();
         Assert.Equal(["Feature"], feature.Rows.Select(r => r.Commit.Subject));
         GitLogView main = Avalonia.VisualTree.VisualExtensions.GetVisualDescendants(window.GitWindow).OfType<GitLogView>().Single(v => v.Range?.To == "main");
@@ -277,16 +410,75 @@ public sealed class BranchesTests : IDisposable
         Ui.Settle();
 
         Choose(panel, rows, "feature", "Show Diff with Working Tree");
-        ChangesWindow changes = Assert.IsType<ChangesWindow>(window.Frontmost);
-        Assert.Equal("Changes Between feature and Current Working Tree", changes.Title);
+        Assert.Equal(["Log", "Compare main and feature", "Compare feature and Working Tree"], window.GitWindow.Titles);
+        WorkingTreeDiffView changes = Assert.IsType<WorkingTreeDiffView>(window.GitWindow.Shown);
         Assert.Equal(["Feature.cs Deleted", "Notes.txt Added", "Shop.cs Modified"], changes.Files.Select(f => $"{f.Name} {f.Kind}").Order());
-        changes.Select(changes.Files.Single(f => f.Name == "Shop.cs"));
-        changes.Open();
-        Ui.Landed(() => window.Frontmost is DiffWindow, "Shop.cs as feature has it beside the file");
-        DiffWindow diff = (DiffWindow)window.Frontmost;
-        Assert.Equal(Shop, diff.View.Left.Document.Snapshot.ToString());
+        Ui.Click(Ui.Row(changes.List, changes.Files.Single(f => f.Name == "Shop.cs")));
+        Ui.Press(window, "ENTER");
+        IDiffHost diff = OpenDiffs.Landed(window, "Shop.cs as feature has it beside the file");
+        Assert.Equal(Shop, OpenDiffs.ViewOf(diff).Left.Document.Snapshot.ToString());
         diff.Close();
-        changes.Close();
+        window.Close();
+    }
+
+    /// <summary>Show Diff with Working Tree lists a branch's files that differ from the working tree in a tab of the Git
+    /// window, said above them, the first chosen with the keys; a file's diff opens beside the editors' files as a tab with
+    /// diffs set to open as tabs, and over them in a window of its own with diffs set to open in windows, the list staying in
+    /// the Git window either way. The list follows the working tree, and a branch nothing differs from says so.</summary>
+    [AvaloniaFact]
+    public void Show_diff_with_working_tree_lists_the_files_in_the_Git_window_and_opens_their_diffs_in_a_tab_or_a_window()
+    {
+        Commit("Notes.txt", "notes\n", "Notes on main");
+        File.WriteAllText(Path.Combine(folder, "Shop.cs"), Shop.Replace("int count", "long count", StringComparison.Ordinal));
+        MainWindow window = Open();
+        BranchesPanel panel = window.GitBranches;
+        ListBox rows = List(panel);
+
+        Choose(panel, rows, "feature", "Show Diff with Working Tree");
+        Assert.Equal(["Log", "Compare feature and Working Tree"], window.GitWindow.Titles);
+        WorkingTreeDiffView changes = Assert.IsType<WorkingTreeDiffView>(window.GitWindow.Shown);
+        Assert.Contains(Avalonia.VisualTree.VisualExtensions.GetVisualDescendants(window.GitWindow).OfType<TextBlock>(),
+            t => t.Text == "Files that differ between feature and the working tree");
+        Assert.Equal(["Feature.cs Deleted", "Notes.txt Added", "Shop.cs Modified"], changes.Files.Select(f => $"{f.Name} {f.Kind}").Order());
+        Assert.True(changes.List.SelectedIndex == 0 && changes.List.IsKeyboardFocusWithin,
+            $"The list opened with row {changes.List.SelectedIndex} chosen and the keys {(changes.List.IsKeyboardFocusWithin ? "in" : "out of")} it, not on its first file");
+
+        // Diffs set to open as tabs: Shop.cs's opens beside the files, the Git window still listing the branch's.
+        window.ApplySettings(window.Settings with { OpenDiffsIn = Passenger.App.Settings.DiffPlace.Tab });
+        Ui.Click(Ui.Row(changes.List, changes.Files.Single(f => f.Name == "Shop.cs")));
+        Ui.Press(window, "ENTER");
+        DiffTab tab = Assert.IsType<DiffTab>(OpenDiffs.Landed(window, "Shop.cs as feature has it, in a tab beside the file"));
+        Assert.Equal("Shop.cs: feature and your version", tab.Document.Title);
+        Assert.Same(tab.Document, window.EditorArea.Active);
+        Assert.Equal(Shop, OpenDiffs.ViewOf(tab).Left.Document.Snapshot.ToString());
+        Assert.True(window.DockHost.IsShown(ToolWindowIds.Git) && window.GitWindow.Shown == changes && changes.IsVisible,
+            "The diff's tab opened, the Git window no longer showed the branch's files");
+        tab.Close();
+        Ui.Settle();
+
+        // Diffs set to open in windows: Shop.cs's opens in a window of its own over the IDE's, the list staying.
+        window.ApplySettings(window.Settings with { OpenDiffsIn = Passenger.App.Settings.DiffPlace.Window });
+        Ui.Click(Ui.Row(changes.List, changes.Files.Single(f => f.Name == "Shop.cs")));
+        Ui.Press(window, "ENTER");
+        DiffWindow shown = Assert.IsType<DiffWindow>(OpenDiffs.Landed(window, "Shop.cs as feature has it, in a window of its own"));
+        Assert.Same(shown, window.Frontmost);
+        Assert.Equal(Shop, shown.View.Left.Document.Snapshot.ToString());
+        Assert.True(window.GitWindow.Shown == changes, "The diff's window opened, the Git window no longer showed the branch's files");
+        shown.Close();
+        Ui.Settle();
+
+        // Shop.cs put back as committed: the list follows, and main, which the working tree now matches, has nothing listed.
+        File.WriteAllText(Path.Combine(folder, "Shop.cs"), Shop);
+        Ui.WaitFor(() => window.Vcs.Changes.Count == 0, "Shop.cs put back as committed, Git listing nothing changed");
+        Ui.Landed(() => changes.Files.Count == 2, $"feature's files following the working tree, where it lists [{string.Join(", ", changes.Files.Select(f => f.Name))}]");
+        Assert.Equal(["Feature.cs Deleted", "Notes.txt Added"], changes.Files.Select(f => $"{f.Name} {f.Kind}").Order());
+        window.GitWindow.ShowLog();
+        Ui.Settle();
+        Choose(panel, rows, "main", "Show Diff with Working Tree");
+        WorkingTreeDiffView same = Assert.IsType<WorkingTreeDiffView>(window.GitWindow.Shown);
+        Assert.Equal(["Log", "Compare feature and Working Tree", "Compare main and Working Tree"], window.GitWindow.Titles);
+        Assert.True(same.Files.Count == 0 && same.Placeholder == "No differences",
+            $"main, which the working tree matches, lists [{string.Join(", ", same.Files.Select(f => f.Name))}] and says \"{same.Placeholder}\"");
         window.Close();
     }
 
@@ -491,6 +683,35 @@ public sealed class BranchesTests : IDisposable
 
     private static ListBox List(BranchesPanel panel) =>
         Avalonia.VisualTree.VisualExtensions.GetVisualDescendants(panel).OfType<ListBox>().Single();
+
+    /// <summary>A side button of the panel, by the name a screen reader says for it.</summary>
+    private static Button SideButton(BranchesPanel panel, string name) =>
+        Avalonia.VisualTree.VisualExtensions.GetVisualDescendants(panel).OfType<Button>().Single(b => Avalonia.Automation.AutomationProperties.GetName(b) == name);
+
+    /// <summary>The side buttons' tips top to bottom, as the pointer finds them: a button's name, or its name and why it is
+    /// greyed; a tip promising what a greyed button would do fails.</summary>
+    private static string[] Tools(BranchesPanel panel) =>
+    [
+        .. ((string[])["New Branch…", "Update Selected", "Delete", "Mark/Unmark As Favorite", "Navigate Log to Selected Branch Head"]).Select(name =>
+        {
+            Button button = SideButton(panel, name);
+            string tip = ToolTip.GetTip(button) as string ?? string.Empty;
+            Assert.True(button.IsEnabled == (tip == name), $"{name} is {(button.IsEnabled ? "enabled" : "greyed")} with the tip '{tip}'");
+            return tip;
+        }),
+    ];
+
+    /// <summary>The chosen row's menu as it opens under the pointer, closed again.</summary>
+    private static MenuItem[] MenuOf(ListBox rows)
+    {
+        ContextMenu menu = rows.ContextMenu ?? throw new InvalidOperationException("The branches panel's rows have no menu");
+        rows.RaiseEvent(new Avalonia.Input.ContextRequestedEventArgs());
+        Ui.Settle();
+        MenuItem[] items = [.. menu.Items.OfType<MenuItem>()];
+        menu.Close();
+        Ui.Settle();
+        return items;
+    }
 
     /// <summary>The rows as the panel shows them: indented by depth, the current and favourite marked, and a local branch's
     /// upstream after it.</summary>

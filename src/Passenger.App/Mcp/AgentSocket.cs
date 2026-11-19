@@ -241,7 +241,12 @@ public sealed class AgentSocket : IDisposable
 /// <summary>What the person said to an agent's question: whether it may work in the window, use a tool, open a folder.</summary>
 public enum Admission
 {
+    /// <summary>Allowed, and for a tool for every call of it until the agent goes or the window leaves the folder.</summary>
     Allowed,
+
+    /// <summary>A tool allowed for the one call whose arguments its question showed (<see cref="AgentToolDialog.AllowOnce"/>).</summary>
+    AllowedOnce,
+
     NotAllowed,
 
     /// <summary>Nobody answered within the window's limit, or every call waiting for the answer went first.</summary>
@@ -252,14 +257,23 @@ public enum Admission
 }
 
 /// <summary>One agent's connection: its calls end when it does; on a person's window (attached) it is let in before its
-/// first call goes on, and a tool that changes something waits the first time for the person to allow it, each question
-/// waited for at most the window's <see cref="MainWindow.AgentAnswerLimit"/>. UI thread only, but for <see cref="Gone"/>.</summary>
+/// first call goes on, and a call of a tool that changes something waits for the person to allow it, once or for the
+/// session, or every tool at once at the agent's request, each question waited for at most the window's
+/// <see cref="MainWindow.AgentAnswerLimit"/>. UI thread only, but for <see cref="Gone"/>.</summary>
 public sealed class AgentConnection(CancellationToken gone, bool attached)
 {
-    /// <summary>The tools the person allowed, which the agent uses unasked until it goes or the window opens another folder.</summary>
+    /// <summary>What every tool at once is asked, allowed and denied under for the session (request_full_access).</summary>
+    private const string EveryTool = McpTools.RequestFullAccess;
+
+    /// <summary>The tools the person allowed for the session, which the agent uses unasked until it goes or the window opens
+    /// another folder, as <see cref="AllowAsync"/> keys them, every tool at once among them (<see cref="EveryTool"/>).</summary>
     private readonly HashSet<string> allowed = new(StringComparer.Ordinal);
 
-    /// <summary>Each tool's question while the person is asked it, which every call of that tool waits on.</summary>
+    /// <summary>Whether the person denied every tool at once, which holds as long as an allowance would: a later request
+    /// is refused unasked, each tool still asking at its call.</summary>
+    private bool everyToolDenied;
+
+    /// <summary>Each tool's question while the person is asked it, which the calls of that tool wait on.</summary>
     private readonly Dictionary<string, Asked> allowing = new(StringComparer.Ordinal);
 
     /// <summary>The question whether the agent may work in the window, while the person is asked it, which every call waits on.</summary>
@@ -344,25 +358,23 @@ public sealed class AgentConnection(CancellationToken gone, bool attached)
     internal static string Where(MainWindow window) => window.Folder is { } folder ? $"the Passenger window on {folder}" : "the Passenger window";
 
     /// <summary>The window's limit on a question, as an answer says it.</summary>
-    internal static string Limit(MainWindow window) =>
-        window.AgentAnswerLimit.TotalSeconds >= 120 && window.AgentAnswerLimit.TotalSeconds % 60 == 0
-            ? $"{window.AgentAnswerLimit.TotalMinutes:0} minutes"
-            : $"{window.AgentAnswerLimit.TotalSeconds:0} s";
+    internal static string Limit(MainWindow window) => Durations.Said(window.AgentAnswerLimit);
 
     /// <summary>The window opened another folder and the agent stays let in (its own open, or agents let in unasked there):
-    /// the tools allowed in the one it left are asked for again.</summary>
+    /// the tools allowed for the session in the one it left are asked for again, every tool at once too, allowed or denied.</summary>
     internal void Moved()
     {
         UiThread.Check();
         allowed.Clear();
+        everyToolDenied = false;
     }
 
-    /// <summary>The connection ended: the window stops counting it.</summary>
     /// <summary>Something of the agent's session that ends as it goes (the files its calls keep open), on the UI thread.</summary>
     internal void WhenLeft(Action ending) => leaving.Add(ending);
 
     private readonly List<Action> leaving = [];
 
+    /// <summary>The connection ended: the window stops counting it.</summary>
     internal void Left(MainWindow window)
     {
         UiThread.Check();
@@ -378,53 +390,135 @@ public sealed class AgentConnection(CancellationToken gone, bool attached)
         }
     }
 
-    /// <summary>Whether the person lets this agent use a tool, or why not: asked the first time, and again after a no or no
-    /// answer within the window's limit; never on a window nobody is at (<see cref="MainWindow.AgentsUnattended"/>), whose
-    /// agent uses them all. Every call of the tool waits on the one question, which goes away unanswered once none waits.</summary>
+    /// <summary>Whether the person lets this call of a tool go on, or why not: asked each time unless they allowed the tool, or
+    /// every tool, for the session, an app_ tool's input to Passenger's own windows apart from an app's; never where nobody
+    /// is at the window (<see cref="MainWindow.AgentsUnattended"/>), as <see cref="AnswerAsync"/> asks.</summary>
     internal async Task<string?> AllowAsync(MainWindow window, Tool tool, IDictionary<string, JsonElement>? arguments, AgentCall call, CancellationToken cancel)
     {
         UiThread.Check();
-        if (window.AgentsUnattended || allowed.Contains(tool.Name))
+        if (window.AgentsUnattended)
         {
             return null;
         }
-        if (!allowing.TryGetValue(tool.Name, out Asked? asked))
-        {
-            CancellationTokenSource takenAway = CancellationTokenSource.CreateLinkedTokenSource(Gone);
-            asked = new(window.AllowAgentAsync(Agent, tool.Name, tool.Title ?? tool.Name,
-                [.. (arguments ?? new Dictionary<string, JsonElement>()).Select(a => (a.Key, Shown(a.Value)))], takenAway.Token), takenAway, window.Folder);
-            allowing[tool.Name] = asked;
-        }
-        asked.Waiting++;
-        call.Waits($"Waiting for the person at {Where(window)} to allow {Agent} to use {tool.Name} (at most {Limit(window)})");
-        Admission said;
-        try
-        {
-            said = await asked.Answer.WaitAsync(cancel);
-        }
-        finally
-        {
-            call.Waited(asked.Answer is { IsCompletedSuccessfully: true } answer ? answer.Result.ToString() : "given up");
-            // The last call waiting gives the question up: it closes unanswered, and the next call asks again.
-            if (--asked.Waiting == 0 && !asked.Answer.IsCompleted)
-            {
-                asked.TakenAway.Cancel();
-                Forget(tool.Name, asked);
-            }
-        }
-        Forget(tool.Name, asked);
-        if (said == Admission.Allowed)
-        {
-            allowed.Add(tool.Name);
-            return null;
-        }
+        bool own = OnOwnWindows(arguments);
+        string key = own ? $"{tool.Name} {PassengerTools.OwnWindows}" : tool.Name;
+        string named = own ? $"{tool.Name} in Passenger's own windows (app {PassengerTools.OwnWindows})" : tool.Name;
+        (Admission said, string? folder) = await AnswerAsync(window, key, named, takenAway => window.AllowAgentAsync(Agent, tool.Name, tool.Title ?? tool.Name, own,
+            [.. (arguments ?? new Dictionary<string, JsonElement>()).Select(a => (a.Key, Shown(a.Value)))], takenAway), call, cancel);
         return said switch
         {
-            Admission.NotAllowed => $"The person at {Where(window)} did not allow {tool.Name}. Ask them, or do without it; a later call asks them again.",
-            Admission.FolderChanged => Refusals.FolderChanged(asked.Folder),
-            _ => $"Nobody at {Where(window)} answered within {Limit(window)} whether {Agent} may use {tool.Name}. A later call asks again.",
+            Admission.Allowed or Admission.AllowedOnce => null,
+            Admission.NotAllowed => $"The person at {Where(window)} did not allow {named}. Ask them, or do without it; a later call asks them again.",
+            Admission.FolderChanged => Refusals.FolderChanged(folder),
+            _ => $"Nobody at {Where(window)} answered within {Limit(window)} whether {Agent} may use {named}. A later call asks again.",
         };
     }
+
+    /// <summary>What a request for every tool answers on the agent's own IDE, which asks nobody.</summary>
+    public const string NothingAsks = "Nothing asks here: this Passenger is the agent's own (--mcp), whose every tool goes on without a question.";
+
+    /// <summary>Whether the person lets every tool that changes something go on unasked for the session (request_full_access),
+    /// as if each were allowed for the session by its own question, in words for the agent, with whether they refuse: asked
+    /// once, the tools' own questions waiting then taken away as allowed; a Deny holds as an allowance would, a later request
+    /// refused unasked while each tool still asks at its call. Nothing asks on the agent's own IDE or a window nobody is at.</summary>
+    internal async Task<(string Said, bool Refused)> AllowEveryToolAsync(MainWindow window, AgentCall? call, CancellationToken cancel)
+    {
+        UiThread.Check();
+        if (!Attached || window.AgentsUnattended)
+        {
+            return (Attached ? $"Nobody is at {Where(window)} to ask: every tool goes on without a question." : NothingAsks, false);
+        }
+        string lasts = "until the agent disconnects or the window opens another folder";
+        if (allowed.Contains(EveryTool))
+        {
+            return ($"Every tool is allowed already: calls go on without asking the person at {Where(window)} {lasts}.", false);
+        }
+        if (everyToolDenied)
+        {
+            return ($"The person at {Where(window)} denied every tool at once, so they are not asked again {lasts}; each tool still asks them at its call.", true);
+        }
+        IEnumerable<string> asks = McpHost.Tools.Select(t => t.ProtocolTool).Where(ConnectedTool.Asks).Select(t => t.Name).Order(StringComparer.Ordinal);
+        (Admission said, string? folder) = await AnswerAsync(window, EveryTool, "every tool", takenAway => window.AllowAgentEveryToolAsync(Agent, asks, takenAway), call, cancel);
+        switch (said)
+        {
+            case Admission.Allowed:
+                // Each tool's question still asked has its answer now: its calls go on.
+                foreach (Asked waiting in allowing.Values.ToList())
+                {
+                    waiting.TakenAway.Cancel();
+                }
+                return ($"The person at {Where(window)} allowed every tool: calls go on without asking them {lasts}. Opening another folder in "
+                    + "their window still asks.", false);
+            case Admission.NotAllowed:
+                everyToolDenied = true;
+                return ($"The person at {Where(window)} denied every tool at once: each tool still asks them at its call, and a later request is refused unasked {lasts}.", true);
+            case Admission.FolderChanged:
+                return (Refusals.FolderChanged(folder), true);
+            default:
+                return ($"Nobody at {Where(window)} answered within {Limit(window)} whether {Agent} may use every tool. A later request asks again.", true);
+        }
+    }
+
+    /// <summary>The person's answer for this call to the question <paramref name="key"/> names, put through
+    /// <paramref name="ask"/> unless it, or every tool, is allowed for the session, with the folder it was asked in. The
+    /// calls of one key wait on one question, which shows the call that asked it and goes as that one gives up, the others
+    /// then asking their own; an Allow Once lets the asker alone go on, the others asking their own; one taken away as
+    /// every tool was allowed lets them all go on. Allowed for the session, the key holds until <see cref="Moved"/>.</summary>
+    private async Task<(Admission Said, string? Folder)> AnswerAsync(MainWindow window, string key, string named, Func<CancellationToken, Task<Admission>> ask,
+        AgentCall? call, CancellationToken cancel)
+    {
+        while (!Allows(key))
+        {
+            bool asker = !allowing.TryGetValue(key, out Asked? asked);
+            if (asked is null)
+            {
+                CancellationTokenSource takenAway = CancellationTokenSource.CreateLinkedTokenSource(Gone);
+                asked = new(ask(takenAway.Token), takenAway, window.Folder);
+                allowing[key] = asked;
+            }
+            call?.Waits($"Waiting for the person at {Where(window)} to allow {Agent} to use {named} (at most {Limit(window)})");
+            Admission said;
+            try
+            {
+                said = await asked.Answer.WaitAsync(cancel);
+            }
+            finally
+            {
+                call?.Waited(asked.Answer is { IsCompletedSuccessfully: true } answer ? answer.Result.ToString() : "given up");
+                // The question shows the asker's arguments, so it goes with the asker, and the calls left ask their own.
+                if (asker && !asked.Answer.IsCompleted)
+                {
+                    asked.AskerGaveUp = true;
+                    asked.TakenAway.Cancel();
+                    Forget(key, asked);
+                }
+            }
+            Forget(key, asked);
+            switch (said)
+            {
+                case Admission.Allowed:
+                    allowed.Add(key);
+                    return (said, asked.Folder);
+                case Admission.AllowedOnce when asker:
+                    return (said, asked.Folder);
+                case Admission.AllowedOnce:
+                case Admission.Unanswered when asked.AskerGaveUp || Allows(key):
+                    continue;
+                default:
+                    return (said, asked.Folder);
+            }
+        }
+        return (Admission.Allowed, window.Folder);
+    }
+
+    /// <summary>Whether the person allowed the tool keyed so for the session, or every tool at once.</summary>
+    private bool Allows(string key) => allowed.Contains(key) || allowed.Contains(EveryTool);
+
+    /// <summary>Whether a call gives its input to Passenger's own windows (an app_ tool's app ide), where it does what the
+    /// person's would.</summary>
+    private static bool OnOwnWindows(IDictionary<string, JsonElement>? arguments) =>
+        arguments is not null && arguments.TryGetValue("app", out JsonElement app) && app.ValueKind == JsonValueKind.String
+        && app.GetString() == PassengerTools.OwnWindows;
 
     private void Forget(string tool, Asked asked)
     {
@@ -447,8 +541,8 @@ public sealed class AgentConnection(CancellationToken gone, bool attached)
     private static string Shown(JsonElement value) =>
         value.ValueKind == JsonValueKind.String ? value.GetString() ?? string.Empty : value.GetRawText();
 
-    /// <summary>A tool's question while it is asked: its answer, what takes it away unanswered, the folder it was asked in,
-    /// and how many calls wait on it.</summary>
+    /// <summary>A question while it is asked: its answer, what takes it away unanswered, the folder it was asked in, and
+    /// how many calls wait on it.</summary>
     private sealed class Asked(Task<Admission> answer, CancellationTokenSource takenAway, string? folder)
     {
         public Task<Admission> Answer { get; } = answer;
@@ -458,12 +552,17 @@ public sealed class AgentConnection(CancellationToken gone, bool attached)
         public string? Folder { get; } = folder;
 
         public int Waiting { get; set; }
+
+        /// <summary>A tool's question taken away as the call it shows gave up, which the other calls waiting ask again for.</summary>
+        public bool AskerGaveUp { get; set; }
     }
 }
 
 /// <summary>A tool as one connection reaches it: its call cancelled with the connection, and on a person's window held
-/// until the agent is let in, then first allowed by them when it changes something (not read-only nor declared harmless),
-/// and named in the status bar while it runs; told to the agent as it goes and logged (<see cref="AgentCall"/>).</summary>
+/// until the agent is let in, then allowed by them when it changes something (not read-only nor declared harmless),
+/// and named in the status bar while it runs; after a quiet spell, run once the window looked again for what the system
+/// dropped (<see cref="PassengerTools.LookedAgainAsync"/>); told to the agent as it goes and logged (<see cref="AgentCall"/>),
+/// an exception it ends with written to the IDE's log whole, its stack and what it wrapped with it.</summary>
 internal sealed class ConnectedTool(McpServerTool tool, MainWindow? window, AgentConnection connection, Task<PassengerTools> tools) : DelegatingMcpServerTool(tool)
 {
     public override async ValueTask<CallToolResult> InvokeAsync(RequestContext<CallToolRequestParams> request, CancellationToken cancellationToken = default)
@@ -491,6 +590,8 @@ internal sealed class ConnectedTool(McpServerTool tool, MainWindow? window, Agen
         catch (Exception error)
         {
             told.Ended($"failed ({error.GetType().Name})");
+            // The agent hears its words alone (the SDK's answer): what threw it, and what it wrapped, are kept here.
+            IdeErrors.Write($"An agent's {shown.Name} failed: {error}");
             throw;
         }
     }
@@ -501,6 +602,7 @@ internal sealed class ConnectedTool(McpServerTool tool, MainWindow? window, Agen
         {
             // --mcp's own IDE, whose server answers before the IDE is up: a call waits for it.
             McpHost.Serving.Value = await tools.WaitAsync(cancel);
+            await McpHost.Serving.Value.LookedAgainAsync(cancel);
             return await base.InvokeAsync(request, cancel);
         }
         // Read-only or not, no call goes on before the agent is let into the window.
@@ -509,7 +611,13 @@ internal sealed class ConnectedTool(McpServerTool tool, MainWindow? window, Agen
             connection.Named(request.Server.ClientInfo);
             return connection.AdmitAsync(window!, told, cancel);
         });
-        if (refused is null && shown.Annotations is not ({ ReadOnlyHint: true } or { DestructiveHint: false }) && !ChangesNothing(shown, request.Params?.Arguments))
+        // A folder not trusted runs none of its code, nor are its feeds asked, for any agent: the person trusts it first.
+        if (refused is null && McpTools.Untrusted.TryGetValue(shown.Name, out string? untrusted)
+            && await UiThread.InvokeAsync(() => window!.Session is { Folder: not null, Trusted: false }))
+        {
+            refused = untrusted;
+        }
+        if (refused is null && Asks(shown) && !ChangesNothing(shown, request.Params?.Arguments))
         {
             refused = await UiThread.InvokeAsync(() => connection.AllowAsync(window!, shown, request.Params?.Arguments, told, cancel));
         }
@@ -521,6 +629,7 @@ internal sealed class ConnectedTool(McpServerTool tool, MainWindow? window, Agen
         told.Logged("working");
         // The tools are every connection's (McpHost.Tools): the call reaches this one's.
         McpHost.Serving.Value = await tools;
+        await McpHost.Serving.Value.LookedAgainAsync(cancel);
         if (shown.Annotations is { ReadOnlyHint: true })
         {
             return await base.InvokeAsync(request, cancel);
@@ -538,6 +647,10 @@ internal sealed class ConnectedTool(McpServerTool tool, MainWindow? window, Agen
     }
 
     private static CallToolResult Refused(string why) => new() { IsError = true, Content = [new TextContentBlock { Text = why }] };
+
+    /// <summary>Whether a tool's calls on a person's window wait for them to allow it: it may change something, being neither
+    /// read-only nor declared harmless.</summary>
+    internal static bool Asks(Tool tool) => tool.Annotations is not ({ ReadOnlyHint: true } or { DestructiveHint: false });
 
     /// <summary>Whether a call of a tool that may change something changes nothing by what it is given, and so asks nobody:
     /// godot_editor's reads (<see cref="PassengerTools.GodotEditorReads"/>).</summary>

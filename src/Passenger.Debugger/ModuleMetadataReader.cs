@@ -41,12 +41,35 @@ public partial class ModuleMetadataReader : IDisposable
     /// <summary>Whether a method is [DebuggerHidden], which no debugger stops in, Just My Code or not.</summary>
     internal bool IsHidden(int methodToken)
     {
-        _hidden ??= [.. _peMetadataReader.MethodDefinitions.Where(m => HasAttribute(_peMetadataReader, _peMetadataReader.GetMethodDefinition(m).GetCustomAttributes(), ["System.Diagnostics.DebuggerHiddenAttribute"])).Select(m => MetadataTokens.GetToken(m))];
+        _hidden ??= [.. _peMetadataReader.MethodDefinitions.Where(m => HasAttribute(_peMetadataReader, _peMetadataReader.GetMethodDefinition(m).GetCustomAttributes(), DebuggerHidden)).Select(m => MetadataTokens.GetToken(m))];
         return _hidden.Contains(methodToken);
     }
 
+    /// <summary>Whether a method's code hides it from debuggers and stack traces alike, [DebuggerHidden] with
+    /// [StackTraceHidden] on it or its type, so no frame of it is shown, as its exception's stack trace shows none: the
+    /// runtime's helpers that compiled code calls, its exception dispatch, and a program's own method marked so.</summary>
+    internal bool IsHiddenFrame(int methodToken)
+    {
+        if (!_hiddenFrames.TryGetValue(methodToken, out bool hidden))
+        {
+            MethodDefinitionHandle handle = MetadataTokens.MethodDefinitionHandle(methodToken);
+            hidden = MetadataTokens.GetRowNumber(handle) <= _peMetadataReader.GetTableRowCount(TableIndex.MethodDef) && Hides(_peMetadataReader.GetMethodDefinition(handle));
+            _hiddenFrames[methodToken] = hidden;
+        }
+        return hidden;
+
+        bool Hides(MethodDefinition method) =>
+            HasAttribute(_peMetadataReader, method.GetCustomAttributes(), DebuggerHidden)
+            && (HasAttribute(_peMetadataReader, method.GetCustomAttributes(), StackTraceHidden)
+                || HasAttribute(_peMetadataReader, _peMetadataReader.GetTypeDefinition(method.GetDeclaringType()).GetCustomAttributes(), StackTraceHidden));
+    }
+
+    private static readonly string[] DebuggerHidden = ["System.Diagnostics.DebuggerHiddenAttribute"];
+    private static readonly string[] StackTraceHidden = ["System.Diagnostics.StackTraceHiddenAttribute"];
+
     private HashSet<int>? _nonUserCode;
     private HashSet<int>? _hidden;
+    private readonly Dictionary<int, bool> _hiddenFrames = [];
 
     private IEnumerable<int> FindNonUserCodeMethodTokens()
     {
@@ -665,6 +688,41 @@ public partial class ModuleMetadataReader : IDisposable
         }
 
         return result;
+    }
+
+    // Roslyn's kind for the IL scopes of a state machine's hoisted locals, one a slot.
+    // https://github.com/dotnet/roslyn/blob/main/src/Dependencies/CodeAnalysis.Debugging/PortableCustomDebugInfoKinds.cs
+    private static readonly Guid _stateMachineHoistedLocalScopes = new("6DA9A61E-F8C7-4874-BE62-68BC5630DF71");
+
+    /// <summary>The slots of a state machine's hoisted locals in scope at an IL offset of its MoveNext, as the compiler
+    /// recorded each slot's scope; null where it recorded none (an optimized build's), which leaves every one in scope.</summary>
+    public IReadOnlySet<int>? HoistedSlotsInScope(int moveNextToken, int ilOffset, int? version = null)
+    {
+        if (DebugOf(moveNextToken, version) is not { Reader: { } reader } debug)
+        {
+            return null;
+        }
+        foreach (CustomDebugInformationHandle cdiHandle in reader.GetCustomDebugInformation(debug.Handle))
+        {
+            CustomDebugInformation cdi = reader.GetCustomDebugInformation(cdiHandle);
+            if (reader.GetGuid(cdi.Kind) != _stateMachineHoistedLocalScopes)
+            {
+                continue;
+            }
+            HashSet<int> slots = [];
+            BlobReader blobReader = reader.GetBlobReader(cdi.Value);
+            for (int slot = 0; blobReader.RemainingBytes >= 8; slot++)
+            {
+                long start = blobReader.ReadUInt32();
+                long length = blobReader.ReadUInt32();
+                if (start <= ilOffset && ilOffset < start + length)
+                {
+                    slots.Add(slot);
+                }
+            }
+            return slots;
+        }
+        return null;
     }
 
     /// <summary>

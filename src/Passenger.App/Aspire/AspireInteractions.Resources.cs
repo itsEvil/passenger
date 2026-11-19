@@ -189,7 +189,7 @@ public sealed partial class AspireInteractions
         {
             throw cancellation.IsCancellationRequested
                 ? new IOException(Failure ?? "The AppHost's resource connection has ended.")
-                : new TimeoutException($"The AppHost sent no resources within {ResourcesWait.TotalSeconds:0} s.");
+                : new TimeoutException($"The AppHost sent no resources within {Durations.Said(ResourcesWait)}.");
         }
     }
 
@@ -522,7 +522,7 @@ public sealed partial class AspireInteractions
         {
             throw new InvalidDataException("The AppHost sent an unsupported health status.");
         }
-        string? health = resource.State != "Running" ? null
+        string? health = resource.State != AspireStates.Running ? null
             : resource.HealthReports.Any(report => !report.HasStatus || report.Status == HealthStatus.Unhealthy) ? "Unhealthy"
             : resource.HealthReports.Any(report => report.Status == HealthStatus.Degraded) ? "Degraded" : "Healthy";
         JsonElement data = JsonSerializer.SerializeToElement(new
@@ -531,6 +531,7 @@ public sealed partial class AspireInteractions
             displayName = resource.DisplayName,
             type = resource.ResourceType,
             resourceType = resource.ResourceType,
+            resourceTypeDisplayName = resource.HasResourceTypeDisplayName && resource.ResourceTypeDisplayName.Length > 0 ? resource.ResourceTypeDisplayName : null,
             uid = resource.Uid,
             state = resource.HasState ? resource.State : null,
             stateStyle = resource.HasStateStyle ? resource.StateStyle : null,

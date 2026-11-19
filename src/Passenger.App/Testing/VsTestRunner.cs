@@ -78,8 +78,8 @@ public sealed class VsTestRunner : ITestRunner
         {
             throw new InvalidOperationException($"VSTest cannot start: the folder's .NET SDK could not be named ({unnamed.Message})", unnamed);
         }
-        string host = Dotnet.Host();
-        string console = System.IO.Path.Combine(Dotnet.Root(), "sdk", sdk, "vstest.console.dll");
+        string host = Dotnet.Host(folder);
+        string console = System.IO.Path.Combine(Dotnet.Root(folder), "sdk", sdk, "vstest.console.dll");
         if (!File.Exists(console))
         {
             throw new FileNotFoundException($"The SDK {sdk} has no vstest.console", console);
@@ -117,12 +117,13 @@ public sealed class VsTestRunner : ITestRunner
 
     public bool IsUsable { get; private set; } = true;
 
-    /// <summary>The tests in built test assemblies, as their adapters find them, each with its project's run settings.
-    /// Canceled, VSTest stops finding them and ends its test hosts; one that does not within a few seconds leaves the runner
-    /// unusable, to be ended.</summary>
-    public async Task<IReadOnlyList<TestItem>> DiscoverAsync(IReadOnlyList<TestAssembly> assemblies, Action<string>? log = null, CancellationToken cancel = default)
+    /// <summary>The tests in built test assemblies, as their adapters find them, each with its project's run settings, and
+    /// those VSTest could not look through, with what it said. Canceled, VSTest stops finding them and ends its test hosts;
+    /// one that does not within a few seconds leaves the runner unusable, to be ended.</summary>
+    public async Task<FoundTests> DiscoverAsync(IReadOnlyList<TestAssembly> assemblies, Action<string>? log = null, CancellationToken cancel = default)
     {
         List<TestCase> found = [];
+        List<UnfoundTests> unfound = [];
         foreach (IGrouping<string?, TestAssembly> group in assemblies.GroupBy(a => a.RunSettings, StringComparer.Ordinal))
         {
             foreach (TestAssembly assembly in group)
@@ -138,13 +139,56 @@ public sealed class VsTestRunner : ITestRunner
                 }
             }
             string settings = await BackgroundWork.Run(() => Settings(null, log, group.Key, [], false), cancel);
-            found.AddRange(await DiscoverWith([.. group.Select(a => a.Path)], settings, log, cancel));
+            (List<TestCase> cases, List<UnfoundTests> missed) = await DiscoverWith([.. group.DistinctBy(a => a.Path, PathNames.Comparer)], settings, log, cancel);
+            found.AddRange(cases);
+            unfound.AddRange(missed);
         }
-        return await BackgroundWork.Run(() => Tell(assemblies, found));
+        return new FoundTests(await BackgroundWork.Run(() => Tell(assemblies, found)), unfound);
     }
 
-    /// <summary>The test cases in assemblies, found with these settings.</summary>
-    private async Task<IReadOnlyList<TestCase>> DiscoverWith(List<string> assemblies, string settings, Action<string>? log, CancellationToken cancel)
+    /// <summary>The test cases in assemblies, found with these settings in one discovery, and the assemblies whose tests could
+    /// not be found. A discovery aborted (a test host that cannot start) ends VSTest's look at every assembly it has yet to
+    /// look through, so each it did not look through whole is looked through again alone: one aborted alone is one whose
+    /// tests cannot be found, said with VSTest's words; what the first look said is not said again.</summary>
+    private async Task<(List<TestCase> Found, List<UnfoundTests> Unfound)> DiscoverWith(IReadOnlyList<TestAssembly> assemblies, string settings,
+        Action<string>? log, CancellationToken cancel)
+    {
+        Looked all = await LookAsync([.. assemblies.Select(a => a.Path)], settings, log, cancel);
+        if (!all.Aborted)
+        {
+            return ([.. all.Found], []);
+        }
+        if (assemblies is [{ } only])
+        {
+            return ([.. all.Found], [UnfoundTests.Of(only, all.Said)]);
+        }
+        HashSet<string> whole = new(all.Whole, PathNames.Comparer);
+        HashSet<string> saidOnce = new(all.Notable, StringComparer.Ordinal);
+        Action<string>? saidAgain = log is null ? null : line =>
+        {
+            if (!saidOnce.Contains(line))
+            {
+                log(line);
+            }
+        };
+        List<TestCase> found = [.. all.Found.Where(test => whole.Contains(test.Source))];
+        List<UnfoundTests> unfound = [];
+        List<TestAssembly> again = [.. assemblies.Where(a => !whole.Contains(a.Path))];
+        IdeLog.Write(IdeLog.Tests, $"Discovery aborted: {Plural.Of(again.Count, "assembly", "assemblies")} looked through again, each alone");
+        foreach (TestAssembly assembly in again)
+        {
+            Looked alone = await LookAsync([assembly.Path], settings, saidAgain, cancel);
+            found.AddRange(alone.Found);
+            if (alone.Aborted)
+            {
+                unfound.Add(UnfoundTests.Of(assembly, alone.Said));
+            }
+        }
+        return (found, unfound);
+    }
+
+    /// <summary>One discovery of assemblies with these settings: what VSTest found and said.</summary>
+    private async Task<Looked> LookAsync(List<string> assemblies, string settings, Action<string>? log, CancellationToken cancel)
     {
         Discovery handler = new(log);
         VsTestConsoleWrapper session = console;
@@ -287,11 +331,11 @@ public sealed class VsTestRunner : ITestRunner
     {
         if (!await EndsWithin(run, CancelLimit))
         {
-            IdeLog.Write(IdeLog.Tests, $"A run told to stop ran on {Waits.Of(CancelLimit).TotalSeconds:0} s: aborted");
+            IdeLog.Write(IdeLog.Tests, $"A run told to stop ran on {Durations.Said(Waits.Of(CancelLimit))}: aborted");
             IdeErrors.Observe(BackgroundWork.Unheld(session.AbortTestRun));
             if (!await EndsWithin(run, AbortLimit))
             {
-                IdeLog.Write(IdeLog.Tests, $"A run aborted ran on {Waits.Of(AbortLimit).TotalSeconds:0} s: vstest.console is ended, its test hosts with it");
+                IdeLog.Write(IdeLog.Tests, $"A run aborted ran on {Durations.Said(Waits.Of(AbortLimit))}: vstest.console is ended, its test hosts with it");
                 IdeErrors.Observe(LetGoAsync(run));
                 await BackgroundWork.Unheld(() => End(session));
                 try
@@ -507,7 +551,7 @@ public sealed class VsTestRunner : ITestRunner
     {
         DisplayName = result.DisplayName ?? result.TestCase.DisplayName,
         Message = result.ErrorMessage,
-        StackTrace = result.ErrorStackTrace,
+        StackTrace = FailureStacks.Once(result.ErrorStackTrace, result.ErrorMessage),
         Output = string.Concat(result.Messages.Select(m => m.Text)) is { Length: > 0 } output ? output : null,
         // An adapter writes each attachment to a file and names it by a URI, the test's name for it as its description.
         Attachments = [.. result.Attachments.SelectMany(set => set.Attachments).Select(a =>
@@ -522,11 +566,18 @@ public sealed class VsTestRunner : ITestRunner
         _ => TestState.NotRun,
     };
 
+    /// <summary>What one discovery came to: the test cases found; whether VSTest aborted it, as a test host that cannot start
+    /// does; the assemblies it says it looked through whole (none where it names none); the warnings and errors it said, and
+    /// its errors as one text.</summary>
+    private sealed record Looked(IReadOnlyList<TestCase> Found, bool Aborted, IReadOnlyList<string> Whole, IReadOnlyList<string> Notable, string Said);
+
     private sealed class Discovery(Action<string>? log) : ITestDiscoveryEventsHandler2
     {
         private readonly List<TestCase> found = [];
+        private readonly List<string> notable = [];
+        private readonly List<string> errors = [];
 
-        public TaskCompletionSource<IReadOnlyList<TestCase>> Done { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public TaskCompletionSource<Looked> Done { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
 
         public void HandleDiscoveredTests(IEnumerable<TestCase>? discoveredTestCases)
         {
@@ -542,11 +593,26 @@ public sealed class VsTestRunner : ITestRunner
             lock (found)
             {
                 IdeLog.Write(IdeLog.Tests, $"Discovery {(discoveryCompleteEventArgs.IsAborted ? "aborted" : "complete")}: {Plural.Of(found.Count, "test")} found");
-                Done.TrySetResult([.. found]);
+                Done.TrySetResult(new Looked([.. found], discoveryCompleteEventArgs.IsAborted, [.. discoveryCompleteEventArgs.FullyDiscoveredSources ?? []],
+                    [.. notable], string.Join("\n", errors)));
             }
         }
 
-        public void HandleLogMessage(TestMessageLevel level, string? message) => Said(level, message, log);
+        public void HandleLogMessage(TestMessageLevel level, string? message)
+        {
+            if (message is not null && level != TestMessageLevel.Informational)
+            {
+                lock (found)
+                {
+                    notable.Add(message);
+                    if (level == TestMessageLevel.Error)
+                    {
+                        errors.Add(message);
+                    }
+                }
+            }
+            Said(level, message, log);
+        }
 
         public void HandleRawMessage(string rawMessage) => Raw(rawMessage);
     }
@@ -625,7 +691,7 @@ public sealed class VsTestRunner : ITestRunner
                 ended ??= closed ? null : summary;
             }
             string how = testRunCompleteArgs.IsCanceled ? "stopped" : testRunCompleteArgs.IsAborted ? "aborted" : "complete";
-            IdeLog.Write(IdeLog.Tests, $"Run {how}: {Plural.Of(summary.Outcomes.Count, "result")} in {testRunCompleteArgs.ElapsedTimeInRunningTests.TotalSeconds:0.00} s"
+            IdeLog.Write(IdeLog.Tests, $"Run {how}: {Plural.Of(summary.Outcomes.Count, "result")} in {Durations.Said(testRunCompleteArgs.ElapsedTimeInRunningTests)}"
                 + (summary.Error is { } failed ? $": {failed}" : string.Empty));
             Done.TrySetResult(summary);
         }

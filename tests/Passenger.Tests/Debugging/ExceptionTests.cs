@@ -14,12 +14,18 @@ public class ExceptionTests(ITestOutputHelper testOutputHelper)
     private static readonly int Thrown = Debuggees.Line("DebuggableConsoleApp", "Exceptions.cs", "throw new InvalidOperationException(\"Test exception\");");
     private static readonly int Parsed = Debuggees.Line("DebuggableConsoleApp", "Exceptions.cs", "int myInt = int.Parse(\"x\");");
     private static readonly int Caught = Debuggees.Line("DebuggableConsoleApp", "Exceptions.cs", "catch (Exception e)");
+    private static readonly int Tested = Debuggees.Line("DebuggableConsoleApp", "Exceptions.cs", "if (exceptionToThrow is ExceptionToThrow.Normal)");
 
-    [Fact]
-    public async Task At_an_exceptions_stop_the_exception_is_listed_with_the_locals_and_evaluates()
+    /// <summary>On the .NET the program targets and on the newest, whose runtime leaves its exception dispatch among the
+    /// stop's frames: the stop is in the frame that threw, with its locals.</summary>
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task At_an_exceptions_stop_the_exception_is_listed_with_the_locals_and_evaluates_and_the_next_statement_is_refused_saying_why(bool newestRuntime)
     {
         bool startSuspended = true;
-        await using DebugSession debugProtocolHost = DebugSession.ForAttach(testOutputHelper, startSuspended, out Process p2);
+        await using DebugSession debugProtocolHost = DebugSession.ForAttach(testOutputHelper, startSuspended, out Process p2,
+            programEnvironment: newestRuntime ? Debuggees.NewestRuntime : null);
 
         await debugProtocolHost
             .InitializeAsync()
@@ -67,6 +73,10 @@ public class ExceptionTests(ITestOutputHelper testOutputHelper)
 
         EvaluateResponse? evaluateResponse2 = await debugProtocolHost.EvaluateAsync(stackTraceResponse2.StackFrames.First().Id, "$exception");
         Assert.Equal(expectedVariables[0].Value, evaluateResponse2.Result);
+        if (newestRuntime)
+        {
+            Assert.Equal("true", (await debugProtocolHost.EvaluateAsync(stackTraceResponse2.StackFrames.First().Id, Debuggees.RunsOnNewestRuntime)).Result);
+        }
 
         ExceptionInfoResponse expectedExceptionInfoResponse = new ExceptionInfoResponse
         {
@@ -90,6 +100,13 @@ public class ExceptionTests(ITestOutputHelper testOutputHelper)
 
         ExceptionInfoResponse exceptionInfoResponse = await debugProtocolHost.RequestAsync<ExceptionInfoResponse>(DapCommands.ExceptionInfo, new ThreadArguments(stoppedEvent2.ThreadId.Value));
         Assert.Equivalent(expectedExceptionInfoResponse, exceptionInfoResponse, strict: true);
+
+        // The thread cannot go on from another statement while its exception is thrown, said alike whatever runs above its frame.
+        GotoTargetsResponse targets = await debugProtocolHost.RequestAsync<GotoTargetsResponse>(DapCommands.GotoTargets,
+            new GotoTargetsArguments(new DapSource { Path = breakpointedFilePath }, Tested, null));
+        DapException refused = await Assert.ThrowsAsync<DapException>(() =>
+            debugProtocolHost.RequestAsync(DapCommands.Goto, new GotoArguments(stoppedEvent2.ThreadId.Value, Assert.Single(targets.Targets).Id)));
+        Assert.Contains("the thread is stopped at an exception being thrown", refused.Message, StringComparison.Ordinal);
     }
 
     [Fact]

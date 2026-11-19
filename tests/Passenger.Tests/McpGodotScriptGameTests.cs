@@ -3,14 +3,15 @@ using ModelContextProtocol.Client;
 using ModelContextProtocol.Protocol;
 using Passenger.App.Mcp;
 using Passenger.Core;
+using Passenger.Dap;
 
 namespace Passenger.Tests;
 
 /// <summary>An agent debugging a Godot game of GDScript alone: app_tree, refused before it runs, names such a game among
 /// those it reaches, and reaches it once it does; a script it edits (and so saves) reloads in the game, which then says the
 /// edit's words, and hot_reload answers that Godot reloads each script as it is saved, with nothing else to apply, not that
-/// Hot Reload is off; a click stopping at a breakpoint is said so at once; a condition holds as the game's own if reads it.
-/// Godot runs headless, its user folders the test's; without a Godot 4 it skips saying why. Debugged, so run alone.</summary>
+/// Hot Reload is off; a click stopping at a breakpoint is said so at once; a condition holds as the game's own if reads it,
+/// and a hit count counts the hits it held on, as every debugger's does. Godot runs headless, its user folders the test's; without a Godot 4 it skips saying why. Debugged, so run alone.</summary>
 [Collection(Alone.Name)]
 public sealed class McpGodotScriptGameTests : McpRig
 {
@@ -176,6 +177,31 @@ public sealed class McpGodotScriptGameTests : McpRig
         await Call(client, McpTools.Stop);
     }
 
+    /// <summary>Punctuation keys an agent presses by the characters they type reach the game as a US keyboard gives them to
+    /// Godot: each typed into its text box, a shifted one its Shift's character, and held with Ctrl heard by the key's own
+    /// code whatever Shift holds, ctrl+/ as Ctrl with the slash key and ctrl+plus as Ctrl and Shift with the equal sign's,
+    /// typing nothing.</summary>
+    [Fact]
+    public async Task Punctuation_keys_pressed_by_their_characters_type_them_into_a_games_text_box_and_with_ctrl_are_heard_by_their_keys()
+    {
+        File.WriteAllText(Path.Combine(folder, "main.tscn"), TwoWindows);
+        File.WriteAllText(Path.Combine(folder, "second.gd"), "extends Control\n\nfunc _input(event: InputEvent) -> void:\n\tvar key := event as InputEventKey\n"
+            + "\tif key != null and key.pressed and key.ctrl_pressed:\n"
+            + "\t\tprint(\"heard ctrl+%s%s typing %d\" % [\"shift+\" if key.shift_pressed else \"\", OS.get_keycode_string(key.keycode), key.unicode])\n");
+        await using McpClient client = await Start(["--mcp", folder], languageServer: false,
+            environment: new() { [Passenger.App.Godot.GodotUserFolders.HomeVariable] = folder + "-home" });
+        await Call(client, McpTools.DebugStart, new() { ["configuration"] = "Ticker", ["waitSeconds"] = 10 });
+        await Until(async () => await Result(client, McpTools.AppTree) is { IsError: not true } tree && Text(tree).Contains("#Field", StringComparison.Ordinal), "the game's text box");
+
+        const string Typed = "/?+=[}`~\\|";
+        string pressed = Text(await Call(client, McpTools.AppKey, new() { ["control"] = "#Field", ["keys"] = string.Join(' ', Typed.Select(c => c.ToString())) }));
+        Assert.True(pressed.Contains($"it shows \"{Typed}\"", StringComparison.Ordinal), $"The punctuation keys pressed by their characters typed something else: {pressed}");
+        string held = Text(await Call(client, McpTools.AppKey, new() { ["control"] = "#Field", ["keys"] = "ctrl+/ ctrl+plus" }));
+        await Until(async () => Text(await Call(client, McpTools.Output)) is var said && said.Contains("heard ctrl+Slash typing 0", StringComparison.Ordinal)
+            && said.Contains("heard ctrl+shift+Equal typing 0", StringComparison.Ordinal), $"the game to hear ctrl+/ and ctrl+plus by their keys ({held})");
+        await Call(client, McpTools.Stop);
+    }
+
     /// <summary>A control whose script names a <c>text</c>, <c>disabled</c> and <c>editable</c> of its own, each read counted:
     /// its getter, its <c>_get</c>, and a plain <c>note</c>.</summary>
     private const string Counting = "extends Control\n\nvar getter_reads := 0\nvar get_reads := 0\nvar text := \"stored\":\n\tget:\n\t\tgetter_reads += 1\n\t\treturn \"by getter\"\n"
@@ -239,6 +265,52 @@ public sealed class McpGodotScriptGameTests : McpRig
         JsonElement state = await Call(client, McpTools.DebugState);
         Assert.True(state.GetProperty("location").GetString() == $"ticker.gd:{stopped}:1",
             $"The game stopped at {state.GetProperty("location")}, where every condition before line {stopped} is false to the game's own if: {state}");
+        await Call(client, McpTools.Stop);
+    }
+
+    /// <summary>A loop run once, in the first frame (in _ready the game's tree is still being set up), whose every turn adds
+    /// its number, the thirteenth pausing at a line of its own, and its end said; and a name.</summary>
+    private const string Loop = "extends Node\n\nvar total := 0\nvar looped := false\nvar who := \"Ada\"\n\n\nfunc _process(_delta: float) -> void:\n\tif looped:\n\t\treturn\n"
+        + "\tlooped = true\n\tfor i in 30:\n\t\ttotal += i\n\t\tif i == 12:\n\t\t\ttotal += 0\n\tprint(\"done \", total)\n";
+
+    /// <summary>A hit count counts only hits whose condition held, through an edit of its message: i &gt; 10 and ==4 stop the
+    /// game at i 14, as every debugger counts (the managed debugger's and the browser's tests stop alike); one that neither
+    /// stops nor logs says where it was reached. The edited message logs \{ and \} as braces, a string quoted unless ,nq and
+    /// an int, 64 bits, in hexadecimal under ,h, as every debugger does; one writing {{ is refused saying how to write a brace.</summary>
+    [Fact]
+    public async Task A_hit_count_counts_the_hits_its_condition_held_on_through_an_edit_of_its_message_logged_as_every_debugger_logs_it()
+    {
+        File.WriteAllText(Path.Combine(folder, "ticker.gd"), Loop);
+        await using McpClient client = await Start(["--mcp", folder], languageServer: false,
+            environment: new() { [Passenger.App.Godot.GodotUserFolders.HomeVariable] = folder + "-home" });
+        string[] lines = Loop.Split('\n');
+        int counted = Array.FindIndex(lines, l => l.Contains("total += i", StringComparison.Ordinal)) + 1;
+        int paused = Array.FindIndex(lines, l => l.Contains("total += 0", StringComparison.Ordinal)) + 1;
+        int done = Array.FindIndex(lines, l => l.Contains("print(\"done", StringComparison.Ordinal)) + 1;
+        Dictionary<string, object?> counting = new() { ["path"] = "ticker.gd", ["line"] = counted, ["condition"] = "i > 10", ["hitCondition"] = "==4", ["logMessage"] = "first {i}" };
+        await Call(client, McpTools.BreakpointSet, counting);
+        await Call(client, McpTools.BreakpointSet, new() { ["path"] = "ticker.gd", ["line"] = paused });
+        await Call(client, McpTools.BreakpointSet, new() { ["path"] = "ticker.gd", ["line"] = done, ["suspend"] = false });
+        await Call(client, McpTools.DebugStart, new() { ["configuration"] = "Ticker", ["arguments"] = "--headless", ["waitSeconds"] = 60 });
+        Assert.Equal($"ticker.gd:{paused}:1", (await Call(client, McpTools.DebugState)).GetProperty("location").GetString());
+
+        await Call(client, McpTools.BreakpointSet, new(counting) { ["logMessage"] = "second \\{{i}\\} {who} {who,nq} {i,h}" });
+        JsonElement doubled = (await Call(client, McpTools.BreakpointSet, new() { ["path"] = "ticker.gd", ["line"] = paused, ["logMessage"] = "{{i}}" }))
+            .EnumerateArray().Single(b => b.GetProperty("line").GetInt32() == paused);
+        string? refused = doubled.TryGetProperty("message", out JsonElement message) ? message.GetString() : null;
+        Assert.True(refused == DisplayFormat.Misread("{{i}}"), $"The tracepoint writing a brace as {{{{ was taken, to log what it was not meant to, or refused saying something else: {doubled}");
+        await Call(client, McpTools.BreakpointSet, new() { ["path"] = "ticker.gd", ["line"] = paused, ["remove"] = true });
+        await Call(client, McpTools.DebugContinue, new() { ["waitSeconds"] = 30 });
+        string location = (await Call(client, McpTools.DebugState)).GetProperty("location").GetString()!;
+        string i = (await Call(client, McpTools.DebugEvaluate, new() { ["expression"] = "i" })).GetProperty("value").GetString()!;
+        Assert.True((location, i) == ($"ticker.gd:{counted}:1", "14"),
+            $"The breakpoint counting where i > 10 stopped at {location} with i {i}, not on its fourth such hit at line {counted} with i 14");
+        await Call(client, McpTools.DebugContinue, new() { ["waitSeconds"] = 5 });
+        string said = string.Empty;
+        await Until(async () => (said = Text(await Call(client, McpTools.Output, new() { ["of"] = "debug" }))).Contains("done ", StringComparison.Ordinal), "the game to say the loop's end");
+        Assert.True(said.Contains("second {14} \"Ada\" Ada 0x000000000000000e\n", StringComparison.Ordinal) && !said.Contains("first 1", StringComparison.Ordinal)
+            && said.Contains($"Breakpoint reached at ticker.gd:{done}", StringComparison.Ordinal),
+            $"The game's console did not say the edited message at the stop, then where the breakpoint that neither stops nor logs was reached: {said}");
         await Call(client, McpTools.Stop);
     }
 

@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using Avalonia;
 using Avalonia.Controls;
 using Avalonia.Layout;
@@ -276,7 +277,7 @@ public sealed class GodotLiveValues
         {
             return;
         }
-        long at = Environment.TickCount64;
+        long at = Milliseconds();
         Show(wanted, asks, answers, at);
         history.Forget(at);
     }
@@ -390,7 +391,7 @@ public sealed class GodotLiveValues
         }
         (_, string member, GodotMemberValue read) = shown.Hints[at];
         card.AddCode($"{shown.NodeName}.{member} = {GodotLiveWords.Of(read)}");
-        IReadOnlyList<(long At, double[] Parts)> readings = history.Of(shown.Node, member, Environment.TickCount64);
+        IReadOnlyList<(long At, double[] Parts)> readings = history.Of(shown.Node, member, Milliseconds());
         if (readings.Count < 2)
         {
             card.AddText(GodotLiveWords.Parts(read.Words is null && !read.IsPath ? read.Value : null) is null
@@ -401,7 +402,7 @@ public sealed class GodotLiveValues
         IReadOnlyList<string> names = GodotLiveWords.PartNames(read.Value);
         int parts = readings[^1].Parts.Length;
         string[] brushes = [.. Enumerable.Range(0, parts).Select(i => Graphs[i % Graphs.Length])];
-        Sparkline line = new(Kept, fromZero: false, fromRight: true, brushes) { Height = 44, Width = 240 };
+        Sparkline line = new(Kept, fromZero: false, fromRight: true, brushes) { Height = 44, Wanted = 240 };
         foreach ((long _, double[] values) in readings)
         {
             line.Add(values);
@@ -414,15 +415,15 @@ public sealed class GodotLiveValues
             card.AddText($"From {Range(0)} {over}");
             return true;
         }
-        // Each part's line named beside its colour, with its lowest and highest.
-        StackPanel legend = new() { Orientation = Orientation.Horizontal, Spacing = 14 };
+        // Each part's line named beside its colour with its lowest and highest, as many to a row as fit, its words wrapping alone.
+        WrapPanel legend = new() { ItemSpacing = Gaps.Wide, LineSpacing = Gaps.Tight };
         for (int i = 0; i < parts; i++)
         {
-            Border swatch = new() { Width = 9, Height = 9, VerticalAlignment = VerticalAlignment.Center };
+            Border swatch = new() { Width = 9, Height = 9, Margin = new Thickness(0, 0, Gaps.Small, 0), VerticalAlignment = VerticalAlignment.Center, [DockPanel.DockProperty] = Dock.Left };
             swatch.Bind(Border.BackgroundProperty, swatch.GetResourceObservable(brushes[i]));
-            TextBlock words = MutedText.Of($"{(i < names.Count ? names[i] : $"{i}")} {Range(i)}");
+            TextBlock words = MutedText.Wrapped($"{(i < names.Count ? names[i] : $"{i}")} {Range(i)}");
             words.FontSize = 12;
-            legend.Children.Add(new StackPanel { Orientation = Orientation.Horizontal, Spacing = 5, Children = { swatch, words } });
+            legend.Children.Add(new DockPanel { Children = { swatch, words } });
         }
         card.AddChart(legend);
         card.AddText($"Each part's lowest and highest {over}");
@@ -431,6 +432,9 @@ public sealed class GodotLiveValues
 
     /// <summary>How many readings a card's line has room for: a minute's, one a second.</summary>
     private const int Kept = (int)(GodotLiveHistory.Span / 1000);
+
+    /// <summary>The moment now in milliseconds of <see cref="Stopwatch"/>'s clock, which times the history's readings.</summary>
+    private static long Milliseconds() => (long)Stopwatch.GetElapsedTime(0).TotalMilliseconds;
 
     /// <summary>The colours of a value's parts, in the order of the theme's charts.</summary>
     private static readonly string[] Graphs = [TokenKeys.Graph_0, TokenKeys.Graph_1, TokenKeys.Graph_2, TokenKeys.Graph_3];

@@ -670,7 +670,7 @@ public sealed class RunConfigurationsTests : IClassFixture<RestoredFolders>, IDi
             Ui.Settle();
             Ui.ClickRow(window, window.ExplorerView.Tree.Rows.First(r => r.Name.StartsWith("Hello", StringComparison.Ordinal)));
             Ui.Run(window, Passenger.Editor.EditorActions.Undo);
-            Assert.Equal(["Undo Save Greeting as a Launch Profile? It changes launchSettings.json, the Properties folder and the run configuration Greeting."], asked);
+            Assert.Equal(["Undo Save Greeting as a Launch Profile? It changes the Properties folder and the run configuration Greeting, and deletes launchSettings.json."], asked);
             Assert.False(File.Exists(settingsFile) || Directory.Exists(properties), "Undo left launchSettings.json or the Properties folder made for it");
             Assert.Equal(["Hello", "Greeting"], Names(window));
             Assert.True(window.Configuration is { Name: "Greeting", Generated: false, BuildBeforeLaunch: false },
@@ -996,6 +996,53 @@ public sealed class RunConfigurationsTests : IClassFixture<RestoredFolders>, IDi
         }
     }
 
+    /// <summary>A program drawing with Spectre.Console, itself or through a library it references, is generated running in
+    /// the terminal, Edit Configurations saying why, since through the Run window's pipe its colours, live output and
+    /// prompts show as plain text or refuse; one of its launch profiles does too, Hello beside it keeps the Run window, and
+    /// Use external console turned off is kept with the folder over the default.</summary>
+    [AvaloniaFact]
+    public void A_program_drawing_with_a_terminal_package_is_generated_running_in_the_terminal_and_the_person_may_turn_it_off()
+    {
+        Write("Shop/Shop.csproj", TestProjects.Console().With("  <ItemGroup>\n    <PackageReference Include=\"Spectre.Console\" Version=\"0.57.2\" />\n  </ItemGroup>\n"));
+        Write("Shop/Program.cs", "System.Console.WriteLine(\"shop\");\n");
+        Write("Shop/Properties/launchSettings.json", "{ \"profiles\": { \"Shop\": { \"commandName\": \"Project\" } } }\n");
+        Write("Lib/Lib.csproj", TestProjects.Library().With("  <ItemGroup>\n    <PackageReference Include=\"Spectre.Console.Cli\" Version=\"0.57.2\" />\n  </ItemGroup>\n"));
+        Write("Tool/Tool.csproj", TestProjects.Console().With("  <ItemGroup>\n    <ProjectReference Include=\"../Lib/Lib.csproj\" />\n  </ItemGroup>\n"));
+        Write("Tool/Program.cs", "System.Console.WriteLine(\"tool\");\n");
+        Write("Shop.slnx", "<Solution>\n  <Project Path=\"Hello/Hello.csproj\" />\n  <Project Path=\"Shop/Shop.csproj\" />\n  <Project Path=\"Lib/Lib.csproj\" />\n  <Project Path=\"Tool/Tool.csproj\" />\n</Solution>\n");
+        MainWindow window = Keeping();
+        Ui.WaitFor(() => Names(window) is ["Hello", "Shop: Shop", "Tool"] && window.Configurations.Any(c => c.Console == ConsoleKind.Terminal),
+            () => $"Hello's, Shop's profile's and Tool's configurations, a drawing one in the terminal: {string.Join(", ", window.Configurations.Select(c => $"{c.Name} ({c.Console})"))}");
+        Assert.Equal([ConsoleKind.Internal, ConsoleKind.Terminal, ConsoleKind.Terminal], window.Configurations.Select(c => c.Console));
+        RunConfigurationsDialog dialog = window.ShowRunConfigurations();
+        Assert.True(dialog.Choose("Tool"));
+        Ui.Settle();
+        Assert.True(dialog.ConsoleBox.IsChecked == true, "A program drawing with Spectre.Console through its library is not run in the terminal, so its prompts refuse");
+        Assert.Contains("It runs in the terminal: Tool draws with Spectre.Console.Cli", dialog.Note, StringComparison.Ordinal);
+        Assert.True(dialog.Choose("Shop: Shop"));
+        Ui.Settle();
+        Assert.Contains("Shop draws with Spectre.Console,", dialog.Note, StringComparison.Ordinal);
+        dialog.ConsoleBox.IsChecked = false;
+        Ui.Settle();
+        Assert.DoesNotContain("draws with", dialog.Note, StringComparison.Ordinal);
+        Ui.Click(dialog.OkButton);
+        Ui.Settle();
+        Assert.Equal(ConsoleKind.Internal, window.Configurations.Single(c => c.Name == "Shop: Shop").Console);
+        window.Close();
+
+        MainWindow again = Keeping();
+        try
+        {
+            Ui.WaitFor(() => Names(again) is ["Hello", "Shop: Shop", "Tool"] && again.Configurations[2].Console == ConsoleKind.Terminal,
+                () => $"the configurations again: {string.Join(", ", again.Configurations.Select(c => $"{c.Name} ({c.Console})"))}");
+            Assert.True(again.Configurations[1].Console == ConsoleKind.Internal, "Use external console turned off for a drawing program was not kept with the folder");
+        }
+        finally
+        {
+            again.Close();
+        }
+    }
+
     /// <summary>Open browser, After launch: a launch profile's launchBrowser shows ticked with the URL its launchUrl and
     /// applicationUrl make, and opens that URL once the program listens; turned off in a copy, the copy opens none.</summary>
     [Gate]
@@ -1057,6 +1104,96 @@ public sealed class RunConfigurationsTests : IClassFixture<RestoredFolders>, IDi
         }
     }
 
+    /// <summary>Browser: a web app's page opens once its program listens in the system's default browser, starting no
+    /// program; in the browser program Settings › Run › Browser names, with that line's arguments before the page's address;
+    /// and in the one its run configuration names in Edit Configurations, over Settings'.</summary>
+    [AvaloniaFact]
+    public void A_web_apps_page_opens_in_the_browser_Settings_names_with_its_arguments_and_in_its_run_configurations_own_over_it()
+    {
+        Restored();
+        using HeldPort held = new();
+        int port = held.Port;
+        string gates = TestFolders.Create("gates-");
+        string listen = Path.Combine(gates, "listen");
+        string done = Path.Combine(gates, "done");
+        Write("Hello/Program.cs", "using System.Net;\nusing System.Net.Sockets;\n\n"
+            + $"while (!File.Exists(@\"{listen}\"))\n{{\n    Thread.Sleep(20);\n}}\n"
+            + "TcpListener listener = new(IPAddress.Loopback, int.Parse(Environment.GetEnvironmentVariable(\"PORT\")!));\n"
+            + $"listener.Start();\nConsole.WriteLine(\"Listening\");\nwhile (!File.Exists(@\"{done}\"))\n{{\n    Thread.Sleep(20);\n}}\n");
+        Write("Hello/Properties/launchSettings.json", "{ \"profiles\": { \"Serve\": { \"commandName\": \"Project\", \"launchBrowser\": true, \"launchUrl\": \"status\", "
+            + $"\"applicationUrl\": \"http://127.0.0.1:{port}\", \"environmentVariables\": {{ \"PORT\": \"{port}\" }} }} }} }}");
+        string page = $"http://127.0.0.1:{port}/status";
+        string browsers = TestFolders.Create("browsers-");
+        (string settingsBrowser, string settingsRecord) = Browser(browsers, "settings-browser");
+        (string ownBrowser, string ownRecord) = Browser(browsers, "own-browser");
+        // Seen, as a window nobody sees starts no browser program.
+        MainWindow window = Keeping(unseen: false);
+        try
+        {
+            Served();
+            Assert.Equal([page], window.Browsed.Select(u => u.AbsoluteUri));
+            Assert.True(window.BrowsersStarted.Count == 0, $"With no browser named, the page opened in a program: {string.Join(", ", window.BrowsersStarted)}");
+
+            window.ApplySettings(window.Settings with { Browser = $"\"{settingsBrowser}\" --incognito --lang=fr" });
+            Served();
+            Assert.Equal(["--incognito", "--lang=fr", page], Said(settingsRecord, "the browser Settings names"));
+
+            RunConfigurationsDialog dialog = window.ShowRunConfigurations();
+            Assert.Equal("Hello: Serve", dialog.Chosen?.Name);
+            Assert.True(dialog.BrowserLineBox.IsEffectivelyVisible, "Edit Configurations shows no Browser for a web app's configuration");
+            Assert.Equal($"\"{settingsBrowser}\" --incognito --lang=fr, from {PageBrowsers.SettingPlace}", dialog.BrowserLineBox.PlaceholderText);
+            Type(dialog.BrowserLineBox, $"\"{ownBrowser}\" --new-window");
+            Assert.Contains("Browser", dialog.Marked);
+            Ui.Click(dialog.OkButton);
+            Ui.Settle();
+            Assert.Equal($"\"{ownBrowser}\" --new-window", window.Configuration?.Browser);
+            File.Delete(settingsRecord);
+            Served();
+            Assert.Equal(["--new-window", page], Said(ownRecord, "the browser the run configuration names"));
+            Assert.False(File.Exists(settingsRecord), "The browser Settings names opened the page though the run configuration names its own");
+            Assert.Equal([page, page, page], window.Browsed.Select(u => u.AbsoluteUri));
+        }
+        finally
+        {
+            // A program a failure left listening ends; one still waiting to listen ends with the window.
+            File.WriteAllText(done, string.Empty);
+            window.Close();
+            TestFolders.Delete(browsers);
+        }
+
+        // A run of the chosen configuration that opens its page once it listens, then ends.
+        void Served()
+        {
+            int before = window.Browsed.Count;
+            File.Delete(done);
+            held.Hold(listen);
+            Ui.Launched(window, window.RunAsync(), "the site's run to start", TimeSpan.FromMinutes(2));
+            held.LetGo(listen);
+            Ui.WaitFor(() => window.Browsed.Count > before, "the page to open once the site listens", TimeSpan.FromSeconds(60));
+            File.WriteAllText(done, string.Empty);
+            Ui.WaitFor(() => window.Runner.Ended.IsCompleted, "the site's run to end");
+        }
+
+        // The words a stand-in browser was started with, once it has written them.
+        static IReadOnlyList<string> Said(string record, string browser)
+        {
+            Ui.WaitFor(() => File.Exists(record), $"{browser} to start with the page", TimeSpan.FromSeconds(30));
+            string[] lines = File.ReadAllLines(record);
+            // A batch file's %* is the line cmd.exe was given, a word quoted where cmd needs it to be.
+            return OperatingSystem.IsWindows() ? [.. CommandLine.Split(lines[0])] : lines;
+        }
+    }
+
+    /// <summary>A stand-in browser that writes the words it was started with to its record, a line each (a line of them on
+    /// Windows), and ends, as a browser already running hands its page over: its program and its record.</summary>
+    private static (string Program, string Record) Browser(string folder, string name)
+    {
+        string record = Path.Combine(folder, $"{name}.txt");
+        string program = TestFolders.StandIn(folder, name, $"echo %*> \"{record}.part\"\r\nmove /y \"{record}.part\" \"{record}\" > nul",
+            $"for word in \"$@\"; do printf '%s\\n' \"$word\"; done > '{record}.part' && mv '{record}.part' '{record}'");
+        return (program, record);
+    }
+
     [Gate]
     [AvaloniaFact]
     public void A_configuration_removed_in_the_dialog_is_gone_from_the_toolbar_and_the_folder()
@@ -1095,7 +1232,7 @@ public sealed class RunConfigurationsTests : IClassFixture<RestoredFolders>, IDi
     [AvaloniaFact]
     public void A_compose_configuration_added_in_the_dialog_shows_its_kinds_page_and_is_kept_with_its_files_and_choices()
     {
-        Write("compose.yaml", "services:\n  web:\n    image: busybox:1.37\n");
+        Write("compose.yaml", "services:\n  web:\n    image: busybox:1.38\n");
         Write("compose.override.yaml", "services:\n  web:\n    environment: { A: \"1\" }\n");
         MainWindow window = Keeping();
         RunConfigurationsDialog dialog = window.ShowRunConfigurations();
@@ -1237,9 +1374,81 @@ public sealed class RunConfigurationsTests : IClassFixture<RestoredFolders>, IDi
     }
 
     /// <summary>A window that keeps its state in the tests' own store, on the folder.</summary>
-    private MainWindow Keeping()
+    /// <summary>A solution's multi-project launch profile, as Visual Studio keeps it beside the solution, is listed and changed
+    /// in Edit Configurations: its projects' actions and launch profiles in a table, renamed; one made there kept in the
+    /// person's own file; one removed. OK writes them in Visual Studio's format, every character it did not change and a
+    /// member Passenger does not model kept, and Undo takes the change back whole.</summary>
+    [AvaloniaFact]
+    public void A_launch_profile_of_several_projects_is_changed_made_and_removed_in_the_dialog_and_written_as_Visual_Studio_writes_it()
     {
-        MainWindow window = new() { Width = 1200, Height = 800, StateFolder = settings, StartsLanguageServer = false };
+        Write("Tool/Tool.csproj", TestProjects.Console());
+        Write("Tool/Program.cs", "System.Console.WriteLine(\"tool\");\n");
+        Write("Tool/Properties/launchSettings.json", "{ \"profiles\": { \"quiet\": { \"commandName\": \"Project\" } } }\n");
+        Write("Shop.slnx", "<Solution>\n  <Project Path=\"Hello/Hello.csproj\" />\n  <Project Path=\"Tool/Tool.csproj\" />\n</Solution>\n");
+        const string Launch = "[\n  {\n    \"Name\": \"Both\",\n    \"Projects\": [\n      {\n        \"Path\": \"Hello\\\\Hello.csproj\",\n        \"Action\": \"Start\"\n      },\n"
+            + "      {\n        \"Path\": \"Tool\\\\Tool.csproj\",\n        \"Action\": \"StartWithoutDebugging\",\n        \"Kept\": true\n      }\n    ]\n  },\n"
+            + "  {\n    \"Name\": \"Old\",\n    \"Projects\": []\n  }\n]";
+        Write("Shop.slnLaunch", Launch);
+        string shared = Path.Combine(folder, "Shop.slnLaunch");
+        string own = Path.Combine(folder, "Shop.slnLaunch.user");
+        MainWindow window = Keeping();
+        try
+        {
+            Ui.WaitFor(() => Names(window).Contains("Both"), () => $"the solution's launch profiles to be listed ({string.Join(", ", Names(window))})");
+            Assert.Equal(["Hello", "Tool: quiet", "Both", "Old"], Names(window));
+            RunConfigurationsDialog dialog = window.ShowRunConfigurations();
+            Assert.True(dialog.Choose("Both"));
+            Assert.Equal("Multiple Projects", dialog.KindText.Text);
+            Assert.True(dialog.SharedBox.IsChecked == true && dialog.SharedBox.IsEffectivelyVisible, "A profile of the team's file is not shown as shared");
+            Assert.Equal([("Hello", 0, 0), ("Tool", 1, 0)], dialog.StartsTable.Rows.Select(r => (Path.GetFileNameWithoutExtension(r.Project), r.Action.SelectedIndex, r.Profile.SelectedIndex)));
+
+            dialog.StartsTable.Rows[0].Action.SelectedIndex = (int)Passenger.Workspace.ProjectLaunchAction.None;
+            dialog.StartsTable.Rows[1].Profile.SelectedIndex = 1;
+            Type(dialog.NameBox, "Tool alone");
+            Ui.Click(dialog.AddButton);
+            Ui.Click(Assert.IsType<ContextMenu>(dialog.AddMenu).Items.OfType<MenuItem>().Single(i => (string?)i.Header == "Multiple Projects"));
+            Type(dialog.NameBox, "Mine");
+            Assert.Equal([0, 0], dialog.StartsTable.Rows.Select(r => r.Profile.SelectedIndex));
+            Assert.True(dialog.StartsTable.Rows.All(r => r.Action.SelectedIndex == (int)Passenger.Workspace.ProjectLaunchAction.None), "A new profile starts a project nobody chose");
+            dialog.StartsTable.Rows[0].Action.SelectedIndex = (int)Passenger.Workspace.ProjectLaunchAction.Start;
+            dialog.SharedBox.IsChecked = false;
+            Ui.Settle();
+            Assert.True(dialog.Choose("Old"));
+            Ui.Click(dialog.RemoveButton);
+            Ui.Click(dialog.OkButton);
+            Ui.WaitFor(() => window.RunConfigurationsDialog is null, () => $"the dialog to close once the profiles are written ({dialog.Problem})");
+
+            Assert.Equal("[\n  {\n    \"Name\": \"Tool alone\",\n    \"Projects\": [\n      {\n        \"Path\": \"Hello\\\\Hello.csproj\",\n        \"Action\": \"None\"\n      },\n"
+                + "      {\n        \"Path\": \"Tool\\\\Tool.csproj\",\n        \"Action\": \"StartWithoutDebugging\",\n        \"Kept\": true,\n        \"DebugTarget\": \"quiet\"\n      }\n    ]\n  }\n]",
+                File.ReadAllText(shared));
+            Assert.Equal("[\n  {\n    \"Name\": \"Mine\",\n    \"Projects\": [\n      {\n        \"Path\": \"Hello\\\\Hello.csproj\",\n        \"Action\": \"Start\"\n      }\n    ]\n  }\n]",
+                File.ReadAllText(own));
+            Assert.Equal(["Hello", "Tool: quiet", "Tool alone", "Mine"], Names(window));
+            Assert.Equal("Mine", window.Configuration?.Name);
+
+            List<string> asked = [];
+            window.Confirm = (_, question, _) =>
+            {
+                asked.Add(question);
+                return Task.FromResult(true);
+            };
+            window.ExplorerView.Reveal(Path.Combine(project, "Hello.csproj"));
+            Ui.Settle();
+            Ui.ClickRow(window, window.ExplorerView.Tree.Rows.First(r => r.Name.StartsWith("Hello", StringComparison.Ordinal)));
+            Heard(window, shared, () => Ui.Run(window, Passenger.Editor.EditorActions.Undo));
+            Assert.Equal(["Undo Change Launch Profiles? It changes Shop.slnLaunch, and deletes Shop.slnLaunch.user."], asked);
+            Assert.True(File.ReadAllText(shared) == Launch && !File.Exists(own), "Undo did not put the launch profiles back as they were");
+            Ui.WaitFor(() => Names(window).SequenceEqual(["Hello", "Tool: quiet", "Both", "Old"]), () => $"the configurations to follow the files taken back ({string.Join(", ", Names(window))})");
+        }
+        finally
+        {
+            window.Close();
+        }
+    }
+
+    private MainWindow Keeping(bool? unseen = null)
+    {
+        MainWindow window = new() { Width = 1200, Height = 800, StateFolder = settings, StartsLanguageServer = false, Unseen = unseen ?? PassengerApp.ShowsNoWindow };
         window.Show();
         window.KeepLayout();
         window.OpenFolder(folder);
@@ -1261,7 +1470,7 @@ public sealed class RunConfigurationsTests : IClassFixture<RestoredFolders>, IDi
     {
         Ui.Click(dialog.AddButton);
         ContextMenu kinds = Assert.IsType<ContextMenu>(dialog.AddMenu);
-        Assert.Equal([".NET Project", "Docker Compose", "Dockerfile", "SDK Container"], kinds.Items.OfType<MenuItem>().Select(i => (string?)i.Header));
+        Assert.Equal([".NET Project", "Multiple Projects", "Docker Compose", "Dockerfile", "SDK Container"], kinds.Items.OfType<MenuItem>().Select(i => (string?)i.Header));
         Ui.Click(kinds.Items.OfType<MenuItem>().First());
     }
 

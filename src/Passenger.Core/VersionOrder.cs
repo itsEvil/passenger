@@ -7,12 +7,32 @@ public sealed class VersionOrder : IComparer<string>
 {
     public static readonly VersionOrder Instance = new();
 
-    public static bool IsPrerelease(string version) => Release(version).Contains('-', StringComparison.Ordinal);
+    public static bool IsPrerelease(string version) => Label(version) is not null;
+
+    /// <summary>A version's prerelease label (rc.2 of 9.0.0-rc.2+abc), null for a release.</summary>
+    public static string? Label(string version) => Release(version.Trim()).Split('-', 2) is [_, { } label] ? label : null;
 
     /// <summary>A version's first number (9 of 9.0.1 and 9.0.0-rc.2); null for a version that starts with none.</summary>
     public static int? Major(string version) =>
         int.TryParse(Release(version.Trim()).Split('-', 2)[0].Split('.')[0], System.Globalization.NumberStyles.None, System.Globalization.CultureInfo.InvariantCulture, out int major)
             ? major : null;
+
+    /// <summary>Whether two versions share their first two numbers, as a patch release shares its minor version's (0.4.1
+    /// and 0.4.0).</summary>
+    public static bool SameMinor(string x, string y) => Parse(x).Numbers is var a && Parse(y).Numbers is var b && a[0] == b[0] && a[1] == b[1];
+
+    /// <summary>The folder of these whose name is the newest version (<see cref="NewestFirst"/>); null for none.</summary>
+    public static string? Newest(IEnumerable<string> folders) => NewestFirst(folders).FirstOrDefault();
+
+    /// <summary>The folders named by versions (a runtime's, a pack's, a tool's), newest first: a release above its release
+    /// candidates and previews, which share its numbers. A name beginning with no digit is no version and left out; two
+    /// names of one version (1.0, 1.0.0) go by their names, ordinal, so the order they are listed in never decides.</summary>
+    public static IReadOnlyList<string> NewestFirst(IEnumerable<string> folders) =>
+        [.. folders.Select(f => (Folder: f, Name: Path.GetFileName(f.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar))))
+            .Where(f => f.Name.Length > 0 && char.IsAsciiDigit(f.Name[0]))
+            .OrderByDescending(f => f.Name, Instance)
+            .ThenBy(f => f.Name, StringComparer.Ordinal)
+            .Select(f => f.Folder)];
 
     public int Compare(string? x, string? y)
     {

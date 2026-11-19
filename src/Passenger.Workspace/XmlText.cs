@@ -56,6 +56,11 @@ internal sealed class XmlText
     public string IndentIn(XElement parent) =>
         parent.Elements().LastOrDefault() is { } last && Indent(last) is { Length: > 0 } own ? own : LineIndent(Span(parent).Start) + Unit;
 
+    /// <summary>The step a parent's children are indented by beyond it: theirs less its own, else <see cref="Unit"/>.</summary>
+    public string StepIn(XElement parent) =>
+        IndentIn(parent) is { } inside && LineIndent(Span(parent).Start) is { } outside && inside.Length > outside.Length && inside.StartsWith(outside, StringComparison.Ordinal)
+            ? inside[outside.Length..] : Unit;
+
     /// <summary>Puts an element after another: on the same line when more follows it there, else on a line of its own
     /// indented as it is, a step further in when its line begins with what holds it.</summary>
     public void After(XElement element, string with)
@@ -95,13 +100,13 @@ internal sealed class XmlText
         }
         string indent = IndentIn(parent);
         int close = Text.LastIndexOf("</", end - 1, StringComparison.Ordinal);
-        int closeLine = Text.LastIndexOf('\n', Math.Max(0, close - 1)) + 1;
+        int closeLine = TextNavigation.LineStart(Text, close);
         if (closeLine <= open || Text[closeLine..close].Trim().Length > 0)
         {
             Splice(close, 0, ownLine ? NewLine + indent + element + NewLine : element);
             return;
         }
-        int previous = closeLine >= 2 ? Text.LastIndexOf('\n', closeLine - 2) + 1 : 0;
+        int previous = TextNavigation.LineStart(Text, closeLine - 1);
         bool spaced = previous > open && Text[previous..(closeLine - 1)].Trim().Length == 0;
         Splice(closeLine, 0, indent + element + NewLine + (spaced ? NewLine : string.Empty));
     }
@@ -234,6 +239,35 @@ internal sealed class XmlText
 
     public string Written((int Start, int Length) span) => Text.Substring(span.Start, span.Length);
 
+    /// <summary>Where each part of a value is as written (an item's list of paths), split where MSBuild splits it once XML
+    /// has read it: at each semicolon, written or as a reference, never one ending another reference. Each part keeps the
+    /// spaces around it; one written empty is there too.</summary>
+    public List<(int Start, int Length)> PartsOf((int Start, int Length) span)
+    {
+        string raw = Written(span);
+        List<(int Start, int Length)> parts = [];
+        int start = 0;
+        for (int at = 0; at < raw.Length; at++)
+        {
+            if (raw[at] == '&' && XmlEntities.ReferenceAt(raw, at, out int length) is { } named)
+            {
+                if (named == ";")
+                {
+                    parts.Add((span.Start + start, at - start));
+                    start = at + length;
+                }
+                at += length - 1;
+            }
+            else if (raw[at] == ';')
+            {
+                parts.Add((span.Start + start, at - start));
+                start = at + 1;
+            }
+        }
+        parts.Add((span.Start + start, raw.Length - start));
+        return parts;
+    }
+
     /// <summary>Makes several changes of the text as it reads now at once, each a span and what replaces it, none
     /// overlapping another.</summary>
     public void Apply(IEnumerable<(int Start, int Length, string With)> edits)
@@ -266,7 +300,7 @@ internal sealed class XmlText
         {
             to += to < Text.Length && Text[to] == '\r' ? 1 : 0;
             to += to < Text.Length && Text[to] == '\n' ? 1 : 0;
-            int previous = from >= 2 ? Text.LastIndexOf('\n', from - 2) + 1 : -1;
+            int previous = from > 0 ? TextNavigation.LineStart(Text, from - 1) : -1;
             int blank = Text.IndexOf('\n', to);
             if (spaced && previous >= 0 && Text[previous..(from - 1)].Trim().Length == 0 && blank >= 0 && Text[to..blank].Trim().Length == 0)
             {

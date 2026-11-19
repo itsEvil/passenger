@@ -1,4 +1,3 @@
-using System.Diagnostics;
 using Avalonia;
 using Avalonia.Controls;
 using Avalonia.Headless;
@@ -20,19 +19,29 @@ namespace Passenger.Tests;
 /// branch made from the toolbar is checked out, and going back reloads the open file; Commit, Stash and Unstash run one
 /// at a time, a drop asked first and the log leaving the stash out; a status older than a commit never lands after it,
 /// nor lists a save's temporary file, and the last commit's texts are read again only when HEAD moves.</summary>
-public sealed class VcsTests : IDisposable
+public sealed partial class VcsTests : IDisposable
 {
     private const string Original = "class Shop\n{\n    int count;\n\n    void Add() { count++; }\n}\n";
 
     private readonly string folder = TestFolders.Create("git-");
+    private readonly string trash = TestFolders.Create("trash-");
 
-    public VcsTests() => TestFolders.Prepare(() =>
+    public VcsTests()
     {
-        File.WriteAllText(Path.Combine(folder, "Shop.cs"), Original);
-        TestGit.Init(folder);
-    }, folder);
+        TestFolders.Prepare(() =>
+        {
+            File.WriteAllText(Path.Combine(folder, "Shop.cs"), Original);
+            TestGit.Init(folder);
+        }, folder);
+        Trash.Folder = trash;
+    }
 
-    public void Dispose() => TestFolders.Delete(folder);
+    public void Dispose()
+    {
+        Trash.Folder = null;
+        TestFolders.Delete(folder);
+        TestFolders.Delete(trash);
+    }
 
     /// <summary>Git's commands start off the window's thread, since a fork costs a large process tens of milliseconds: the
     /// working tree's status and branch as it opens, an edit's bars, a commit and the log start none of theirs on
@@ -135,8 +144,8 @@ public sealed class VcsTests : IDisposable
             Button showDiff = commit.GetVisualDescendants().OfType<Button>().Single(b => (ToolTip.GetTip(b) as string)?.StartsWith("Show Diff", StringComparison.Ordinal) == true);
             Assert.Equal($"Show Diff ({Shortcut.Parse($"{cmd} D").Display()})", ToolTip.GetTip(showDiff));
 
-            DiffWindow diff = DiffFromCommit(window, $"{cmd} D");
-            Assert.Equal($"Settings ({Shortcut.Parse($"{cmd} shift D").Display()})", ToolTip.GetTip(diff.View.SettingsButton));
+            IDiffHost diff = DiffFromCommit(window, $"{cmd} D");
+            Assert.Equal($"Settings ({Shortcut.Parse($"{cmd} shift D").Display()})", ToolTip.GetTip(OpenDiffs.ViewOf(diff).SettingsButton));
             SettingsOpen(diff, $"{cmd} shift D");
             diff.Close();
             Ui.Settle();
@@ -148,10 +157,11 @@ public sealed class VcsTests : IDisposable
             Ui.Settle();
             Assert.Equal($"Show Diff ({Shortcut.Parse($"{cmd} alt D").Display()})", ToolTip.GetTip(showDiff));
             diff = DiffFromCommit(window, $"{cmd} alt D");
-            Assert.Equal($"Settings ({Shortcut.Parse($"{cmd} alt shift D").Display()})", ToolTip.GetTip(diff.View.SettingsButton));
-            diff.View.Right.Focus();
-            Ui.Press(diff, $"{cmd} shift D");
-            Assert.False(diff.View.SettingsButton.ContextMenu?.IsOpen, $"{cmd} shift D still opened the diff's settings, the person having set {cmd} alt shift D");
+            DiffView view = OpenDiffs.ViewOf(diff);
+            Assert.Equal($"Settings ({Shortcut.Parse($"{cmd} alt shift D").Display()})", ToolTip.GetTip(view.SettingsButton));
+            view.Right.Focus();
+            Ui.Press(OpenDiffs.KeysOf(diff), $"{cmd} shift D");
+            Assert.False(view.SettingsButton.ContextMenu?.IsOpen, $"{cmd} shift D still opened the diff's settings, the person having set {cmd} alt shift D");
             SettingsOpen(diff, $"{cmd} alt shift D");
             diff.Close();
         }
@@ -161,21 +171,21 @@ public sealed class VcsTests : IDisposable
             window.Close();
         }
 
-        static DiffWindow DiffFromCommit(MainWindow window, string keys)
+        static IDiffHost DiffFromCommit(MainWindow window, string keys)
         {
             ListBox changes = Find(window.CommitView, window.CommitView.Rows);
             Ui.Click(Ui.Row(changes, window.CommitView.Rows.OfType<CommitRow>().First(r => r.Change.Name == "Shop.cs")));
             Ui.Press(window, keys);
-            Ui.Landed(() => window.Frontmost is DiffWindow, $"the diff {keys} in the Commit window opens, as its Show Diff names");
-            return (DiffWindow)window.Frontmost;
+            return OpenDiffs.Landed(window, $"the diff {keys} in the Commit window opens, as its Show Diff names");
         }
 
-        static void SettingsOpen(DiffWindow diff, string keys)
+        static void SettingsOpen(IDiffHost diff, string keys)
         {
-            diff.View.Right.Focus();
-            Ui.Press(diff, keys);
-            Assert.True(diff.View.SettingsButton.ContextMenu?.IsOpen, $"{keys}, which the diff's Settings names, did not open them");
-            diff.View.SettingsButton.ContextMenu!.Close();
+            DiffView view = OpenDiffs.ViewOf(diff);
+            view.Right.Focus();
+            Ui.Press(OpenDiffs.KeysOf(diff), keys);
+            Assert.True(view.SettingsButton.ContextMenu?.IsOpen, $"{keys}, which the diff's Settings names, did not open them");
+            view.SettingsButton.ContextMenu!.Close();
         }
     }
 
@@ -214,9 +224,10 @@ public sealed class VcsTests : IDisposable
         Assert.True(Marks(window) is [{ Line: 2, Count: 1, Kind: ChangeMarkKind.Modified }],
             $"Store.cs, git mv'd from Shop.cs with one line changed, shows the bars [{string.Join(", ", Marks(window))}]: compared with nothing, every line is new");
 
-        DiffWindow diff = (DiffWindow)Ui.Landed(window.ShowDiffAsync(PathNames.Canonical(store)), "Store.cs's diff")!;
-        Assert.Equal(Original, diff.View.Left.Document.Snapshot.ToString());
-        Assert.True(diff.View.Hunks.Count == 1, $"Show Diff of the renamed Store.cs found {diff.View.Hunks.Count} differences from the last commit's Shop.cs, not its one line");
+        IDiffHost diff = Ui.Landed(window.ShowDiffAsync(PathNames.Canonical(store)), "Store.cs's diff")!;
+        DiffView view = OpenDiffs.ViewOf(diff);
+        Assert.Equal(Original, view.Left.Document.Snapshot.ToString());
+        Assert.True(view.Hunks.Count == 1, $"Show Diff of the renamed Store.cs found {view.Hunks.Count} differences from the last commit's Shop.cs, not its one line");
         diff.Close();
         Ui.Settle();
 
@@ -252,6 +263,22 @@ public sealed class VcsTests : IDisposable
         Assert.True(held == "A\tShop.cs", $"Amend with no file chosen took the index's rename into the last commit, which now holds [{held}]");
         string listed = string.Join(", ", window.Vcs.Changes.Select(c => $"{c.Name} ({c.Kind})"));
         Assert.True(window.Vcs.Changes.Any(c => c.Name == "Store.cs" && c.Kind == ChangeKind.Renamed), $"After the amend the rename is no change: Git lists [{listed}]");
+        window.Close();
+    }
+
+    /// <summary>A file renamed in the Explorer, which stages the rename, commits with its change chosen: the old name, which
+    /// only the last commit still has, is no pathspec git refuses to add.</summary>
+    [AvaloniaFact]
+    public void A_file_renamed_in_the_Explorer_is_committed_as_a_rename()
+    {
+        MainWindow window = Open();
+        Assert.Null(Ui.Await(window.RenameAsync(PathNames.Canonical(Path.Combine(folder, "Shop.cs")), "Store.cs"), "the rename"));
+        Ui.Landed(() => window.Vcs.Changes.Any(c => c.Name == "Store.cs" && c.Kind == ChangeKind.Renamed), "Store.cs listed as renamed from Shop.cs");
+
+        CommitResult made = Ui.Landed(window.Vcs.CommitAsync([.. window.Vcs.Changes.Where(c => c.Name == "Store.cs")], "Rename Shop", amend: false, push: false), "the commit");
+
+        Assert.True(made.Commit.Succeeded, $"Committing the renamed file failed with: {made.Commit.Message}");
+        Assert.Equal("R\tShop.cs\tStore.cs", Git("show", "--name-status", "--format=", "-M", "HEAD").Trim().Replace("R100", "R", StringComparison.Ordinal));
         window.Close();
     }
 
@@ -556,6 +583,56 @@ public sealed class VcsTests : IDisposable
         window.Close();
     }
 
+    /// <summary>Rollback of a changed file and an unversioned one puts the changed one back and moves the unversioned one to
+    /// the Trash in a command of its own, as its question says first: one Undo, asked once, brings the unversioned file back
+    /// out of the Trash, listed as unversioned again, the changed one staying as the last commit has it.</summary>
+    [AvaloniaFact]
+    public void Rollback_moves_an_unversioned_file_to_the_Trash_and_one_undo_brings_it_back()
+    {
+        string shop = Path.Combine(folder, "Shop.cs");
+        string added = Path.Combine(folder, "Prices.cs");
+        File.WriteAllText(shop, "sealed " + Original);
+        File.WriteAllText(added, "class Prices { }\n");
+        MainWindow window = Ui.OpenFolder(folder, languageServer: false);
+        Ui.Landed(() => window.Vcs.Changes.Count == 2, "a changed file and a new one listed");
+        List<string> asked = [];
+        window.Confirm = (_, text, _) =>
+        {
+            asked.Add(text);
+            return Task.FromResult(true);
+        };
+        window.ShowToolWindow(ToolWindowIds.Commit);
+        Ui.Settle();
+        foreach (CommitRow row in window.CommitView.Rows.OfType<CommitRow>())
+        {
+            row.IsChosen = true;
+        }
+
+        RollbackChosen(window);
+        Ui.WaitFor(() => window.Status == "Rolled back 2 files" || window.Status?.Contains("could not", StringComparison.Ordinal) == true, () => $"the rollback: {window.Status}");
+        Assert.True(asked.Count == 1 && asked[0].Contains("Unversioned files are deleted to the Trash, and Undo brings them back.", StringComparison.Ordinal),
+            $"Rollback asked: {string.Join(" | ", asked)}");
+        Assert.True(File.ReadAllText(shop) == Original && !File.Exists(added), $"The rollback left Shop.cs changed or Prices.cs there: {window.Status}");
+        Assert.True(File.ReadAllText(Path.Combine(trash, "Prices.cs")) == "class Prices { }\n", "Rollback did not move Prices.cs to the Trash");
+
+        asked.Clear();
+        window.ShowToolWindow(ToolWindowIds.Explorer);
+        window.ExplorerView.Reveal(PathNames.Canonical(shop));
+        Ui.Settle();
+        Ui.ClickRow(window, window.ExplorerView.Tree.Rows.First(r => r.Path == PathNames.Canonical(shop)));
+        Ui.Run(window, EditorActions.Undo);
+        Ui.WaitFor(() => File.Exists(added), () => $"one Undo to bring Prices.cs back: {window.Status}");
+        Assert.True(asked.Count == 1 && asked[0].Contains("brings back Prices.cs", StringComparison.Ordinal), $"Undo of the rollback asked: {string.Join(" | ", asked)}");
+        Assert.Equal("class Prices { }\n", File.ReadAllText(added));
+        Assert.Equal(Original, File.ReadAllText(shop));
+        Assert.Empty(Directory.EnumerateFileSystemEntries(trash));
+        Task read = window.Vcs.RefreshAsync();
+        Ui.Landed(() => read.IsCompleted, "Git read again");
+        string listed = string.Join(", ", window.Vcs.Changes.Select(c => $"{c.Name} ({c.Kind})"));
+        Assert.True(listed == "Prices.cs (Unversioned)", $"After Undo Git lists [{listed}]");
+        window.Close();
+    }
+
     /// <summary>Rollback of a new file another program added to Git (git add, or a merge's), which no commit holds, keeps
     /// it on disk as it is now, unversioned, as the question says first; the changed file beside it goes back.</summary>
     [AvaloniaFact]
@@ -605,40 +682,43 @@ public sealed class VcsTests : IDisposable
         window.Perform(AppActions.Save);
         _ = window.Vcs.RefreshAsync();
         Ui.Landed(() => window.Vcs.Changes.Count == 1, "Shop.cs listed as changed");
+        Passenger.App.Workspace.OpenDocument file = window.EditorArea.Active!;
 
         Task<IDiffHost?> opening = window.ShowDiffAsync(window.Vcs.Changes[0].Path);
-        DiffWindow diff = (DiffWindow)Ui.Landed(opening, "the diff open")!;
-        Assert.Same(diff, window.Frontmost);
-        DiffView view = diff.View;
+        IDiffHost diff = Ui.Landed(opening, "the diff open")!;
+        Assert.True(OpenDiffs.Shown(window) == diff, "Show Diff opened the diff behind what the person sees");
+        DiffView view = OpenDiffs.ViewOf(diff);
         Assert.Equal(Original, view.Left.Document.Snapshot.ToString());
-        Assert.Same(window.EditorArea.Active!.Text, view.Right.Document);
+        Assert.Same(file.Text, view.Right.Document);
         Assert.Equal([new DiffHunk(2, 1, 2, 1), new DiffHunk(4, 0, 4, 1)], view.Hunks);
         // Below the added line, the left side stands one line higher.
         Assert.Equal(5, view.MapLine(6, toLeft: true));
 
         view.Revert(view.Hunks[1]);
         Ui.Settle();
-        Assert.DoesNotContain("int total;", Text(window), StringComparison.Ordinal);
+        Assert.DoesNotContain("int total;", file.Text.Snapshot.ToString(), StringComparison.Ordinal);
         Assert.Equal([new DiffHunk(2, 1, 2, 1)], view.Hunks);
-        Assert.True(window.EditorArea.Active!.IsModified);
+        Assert.True(file.IsModified, "A change put back from the diff left the file it edits unchanged");
         diff.Close();
         window.Close();
     }
 
     /// <summary>The IDE's keys work in a diff's window as in the main one, the diff keeping its own: Find Action opens over
     /// it and Escape closes that first, the keys back on the file's side; F7 is still the diff's next difference; an
-    /// editor's key goes to the side with the keys, not to the main window's editor; and Escape then closes the window.</summary>
+    /// editor's key goes to the side with the keys, not to the main window's editor; and Escape then closes the window.
+    /// Diffs are set to open in a window of their own, the window being what this holds of.</summary>
     [AvaloniaFact]
     public void The_IDEs_keys_work_in_a_diffs_window_on_the_side_with_them_and_Escape_still_closes_it()
     {
         MainWindow window = Open();
+        window.ApplySettings(window.Settings with { OpenDiffsIn = Passenger.App.Settings.DiffPlace.Window });
         CodeEditor editor = window.EditorArea.CodeEditor;
         editor.GoTo(new TextPosition(2, 4));
         window.KeyTextInput("long ");
         window.Perform(AppActions.Save);
         editor.GoTo(new TextPosition(0, 0));
         Task<IDiffHost?> opening = window.ShowDiffAsync(window.EditorArea.Active!.Path);
-        DiffWindow diff = (DiffWindow)Ui.Landed(opening, "the diff open")!;
+        DiffWindow diff = Assert.IsType<DiffWindow>(Ui.Landed(opening, "the diff open"));
         DiffView view = diff.View;
         Ui.Landed(() => view.Right.IsFocused, "the diff's side of the file to have the keys");
 
@@ -663,8 +743,8 @@ public sealed class VcsTests : IDisposable
     }
 
     /// <summary>Jump to Source goes from a diff to its file: F4 on the file's side opens it in the main window at the caret,
-    /// the diff's window closed so the file shows; F4 on the last commit's side lands on the line that one stands at now,
-    /// past the lines put in above it; and the diff's toolbar names it with its key.</summary>
+    /// the file shown in front of the diff; F4 on the last commit's side lands on the line that one stands at now, past
+    /// the lines put in above it; and the diff's toolbar names it with its key.</summary>
     [AvaloniaFact]
     public void F4_in_a_diff_opens_its_file_at_the_carets_line_from_either_side()
     {
@@ -675,23 +755,25 @@ public sealed class VcsTests : IDisposable
         window.OpenFile(Path.Combine(folder, "Notes.txt"));
         Ui.Settle();
 
-        DiffWindow diff = (DiffWindow)Ui.Landed(window.ShowDiffAsync(shop), "the diff open")!;
-        Ui.Landed(() => diff.View.Right.IsFocused, "the diff's side of the file to have the keys");
-        Button jump = diff.View.GetVisualDescendants().OfType<Button>().Single(b => b.Name == AppActions.DiffJumpToSource);
+        IDiffHost diff = Ui.Landed(window.ShowDiffAsync(shop), "the diff open")!;
+        DiffView view = OpenDiffs.ViewOf(diff);
+        Ui.Landed(() => view.Right.IsFocused, "the diff's side of the file to have the keys");
+        Button jump = view.GetVisualDescendants().OfType<Button>().Single(b => b.Name == AppActions.DiffJumpToSource);
         Assert.Equal("Jump to Source (F4)", ToolTip.GetTip(jump));
-        diff.View.Right.GoTo(new TextPosition(4, 4));
-        Ui.Press(diff, "F4");
-        Assert.False(diff.IsVisible, "Jump to Source left the diff's window open over the file it opened");
+        view.Right.GoTo(new TextPosition(4, 4));
+        Ui.Press(OpenDiffs.KeysOf(diff), "F4");
+        Assert.True(OpenDiffs.Shown(window) is null && window.Frontmost == window, "Jump to Source left the diff in front of the file it opened");
         Assert.True(window.EditorArea.Active?.Path == shop, $"Jump to Source opened {window.EditorArea.Active?.Path}, not the diff's file");
         Assert.Equal(new TextPosition(4, 4), window.EditorArea.CodeEditor.CaretPosition);
 
         window.OpenFile(Path.Combine(folder, "Notes.txt"));
         Ui.Settle();
-        diff = (DiffWindow)Ui.Landed(window.ShowDiffAsync(shop), "the diff open again")!;
-        diff.View.Left.Focus();
-        diff.View.Left.GoTo(new TextPosition(2, 4));
-        Ui.Press(diff, "F4");
-        Assert.False(diff.IsVisible, "Jump to Source from the last commit's side left the diff's window open");
+        diff = Ui.Landed(window.ShowDiffAsync(shop), "the diff open again")!;
+        view = OpenDiffs.ViewOf(diff);
+        view.Left.Focus();
+        view.Left.GoTo(new TextPosition(2, 4));
+        Ui.Press(OpenDiffs.KeysOf(diff), "F4");
+        Assert.True(OpenDiffs.Shown(window) is null && window.Frontmost == window, "Jump to Source from the last commit's side left the diff in front of the file it opened");
         Assert.True(window.EditorArea.Active?.Path == shop && window.EditorArea.CodeEditor.CaretPosition.Line == 4,
             $"F4 on the last commit's line 3 went to line {window.EditorArea.CodeEditor.CaretPosition.Line + 1} of {window.EditorArea.Active?.Path}, not to line 5 of Shop.cs, where it stands now");
         window.Close();
@@ -711,14 +793,15 @@ public sealed class VcsTests : IDisposable
         window.Perform(AppActions.Save);
         editor.GoTo(new TextPosition(0, 0));
         Task<IDiffHost?> opening = window.ShowDiffAsync(window.EditorArea.Active!.Path);
-        DiffWindow diff = (DiffWindow)Ui.Landed(opening, "the diff open")!;
-        DiffView view = diff.View;
+        IDiffHost diff = Ui.Landed(opening, "the diff open")!;
+        DiffView view = OpenDiffs.ViewOf(diff);
+        TopLevel keys = OpenDiffs.KeysOf(diff);
         Ui.Landed(() => view.Right.IsFocused, "the diff's side of the file to have the keys");
         Assert.Equal([2, 4], view.Hunks.Select(h => h.NewStart));
 
-        Ui.Press(diff, "F7");
+        Ui.Press(keys, "F7");
         Assert.Equal(2, view.Right.CaretPosition.Line);
-        Ui.Press(diff, "F8");
+        Ui.Press(keys, "F8");
         if (OperatingSystem.IsMacOS())
         {
             Assert.True(view.Right.CaretPosition.Line == 2, "F8 stepped in a diff on the Mac, whose keymap leaves it to the IDE");
@@ -726,7 +809,7 @@ public sealed class VcsTests : IDisposable
         else
         {
             Assert.True(view.Right.CaretPosition.Line == 4, $"F8 left a diff's caret on line {view.Right.CaretPosition.Line + 1}, not at the next difference");
-            Ui.Press(diff, "shift F8");
+            Ui.Press(keys, "shift F8");
             Assert.True(view.Right.CaretPosition.Line == 2, $"Shift+F8 left a diff's caret on line {view.Right.CaretPosition.Line + 1}, not at the previous difference");
         }
         diff.Close();
@@ -742,9 +825,9 @@ public sealed class VcsTests : IDisposable
         TestFolders.Write(folder, "Shop.cs", string.Concat(Enumerable.Range(0, 400).Select(i => $"// Note {i}\n")) + Original);
         MainWindow window = Open();
         Task<IDiffHost?> opening = window.ShowDiffAsync(window.EditorArea.Active!.Path);
-        DiffWindow diff = (DiffWindow)Ui.Landed(opening, "the diff open")!;
-        CodeEditor side = diff.View.Right;
-        Assert.Equal([new DiffHunk(0, 0, 0, 400)], diff.View.Hunks);
+        IDiffHost diff = Ui.Landed(opening, "the diff open")!;
+        CodeEditor side = OpenDiffs.ViewOf(diff).Right;
+        Assert.Equal([new DiffHunk(0, 0, 0, 400)], OpenDiffs.ViewOf(diff).Hunks);
         CodeEditor.StripeMark change = Assert.Single(side.StripeMarks, m => m.Kind == StripeMarkKind.Change);
 
         ErrorStripeTests.CheckBarTakesItsPresses(side);
@@ -772,8 +855,8 @@ public sealed class VcsTests : IDisposable
         Passenger.App.Workspace.OpenDocument shop = window.EditorArea.Active!;
         Ui.PumpUntil(() => window.Vcs.Repository is not null, "the working tree found");
         Task<IDiffHost?> opening = window.ShowDiffAsync(shop.Path);
-        DiffWindow diff = (DiffWindow)Ui.AwaitPumped(opening, "the diff open")!;
-        CodeEditor right = diff.View.Right;
+        IDiffHost diff = Ui.AwaitPumped(opening, "the diff open")!;
+        CodeEditor right = OpenDiffs.ViewOf(diff).Right;
         Assert.True(right.Highlighter is not Passenger.Languages.CSharp.SemanticHighlighter, "The language server answered before the diff opened, so it had nothing to follow");
 
         // The use of count in Add() is coloured as a field by the server alone.
@@ -783,11 +866,11 @@ public sealed class VcsTests : IDisposable
             "The diff opened before the language server answered never took its colours: the field it colours in the editor is plain in the diff");
 
         int ended = window.CSharpService!.Session!.Server.ProcessId;
-        Process.GetProcessById(ended).Kill();
+        OwnProcess.Of(ended).Kill(alone: true);
         Ui.WaitFor(() => window.CSharpService.Session is { IsLoaded: true } session && session.Server.ProcessId != ended, "the language server started again");
         Ui.WaitFor(() => Field(shop.Highlighter, shop.Text.Snapshot, use), "the new server's colour on the field in the editor");
         right.Focus();
-        diff.KeyTextInput("sealed ");
+        OpenDiffs.KeysOf(diff).KeyTextInput("sealed ");
         Ui.Settle();
         int moved = use + "sealed ".Length;
         Assert.Equal(moved, shop.Text.Snapshot.ToString().IndexOf("count++", StringComparison.Ordinal));
@@ -811,13 +894,16 @@ public sealed class VcsTests : IDisposable
         window.Close();
     }
 
+    /// <summary>A diff's window outlives its file's tab, holding the file open while it edits it: diffs are set to open in
+    /// a window of their own, as a tab closes with its file's last tab.</summary>
     [AvaloniaFact]
-    public void An_edit_in_a_diff_after_the_files_tab_closed_is_saved_with_the_others_and_as_the_diff_closes()
+    public void An_edit_in_a_diffs_window_after_the_files_tab_closed_is_saved_with_the_others_and_as_the_window_closes()
     {
         MainWindow window = Open();
+        window.ApplySettings(window.Settings with { OpenDiffsIn = Passenger.App.Settings.DiffPlace.Window });
         string shop = window.EditorArea.Active!.Path;
         Task<IDiffHost?> opening = window.ShowDiffAsync(shop);
-        DiffWindow diff = (DiffWindow)Ui.Landed(opening, "the diff open")!;
+        DiffWindow diff = Assert.IsType<DiffWindow>(Ui.Landed(opening, "the diff open"));
 
         window.Perform(AppActions.CloseTab);
         Ui.Settle();
@@ -908,9 +994,8 @@ public sealed class VcsTests : IDisposable
 
         Ui.Click(Avalonia.VisualTree.VisualExtensions.GetVisualDescendants(popup).OfType<Avalonia.Controls.Button>()
             .First(b => Avalonia.Controls.ToolTip.GetTip(b) as string == "Show Diff"), settle: false);
-        Ui.Landed(() => window.Frontmost is DiffWindow, "the diff window");
-        DiffWindow diff = (DiffWindow)window.Frontmost;
-        Assert.Equal(1669, diff.View.Hunks.Count);
+        IDiffHost diff = OpenDiffs.Landed(window, "the diff from the change bar's popup");
+        Assert.Equal(1669, OpenDiffs.ViewOf(diff).Hunks.Count);
         Assert.True(vcs.Comparisons == comparisons, $"Show Diff compared the file {vcs.Comparisons - comparisons} times again");
         diff.Close();
 
@@ -936,8 +1021,8 @@ public sealed class VcsTests : IDisposable
         // The first Enter's bar can land before the second's: the wait is for the bar over both.
         Ui.Landed(() => Marks(window).SequenceEqual([new ChangeMark(6, 2, ChangeMarkKind.Added)]), "a bar over both blank lines");
         Task<IDiffHost?> opening = window.ShowDiffAsync(window.EditorArea.Active!.Path);
-        DiffWindow diff = (DiffWindow)Ui.Landed(opening, "the diff open")!;
-        Assert.Equal([new DiffHunk(6, 0, 6, 2)], diff.View.Hunks);
+        IDiffHost diff = Ui.Landed(opening, "the diff open")!;
+        Assert.Equal([new DiffHunk(6, 0, 6, 2)], OpenDiffs.ViewOf(diff).Hunks);
         diff.Close();
 
         editor.GoTo(new TextPosition(7, 0));
@@ -1000,8 +1085,8 @@ public sealed class VcsTests : IDisposable
         Assert.Equal((PathNames.Canonical(shop), ChangeKind.Modified), (changed.Path, changed.Kind));
         Assert.Contains("Twice", log.Details, StringComparison.Ordinal);
         Task<IDiffHost?> opening = window.ShowCommitDiffAsync(twice, changed);
-        DiffWindow shown = (DiffWindow)Ui.Landed(opening, "the commit's diff")!;
-        DiffView diff = shown.View;
+        IDiffHost shown = Ui.Landed(opening, "the commit's diff")!;
+        DiffView diff = OpenDiffs.ViewOf(shown);
         Assert.Equal(Original, diff.Left.Document.Snapshot.ToString());
         Assert.Contains("count += 2", diff.Right.Document.Snapshot.ToString(), StringComparison.Ordinal);
         Assert.Single(diff.Hunks);
@@ -1455,7 +1540,7 @@ public sealed class VcsTests : IDisposable
         {
             File.SetUnixFileMode(hook, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
         }
-        Git("config", "core.fsmonitor", Unix(hook));
+        Git("config", Passenger.Vcs.GitConfigKeys.CoreFsmonitor, Unix(hook));
         MainWindow window = new() { Width = 1200, Height = 800, Autosaves = false };
         Assert.True(Screenshot.Prepare(window, LaunchOptions.Parse([folder, "--file", shop]), []), "The screenshot's window never settled");
 
@@ -1915,7 +2000,7 @@ public sealed class VcsTests : IDisposable
         Git("switch", "-q", "main");
         MainWindow window = Open();
         int asked = 0;
-        window.AskConflict = _ => Task.FromResult(asked++ < 0);
+        window.AskConflict = _ => Task.FromResult<bool?>(asked++ < 0);
         window.OpenFile(Path.Combine(folder, "Notes.cs"));
         Ui.Settle();
         window.EditorArea.CodeEditor.Selections = SelectionSet.Single(0);
@@ -2299,6 +2384,71 @@ public sealed class VcsTests : IDisposable
         window.Close();
     }
 
+    /// <summary>A commit's message file another program opens as git reads it (a scanner, an indexer; here a handle sharing
+    /// neither writes nor its deletion, which Windows then refuses) fails nothing: the commit is made and said, and the file
+    /// goes once the program lets go of it.</summary>
+    [AvaloniaFact]
+    public void A_commit_whose_message_file_another_program_holds_is_made_and_the_file_goes_once_let_go()
+    {
+        string tree = PathNames.Canonical(folder);
+        Lock gate = new();
+        string? message = null;
+        FileStream? holding = null;
+        Exception? unheld = null;
+        void Heard(object? sender, ChildStart start)
+        {
+            if (start.Start is not { } given || start.Folder.Length == 0 || PathNames.Canonical(start.Folder) != tree || !given.ArgumentList.Contains("commit")
+                || given.ArgumentList.IndexOf("-F") is not (>= 0 and int at) || at + 1 >= given.ArgumentList.Count)
+            {
+                return;
+            }
+            lock (gate)
+            {
+                message = given.ArgumentList[at + 1];
+                try
+                {
+                    holding = new FileStream(message, FileMode.Open, FileAccess.Read, FileShare.Read);
+                }
+                catch (IOException failed)
+                {
+                    unheld = failed;
+                }
+            }
+        }
+        File.AppendAllText(Path.Combine(tree, "Shop.cs"), "// held\n");
+        MainWindow window = Ui.OpenFolder(tree, languageServer: false);
+        CommitView commit = window.CommitView;
+        window.Perform(AppActions.ShowCommit);
+        Ui.WaitFor(() => commit.Chosen.Any(c => c.Name == "Shop.cs"), () => $"Shop.cs listed to commit, where the Commit window lists {string.Join(", ", commit.Chosen.Select(c => c.Name))}");
+        commit.Message = "Held a moment";
+        ChildProcesses.Started += Heard;
+        try
+        {
+            Ui.ClickButton(commit, "Commit");
+            Ui.WaitFor(() => window.Vcs.Changes.Count == 0 && !window.Vcs.IsBusy, () => $"the commit, where the status bar says '{window.Status}'");
+        }
+        finally
+        {
+            ChildProcesses.Started -= Heard;
+        }
+        lock (gate)
+        {
+            Assert.True(message is not null && unheld is null, $"The commit's message file was not held as git read it: {unheld?.Message ?? "git was given none"}");
+        }
+        Assert.Equal("1 file committed: Held a moment", window.Status);
+        Assert.Equal("Held a moment", Git("log", "-1", "--format=%s").Trim());
+        if (OperatingSystem.IsWindows())
+        {
+            Assert.True(File.Exists(message), "The message file a program held was deleted under it, where Windows refuses that");
+        }
+        lock (gate)
+        {
+            holding!.Dispose();
+        }
+        Ui.WaitFor(() => !File.Exists(message), () => $"the commit's message file {message} to be deleted once let go");
+        window.Close();
+    }
+
     [AvaloniaFact]
     public void A_commit_whose_hook_leaves_a_job_holding_gits_output_is_done_within_seconds()
     {
@@ -2371,7 +2521,7 @@ public sealed class VcsTests : IDisposable
         {
             File.SetUnixFileMode(hook, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
         }
-        Git("config", "core.fsmonitor", Unix(hook));
+        Git("config", Passenger.Vcs.GitConfigKeys.CoreFsmonitor, Unix(hook));
         MainWindow window = Open();
         Assert.Equal("main", window.Vcs.Branch);
         CodeEditor editor = window.EditorArea.CodeEditor;
@@ -2498,16 +2648,18 @@ public sealed class VcsTests : IDisposable
     [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
     private static WeakReference<DiffView> DiffAndClose(MainWindow window)
     {
-        Task<IDiffHost?> opening = window.ShowDiffAsync(window.EditorArea.Active!.Path);
-        DiffWindow diff = (DiffWindow)Ui.Landed(opening, "the diff open")!;
-        Assert.Same(window.EditorArea.Active!.Text, diff.View.Right.Document);
-        diff.View.Right.Focus();
-        diff.KeyTextInput("// ");
-        Ui.Landed(() => diff.View.Hunks.Count == 1, "the difference typed");
+        Passenger.App.Workspace.OpenDocument file = window.EditorArea.Active!;
+        Task<IDiffHost?> opening = window.ShowDiffAsync(file.Path);
+        IDiffHost diff = Ui.Landed(opening, "the diff open")!;
+        DiffView view = OpenDiffs.ViewOf(diff);
+        Assert.Same(file.Text, view.Right.Document);
+        view.Right.Focus();
+        OpenDiffs.KeysOf(diff).KeyTextInput("// ");
+        Ui.Landed(() => view.Hunks.Count == 1, "the difference typed");
         diff.Close();
         Ui.Settle();
-        Assert.Empty(window.OwnedWindows);
-        return new WeakReference<DiffView>(diff.View);
+        OpenDiffs.None(window, "Closed, the diff stayed");
+        return new WeakReference<DiffView>(view);
     }
 
     private static IReadOnlyList<ChangeMark> Marks(MainWindow window) => window.EditorArea.Active?.ChangeMarks ?? [];

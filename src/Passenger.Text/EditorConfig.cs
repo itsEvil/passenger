@@ -7,9 +7,10 @@ using Passenger.Core;
 namespace Passenger.Text;
 
 /// <summary>What the .editorconfig files over a file say of it (editorconfig.org): each from the file's folder up to the
-/// first marked <c>root = true</c>, the farthest read first, so the nearest file's sections, and a file's later ones, win
-/// where they match the file; <c>unset</c> takes a property back. Read afresh each time, so a change on disk is seen. A
-/// section whose glob cannot be used (<see cref="Refused"/>) matches no file, the log naming it once.</summary>
+/// first marked <c>root = true</c>, in the person's folders (<see cref="FoldersUp"/>), the farthest read first, so the
+/// nearest file's sections, and a file's later ones, win where they match the file; <c>unset</c> takes a property back.
+/// Read afresh each time, so a change on disk is seen. A section whose glob cannot be used (<see cref="Refused"/>) matches
+/// no file, the log naming it once.</summary>
 public sealed class EditorConfig
 {
     public const string FileName = ".editorconfig";
@@ -34,9 +35,9 @@ public sealed class EditorConfig
     public static EditorConfig For(string path)
     {
         List<(string Folder, ConfigFile Config)> chain = [];
-        for (string? folder = Path.GetDirectoryName(path); folder is not null; folder = Path.GetDirectoryName(folder))
+        foreach (string folder in Path.GetDirectoryName(path) is { } start ? FoldersUp.From(start) : [])
         {
-            if (Read(Path.Combine(folder, FileName)) is { } config)
+            if (FoldersUp.Found(folder, FileName) is { } file && Read(file) is { } config)
             {
                 chain.Add((folder, config));
                 if (config.Root)
@@ -50,7 +51,7 @@ public sealed class EditorConfig
         {
             (string folder, ConfigFile config) = chain[i];
             string file = Path.Combine(folder, FileName);
-            string relative = "/" + Path.GetRelativePath(folder, path).Replace(Path.DirectorySeparatorChar, '/');
+            string relative = "/" + PathNames.Relative(path, folder);
             foreach (Section section in config.Sections)
             {
                 CompiledGlob glob = Compiled(section.Glob);
@@ -62,7 +63,7 @@ public sealed class EditorConfig
                 {
                     continue;
                 }
-                foreach ((string key, string value) in section.Pairs)
+                foreach ((string key, string value, _) in section.Pairs)
                 {
                     if (Word(value) == "unset")
                     {
@@ -173,10 +174,25 @@ public sealed class EditorConfig
     /// <summary>A width in columns, or null for a value that is not one.</summary>
     private static int? Width(string? value) => Number(value) is int width and >= 1 and <= 32 ? width : null;
 
-    /// <summary>A section: its glob, the line its header is on (from 1) and where the glob starts in the file's text.</summary>
-    private sealed record Section(string Glob, int Line, int Offset, List<(string Key, string Value)> Pairs);
+    /// <summary>A section: its glob, the line its header is on (from 1), where the glob starts in the file's text, and its
+    /// pairs with the line each is on.</summary>
+    private sealed record Section(string Glob, int Line, int Offset, List<(string Key, string Value, int Line)> Pairs);
 
     private sealed record ConfigFile(bool Root, List<Section> Sections);
+
+    /// <summary>A key a section sets: the section's glob as written, the line the key is on (from 1), the key in lower case
+    /// and its value as written.</summary>
+    public readonly record struct Pair(string Glob, int Line, string Key, string Value);
+
+    /// <summary>What an .editorconfig says: whether it is marked <c>root = true</c>, and each key its sections set, in the
+    /// file's order.</summary>
+    public sealed record Written(bool Root, IReadOnlyList<Pair> Pairs);
+
+    /// <summary>What the .editorconfig at a path says, read as <see cref="For"/> reads it; null where there is none to read.</summary>
+    public static Written? WrittenIn(string file) =>
+        Read(file) is { } config
+            ? new Written(config.Root, [.. config.Sections.SelectMany(s => s.Pairs.Select(p => new Pair(s.Glob, p.Line, p.Key, p.Value)))])
+            : null;
 
     /// <summary>A section of an .editorconfig's text that matches no file: where its glob is in the text, and why.</summary>
     public readonly record struct RefusedSection(TextRange Glob, string Why);
@@ -247,7 +263,7 @@ public sealed class EditorConfig
             string value = line[(equals + 1)..].Trim();
             if (current is not null)
             {
-                current.Pairs.Add((key, value));
+                current.Pairs.Add((key, value, number));
             }
             else if (!inSections && key == "root")
             {
@@ -275,7 +291,9 @@ public sealed class EditorConfig
         }
         try
         {
-            return new CompiledGlob(new Regex(@"\A" + regex + @"\z", RegexOptions.CultureInvariant | RegexOptions.Singleline), translation.Ranges, null);
+            // The repository's text: on the linear engine, so no glob holds a match (and the window) past a moment.
+            return new CompiledGlob(new Regex(@"\A" + regex + @"\z", RegexOptions.CultureInvariant | RegexOptions.Singleline | RegexOptions.NonBacktracking),
+                translation.Ranges, null);
         }
         catch (RegexParseException failed)
         {

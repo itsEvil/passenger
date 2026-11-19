@@ -1,12 +1,19 @@
 using Avalonia;
 using Avalonia.Controls;
+using Avalonia.Input;
+using Avalonia.Layout;
+using Avalonia.VisualTree;
+using Passenger.Editor;
 
 namespace Passenger.App.Docking;
 
-/// <summary>The window's frame: a stripe of tool window buttons down each edge (<see cref="Stripe"/>), the side areas
-/// left and right of the editor, the bottom area under them, each side split in two halves that show one window each
-/// (<see cref="ToolPane"/>). A window moves by a drag (<see cref="DockDrag"/>) or by its header's Move to, floats in a
-/// <see cref="FloatWindow"/>, and the layout is captured for the next start.</summary>
+/// <summary>The window's frame: the side areas left and right of the editor, the bottom area under them, each side split
+/// in two halves that show one window each (<see cref="ToolPane"/>), and the windows named in one of two looks. By stripe
+/// icons, a stripe of tool window buttons down each edge (<see cref="Stripe"/>) names and switches every window; by titled
+/// tabs, no stripe stands: a place's windows are tabs along its foot, and a hidden one is a tab along the frame's edge
+/// (<see cref="EdgeTabs"/>) that opens it over the editors (<see cref="Peek"/>). A window moves by a drag
+/// (<see cref="DockDrag"/>) or by its header's Move to, floats in a <see cref="FloatWindow"/>, and the layout is captured
+/// for the next start.</summary>
 public sealed class DockHost : Grid
 {
     internal const double StripeWidth = 40;
@@ -19,6 +26,43 @@ public sealed class DockHost : Grid
     private readonly Dictionary<ToolAnchor, ToolPane> panes = [];
     private readonly Stripe leftStripe;
     private readonly Stripe rightStripe;
+    private readonly EdgeTabs leftEdge;
+    private readonly EdgeTabs rightEdge;
+    private readonly EdgeTabs bottomEdge;
+
+    /// <summary>The window opened over the editors from its edge tab, while one is (<see cref="Peek"/>), and the frame it
+    /// stands in there.</summary>
+    private ToolWindow? peeked;
+
+    private readonly ToolPane peekPane;
+    private readonly Border peekFrame = new() { Classes = { StyleClasses.ToolPeek }, ZIndex = 1, IsVisible = false };
+
+    /// <summary>The edge of the window over the editors toward them, which a drag resizes it by (<see cref="ResizePeek"/>),
+    /// and where a drag of it began: the pointer's place and the size it had.</summary>
+    private readonly Border peekGrip = new() { Classes = { StyleClasses.PeekGrip } };
+    private (Point At, double Size)? gripFrom;
+    private readonly Cursor acrossCursor = new(StandardCursorType.SizeWestEast);
+    private readonly Cursor downCursor = new(StandardCursorType.SizeNorthSouth);
+
+    /// <summary>The most the window over the editors may be across (or, from the foot, high), as last laid out.</summary>
+    private double peekRoom;
+
+    /// <summary>How long the pointer rests on an edge tab before its window opens over the editors, and how long it is
+    /// away from that window and its tab before one opened so goes again.</summary>
+    internal static readonly TimeSpan HoverRests = TimeSpan.FromMilliseconds(400);
+
+    internal static readonly TimeSpan HoverLeft = TimeSpan.FromMilliseconds(500);
+
+    /// <summary>Whether the window over the editors came by the pointer resting on its tab, without the keys: it goes again
+    /// once the pointer has been away from it and its tab for a moment (<see cref="HoverLeft"/>), until a press in it, or on
+    /// its tab, keeps it.</summary>
+    private bool hovered;
+
+    /// <summary>The edge tab the pointer is on, if any, whose window opens once it rests there.</summary>
+    private ToolWindow? hoverTab;
+
+    private readonly Debounce hoverRest;
+    private readonly Debounce hoverAway;
     private readonly Grid leftArea = new() { RowDefinitions = new RowDefinitions("*,0,*") };
     private readonly Grid rightArea = new() { RowDefinitions = new RowDefinitions("*,0,*") };
     private readonly Grid bottomArea = new() { ColumnDefinitions = new ColumnDefinitions("*,0,*") };
@@ -38,8 +82,11 @@ public sealed class DockHost : Grid
     private const double DefaultRight = 300;
     private const double DefaultBottom = 280;
 
-    /// <summary>Each window's place as it was added, which Restore Default Layout puts it back in.</summary>
+    /// <summary>Each window's place as it was added, which Restore Default Layout puts it back in unless the theme places it.</summary>
     private readonly Dictionary<string, DockedWindow> firstPlaces = [];
+
+    /// <summary>The theme's default layout, over <see cref="firstPlaces"/>; null for Passenger's own.</summary>
+    private ThemeLayout? themed;
 
     /// <summary>The sizes the areas were last given, fitted to the frame: a definition no longer its size was dragged.</summary>
     private (double Left, double Right, double Bottom) given;
@@ -54,14 +101,28 @@ public sealed class DockHost : Grid
     /// <summary>The IDE's window the frame is in, once it is.</summary>
     private Window? host;
 
+    private readonly DockDrag drag;
+
+    private bool titledTabs;
+    private bool closesOffStripe;
+
+    /// <summary>Whether a tool window is being dragged (<see cref="Dragging"/>).</summary>
+    private bool dragged;
+
     public DockHost()
     {
         ColumnDefinitions = new ColumnDefinitions($"{StripeWidth},0,0,*,0,0,{StripeWidth}");
-        RowDefinitions = new RowDefinitions("*,0,0");
+        RowDefinitions = new RowDefinitions("*,0,0,0");
         leftStripe = new Stripe(this, ToolAnchor.LeftTop, ToolAnchor.LeftBottom, ToolAnchor.BottomLeft);
         rightStripe = new Stripe(this, ToolAnchor.RightTop, ToolAnchor.RightBottom, ToolAnchor.BottomRight);
-        Place(leftStripe, 0, 0, rowSpan: 3);
-        Place(rightStripe, 0, 6, rowSpan: 3);
+        Place(leftStripe, 0, 0, rowSpan: 4);
+        Place(rightStripe, 0, 6, rowSpan: 4);
+        leftEdge = new EdgeTabs(this, ToolAnchor.LeftTop, ToolAnchor.LeftBottom, down: true, "Hidden tool windows, left edge");
+        rightEdge = new EdgeTabs(this, ToolAnchor.RightTop, ToolAnchor.RightBottom, down: true, "Hidden tool windows, right edge");
+        bottomEdge = new EdgeTabs(this, ToolAnchor.BottomLeft, ToolAnchor.BottomRight, down: false, "Hidden tool windows, bottom edge");
+        Place(leftEdge, 0, 0, rowSpan: 4);
+        Place(rightEdge, 0, 6, rowSpan: 4);
+        Place(bottomEdge, 3, 1, columnSpan: 5);
         leftDivider = Divider(GridResizeDirection.Columns);
         rightDivider = Divider(GridResizeDirection.Columns);
         bottomDivider = Divider(GridResizeDirection.Rows);
@@ -83,6 +144,12 @@ public sealed class DockHost : Grid
         {
             ToolPane pane = new(this);
             panes[anchor] = pane;
+            // A size the splitter's keys changed is kept first, as a resize keeps it.
+            pane.LeastChanged += (_, _) =>
+            {
+                Remember();
+                Fit();
+            };
             (Grid area, int slot) = Area(anchor);
             if (area == bottomArea)
             {
@@ -97,12 +164,71 @@ public sealed class DockHost : Grid
         leftArea.Children.Add(new HairlineDivider(GridResizeDirection.Rows) { [Grid.RowProperty] = 1 });
         rightArea.Children.Add(new HairlineDivider(GridResizeDirection.Rows) { [Grid.RowProperty] = 1 });
         bottomArea.Children.Add(new HairlineDivider(GridResizeDirection.Columns) { [Grid.ColumnProperty] = 1 });
-        DockDrag drag = new(this, leftStripe, rightStripe);
+        peekPane = new ToolPane(this) { Peeking = true };
+        peekPane.LeastChanged += (_, _) => Fit();
+        peekFrame.Child = new Panel { Children = { peekPane, peekGrip } };
+        hoverRest = new Debounce(HoverRests, () =>
+        {
+            HoverRested();
+            return Task.CompletedTask;
+        });
+        hoverAway = new Debounce(HoverLeft, () =>
+        {
+            if (peeked is { } over && hovered && !peekFrame.IsPointerOver && hoverTab != over)
+            {
+                Hide(over.Id);
+            }
+            return Task.CompletedTask;
+        });
+        peekFrame.PointerEntered += (_, _) => hoverAway.Stop();
+        peekFrame.PointerExited += (_, _) => LeftPeek();
+        peekGrip.PointerPressed += (_, e) =>
+        {
+            if (e.GetCurrentPoint(peekGrip).Properties.IsLeftButtonPressed && peeked is { } over)
+            {
+                gripFrom = (e.GetPosition(this), over.Anchor is ToolAnchor.BottomLeft or ToolAnchor.BottomRight ? peekFrame.Bounds.Height : peekFrame.Bounds.Width);
+                e.Pointer.Capture(peekGrip);
+                e.Handled = true;
+            }
+        };
+        peekGrip.PointerMoved += (_, e) =>
+        {
+            if (gripFrom is { } from)
+            {
+                ResizePeek(from, e.GetPosition(this));
+            }
+        };
+        peekGrip.PointerReleased += (_, e) =>
+        {
+            if (gripFrom is not null)
+            {
+                gripFrom = null;
+                e.Pointer.Capture(null);
+                LayoutChanged?.Invoke(this, EventArgs.Empty);
+            }
+        };
+        Place(peekFrame, 0, 1, rowSpan: 3, columnSpan: 5);
+        drag = new(this, leftStripe, rightStripe, leftEdge, rightEdge);
         Drag = drag.Gesture;
-        Place(drag.Overlay, 0, 0, rowSpan: 3, columnSpan: 7);
+        Drag.DraggingChanged += (_, e) => Dragging(e.Dragging);
+        Place(drag.Overlay, 0, 0, rowSpan: 4, columnSpan: 7);
         Layout();
         AttachedToVisualTree += (_, _) => FollowHost();
+        // A press anywhere in the frame but the window over the editors and the edges' tabs puts it away; one in it keeps it.
+        AddHandler(PointerPressedEvent, (_, e) =>
+        {
+            if (peeked is not null && e.Source is Visual pressed && !Within(pressed, peekFrame, leftEdge, rightEdge, bottomEdge))
+            {
+                Hide(peeked.Id);
+            }
+            else if (peeked is not null && e.Source is Visual inside && Within(inside, peekFrame))
+            {
+                hovered = false;
+            }
+        }, Avalonia.Interactivity.RoutingStrategies.Tunnel, handledEventsToo: true);
     }
+
+    private static bool Within(Visual visual, params Visual[] parts) => parts.Any(part => part == visual || part.IsVisualAncestorOf(visual));
 
     /// <summary>The IDE's window's close: its floating and windowed tool windows go with it, quietly, each kept shown where
     /// it stood by the layout kept as it closed.</summary>
@@ -112,6 +238,14 @@ public sealed class DockHost : Grid
         {
             host = window;
             host.Closed += (_, _) => CloseFloats();
+            // The keys gone anywhere in the IDE's window but the window over the editors and the edges' tabs put it away.
+            host.AddHandler(GotFocusEvent, (_, e) =>
+            {
+                if (peeked is not null && e.Source is Visual focused && !Within(focused, peekFrame, leftEdge, rightEdge, bottomEdge))
+                {
+                    Hide(peeked.Id);
+                }
+            }, Avalonia.Interactivity.RoutingStrategies.Bubble, handledEventsToo: true);
         }
     }
 
@@ -122,8 +256,29 @@ public sealed class DockHost : Grid
     /// would have.</summary>
     internal double LeftAreaWidth => ColumnDefinitions[1].ActualWidth > 0 ? ColumnDefinitions[1].ActualWidth : leftWidth;
 
+    /// <summary>The right area's width as laid out, or as kept while it is closed.</summary>
+    internal double RightAreaWidth => ColumnDefinitions[5].ActualWidth > 0 ? ColumnDefinitions[5].ActualWidth : rightWidth;
+
     /// <summary>The bottom area's height as kept, open or not.</summary>
     internal double BottomAreaHeight => bottomHeight;
+
+    /// <summary>The left stripe's width as laid out, or the left edge's under titled tabs: none while it is folded away.</summary>
+    internal double LeftStripeWidth => ColumnDefinitions[0].ActualWidth;
+
+    /// <summary>The right stripe's width as laid out, or the right edge's under titled tabs: none while it is folded away.</summary>
+    internal double RightStripeWidth => ColumnDefinitions[6].ActualWidth;
+
+    /// <summary>A tool window dragged (by its stripe icon, its header, its titled tab, its edge tab or its editor tab), or
+    /// let go: while it is, every stripe shows under stripe icons, as each is a place to drop it.</summary>
+    internal void Dragging(bool dragging)
+    {
+        if (dragging != dragged)
+        {
+            dragged = dragging;
+            FoldStripes();
+            Fit();
+        }
+    }
 
     /// <summary>The editor area, between the side areas and above the bottom one.</summary>
     public Control? Center
@@ -133,6 +288,139 @@ public sealed class DockHost : Grid
     }
 
     public IReadOnlyList<ToolWindow> Windows => windows;
+
+    /// <summary>Whether the windows are named by titled tabs, a place's along its foot and a hidden one's along the frame's
+    /// edge, no stripe standing; else by stripe icons alone.</summary>
+    public bool TitledTabs
+    {
+        get => titledTabs;
+        set
+        {
+            if (value != titledTabs)
+            {
+                titledTabs = value;
+                Layout();
+            }
+        }
+    }
+
+    /// <summary>Whether a window closed by its × leaves its stripe (or its edge, and its place's tabs) until it is opened
+    /// again, rather than keeping its icon or its tab as a hidden window does. It governs only ×: a window off its stripe, however it went, stays
+    /// off until it is opened or checked on its stripe's checklist again.</summary>
+    public bool ClosesOffStripe
+    {
+        get => closesOffStripe;
+        set
+        {
+            if (value != closesOffStripe)
+            {
+                closesOffStripe = value;
+                Layout();
+            }
+        }
+    }
+
+    /// <summary>Where a window shown as an editor tab (<see cref="ToolMode.Editor"/>) goes: Show opens its tab among the
+    /// editors, given the keys when brought forward, and Close closes it; its tab closed there tells
+    /// <see cref="EditorTabClosed"/>.</summary>
+    public (Action<ToolWindow, bool> Show, Action<ToolWindow> Close)? EditorTabs { get; set; }
+
+    /// <summary>A window's editor tab closed among the editors: the window is hidden, its icon kept. One closed as the window
+    /// stopped serving the folder stays shown in its layout, to come back.</summary>
+    public void EditorTabClosed(ToolWindow window)
+    {
+        if (window is { Mode: ToolMode.Editor, IsShown: true, Unserved: null })
+        {
+            window.IsShown = false;
+            PassActive(window);
+            Layout();
+            LayoutChanged?.Invoke(this, EventArgs.Empty);
+        }
+    }
+
+    /// <summary>The place a window dragged at a point on the screen would dock in, lit in the frame's overlay; null where
+    /// it would dock nowhere.</summary>
+    public DropZone? ZoneFor(ToolWindow window, PixelPoint at) => drag.ZoneFor(window, this.PointToClient(at));
+
+    /// <summary>Docks a window where it was let go, at a point on the screen, as a drag of its icon docks it.</summary>
+    public void DropAt(ToolWindow window, PixelPoint at) => drag.Drop(window, this.PointToClient(at));
+
+    /// <summary>The editor area's place in the frame, where a window dropped goes into an editor tab.</summary>
+    internal Rect EditorBounds => center.Bounds;
+
+    /// <summary>The windows the stripes, the places' tabs and the edges name: those serving the open folder but those closed
+    /// off them.</summary>
+    private List<ToolWindow> OnStripes => [.. Served.Where(w => !w.IsClosed)];
+
+    /// <summary>The windows that serve the open folder (<see cref="ToolWindow.Unserved"/>), which alone the stripes, the places,
+    /// their tabs, the edges and the stripes' checklists show, and which alone are shown, peeked or brought.</summary>
+    internal IEnumerable<ToolWindow> Served => windows.Where(w => w.Unserved is null);
+
+    /// <summary>Why a window serves nothing in the open folder (<see cref="ToolWindow.Unserved"/>), null where it serves it:
+    /// asked of each window as it is added, and of all again at <see cref="Serve"/>.</summary>
+    public Func<ToolWindow, string?>? WhyUnserved { get; set; }
+
+    /// <summary>Asks each window again whether it serves the open folder (<see cref="WhyUnserved"/>): one that stops leaves
+    /// the stripes, its place, its tabs and its edge, put away from over the editors, its own window or editor tab closed
+    /// quietly, shown or not as its layout keeps it; one that serves again comes back where it stood.</summary>
+    public void Serve()
+    {
+        bool changed = false;
+        foreach (ToolWindow window in windows)
+        {
+            string? why = WhyUnserved?.Invoke(window);
+            if (why == window.Unserved)
+            {
+                continue;
+            }
+            bool served = why is null;
+            bool was = window.Unserved is null;
+            window.Unserved = why;
+            changed |= served != was;
+            if (served == was || !window.IsShown)
+            {
+                continue;
+            }
+            if (!served)
+            {
+                if (peeked == window)
+                {
+                    // Over the editors it is in no kept layout: it goes as Hide puts it away.
+                    window.IsShown = false;
+                    PeekAt(null);
+                }
+                if (maximized?.Window == window)
+                {
+                    Restore();
+                }
+                if (floats.Remove(window, out FloatWindow? open))
+                {
+                    window.WindowBounds = open.Placement;
+                    open.CloseQuietly();
+                }
+                if (window.Mode == ToolMode.Editor)
+                {
+                    EditorTabs?.Close(window);
+                }
+                if (Active == window)
+                {
+                    Active = Served.FirstOrDefault(w => w.IsShown);
+                }
+            }
+            else if (window.Mode == ToolMode.Editor)
+            {
+                EditorTabs?.Show(window, false);
+            }
+            else if (window.Mode != ToolMode.Docked && TopLevel.GetTopLevel(this) is not null)
+            {
+                Float(window, forward: false);
+            }
+        }
+        if (changed)
+        {
+            Layout();
+        }
+    }
 
     /// <summary>The window shown last, which Shift+Escape hides.</summary>
     public ToolWindow? Active { get; private set; }
@@ -163,6 +451,7 @@ public sealed class DockHost : Grid
     public void Add(ToolWindow window)
     {
         window.Order = windows.Count(w => w.Anchor == window.Anchor);
+        window.Unserved = WhyUnserved?.Invoke(window);
         windows.Add(window);
         firstPlaces[window.Id] = new DockedWindow(window.Anchor, window.Order, window.OpenAtFirst);
         if (window.ShowAction(this) is { } shows)
@@ -176,8 +465,8 @@ public sealed class DockHost : Grid
         }
     }
 
-    /// <summary>Restore Default Layout: every window back where it was added, docked, open only if it opens at first,
-    /// and the areas at their first sizes, halves shared alike.</summary>
+    /// <summary>Restore Default Layout: every window back in its default place (<see cref="Default"/>), docked, open only
+    /// if the default opens it, and the areas at their default sizes, halves shared alike.</summary>
     public void RestoreDefault()
     {
         foreach (Grid area in (Grid[])[leftArea, rightArea])
@@ -185,12 +474,124 @@ public sealed class DockHost : Grid
             area.RowDefinitions[0].Height = area.RowDefinitions[2].Height = new GridLength(1, GridUnitType.Star);
         }
         bottomArea.ColumnDefinitions[0].Width = bottomArea.ColumnDefinitions[2].Width = new GridLength(1, GridUnitType.Star);
-        Apply(new DockLayout { Windows = new(firstPlaces), LeftWidth = DefaultLeft, RightWidth = DefaultRight, BottomHeight = DefaultBottom });
+        Apply(Default());
         LayoutChanged?.Invoke(this, EventArgs.Empty);
     }
 
-    /// <summary>Shows a window in its place, hiding the one that was there; for an attached agent's call, behind
-    /// (<see cref="ShowBehind"/>).</summary>
+    /// <summary>The default layout: the theme's (<see cref="UseDefault"/>) laid over each window's place as it was added,
+    /// the theme's windows first at each place it names, then the rest in their order, those it puts among the editors
+    /// as editor tabs, their icons where Passenger puts them; one window docked open in each place, the first in its
+    /// order.</summary>
+    public DockLayout Default()
+    {
+        Dictionary<string, DockedWindow> places = new(firstPlaces);
+        if (themed is { } theme)
+        {
+            foreach (ToolAnchor anchor in Enum.GetValues<ToolAnchor>())
+            {
+                IEnumerable<string> placed = theme.Places.Where(p => p.Anchor == anchor && firstPlaces.ContainsKey(p.Id)).Select(p => p.Id);
+                IEnumerable<string> rest = firstPlaces.Where(p => p.Value.Anchor == anchor && !theme.Places.Any(t => t.Id == p.Key)).OrderBy(p => p.Value.Order).Select(p => p.Key);
+                int order = 0;
+                foreach (string id in placed.Concat(rest))
+                {
+                    places[id] = new DockedWindow(anchor, order++, theme.Open is { } open ? open.Contains(id) : firstPlaces[id].Shown);
+                }
+            }
+            foreach (string id in theme.InEditor.Where(firstPlaces.ContainsKey))
+            {
+                places[id] = places[id] with { Mode = ToolMode.Editor };
+            }
+        }
+        foreach (IGrouping<ToolAnchor, KeyValuePair<string, DockedWindow>> place in places.Where(p => p.Value is { Shown: true, Mode: ToolMode.Docked }).GroupBy(p => p.Value.Anchor).ToList())
+        {
+            foreach (KeyValuePair<string, DockedWindow> extra in place.OrderBy(p => p.Value.Order).Skip(1))
+            {
+                places[extra.Key] = extra.Value with { Shown = false };
+            }
+        }
+        return new DockLayout
+        {
+            Windows = places,
+            LeftWidth = themed?.LeftWidth ?? DefaultLeft,
+            RightWidth = themed?.RightWidth ?? DefaultRight,
+            BottomHeight = themed?.BottomHeight ?? DefaultBottom,
+        };
+    }
+
+    /// <summary>Takes a theme's layout as the default (null for Passenger's own), window by window, a change the layout
+    /// kept follows: a window still in the place and the mode the default before gave it goes where the new one puts it,
+    /// and one still open or hidden as that default said opens as the new one says; an area still at that default's size
+    /// takes the new one's, but a window serving nothing in the folder keeps its place. What the person arranged stays as
+    /// they left it, and where nothing was, the whole of the new default is laid as Restore Default Layout lays it.</summary>
+    public void UseDefault(ThemeLayout? layout)
+    {
+        if (ReferenceEquals(layout, themed))
+        {
+            return;
+        }
+        DockLayout before = Default();
+        bool unarranged = Stands(before);
+        themed = layout;
+        if (unarranged)
+        {
+            RestoreDefault();
+            return;
+        }
+        DockLayout now = Capture();
+        DockLayout after = Default();
+        Dictionary<string, DockedWindow> placed = new(now.Windows);
+        HashSet<string> ownOpen = [];
+        // Only the windows serving the folder take the new default; the others keep their places for when they serve.
+        foreach (ToolWindow window in Served)
+        {
+            DockedWindow standing = now.Windows[window.Id];
+            DockedWindow was = before.Windows[window.Id];
+            DockedWindow next = after.Windows[window.Id];
+            bool unmoved = (standing.Anchor, standing.Mode) == (was.Anchor, was.Mode);
+            bool ownShown = standing.Shown != was.Shown;
+            if (ownShown && standing.Shown)
+            {
+                ownOpen.Add(window.Id);
+            }
+            placed[window.Id] = standing with
+            {
+                Anchor = unmoved ? next.Anchor : standing.Anchor,
+                Order = unmoved ? next.Order : standing.Order,
+                Mode = unmoved ? next.Mode : standing.Mode,
+                Shown = !standing.Closed && (ownShown ? standing.Shown : next.Shown),
+            };
+        }
+        // A place the new default and the person both open a window in shows the person's.
+        foreach (IGrouping<ToolAnchor, string> place in placed.Where(p => p.Value is { Shown: true, Mode: ToolMode.Docked } && Find(p.Key) is not null)
+            .GroupBy(p => p.Value.Anchor, p => p.Key).Where(g => g.Count() > 1).ToList())
+        {
+            string kept = place.FirstOrDefault(ownOpen.Contains) ?? place.OrderBy(id => Find(id)!.Unserved is null ? 0 : 1).ThenBy(id => placed[id].Order).First();
+            foreach (string other in place.Where(id => id != kept))
+            {
+                placed[other] = placed[other] with { Shown = false };
+            }
+        }
+        Apply(new DockLayout
+        {
+            Windows = placed,
+            LeftWidth = now.LeftWidth == before.LeftWidth ? after.LeftWidth : now.LeftWidth,
+            RightWidth = now.RightWidth == before.RightWidth ? after.RightWidth : now.RightWidth,
+            BottomHeight = now.BottomHeight == before.BottomHeight ? after.BottomHeight : now.BottomHeight,
+        });
+        LayoutChanged?.Invoke(this, EventArgs.Empty);
+    }
+
+    /// <summary>Whether every window stands docked where a layout puts it, open as it says, the areas at its sizes.</summary>
+    private bool Stands(DockLayout layout)
+    {
+        DockLayout now = Capture();
+        return now.LeftWidth == layout.LeftWidth && now.RightWidth == layout.RightWidth && now.BottomHeight == layout.BottomHeight
+            && windows.All(w => layout.Windows.TryGetValue(w.Id, out DockedWindow? placed) && now.Windows[w.Id] is { } standing
+                && (standing.Anchor, standing.Order, standing.Shown, standing.Closed, standing.Mode) == (placed.Anchor, placed.Order, placed.Shown, placed.Closed, placed.Mode));
+    }
+
+    /// <summary>Shows a window in its place, hiding the one that was there, with the keys where it takes them as shown
+    /// (<see cref="ToolWindow.TakesKeysAsShown"/>); for an attached agent's call, behind (<see cref="ShowBehind"/>).</summary>
     public void Show([IdentifierOf(typeof(ToolWindowIds))] string id) => Show(id, forward: !AgentAsks.Beside);
 
     /// <summary>Shows a window in its place as <see cref="Show(string)"/> does, but brings no window forward: a floating or
@@ -202,7 +603,7 @@ public sealed class DockHost : Grid
     public void ShowBeside([IdentifierOf(typeof(ToolWindowIds))] string id, [IdentifierOf(typeof(ToolWindowIds))] string stays)
     {
         ToolWindow window = this[id];
-        if (this[stays] is { IsShown: true, Mode: ToolMode.Docked } kept && window.Mode == ToolMode.Docked && window.Anchor == kept.Anchor)
+        if (window.Unserved is null && this[stays] is { IsShown: true, Unserved: null, Mode: ToolMode.Docked } kept && window.Mode == ToolMode.Docked && window.Anchor == kept.Anchor)
         {
             Move(window, OtherHalf(window.Anchor));
         }
@@ -222,7 +623,18 @@ public sealed class DockHost : Grid
     private void Show(string id, bool forward)
     {
         ToolWindow window = this[id];
+        // One serving nothing here has nothing to show, and the window in its place stays.
+        if (window.Unserved is not null)
+        {
+            return;
+        }
         hiddenAll = null;
+        window.IsClosed = false;
+        if (peeked == window)
+        {
+            // Shown in its place, a window over the editors docks there.
+            PeekAt(null);
+        }
         if (window.Mode == ToolMode.Docked)
         {
             foreach (ToolWindow other in windows.Where(w => w.Anchor == window.Anchor && w != window && w.Mode == ToolMode.Docked))
@@ -232,16 +644,26 @@ public sealed class DockHost : Grid
         }
         window.IsShown = true;
         Active = window;
-        if (window.Mode != ToolMode.Docked)
+        if (window.Mode == ToolMode.Editor)
+        {
+            EditorTabs?.Show(window, forward);
+        }
+        else if (window.Mode != ToolMode.Docked)
         {
             Float(window, forward);
         }
         Layout();
         LayoutChanged?.Invoke(this, EventArgs.Empty);
+        if (forward && window.TakesKeysAsShown && !AgentAsks.Inputting)
+        {
+            // A view just put in its place joins the window as the window is laid out.
+            UpdateLayout();
+            window.TakeKeys();
+        }
     }
 
-    /// <summary>Shows a window in its place, as <see cref="Show"/> does, and gives it the keys (<see cref="ToolWindow.TakeKeys"/>);
-    /// for an attached agent's call, only shows it behind, the keys left where they are.</summary>
+    /// <summary>Brings a window into view as the person asks for it (<see cref="Bring"/>) and gives it the keys
+    /// (<see cref="ToolWindow.TakeKeys"/>); for an attached agent's call, only shows it behind, the keys left where they are.</summary>
     public void Activate([IdentifierOf(typeof(ToolWindowIds))] string id)
     {
         if (AgentAsks.Beside)
@@ -249,11 +671,264 @@ public sealed class DockHost : Grid
             ShowBehind(id);
             return;
         }
-        Show(id);
+        if (this[id].Unserved is not null)
+        {
+            return;
+        }
+        Bring(id);
         // A view just put in its place joins the window as the window is laid out.
         UpdateLayout();
         this[id].TakeKeys();
     }
+
+    /// <summary>Shows a window as the person asks for it (its keys, View | Tool Windows, Find Action): under titled tabs, a
+    /// docked one whose place stands hidden opens over the editors (<see cref="Peek"/>), its place left hidden; else in its
+    /// place, as <see cref="Show"/> does. For an attached agent's call, it is shown behind, never over the editors.</summary>
+    public void Bring([IdentifierOf(typeof(ToolWindowIds))] string id)
+    {
+        if (PeeksAt(this[id]) && !AgentAsks.Beside)
+        {
+            Peek(id);
+        }
+        else
+        {
+            Show(id);
+        }
+    }
+
+    /// <summary>Whether a window would open over the editors rather than in its place: titled tabs name the windows, it
+    /// docks, and no window of its place stands open there.</summary>
+    private bool PeeksAt(ToolWindow window) => titledTabs && window is { Mode: ToolMode.Docked, Unserved: null } && panes[window.Anchor].Window is null;
+
+    /// <summary>Opens a window whose place stands hidden over the editors beside its edge, as large as its area, until the
+    /// keys or a press go elsewhere in the IDE's window, Escape or Hide puts it away, or its edge tab is clicked again; its
+    /// place stays hidden, and a click on its header's Dock, or any show in its place, docks it there. Where it would not
+    /// (<see cref="PeeksAt"/>), or for an attached agent's call, which never takes the person's keys, it is shown as
+    /// <see cref="Show"/> shows it; for an agent's input into the window, it comes without the keys.</summary>
+    public void Peek([IdentifierOf(typeof(ToolWindowIds))] string id)
+    {
+        ToolWindow window = this[id];
+        if (!PeeksAt(window) || AgentAsks.Beside)
+        {
+            Show(id);
+            return;
+        }
+        PeekOver(window, byHover: false);
+    }
+
+    /// <summary>Opens a window over the editors, with the keys unless the pointer resting on its tab opened it
+    /// (<see cref="hovered"/>) or an agent's input did.</summary>
+    private void PeekOver(ToolWindow window, bool byHover)
+    {
+        hiddenAll = null;
+        window.IsClosed = false;
+        foreach (ToolWindow other in windows.Where(w => (w.Anchor == window.Anchor && w.Mode == ToolMode.Docked) || w == peeked).Where(w => w != window))
+        {
+            other.IsShown = false;
+        }
+        window.IsShown = true;
+        PeekAt(window);
+        hovered = byHover;
+        Active = window;
+        Layout();
+        LayoutChanged?.Invoke(this, EventArgs.Empty);
+        if (!byHover && !AgentAsks.Inputting)
+        {
+            UpdateLayout();
+            window.TakeKeys();
+        }
+    }
+
+    /// <summary>The window open over the editors, if one is.</summary>
+    public ToolWindow? Peeked => peeked;
+
+    /// <summary>A window opened over the editors (true), or put away from there, hidden or docked (false): for the window to
+    /// tell a screen reader.</summary>
+    public event EventHandler<(ToolWindow Window, bool Over)>? PeekChanged;
+
+    private void PeekAt(ToolWindow? window)
+    {
+        if (peeked == window)
+        {
+            return;
+        }
+        ToolWindow? was = peeked;
+        peeked = window;
+        hovered = false;
+        hoverAway.Stop();
+        gripFrom = null;
+        if (was is not null)
+        {
+            PeekChanged?.Invoke(this, (was, false));
+        }
+        if (window is not null)
+        {
+            PeekChanged?.Invoke(this, (window, true));
+        }
+    }
+
+    /// <summary>The pointer onto an edge tab: once it rests there (<see cref="HoverRests"/>), the tab's window opens over the
+    /// editors without the keys, in place of one opened so, but never over one a click or the keys opened.</summary>
+    internal void EdgeTabEntered(ToolWindow window)
+    {
+        hoverTab = window;
+        if (peeked == window)
+        {
+            hoverAway.Stop();
+        }
+        else if (PeeksAt(window) && (peeked is null || hovered))
+        {
+            hoverRest.Restart();
+        }
+    }
+
+    /// <summary>The pointer off an edge tab: its window opens no more, and one it opened goes once the pointer stays away.</summary>
+    internal void EdgeTabLeft(ToolWindow window)
+    {
+        if (hoverTab == window)
+        {
+            hoverTab = null;
+        }
+        hoverRest.Stop();
+        LeftPeek();
+    }
+
+    /// <summary>A press on an edge tab: what it does is a click's or a drag's, never the rest's.</summary>
+    internal void EdgeTabPressed()
+    {
+        hoverRest.Stop();
+        hoverTab = null;
+    }
+
+    private void HoverRested()
+    {
+        if (hoverTab is { } window && peeked != window && PeeksAt(window) && (peeked is null || hovered))
+        {
+            PeekOver(window, byHover: true);
+        }
+    }
+
+    /// <summary>The pointer away from the window over the editors or its tab: one the pointer's rest opened goes once it
+    /// stays away.</summary>
+    private void LeftPeek()
+    {
+        if (peeked is not null && hovered)
+        {
+            hoverAway.Restart();
+        }
+    }
+
+    /// <summary>The window over the editors resized by a drag of its edge toward them, to <paramref name="at"/> from where
+    /// the drag began: between its header's least and the editors' share, kept as its side's width (or the foot's height)
+    /// for the next time it opens, over the editors or docked.</summary>
+    private void ResizePeek((Point At, double Size) from, Point at)
+    {
+        if (peeked is not { } window)
+        {
+            return;
+        }
+        Vector moved = at - from.At;
+        bool side = window.Anchor is not (ToolAnchor.BottomLeft or ToolAnchor.BottomRight);
+        double wanted = window.Anchor switch
+        {
+            ToolAnchor.LeftTop or ToolAnchor.LeftBottom => from.Size + moved.X,
+            ToolAnchor.RightTop or ToolAnchor.RightBottom => from.Size - moved.X,
+            _ => from.Size - moved.Y,
+        };
+        double size = Math.Clamp(wanted, side ? peekPane.LeastWidth : ThemeFiles.LeastArea, Math.Max(peekRoom, side ? peekPane.LeastWidth : ThemeFiles.LeastArea));
+        switch (window.Anchor)
+        {
+            case ToolAnchor.LeftTop or ToolAnchor.LeftBottom:
+                leftWidth = size;
+                break;
+            case ToolAnchor.RightTop or ToolAnchor.RightBottom:
+                rightWidth = size;
+                break;
+            default:
+                bottomHeight = size;
+                break;
+        }
+        Fit();
+    }
+
+    /// <summary>The edge whose tabs name the hidden windows of a side (a left or right place's) or of the foot (a bottom
+    /// place's), while it shows; null while it has none, or the stripes name the windows.</summary>
+    internal EdgeTabs? EdgeOf(ToolAnchor place) => place switch
+    {
+        ToolAnchor.LeftTop or ToolAnchor.LeftBottom => leftEdge,
+        ToolAnchor.RightTop or ToolAnchor.RightBottom => rightEdge,
+        _ => bottomEdge,
+    } is { IsVisible: true } edge ? edge : null;
+
+    /// <summary>An edge tab clicked: a docked window opens over the editors, or is put away where it is open there (one the
+    /// pointer's rest opened is kept instead, given the keys); one floating, windowed or among the editors opens where it
+    /// stands.</summary>
+    internal void EdgeTabClicked(ToolWindow window)
+    {
+        if (peeked == window && hovered)
+        {
+            hovered = false;
+            window.TakeKeys();
+        }
+        else if (peeked == window)
+        {
+            Hide(window.Id);
+        }
+        else if (PeeksAt(window))
+        {
+            Peek(window.Id);
+        }
+        else
+        {
+            Show(window.Id);
+        }
+    }
+
+    /// <summary>Closes a window: hidden as <see cref="Hide"/> hides it, and, while <see cref="ClosesOffStripe"/>, taken off its
+    /// stripe and its place's tabs until it is opened again (its place kept for then). Under titled tabs, one shown in its
+    /// place leaves the tab beside it shown there, the next in its order, else the one before, so the place stays open.</summary>
+    public void Close([IdentifierOf(typeof(ToolWindowIds))] string id)
+    {
+        if (!closesOffStripe)
+        {
+            Hide(id);
+            return;
+        }
+        ToolWindow window = this[id];
+        List<ToolWindow> tabbed = titledTabs && window is { IsShown: true, Mode: ToolMode.Docked } && window != peeked
+            ? [.. OnStripes.Where(w => w.Anchor == window.Anchor && w.Mode == ToolMode.Docked && w != window).OrderBy(w => w.Order)]
+            : [];
+        ToolWindow? beside = tabbed.FirstOrDefault(w => w.Order > window.Order) ?? tabbed.LastOrDefault();
+        SetOnStripe(id, false);
+        if (beside is not null)
+        {
+            Show(beside.Id);
+        }
+    }
+
+    /// <summary>A window's stripe icon, as its stripe's checklist sets it whatever <see cref="ClosesOffStripe"/> says: taken
+    /// off as a window is closed off it (hidden, its place and its keys kept), or put back, hidden as it was.</summary>
+    public void SetOnStripe([IdentifierOf(typeof(ToolWindowIds))] string id, bool on)
+    {
+        ToolWindow window = this[id];
+        if (!on)
+        {
+            Hide(id);
+        }
+        if (window.IsClosed == !on)
+        {
+            return;
+        }
+        window.IsClosed = !on;
+        Layout();
+        LayoutChanged?.Invoke(this, EventArgs.Empty);
+    }
+
+    /// <summary>The checklist a stripe opened of its windows at a place, while it is open.</summary>
+    public ContextMenu? StripeMenu { get; internal set; }
+
+    /// <summary>The menu a place's titled tabs opened of those with no room in their strip, while it is open.</summary>
+    public ContextMenu? HiddenTabsMenu { get; internal set; }
 
     public void Hide([IdentifierOf(typeof(ToolWindowIds))] string id)
     {
@@ -270,6 +945,10 @@ public sealed class DockHost : Grid
                 window.WindowBounds = open.Placement;
                 open.CloseQuietly();
             }
+            if (window.Mode == ToolMode.Editor)
+            {
+                EditorTabs?.Close(window);
+            }
             PassActive(window);
             Layout();
             LayoutChanged?.Invoke(this, EventArgs.Empty);
@@ -281,7 +960,7 @@ public sealed class DockHost : Grid
     {
         if (Active == hidden)
         {
-            Active = windows.FirstOrDefault(w => w.IsShown);
+            Active = Served.FirstOrDefault(w => w.IsShown);
         }
     }
 
@@ -318,13 +997,13 @@ public sealed class DockHost : Grid
             Restore();
             return;
         }
-        if ((window ?? Active) is not { IsShown: true, Mode: ToolMode.Docked } target)
+        if ((window ?? Active) is not { IsShown: true, Mode: ToolMode.Docked } target || target == peeked)
         {
             return;
         }
         Remember();
         maximized = (target, leftWidth, rightWidth, bottomHeight);
-        double width = Bounds.Width - (2 * StripeWidth) - 80;
+        double width = Bounds.Width - Stripes - 80;
         switch (target.Anchor)
         {
             case ToolAnchor.BottomLeft or ToolAnchor.BottomRight:
@@ -342,7 +1021,7 @@ public sealed class DockHost : Grid
 
     public bool IsMaximized => maximized is not null;
 
-    /// <summary>Hides every docked window open, or opens them again (Ctrl+Shift+F12).</summary>
+    /// <summary>Hides every docked window open, or opens them again in their places (Ctrl+Shift+F12).</summary>
     public void ToggleHideAll()
     {
         if (hiddenAll is { } hidden)
@@ -354,7 +1033,11 @@ public sealed class DockHost : Grid
             hiddenAll = null;
             return;
         }
-        List<ToolWindow> open = [.. windows.Where(w => w.IsShown && w.Mode == ToolMode.Docked)];
+        if (peeked is { } over)
+        {
+            Hide(over.Id);
+        }
+        List<ToolWindow> open = [.. Served.Where(w => w.IsShown && w.Mode == ToolMode.Docked)];
         foreach (ToolWindow window in open)
         {
             Hide(window.Id);
@@ -385,7 +1068,15 @@ public sealed class DockHost : Grid
             return;
         }
         FloatWindow created = new(this, window.WindowBounds, new Size(520, 420)) { Title = window.Title, ShowInTaskbar = window.Mode == ToolMode.Windowed, ShowActivated = forward };
-        ToolPane pane = new(this) { Floating = created };
+        ToolPane pane = new(this) { Floating = created, Closes = closesOffStripe };
+        pane.LeastChanged += (_, _) =>
+        {
+            // Told after a layout, by which the window may have closed.
+            if (created.IsVisible)
+            {
+                created.HoldAtLeast(new Size(pane.LeastWidth, created.MinHeight));
+            }
+        };
         pane.Show(window);
         created.Content = pane;
         created.Dismissed += (_, _) => FloatClosed(window, created);
@@ -460,7 +1151,12 @@ public sealed class DockHost : Grid
         return true;
     }
 
-    public bool IsShown([IdentifierOf(typeof(ToolWindowIds))] string id) => this[id].IsShown;
+    /// <summary>Whether a window shows: open, and serving the open folder.</summary>
+    public bool IsShown([IdentifierOf(typeof(ToolWindowIds))] string id) => this[id] is { IsShown: true, Unserved: null };
+
+    /// <summary>The windows shown docked at these places, in their order, each with the place that shows it.</summary>
+    internal IEnumerable<(ToolWindow Window, Control Place)> ShownAt(IEnumerable<ToolAnchor> places) =>
+        places.Select(anchor => panes[anchor]).Where(pane => pane.Window is not null && pane.IsEffectivelyVisible).Select(pane => (pane.Window!, (Control)pane));
 
     /// <summary>Moves a window to another place (at an index among its buttons there), shown if it was.</summary>
     public void Move(ToolWindow window, ToolAnchor anchor, int? index = null)
@@ -492,9 +1188,11 @@ public sealed class DockHost : Grid
     {
         Remember();
         (double left, double right, double bottom) = maximized is { } was ? (was.Left, was.Right, was.Bottom) : (leftWidth, rightWidth, bottomHeight);
-        Dictionary<string, DockedWindow> placed = windows.ToDictionary(w => w.Id, w => new DockedWindow(w.Anchor, w.Order, w.IsShown)
+        // A window over the editors is kept as hidden, its place's state.
+        Dictionary<string, DockedWindow> placed = windows.ToDictionary(w => w.Id, w => new DockedWindow(w.Anchor, w.Order, w.IsShown && w != peeked)
         {
             Mode = w.Mode,
+            Closed = w.IsClosed,
             Bounds = (floats.TryGetValue(w, out FloatWindow? open) ? open.Placement : w.WindowBounds) is { } at ? [at.X, at.Y, at.Width, at.Height] : null,
         });
         foreach ((string id, DockedWindow other) in others)
@@ -509,8 +1207,14 @@ public sealed class DockHost : Grid
     public void Apply(DockLayout layout)
     {
         CloseFloats();
+        foreach (ToolWindow tabbed in windows.Where(w => w is { Mode: ToolMode.Editor, IsShown: true }))
+        {
+            tabbed.IsShown = false;
+            EditorTabs?.Close(tabbed);
+        }
         Restore();
         hiddenAll = null;
+        PeekAt(null);
         others = layout.Windows.Where(w => Find(w.Key) is null).ToDictionary();
         foreach (ToolWindow window in windows)
         {
@@ -520,13 +1224,14 @@ public sealed class DockHost : Grid
                 window.Order = placed.Order;
                 window.IsShown = placed.Shown;
                 window.Mode = placed.Mode;
+                window.IsClosed = placed.Closed && !placed.Shown;
                 window.WindowBounds = placed.Bounds is [int x, int y, int width, int height] ? new PixelRect(x, y, width, height) : null;
             }
         }
-        // Two shown in one place keep the first.
+        // Two shown in one place keep the first serving the folder.
         foreach (IGrouping<ToolAnchor, ToolWindow> place in windows.Where(w => w.IsShown && w.Mode == ToolMode.Docked).GroupBy(w => w.Anchor))
         {
-            foreach (ToolWindow extra in place.OrderBy(w => w.Order).Skip(1))
+            foreach (ToolWindow extra in place.OrderBy(w => w.Unserved is null ? 0 : 1).ThenBy(w => w.Order).Skip(1))
             {
                 extra.IsShown = false;
             }
@@ -535,16 +1240,20 @@ public sealed class DockHost : Grid
         leftWidth = Positive(layout.LeftWidth, leftWidth);
         rightWidth = Positive(layout.RightWidth, rightWidth);
         bottomHeight = Positive(layout.BottomHeight, bottomHeight);
-        Active = windows.FirstOrDefault(w => w.IsShown);
+        Active = Served.FirstOrDefault(w => w.IsShown);
         Layout();
+        foreach (ToolWindow tabbed in Served.Where(w => w is { Mode: ToolMode.Editor, IsShown: true }))
+        {
+            EditorTabs?.Show(tabbed, false);
+        }
         // A floating window kept open opens again once the IDE's own window is there to float over.
-        foreach (ToolWindow floating in windows.Where(w => w.IsShown && w.Mode != ToolMode.Docked))
+        foreach (ToolWindow floating in Served.Where(w => w.IsShown && w.Mode is ToolMode.Floating or ToolMode.Windowed))
         {
             if (TopLevel.GetTopLevel(this) is null)
             {
                 AttachedToVisualTree += (_, _) =>
                 {
-                    if (floating.IsShown && floating.Mode != ToolMode.Docked)
+                    if (floating is { IsShown: true, Unserved: null, Mode: ToolMode.Floating or ToolMode.Windowed })
                     {
                         Float(floating, forward: true);
                     }
@@ -560,26 +1269,73 @@ public sealed class DockHost : Grid
     }
 
 
-    /// <summary>The stripes' tips said again with the keymap in force, which a change of keymap or shortcut has replaced.</summary>
+    /// <summary>The stripes' and the edge tabs' tips said again with the keymap in force, which a change of keymap or
+    /// shortcut has replaced.</summary>
     public void FollowKeys()
     {
-        leftStripe.Fill(windows);
-        rightStripe.Fill(windows);
+        leftStripe.Fill(OnStripes);
+        rightStripe.Fill(OnStripes);
+        FillEdges();
     }
 
     internal void Layout()
     {
+        if (peeked is { } over && !(titledTabs && over is { IsShown: true, IsClosed: false, Unserved: null, Mode: ToolMode.Docked }))
+        {
+            PeekAt(null);
+        }
         foreach ((ToolAnchor anchor, ToolPane pane) in panes)
         {
-            pane.Show(windows.FirstOrDefault(w => w.Anchor == anchor && w.IsShown && w.Mode == ToolMode.Docked));
+            pane.Show(Served.FirstOrDefault(w => w.Anchor == anchor && w.IsShown && w.Mode == ToolMode.Docked && w != peeked));
+            pane.ShowTabs(titledTabs && pane.Window is not null ? [.. OnStripes.Where(w => w.Anchor == anchor && w.Mode == ToolMode.Docked).OrderBy(w => w.Order)] : []);
+            pane.Closes = closesOffStripe;
+            pane.AutoHides = titledTabs;
         }
+        // After the places, so a window docked from over the editors has left them.
+        peekPane.Show(peeked);
+        peekPane.Closes = closesOffStripe;
         Split(leftArea, panes[ToolAnchor.LeftTop], panes[ToolAnchor.LeftBottom], rows: true);
         Split(rightArea, panes[ToolAnchor.RightTop], panes[ToolAnchor.RightBottom], rows: true);
         Split(bottomArea, panes[ToolAnchor.BottomLeft], panes[ToolAnchor.BottomRight], rows: false);
-        leftStripe.Fill(windows);
-        rightStripe.Fill(windows);
+        leftStripe.Fill(OnStripes);
+        rightStripe.Fill(OnStripes);
+        FillEdges();
+        FoldStripes();
         Fit();
     }
+
+    /// <summary>Under titled tabs, a tab along the frame's edge for each window on it that no place shows and no tab at a
+    /// place's foot names: one hidden, or open over the editors; none under stripe icons.</summary>
+    private void FillEdges()
+    {
+        List<ToolWindow> edged = titledTabs
+            ? [.. OnStripes.Where(w => (!w.IsShown || w == peeked) && !(w.Mode == ToolMode.Docked && panes[w.Anchor].Window is not null))]
+            : [];
+        foreach (EdgeTabs edge in (EdgeTabs[])[leftEdge, rightEdge, bottomEdge])
+        {
+            edge.Fill(edged, peeked);
+        }
+    }
+
+    /// <summary>Under stripe icons, a stripe with no icon (none docked at its places) folds away, leaving its width to the
+    /// areas and the editors, and shows again while a window is dragged, as a place to drop it; one of whose windows the
+    /// person took off it stays shown, icon or none, so its checklist can put it back. Under titled tabs no stripe stands,
+    /// and each edge shows while it has tabs.</summary>
+    private void FoldStripes()
+    {
+        foreach ((Stripe stripe, EdgeTabs edge, int column) in ((Stripe, EdgeTabs, int)[])[(leftStripe, leftEdge, 0), (rightStripe, rightEdge, 6)])
+        {
+            bool shown = !titledTabs && (dragged || stripe.HasIcons || Served.Any(w => w.IsClosed && stripe.Lists(w.Anchor)));
+            stripe.IsVisible = shown;
+            edge.IsVisible = titledTabs && edge.HasTabs;
+            ColumnDefinitions[column].Width = new GridLength(shown ? StripeWidth : edge.IsVisible ? EdgeTabs.Breadth : 0);
+        }
+        bottomEdge.IsVisible = titledTabs && bottomEdge.HasTabs;
+        RowDefinitions[3].Height = new GridLength(bottomEdge.IsVisible ? EdgeTabs.Breadth : 0);
+    }
+
+    /// <summary>The stripes' or edges' widths, as they are to be laid out.</summary>
+    private double Stripes => ColumnDefinitions[0].Width.Value + ColumnDefinitions[6].Width.Value;
 
     protected override void OnSizeChanged(SizeChangedEventArgs e)
     {
@@ -599,8 +1355,8 @@ public sealed class DockHost : Grid
         bool bottomOpen = panes[ToolAnchor.BottomLeft].Window is not null || panes[ToolAnchor.BottomRight].Window is not null;
         double share = maximized is null ? EditorShare : 0;
         // Before the first layout there is no frame: the sizes are fitted once there is.
-        double across = Math.Max(0, Bounds.Width - (2 * StripeWidth) - 2);
-        double down = Math.Max(0, Bounds.Height - 1);
+        double across = Math.Max(0, Bounds.Width - Stripes - 2);
+        double down = Math.Max(0, Bounds.Height - RowDefinitions[3].Height.Value - 1);
         double left = leftOpen ? leftWidth : 0;
         double right = rightOpen ? rightWidth : 0;
         double bottom = bottomOpen ? bottomHeight : 0;
@@ -614,10 +1370,14 @@ public sealed class DockHost : Grid
             bottom = Math.Min(bottom, down * (1 - share));
         }
         ColumnDefinitions[1].Width = new GridLength(left);
+        ColumnDefinitions[1].MinWidth = Math.Max(Least(ToolAnchor.LeftTop), Least(ToolAnchor.LeftBottom));
         ColumnDefinitions[2].Width = new GridLength(leftOpen ? 1 : 0);
         ColumnDefinitions[3].MinWidth = across * share;
         ColumnDefinitions[4].Width = new GridLength(rightOpen ? 1 : 0);
         ColumnDefinitions[5].Width = new GridLength(right);
+        ColumnDefinitions[5].MinWidth = Math.Max(Least(ToolAnchor.RightTop), Least(ToolAnchor.RightBottom));
+        bottomArea.ColumnDefinitions[0].MinWidth = Least(ToolAnchor.BottomLeft);
+        bottomArea.ColumnDefinitions[2].MinWidth = Least(ToolAnchor.BottomRight);
         RowDefinitions[0].MinHeight = down * share;
         RowDefinitions[1].Height = new GridLength(bottomOpen ? 1 : 0);
         RowDefinitions[2].Height = new GridLength(bottom);
@@ -628,7 +1388,51 @@ public sealed class DockHost : Grid
         leftSeam.IsVisible = leftOpen && bottomOpen;
         rightSeam.IsVisible = rightOpen && bottomOpen;
         given = (left, right, bottom);
+        PlacePeek(across, down);
     }
+
+    /// <summary>The window over the editors beside its edge, as wide (or, from the foot, as high) as its area is kept,
+    /// though never over more than the editors' share leaves nor narrower than its header at its least, its edge toward the
+    /// editors drawn.</summary>
+    private void PlacePeek(double across, double down)
+    {
+        peekFrame.IsVisible = peeked is not null;
+        if (peeked is not { } window)
+        {
+            return;
+        }
+        double most = 1 - EditorShare;
+        double least = peekPane.LeastWidth;
+        bool side = window.Anchor is not (ToolAnchor.BottomLeft or ToolAnchor.BottomRight);
+        peekRoom = side ? across * most : down * most;
+        (HorizontalAlignment h, VerticalAlignment v, double width, double height, Thickness edge) = window.Anchor switch
+        {
+            ToolAnchor.LeftTop or ToolAnchor.LeftBottom => (HorizontalAlignment.Left, VerticalAlignment.Stretch, Math.Max(least, Math.Min(leftWidth, across * most)), double.NaN, Hairlines.After),
+            ToolAnchor.RightTop or ToolAnchor.RightBottom => (HorizontalAlignment.Right, VerticalAlignment.Stretch, Math.Max(least, Math.Min(rightWidth, across * most)), double.NaN, Hairlines.Before),
+            _ => (HorizontalAlignment.Stretch, VerticalAlignment.Bottom, double.NaN, Math.Min(bottomHeight, down * most), Hairlines.Above),
+        };
+        peekFrame.HorizontalAlignment = h;
+        peekFrame.VerticalAlignment = v;
+        peekFrame.Width = width;
+        peekFrame.Height = height;
+        peekFrame.BorderThickness = edge;
+        peekGrip.HorizontalAlignment = h switch
+        {
+            HorizontalAlignment.Left => HorizontalAlignment.Right,
+            HorizontalAlignment.Right => HorizontalAlignment.Left,
+            _ => HorizontalAlignment.Stretch,
+        };
+        peekGrip.VerticalAlignment = side ? VerticalAlignment.Stretch : VerticalAlignment.Top;
+        peekGrip.Width = side ? GripBreadth : double.NaN;
+        peekGrip.Height = side ? double.NaN : GripBreadth;
+        peekGrip.Cursor = side ? acrossCursor : downCursor;
+    }
+
+    /// <summary>How broad the edge a drag resizes the window over the editors by is.</summary>
+    private const double GripBreadth = 6;
+
+    /// <summary>The least a place may be while it shows a window: what its header holds at its least.</summary>
+    private double Least(ToolAnchor anchor) => panes[anchor] is { Window: not null } pane ? pane.LeastWidth : 0;
 
     /// <summary>A side's two halves: both shown share it, as the person last split it while both were; one shown fills
     /// it.</summary>

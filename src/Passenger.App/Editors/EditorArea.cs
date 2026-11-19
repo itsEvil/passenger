@@ -40,10 +40,19 @@ public sealed partial class EditorArea : UserControl
         Commands = new CommandHistory(this);
         activeGroup = NewGroup();
         activeGroup.IsCurrent = true;
-        emptyTitle = new TextBlock { Text = "Passenger", FontSize = 28, FontWeight = FontWeight.SemiBold, HorizontalAlignment = HorizontalAlignment.Center };
+        // In a narrow editor the title ends in an ellipsis and the hint, just under it, wraps as empty places' words do.
+        emptyTitle = new TextBlock
+        {
+            Text = "Passenger",
+            FontSize = 28,
+            FontWeight = FontWeight.SemiBold,
+            HorizontalAlignment = HorizontalAlignment.Center,
+            TextTrimming = TextTrimming.CharacterEllipsis,
+            Margin = new Thickness(Gaps.Group, 0),
+        };
         emptyTitle.Bind(TextBlock.ForegroundProperty, emptyTitle.GetResourceObservable(TokenKeys.Text));
-        emptyHint = new TextBlock { Classes = { StyleClasses.Muted }, Text = "Open a solution, project or folder to start.", HorizontalAlignment = HorizontalAlignment.Center };
-        folderHint = new StackPanel { Spacing = 10, HorizontalAlignment = HorizontalAlignment.Center, VerticalAlignment = VerticalAlignment.Center, Children = { emptyTitle, emptyHint } };
+        emptyHint = new TextBlock { Classes = { StyleClasses.EmptyText }, Text = "Open a solution, project or folder to start.", Margin = new Thickness(Gaps.Group, 0) };
+        folderHint = new StackPanel { Spacing = Gaps.Normal, HorizontalAlignment = HorizontalAlignment.Center, VerticalAlignment = VerticalAlignment.Center, Children = { emptyTitle, emptyHint } };
         emptyState.Content = folderHint;
         main = NewFrame(new EditorFrame.Leaf(activeGroup), activeGroup, emptyState);
         Content = main.Surface;
@@ -105,12 +114,37 @@ public sealed partial class EditorArea : UserControl
 
     internal void OpenLinked(string path) => FileLinkClicked?.Invoke(this, path);
 
+    /// <summary>The merge of a file in conflict asked for by the banner over it, for the window to open its merge window.</summary>
+    public event EventHandler<OpenDocument>? MergeRequested;
+
+    internal void MergeAsked(OpenDocument document) => MergeRequested?.Invoke(this, document);
+
     /// <summary>The open folder, whose files alone a Markdown preview draws the images of; null for none.</summary>
     public Func<string?> Root { get; set; } = () => null;
+
+    /// <summary>What .gitignore leaves out below a folder, which an HTML preview's page is never served: files and
+    /// folders whole, none where the folder is in no repository.</summary>
+    public Func<string, Task<IReadOnlyList<string>>> LeftOutUnder { get; set; } = _ => Task.FromResult<IReadOnlyList<string>>([]);
 
     /// <summary>What a C# file is parsed with in process, open or not: its project's preprocessor symbols
     /// (<see cref="CSharp.CompilationSymbols"/>), as the window knows its projects. Asked on the UI thread.</summary>
     public Func<string, CSharpParseOptions> ParseOptions { get; set; } = _ => CSharpParsing.Default;
+
+    private EditorTabsPlace tabsPlace;
+
+    /// <summary>Where every group's tabs stand, in every editor window.</summary>
+    public EditorTabsPlace TabsPlace
+    {
+        get => tabsPlace;
+        set
+        {
+            tabsPlace = value;
+            foreach (EditorGroup group in AllGroups)
+            {
+                group.TabsPlace = value;
+            }
+        }
+    }
 
     private bool showsMarkdownPreview = true;
 
@@ -212,7 +246,33 @@ public sealed partial class EditorArea : UserControl
     public IReadOnlyList<OpenDocument> Diffs => [.. AllGroups.SelectMany(g => g.Tabs).Select(t => t.Document).Where(d => d.Diff is not null).Distinct()];
 
     /// <summary>Every group of tabs: the main window's, then each editor window's.</summary>
-    public IReadOnlyList<EditorGroup> Groups => [.. AllGroups];
+    /// <summary>Every frame's groups, in order: the list made last while the frames' groups stay those, so what asks at
+    /// every key and caret move makes none.</summary>
+    public IReadOnlyList<EditorGroup> Groups
+    {
+        get
+        {
+            int at = 0;
+            bool same = true;
+            foreach (EditorFrame frame in frames)
+            {
+                same = same && frame.Root.Lists(groups, ref at);
+            }
+            if (same && at == groups.Length)
+            {
+                return groups;
+            }
+            List<EditorGroup> all = [];
+            foreach (EditorFrame frame in frames)
+            {
+                frame.Root.AddTo(all);
+            }
+            groups = [.. all];
+            return groups;
+        }
+    }
+
+    private EditorGroup[] groups = [];
 
     public EditorGroup ActiveGroup => activeGroup;
 
@@ -535,7 +595,11 @@ public sealed partial class EditorArea : UserControl
         {
             return false;
         }
-        closedTabs.Add(document.Diff is { } diff ? closing with { Diff = diff.Shown.Kept } : closing);
+        // A tool window's tab opens again as the window does, never from a file.
+        if (document.Tool is null)
+        {
+            closedTabs.Add(document.Diff is { } diff ? closing with { Diff = diff.Shown.Kept } : closing);
+        }
         if (closedTabs.Count > ClosedTabsKept)
         {
             closedTabs.RemoveAt(0);
@@ -1001,7 +1065,7 @@ public sealed partial class EditorArea : UserControl
         }
         EditorGroup group = ((EditorFrame.Leaf)node).Group;
         // A diff's tab is not kept: what it compared may be gone by the next time, and the folder opens on its files.
-        List<EditorTab> kept = [.. group.Tabs.Where(t => t.Document.Diff is null)];
+        List<EditorTab> kept = [.. group.Tabs.Where(t => t.Document.Diff is null && t.Document.Tool is null)];
         return new EditorLayout
         {
             Tabs = [.. kept.Select(t =>
@@ -1163,6 +1227,17 @@ public sealed partial class EditorArea : UserControl
         return true;
     }
 
+    /// <summary>Its window has closed: each open file, held ones too, lets go of its colours and folds as a closed file does
+    /// (<see cref="OpenDocument.Close"/>), a parse under way among them, as nothing draws them again. The window's close
+    /// saved and kept them first, so nothing else is done to them.</summary>
+    public void LetGoOfFiles()
+    {
+        foreach (OpenDocument document in documents)
+        {
+            document.Close();
+        }
+    }
+
     /// <summary>Whether a group's window of editors is split, so Unsplit has something to join.</summary>
     public bool IsSplit(EditorGroup group) => (FrameOf(group)?.Groups.Count() ?? 0) > 1;
 
@@ -1219,6 +1294,12 @@ public sealed partial class EditorArea : UserControl
     {
         if (Target(frame, at) is not { } target)
         {
+            // A tool window's tab docks where it was let go, as its icon's drag docks it.
+            if (document.Tool is { } tool && TopLevel.GetTopLevel(frame.Surface) is not null)
+            {
+                ToolTabDropped?.Invoke(this, (tool, frame.Surface.PointToScreen(at)));
+                return;
+            }
             // Out of every window's editors: a window of its own where it was let go, its tab under the pointer.
             if (TopLevel.GetTopLevel(frame.Surface) is not null)
             {
@@ -1266,8 +1347,20 @@ public sealed partial class EditorArea : UserControl
         Bottom,
     }
 
-    /// <summary>The lit place a tab dragged from a frame is over, in the overlay of the window it would drop in.</summary>
-    private DropZone? ZoneAt(EditorFrame frame, Point at) => Target(frame, at) is { } target ? new DropZone(target.Zone, Overlay: target.Frame.Drop) : null;
+    /// <summary>The lit place a tab dragged from a frame is over, in the overlay of the window it would drop in; a tool
+    /// window's tab out of the editors, the place it would dock in.</summary>
+    private DropZone? ZoneAt(EditorFrame frame, OpenDocument document, Point at) => Target(frame, at) is { } target ? new DropZone(target.Zone, Overlay: target.Frame.Drop)
+        : document.Tool is { } tool && TopLevel.GetTopLevel(frame.Surface) is not null ? ToolZoneAt?.Invoke(tool, frame.Surface.PointToScreen(at)) : null;
+
+    /// <summary>Where a tool window's tab dragged out of the editors would dock, at a point on the screen, lit in the dock's
+    /// own overlay; null where it would not.</summary>
+    public Func<ToolTab, PixelPoint, DropZone?>? ToolZoneAt { get; set; }
+
+    /// <summary>A tool window's tab let go out of the editors, at a point on the screen.</summary>
+    public event EventHandler<(ToolTab Tool, PixelPoint At)>? ToolTabDropped;
+
+    /// <summary>A tool window's tab dragged (true), or let go wherever it went (false).</summary>
+    public event EventHandler<bool>? ToolTabDragging;
 
     /// <summary>Where a tab dragged from a frame and let go at a point (in its surface's coordinates) goes: into the
     /// editors under the point, the window it came from first, then the editor windows, then the main window, which the
@@ -1309,12 +1402,19 @@ public sealed partial class EditorArea : UserControl
             {
                 continue;
             }
-            Rect strip = new(origin, new Size(group.Bounds.Width, group.TabStrip.Bounds.Height));
+            Rect strip = group.TabsPlace == EditorTabsPlace.Top ? new Rect(origin, new Size(group.Bounds.Width, group.TabStrip.Bounds.Height))
+                : group.TabStrip.TranslatePoint(default, frame.Surface) is { } placed ? new Rect(placed, group.TabStrip.Bounds.Size) : default;
             if (strip.Contains(at))
             {
                 return (group, DropPlace.Strip, group.IndexAt(frame.Surface.TranslatePoint(at, group.TabStrip) ?? at), strip);
             }
-            Rect body = new(bounds.X, strip.Bottom, bounds.Width, bounds.Bottom - strip.Bottom);
+            // The body is the group but its strip, across its top or down a side.
+            Rect body = group.TabsPlace switch
+            {
+                EditorTabsPlace.Left => new Rect(strip.Right, bounds.Y, bounds.Right - strip.Right, bounds.Height),
+                EditorTabsPlace.Right => new Rect(bounds.X, bounds.Y, strip.X - bounds.X, bounds.Height),
+                _ => new Rect(bounds.X, strip.Bottom, bounds.Width, bounds.Bottom - strip.Bottom),
+            };
             double x = (at.X - body.X) / body.Width;
             double y = (at.Y - body.Y) / body.Height;
             return x < 0.25 ? (group, DropPlace.Left, 0, body.WithWidth(body.Width / 2))
@@ -1328,7 +1428,7 @@ public sealed partial class EditorArea : UserControl
 
     private EditorGroup NewGroup()
     {
-        EditorGroup group = new(this) { IsCurrent = false };
+        EditorGroup group = new(this) { IsCurrent = false, TabsPlace = tabsPlace };
         group.Editor.SelectionChanged += (_, _) =>
         {
             if (group == activeGroup)
@@ -1346,6 +1446,13 @@ public sealed partial class EditorArea : UserControl
     private EditorFrame NewFrame(EditorFrame.Node root, EditorGroup current, Control? empty = null)
     {
         EditorFrame frame = new(root, current, ZoneAt, Drop, empty);
+        frame.TabDrag.DraggingChanged += (_, e) =>
+        {
+            if (e.Item.Document.Tool is not null)
+            {
+                ToolTabDragging?.Invoke(this, e.Dragging);
+            }
+        };
         frames.Add(frame);
         return frame;
     }

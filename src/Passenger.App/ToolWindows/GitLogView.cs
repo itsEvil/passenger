@@ -1,4 +1,3 @@
-using System.Collections.ObjectModel;
 using System.Globalization;
 using Avalonia;
 using Avalonia.Controls;
@@ -26,9 +25,8 @@ public sealed class GitLogView : DockPanel, IOwnKeys
 
     private VcsController vcs;
     private IReadOnlyList<GraphRow> rows = [];
-    private readonly ObservableCollection<FileChange> files = [];
     private readonly ListBox list;
-    private readonly ListBox fileList;
+    private readonly ChangedFileList files;
     private readonly TextBox details;
     private readonly TextBox filter;
     private readonly EmptyState placeholder;
@@ -45,6 +43,15 @@ public sealed class GitLogView : DockPanel, IOwnKeys
     private Dictionary<string, IReadOnlyList<FileChange>> changes = [];
     private bool stale = true;
     private int loads;
+
+    /// <summary>The newest read of the history (<see cref="LoadAsync"/>): done once it has landed, or a newer one overtook it.</summary>
+    private Task reading = Task.CompletedTask;
+
+    /// <summary>The branch filter the rows listed were read for.</summary>
+    private string? readFor;
+
+    /// <summary>What the next read of the history waits for once git has answered it (<see cref="HoldNextRead"/>).</summary>
+    private (Task Until, TaskCompletionSource Answered)? readHeld;
 
     /// <summary>How many commits the Log reads: the newest <see cref="Git.LogLength"/>, more once a commit further down is
     /// asked for (a blame's), kept until another folder's working tree is followed.</summary>
@@ -71,15 +78,7 @@ public sealed class GitLogView : DockPanel, IOwnKeys
         };
         ReusedRows.Use(list, Row);
         list.SelectionChanged += (_, _) => IdeErrors.Observe(ShowCommitAsync());
-        list.DoubleTapped += (_, _) => RequestFileDiff();
-        // Ahead of the list's own keys, which take Enter for its selection.
-        list.AddHandler(KeyDownEvent, (_, e) =>
-        {
-            if (e.Key == Key.Enter && e.KeyModifiers == KeyModifiers.None && RequestFileDiff())
-            {
-                e.Handled = true;
-            }
-        }, Avalonia.Interactivity.RoutingStrategies.Tunnel);
+        ListKeys.Act(list, new ListActs { Open = () => RequestFileDiff() });
         ListMenus.Attach(list, () => Selected is not { } commit ? [] :
         [
             .. FileChangeOf(commit) is { } change ? new Control[]
@@ -100,35 +99,19 @@ public sealed class GitLogView : DockPanel, IOwnKeys
                 ListMenus.Item("Mixed: the changes since kept in the files", null, () => ResetRequested?.Invoke(this, (commit, ResetMode.Mixed))),
                 ListMenus.Item("Hard: the changes since dropped…", null, () => ResetRequested?.Invoke(this, (commit, ResetMode.Hard)))),
         ]);
-        fileList = new ListBox
-        {
-            Classes = { StyleClasses.Tree },
-            ItemsSource = files,
-        };
-        ReusedRows.Use(fileList, FileRow);
-        fileList.DoubleTapped += (_, _) => RequestDiff();
-        fileList.KeyDown += (_, e) =>
-        {
-            if (e.Key == Key.Enter || AppActions.Presses(AppActions.ShowDiff, e))
-            {
-                RequestDiff();
-                e.Handled = true;
-            }
-            else if (e.Key == Key.F4 && e.KeyModifiers == KeyModifiers.None && fileList.SelectedItem is FileChange { Kind: not ChangeKind.Deleted } shown)
-            {
-                OpenRequested?.Invoke(this, shown.Path);
-                e.Handled = true;
-            }
-        };
         // A commit's file offers what the Commit window's changed files do.
-        ListMenus.Attach(fileList, () => Selected is not { } commit || fileList.SelectedItem is not FileChange change ? [] :
+        files = new ChangedFileList(() => vcs.Repository, change => Selected is not { } commit ? [] :
         [
-            ListMenus.Item("Show Diff", "Enter", () => DiffRequested?.Invoke(this, (commit, change))),
             ListMenus.Item("Compare with Local", null, () => CompareRequested?.Invoke(this, (change.Path, commit, change)), change.Kind is not ChangeKind.Deleted),
-            ListMenus.Item("Jump to Source", "F4", () => OpenRequested?.Invoke(this, change.Path), change.Kind is not ChangeKind.Deleted),
-            new Separator(),
-            ListMenus.Item("Copy Path", null, () => IdeErrors.Observe(ListMenus.CopyAsync(this, change.Path))),
         ]);
+        files.DiffRequested += (_, change) =>
+        {
+            if (Selected is { } commit)
+            {
+                DiffRequested?.Invoke(this, (commit, change));
+            }
+        };
+        files.OpenRequested += (_, path) => OpenRequested?.Invoke(this, path);
         details = new TextBox
         {
             IsReadOnly = true,
@@ -136,13 +119,13 @@ public sealed class GitLogView : DockPanel, IOwnKeys
             TextWrapping = TextWrapping.Wrap,
             BorderThickness = new Thickness(0),
             Background = Brushes.Transparent,
-            Padding = new Thickness(10, 8),
+            Padding = new Thickness(ListRow.TextStart, Gaps.Normal),
             FontSize = 12,
         };
         placeholder = new EmptyState();
         placeholder.ActionRequested += (_, action) => ActionRequested?.Invoke(this, action);
 
-        filter = new TextBox { Classes = { StyleClasses.Search }, PlaceholderText = "Text or hash", VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(0, 0, 6, 0) };
+        filter = new TextBox { Classes = { StyleClasses.Search }, PlaceholderText = "Text or hash", VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(0, 0, Gaps.Small, 0) };
         ToolFlow.SetFills(filter, new ToolLayout.Fills(120, 246));
         filter.TextChanged += (_, _) => Filter();
         Button refresh = ToolButtons.Of(AppActions.GitLogRefresh, IconKeys.Rerun, "Refresh", action => ActionRequested?.Invoke(this, action));
@@ -150,25 +133,25 @@ public sealed class GitLogView : DockPanel, IOwnKeys
         branchFilterText = new TextBlock { VerticalAlignment = VerticalAlignment.Center };
         PathIcon clearGlyph = new() { Classes = { StyleClasses.Small } };
         clearGlyph.Bind(PathIcon.DataProperty, clearGlyph.GetResourceObservable(IconKeys.Close));
-        Button clearBranch = new() { Classes = { StyleClasses.TabPin }, Content = clearGlyph, Margin = new Thickness(6, 0, 0, 0) };
+        Button clearBranch = new() { Classes = { StyleClasses.TabPin }, Content = clearGlyph, Margin = new Thickness(Gaps.Small, 0, 0, 0) };
         ToolButtons.Tip(clearBranch, "Clear Branch Filter");
         clearBranch.Click += (_, _) => FilterBranch(null, all: true);
         branchFilter = new Border
         {
             IsVisible = false,
             Classes = { StyleClasses.Tag },
-            Padding = new Thickness(8, 2, 4, 2),
-            Margin = new Thickness(0, 0, 8, 0),
+            Padding = new Thickness(Gaps.Normal, Gaps.Hair, Gaps.Tight, Gaps.Hair),
+            Margin = new Thickness(0, 0, Gaps.Normal, 0),
             VerticalAlignment = VerticalAlignment.Center,
             Child = new StackPanel { Orientation = Orientation.Horizontal, Children = { branchFilterText, clearBranch } },
         };
         branchFilter.Bind(Border.BackgroundProperty, branchFilter.GetResourceObservable(TokenKeys.Selected));
-        Border top = ToolBars.Top(new ToolFlow { Margin = new Thickness(8, 2), Children = { filter, branchFilter, refresh } });
+        Border top = ToolBars.Top(new ToolFlow { Margin = new Thickness(Gaps.Normal, Gaps.Hair), Children = { filter, branchFilter, refresh } });
 
         Grid right = new() { RowDefinitions = new RowDefinitions("*,1,*") };
         HairlineDivider between = new(GridResizeDirection.Rows) { [Grid.RowProperty] = 1 };
         Grid.SetRow(details, 2);
-        right.Children.Add(fileList);
+        right.Children.Add(files.List);
         right.Children.Add(between);
         right.Children.Add(details);
         PaneSplit split = new(new Panel { Children = { list, placeholder } }, right, "3*,1,2*");
@@ -226,10 +209,15 @@ public sealed class GitLogView : DockPanel, IOwnKeys
     /// branch's again with <paramref name="all"/>.</summary>
     public void FilterBranch(BranchInfo? branch, bool all = false)
     {
-        (BranchFilter, BranchFilterName) = all ? (null, null) : branch is null ? ("HEAD", "HEAD") : (branch.Ref.FullName, branch.Name);
+        ShowBranchFilter(all ? (null, null) : branch is null ? ("HEAD", "HEAD") : (branch.Ref.FullName, branch.Name));
+        IdeErrors.Observe(LoadAsync());
+    }
+
+    private void ShowBranchFilter((string? Revision, string? Name) filter)
+    {
+        (BranchFilter, BranchFilterName) = filter;
         branchFilter.IsVisible = BranchFilter is not null;
         branchFilterText.Text = $"Branch: {BranchFilterName}";
-        IdeErrors.Observe(LoadAsync());
     }
 
     /// <summary>A history's tab closed: it stops following the history.</summary>
@@ -276,7 +264,7 @@ public sealed class GitLogView : DockPanel, IOwnKeys
     public IReadOnlyList<GraphRow> Rows => rows;
 
     /// <summary>The chosen commit's files.</summary>
-    public IReadOnlyList<FileChange> Files => files;
+    public IReadOnlyList<FileChange> Files => files.Files;
 
     public CommitInfo? Selected => (list.SelectedItem as GraphRow)?.Commit;
 
@@ -289,18 +277,14 @@ public sealed class GitLogView : DockPanel, IOwnKeys
     }
 
     /// <summary>Chooses the commit with this hash, reading the log first if it has not been, and down to the commit when it
-    /// is older than those read.</summary>
+    /// is older than those read; a filter that hides it, the text's or a branch's whose history lacks it, shows it again.</summary>
     public async Task SelectHashAsync(string hash)
     {
-        if (!all.Any(r => r.Commit.Hash == hash))
+        await ReachAsync(hash);
+        if (!all.Any(r => r.Commit.Hash == hash) && BranchFilter is not null)
         {
-            await LoadAsync();
-        }
-        if (!all.Any(r => r.Commit.Hash == hash) && Scope is null && Range is null && vcs.Repository is { } repository
-            && await repository.LogDepthAsync(hash, BranchFilter is { } branch ? [branch] : null) is int depth && depth > most)
-        {
-            most = depth;
-            await LoadAsync();
+            ShowBranchFilter((null, null));
+            await ReachAsync(hash);
         }
         FilterText = string.Empty;
         Filter();
@@ -311,11 +295,42 @@ public sealed class GitLogView : DockPanel, IOwnKeys
         }
     }
 
+    /// <summary>Reads the log if it has not been, and down to the commit when it is older than those read.</summary>
+    private async Task ReachAsync(string hash)
+    {
+        // Decided on the rows as the filter in force reads them: rows read for another filter, or before a read under way, are read again.
+        if (!all.Any(r => r.Commit.Hash == hash) || readFor != BranchFilter || !reading.IsCompleted)
+        {
+            await LoadAsync();
+        }
+        while (!reading.IsCompleted)
+        {
+            await reading;
+        }
+        if (!all.Any(r => r.Commit.Hash == hash) && Scope is null && Range is null && vcs.Repository is { } repository
+            && await repository.LogDepthAsync(hash, BranchFilter is { } branch ? [branch] : null) is int depth && depth > most)
+        {
+            most = depth;
+            await LoadAsync();
+        }
+    }
+
     /// <summary>Chooses a commit, as a click on its row does.</summary>
     public void Select(CommitInfo commit) => list.SelectedItem = rows.FirstOrDefault(r => r.Commit.Hash == commit.Hash);
 
     /// <summary>Reads the history again.</summary>
-    public async Task LoadAsync()
+    public Task LoadAsync() => reading = ReadAsync();
+
+    /// <summary>Holds the next read of the history, once git has answered it, from landing until <paramref name="until"/>
+    /// ends, for a test of what the log does meanwhile: done once git has answered.</summary>
+    public Task HoldNextRead(Task until)
+    {
+        TaskCompletionSource answered = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        readHeld = (until, answered);
+        return answered.Task;
+    }
+
+    private async Task ReadAsync()
     {
         int load = ++loads;
         stale = false;
@@ -331,11 +346,18 @@ public sealed class GitLogView : DockPanel, IOwnKeys
             }
         }
         IReadOnlyList<HistoryCommit> history = repository is null || Scope is null ? [] : await repository.HistoryAsync(Scope);
+        string? filterRead = BranchFilter;
         IReadOnlyList<CommitInfo> commits = repository is null ? []
             : Scope is not null ? [.. history.Select(h => h.Commit)]
             : Range is { } range ? await repository.LogAsync(revisions: [$"{range.FromRef}..{range.ToRef}"])
             : BranchFilter is { } branch ? await repository.LogAsync(most, [branch])
             : await repository.LogAsync(most);
+        if (readHeld is { } held)
+        {
+            readHeld = null;
+            held.Answered.SetResult();
+            await held.Until;
+        }
         IReadOnlyList<GraphRow> laid = await BackgroundWork.Run(() => Scope is null ? CommitGraph.Layout(commits) : CommitGraph.Line(commits));
         if (load != loads)
         {
@@ -343,6 +365,7 @@ public sealed class GitLogView : DockPanel, IOwnKeys
         }
         changes = history.ToDictionary(h => h.Commit.Hash, h => h.Changes);
         all = laid;
+        readFor = filterRead;
         Filter();
         string name = Scope is null ? string.Empty : Path.GetFileName(Path.TrimEndingDirectorySeparator(Scope.Path));
         placeholder.Text = repository is null ? vcs.NoRepository
@@ -424,7 +447,7 @@ public sealed class GitLogView : DockPanel, IOwnKeys
         int reading = ++showing;
         if (Selected is not { } commit || vcs.Repository is not { } repository)
         {
-            files.Clear();
+            files.Files.Clear();
             details.Text = string.Empty;
             return;
         }
@@ -438,27 +461,18 @@ public sealed class GitLogView : DockPanel, IOwnKeys
         {
             return;
         }
-        files.Clear();
+        files.Files.Clear();
         foreach (FileChange change in changed)
         {
-            files.Add(change);
+            files.Files.Add(change);
         }
         string refs = commit.Refs.Count > 0 ? $"\n{string.Join(", ", commit.Refs)}" : string.Empty;
         string signed = signature is null ? string.Empty : $"\n{signature.Said}";
         details.Text = $"{message}\n\n{commit.Hash}{refs}\n{commit.Author} <{commit.Email}>\n{commit.Time.ToLocalTime():f}{signed}";
     }
 
-    /// <summary>Show Diff's keys, as the log's list of a commit's files takes them (<see cref="AppActions.KeysIn"/>), ahead
-    /// of what they run elsewhere while one is chosen.</summary>
-    public bool TakesKey(KeyEventArgs e) => fileList.IsKeyboardFocusWithin && fileList.SelectedItem is FileChange && AppActions.Presses(AppActions.ShowDiff, e);
-
-    private void RequestDiff()
-    {
-        if (Selected is { } commit && fileList.SelectedItem is FileChange change)
-        {
-            DiffRequested?.Invoke(this, (commit, change));
-        }
-    }
+    /// <summary>Show Diff's keys, as the log's list of a commit's files takes them (<see cref="ChangedFileList.TakesKey"/>).</summary>
+    public bool TakesKey(KeyEventArgs e) => files.TakesKey(e);
 
     /// <summary>A commit's row for whichever commit the list hands its container: its part of the graph, its refs as tags,
     /// the path it had the file at (under another name then), its subject, its signature's mark (read as the row is
@@ -472,7 +486,7 @@ public sealed class GitLogView : DockPanel, IOwnKeys
         then[DockProperty] = Dock.Right;
         then.MaxWidth = 280;
         TextBlock words = new() { VerticalAlignment = VerticalAlignment.Center, TextTrimming = TextTrimming.CharacterEllipsis };
-        RowIcon mark = new() { [DockProperty] = Dock.Right, Width = 14, Height = 14, IsVisible = false, Margin = new Thickness(6, 0, 0, 0), VerticalAlignment = VerticalAlignment.Center };
+        RowIcon mark = new() { [DockProperty] = Dock.Right, Width = 14, Height = 14, IsVisible = false, Margin = new Thickness(Gaps.Small, 0, 0, 0), VerticalAlignment = VerticalAlignment.Center };
         string? marked = null;
         subject.Children.Add(mark);
         subject.Children.Add(then);
@@ -506,7 +520,7 @@ public sealed class GitLogView : DockPanel, IOwnKeys
                 // A long branch's name ends in an ellipsis and leaves the subject room.
                 TextBlock text = new() { FontSize = 11, TextTrimming = TextTrimming.CharacterEllipsis };
                 text.Bind(TextBlock.ForegroundProperty, text.GetResourceObservable(TokenKeys.Vcs_RefText));
-                Border tag = new() { [DockProperty] = Dock.Left, Classes = { StyleClasses.Tag }, Padding = new Thickness(5, 1), Margin = new Thickness(0, 0, 6, 0), Child = text, VerticalAlignment = VerticalAlignment.Center, MaxWidth = 160 };
+                Border tag = new() { [DockProperty] = Dock.Left, Classes = { StyleClasses.Tag },  Margin = new Thickness(0, 0, Gaps.Small, 0), Child = text, VerticalAlignment = VerticalAlignment.Center, MaxWidth = 160 };
                 tag.Bind(Border.BackgroundProperty, tag.GetResourceObservable(TokenKeys.Vcs_Ref));
                 subject.Children.Insert(tags.Count, tag);
                 tags.Add((tag, text));
@@ -551,7 +565,7 @@ public sealed class GitLogView : DockPanel, IOwnKeys
         static TextBlock Muted()
         {
             TextBlock block = MutedText.Of(string.Empty);
-            block.Margin = new Thickness(8, 0);
+            block.Margin = new Thickness(Gaps.Normal, 0);
             return block;
         }
     }
@@ -567,15 +581,6 @@ public sealed class GitLogView : DockPanel, IOwnKeys
             1 => $"Yesterday {clock}",
             _ => local.ToString("d", CultureInfo.CurrentCulture) + " " + clock,
         };
-    }
-
-    /// <summary>A changed file's row for whichever file the list hands its container (<see cref="ChangedFileRow"/>), its
-    /// folder from the repository's top.</summary>
-    private Control FileRow()
-    {
-        ChangedFileRow row = new();
-        return row.Line.Showing<FileChange>(change =>
-            row.Show(change.Path, change.Kind, vcs.Repository is { } repository ? ChangedFileRow.Folder(repository.Relative(change.Path)) : string.Empty));
     }
 
     /// <summary>The lanes' colours as a theme gives them, and a pen of each.</summary>

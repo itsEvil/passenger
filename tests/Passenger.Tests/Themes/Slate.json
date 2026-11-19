@@ -1,0 +1,27 @@
+{
+  "format": 1,
+  "name": "Slate",
+  "description": "A soft blue-grey with lilac keywords, sage strings, cornflower calls and wheat types, its colours those of One Dark Pro by Binaryify (zhuangtongfa.material-theme on Open VSX, MIT), under card shapes, a survey map's contours behind the code, and the terminal and problems open below.",
+  "vscode": {"id": "zhuangtongfa.material-theme", "theme": "One Dark Pro", "version": "3.20.6"},
+  "tokens": {
+    "ControlRadius": 8,
+    "ToolRadius": 8,
+    "PopupRadius": 12,
+    "CardRadius": 14,
+    "BadgeRadius": 99,
+    "ChipRadius": 99,
+    "TabStripHeight": 40,
+    "TabMargin": [1, 6, 1, 0],
+    "TabPadding": [14, 0, 8, 0],
+    "TabRadius": [10, 10, 0, 0],
+    "TabShadow": "0 0 0 0 #00000000",
+    "PopupEdge": 1,
+    "EditorTextPadding": 6,
+    "ToolHeaderHeight": 38,
+    "ToolTitleMargin": [14, 0, 0, 0],
+    "DialogFooterPadding": [16, 10, 16, 10]
+  },
+  "fonts": {"code": {"family": "JetBrains Mono"}},
+  "layout": {"places": {"bottomLeft": ["terminal", "build", "run"], "bottomRight": ["problems"]}, "open": ["explorer", "terminal", "problems"], "sizes": {"left": 260, "bottom": 220}, "toolWindows": "tabs"},
+  "background": {"image": "pictures/slate.webp", "opacity": 0.1, "places": ["editor", "welcome"], "fit": "cover"}
+}

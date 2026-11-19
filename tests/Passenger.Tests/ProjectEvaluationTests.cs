@@ -276,16 +276,13 @@ public sealed class ProjectEvaluationTests : IDisposable
         // The order the server took them in, as its log says it finished (or failed) each: unrestored, they load with errors.
         string[] projects = ["App", "Core", "Reports", "Admin"];
         string log = string.Empty;
-        Ui.PumpUntil(() => window.CSharpService?.Session is { } session && (log = ServerLog(session.Server.ProcessId)) is var read
+        Ui.PumpUntil(() => window.CSharpService?.Session is { } session && (log = Ui.Shared(session.Server.LogPath)) is var read
             && projects.All(p => read.Contains(Path.Combine(p, p + ".csproj"), StringComparison.Ordinal)), "the language server's log to tell of the solution's four projects");
         int At(string project) => log.IndexOf(Path.Combine(project, project + ".csproj"), StringComparison.Ordinal) is >= 0 and var at ? at
             : throw new InvalidOperationException($"The language server's log says nothing of {project}:\n{log}");
         Assert.True(Math.Max(At("App"), At("Core")) < Math.Min(At("Reports"), At("Admin")),
             $"The language server took up another project before the file shown's, and the one it references:\n{log}");
         window.Close();
-
-        static string ServerLog(int process) => Directory.Exists(Passenger.App.CSharp.CSharpService.LogFolder)
-            && Directory.EnumerateFiles(Passenger.App.CSharp.CSharpService.LogFolder, $"server-*-{process}.log").SingleOrDefault() is { } path ? Ui.Shared(path) : string.Empty;
     }
 
     /// <summary>A run whose window closed as it began working out what App runs, the SDK App's folder picks still being
@@ -438,7 +435,7 @@ public sealed class ProjectHostBytesTests(ITestOutputHelper testOutput) : IDispo
         using JsonDocument infos = JsonDocument.Parse(built.Infos.ToString());
         string arguments = string.Join('\n', infos.RootElement[0].GetProperty("commandLineArgs").EnumerateArray().Select(a => a.GetString()));
         Assert.Contains("System.Runtime.dll", arguments, StringComparison.Ordinal);
-        long json = JsonSerializer.SerializeToUtf8Bytes(built, HostJson.Options).Length;
+        long json = JsonSerializer.SerializeToUtf8Bytes(built, PeerJson.Options).Length;
         testOutput.WriteLine($"{json:N0} bytes of JSON, {least:N0} allocated ({(double)least / json:0.00}×)");
         Assert.True(least <= json * 2,
             $"Reading a design-time build's reply of {json:N0} bytes of JSON allocated {least:N0} bytes ({(double)least / json:0.0}× its JSON): every project's build costs the IDE that much more memory as a solution loads");

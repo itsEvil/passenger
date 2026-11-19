@@ -32,7 +32,7 @@ public sealed record EfTool(EfToolPlace Place, string Version, string Where)
         ProcessStartInfo start = ChildProcesses.DotnetCommand(arguments, folder);
         start.FileName = Where;
         // The tool's apphost finds the runtime the IDE runs builds on, whatever the PATH it was started with says.
-        start.Environment[RuntimeVariables.Root] = Dotnet.Root();
+        start.Environment[RuntimeVariables.Root] = Dotnet.Root(folder);
         return start;
     }
 
@@ -125,8 +125,7 @@ public static class EfTools
         {
             return null;
         }
-        string? version = Directory.GetDirectories(store).Select(Path.GetFileName).OfType<string>().Max(VersionOrder.Instance);
-        return version is null ? null : new EfTool(EfToolPlace.Global, version, program);
+        return VersionOrder.Newest(Directory.EnumerateDirectories(store)) is { } newest ? new EfTool(EfToolPlace.Global, Path.GetFileName(newest), program) : null;
     }
 
     /// <summary>Whether the tool's package at a version is in the package cache the folder's restores use, so restoring the
@@ -134,14 +133,15 @@ public static class EfTools
     public static bool Cached(string version, string folder) =>
         Passenger.Packages.NuGetSettings.GlobalPackagesFolder(folder) is { } packages && File.Exists(Path.Combine(packages, Id, version.ToLowerInvariant(), $"{Id}.{version.ToLowerInvariant()}.nupkg"));
 
-    /// <summary>Each folder's manifests from the folder up, nearest first, as dotnet looks for them.</summary>
+    /// <summary>Each folder's manifests from the folder up, nearest first, as dotnet looks for them, in the person's folders
+    /// alone (<see cref="FoldersUp"/>): a tool another user's manifest names is none of the project's.</summary>
     private static IEnumerable<string> Manifests(string folder)
     {
-        for (string? at = folder; at is not null; at = Path.GetDirectoryName(at))
+        foreach (string at in FoldersUp.From(folder))
         {
-            foreach (string manifest in new[] { Path.Combine(at, ".config", "dotnet-tools.json"), Path.Combine(at, "dotnet-tools.json") })
+            foreach (string named in new[] { Path.Combine(".config", "dotnet-tools.json"), "dotnet-tools.json" })
             {
-                if (File.Exists(manifest))
+                if (FoldersUp.Found(at, named) is { } manifest && File.Exists(manifest))
                 {
                     yield return manifest;
                 }

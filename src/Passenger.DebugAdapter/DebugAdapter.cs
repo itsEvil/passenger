@@ -295,7 +295,7 @@ public sealed class DebugAdapter
                 connection.SendEvent(DapEvents.Exited, new ExitedEvent(code));
             }
         };
-        debugger.OnTerminated += () => connection.SendEvent(DapEvents.Terminated, new TerminatedEvent());
+        debugger.OnTerminated += () => connection.SendEvent(DapEvents.Terminated, new TerminatedEvent(Failure: debugger.Failure));
         debugger.OnThreadStarted += threadId => connection.SendEvent(DapEvents.Thread, new ThreadEvent(EventReasons.Started, threadId));
         debugger.OnThreadExited += threadId => connection.SendEvent(DapEvents.Thread, new ThreadEvent(EventReasons.Exited, threadId));
         debugger.OnModuleLoaded += (id, name, path) => connection.SendEvent(DapEvents.Module, new ModuleEvent(EventReasons.New, new DapModule(id, name, path)));
@@ -382,6 +382,7 @@ public sealed class DebugAdapter
                 Unseen = arguments.Unseen ?? false,
             };
             debugger.Present(arguments.Presentations ?? []);
+            debugger.Carry(arguments.Carried ?? []);
             await Locked(() => debugger.Launch(launch, arguments.JustMyCode ?? true));
         }
         catch (Exception error)
@@ -394,9 +395,15 @@ public sealed class DebugAdapter
     {
         try
         {
-            int processId = arguments.ProcessId ?? throw new InvalidOperationException("Missing process ID");
             bool justMyCode = arguments.JustMyCode ?? true;
             debugger.Present(arguments.Presentations ?? []);
+            debugger.Carry(arguments.Carried ?? []);
+            if (arguments.Relay is { } relay)
+            {
+                await Locked(() => debugger.AttachThroughRelay(relay, arguments.RelayModules, arguments.RelayToken, justMyCode, arguments.HotReload ?? false));
+                return;
+            }
+            int processId = arguments.ProcessId ?? throw new InvalidOperationException("Missing process ID");
             await Locked(() => debugger.Attach(processId, justMyCode, arguments.HotReload ?? false));
         }
         catch (Exception error)
@@ -439,7 +446,8 @@ public sealed class DebugAdapter
             b.HitCondition,
             b.Column is int column ? ColumnIn(column) : null,
             b.LogMessage,
-            b.Suspend))];
+            b.Suspend,
+            b.RunTo == true))];
         List<BreakpointManager.BreakpointInfo> breakpoints = await Locked(() => debugger.SetBreakpoints(path, requests));
         return new SetBreakpointsResponse([.. breakpoints.Select(b => ToProtocol(b, isEvent: false))]);
     }
@@ -569,7 +577,7 @@ public sealed class DebugAdapter
         }
         catch (OperationCanceledException) when (limit.IsCancellationRequested)
         {
-            throw new TimeoutException($"The client did not start {Path.GetFileName(programForTitle)} in its terminal within {RunInTerminalLimit.TotalSeconds:0} s");
+            throw new TimeoutException($"The client did not start {Path.GetFileName(programForTitle)} in its terminal within {Durations.Said(RunInTerminalLimit)}");
         }
         catch (DapException refused)
         {

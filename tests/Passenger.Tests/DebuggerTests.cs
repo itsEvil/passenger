@@ -564,7 +564,7 @@ public sealed class DebuggerTests : IClassFixture<DebuggerTests.Sum>, IClassFixt
             Ui.Run(window, AppActions.Resume);
             WaitDebugging(window, () => session.State == DebugState.Paused && session.Stops > stops && Value(window, "i") == i, $"the stop inside the lambda with i at {i}");
             DapStackFrame top = window.BottomPanel.Debug.Frames[0];
-            Assert.True(top.Name.Contains(">b__", StringComparison.Ordinal) && top.Column == body + 1,
+            Assert.True(top.Name.EndsWith("!Program.<Main>$.lambda(int i)", StringComparison.Ordinal) && top.Column == body + 1,
                 $"The lambda's breakpoint stopped in {top.Name} at column {top.Column}, not inside the lambda at column {body + 1}");
         }
         Ui.Run(window, AppActions.Resume);
@@ -670,13 +670,14 @@ public sealed class DebuggerTests : IClassFixture<DebuggerTests.Sum>, IClassFixt
         Ui.Run(window, AppActions.RunToCursor);
         WaitDebugging(window, () => session is { State: DebugState.Paused, Stops: 2 }, "Run to Cursor's stop at the line whose condition is false");
         Assert.Contains(new LineMark(3, LineMarkKind.ExecutionPoint), editor.LineMarks);
-        Assert.Equal(("1", "0"), (Value(window, "i"), Value(window, "total")));
+        Ui.WaitFor(() => (Value(window, "i"), Value(window, "total")) == ("1", "0"),
+            () => $"the stop's locals as the loop's first turn left them, where i is {Value(window, "i") ?? "not listed"} and total {Value(window, "total") ?? "not listed"}");
 
         editor.GoTo(new TextPosition(5, 0));
         Ui.Run(window, AppActions.RunToCursor);
         WaitDebugging(window, () => session is { State: DebugState.Paused, Stops: 3 }, "Run to Cursor's stop at the tracepoint");
         Assert.Contains(new LineMark(5, LineMarkKind.ExecutionPoint), editor.LineMarks);
-        Assert.Equal("6", Value(window, "total"));
+        Ui.WaitFor(() => Value(window, "total") == "6", () => $"the tracepoint's stop's total, listed as {Value(window, "total") ?? "nothing"}");
         Ui.Run(window, AppActions.Resume);
         WaitDebugging(window, () => session.State == DebugState.Ended, "the program to run to its end");
         Assert.Contains("total 6", window.BottomPanel.Debug.Console.Document.Snapshot.ToString(), StringComparison.Ordinal);
@@ -1043,7 +1044,7 @@ public sealed class DebuggerTests : IClassFixture<DebuggerTests.Sum>, IClassFixt
         Assert.Equal(stopped.Id, (threads.SelectedItem as DapThread)?.Id);
         Assert.Equal(Debugging.Helpers.Debuggees.Line(Looping, "stop while the lock is held"), view.SelectedFrame?.Line);
         Assert.Equal("Every thread ran while locked.Value was evaluated, so the values read before it may have moved, and implicit evaluation stays off until the program runs on", view.Moved);
-        Banner said = window.DebugWindow.GetVisualDescendants().OfType<Banner>().Single();
+        Banner said = window.DebugWindow.GetVisualDescendants().OfType<Banner>().Single(b => b.IsEffectivelyVisible);
         Assert.Equal(view.Moved, said.Said);
 
         Ui.Click(said.GetVisualDescendants().OfType<Button>().Single(b => Equals(b.Content, Passenger.App.ToolWindows.DebugView.ReadAgain)));
@@ -1935,6 +1936,46 @@ public sealed class DebuggerTests : IClassFixture<DebuggerTests.Sum>, IClassFixt
         int Said(string word) => Ui.Shared(spins).Split('\n').Count(l => l.StartsWith(word, StringComparison.Ordinal));
     }
 
+    /// <summary>A program debugged with Hot Reload and stopped at once finds the thread of Passenger's hook in it in its call
+    /// of the system's receive, partway through nothing an evaluation there could need, and on macOS and Linux, where .NET's
+    /// sockets have a thread of their own, no such thread in a program that made no socket.</summary>
+    [AvaloniaFact]
+    public void A_program_stopped_at_once_finds_the_hooks_thread_waiting_in_its_read_with_no_thread_of_its_beside_it()
+    {
+        string hook = Passenger.UpdateHandlers.Wire.ThreadName;
+        Write("Program.cs", "Probe probe = new();\nConsole.WriteLine(probe);\nThread.Sleep(500);\nConsole.WriteLine(\"slept\");\n\n"
+            + "sealed class Probe\n{\n    public override string ToString() => $\"probe {DateTime.MinValue.Year}\";\n}\n");
+        MainWindow window = Open();
+        CodeEditor editor = window.EditorArea.CodeEditor;
+        editor.GoTo(new TextPosition(1, 0));
+        Ui.Run(window, AppActions.ToggleBreakpoint);
+        editor.GoTo(new TextPosition(3, 0));
+        Ui.Run(window, AppActions.ToggleBreakpoint);
+        StartDebugging(window);
+        Passenger.App.ToolWindows.DebugModel view = window.BottomPanel.Debug;
+        WaitDebugging(window, () => Value(window, "probe") == "probe 1", "the first stop's probe, its ToString evaluated there");
+        Ui.WaitFor(() => view.Threads.Any(t => t.Name == hook), () => $"the hook's thread among the program's: {string.Join(", ", view.Threads.Select(t => t.Name))}");
+        ComboBox threads = window.DebugWindow.GetVisualDescendants().OfType<ComboBox>().First(c => ReferenceEquals(c.ItemsSource, view.Threads));
+        threads.SelectedItem = view.Threads.First(t => t.Name == hook);
+        Ui.WaitFor(() => view.Frames.Any(f => f.Name.StartsWith("Passenger.UpdateHandlers.dll!", StringComparison.Ordinal)), () => $"the hook's thread's frames: {Frames()}");
+        // The topmost managed frame is the call into the system: what is above it, if shown, is the system's own.
+        string called = view.Frames.First(f => f.Name.Contains('!', StringComparison.Ordinal)).Name;
+        string method = called[called.IndexOf('!', StringComparison.Ordinal)..];
+        Assert.True(method.Contains("Receive", StringComparison.Ordinal) || method.Contains("recv", StringComparison.Ordinal),
+            $"At a stop as Main began the hook's thread was not in its call of the system's receive, so a stop there catches it partway through what an evaluation may need: {Frames()}");
+
+        Ui.Run(window, AppActions.Resume);
+        WaitDebugging(window, () => editor.LineMarks.Contains(new LineMark(3, LineMarkKind.ExecutionPoint)), "the stop after the program slept");
+        Ui.WaitFor(() => view.Threads.Any(t => t.Name == hook), "the threads at the second stop");
+        Assert.False(!OperatingSystem.IsWindows() && view.Threads.Any(t => t.Name == ".NET Sockets"),
+            $".NET's socket thread runs in a program that made no socket, started by the hook, where a stop can catch it starting: {string.Join(", ", view.Threads.Select(t => t.Name))}");
+        Ui.Run(window, AppActions.Stop);
+        Ui.WaitFor(() => !window.Debugger.IsDebugging, "the session to end");
+        window.Close();
+
+        string Frames() => string.Join("; ", view.Frames.Select(f => f.Name));
+    }
+
     /// <summary>An exception whose own Message outlasts the debugger's wait for code it runs is still named where the
     /// program stopped, by its type and the message it was made with, beside the stop's frames and locals.</summary>
     [AvaloniaFact]
@@ -2014,8 +2055,10 @@ public sealed class DebuggerTests : IClassFixture<DebuggerTests.Sum>, IClassFixt
     [AvaloniaFact]
     public void What_is_typed_into_the_debug_console_is_the_programs_input_and_pause_stops_it_where_it_is_in_its_loop()
     {
+        // Said by another thread once the loop has turned: said before it, a pause could find the program in its write.
         Write("Program.cs", "Console.Write(\"Name? \");\nstring? name = Console.ReadLine();\nConsole.WriteLine($\"read: {name}\");\n"
-            + "long turns = 0;\nConsole.WriteLine(\"looping\");\nwhile (true)\n{\n    turns++;\n}\n");
+            + "long turns = 0;\nTurned turned = new();\nnew Thread(() => { while (!turned.Yes) { Thread.Sleep(1); } Console.WriteLine(\"looping\"); }).Start();\n"
+            + "while (true)\n{\n    turns++;\n    turned.Yes = true;\n}\n\nclass Turned\n{\n    public volatile bool Yes;\n}\n");
         MainWindow window = Open();
         try
         {
@@ -2028,8 +2071,8 @@ public sealed class DebuggerTests : IClassFixture<DebuggerTests.Sum>, IClassFixt
 
             window.Perform(AppActions.Pause);
             Ui.WaitFor(() => window.Debugger.Session?.State == DebugState.Paused && window.BottomPanel.Debug.Frames.Count > 0, "the pause to be shown");
-            Assert.InRange(window.BottomPanel.Debug.Frames[0].Line, 6, 9);
-            Assert.Contains(window.EditorArea.CodeEditor.LineMarks, m => m.Kind == LineMarkKind.ExecutionPoint && m.Line is >= 5 and <= 8);
+            Assert.InRange(window.BottomPanel.Debug.Frames[0].Line, 7, 11);
+            Assert.Contains(window.EditorArea.CodeEditor.LineMarks, m => m.Kind == LineMarkKind.ExecutionPoint && m.Line is >= 6 and <= 10);
         }
         finally
         {
@@ -2039,10 +2082,15 @@ public sealed class DebuggerTests : IClassFixture<DebuggerTests.Sum>, IClassFixt
         }
     }
 
+    /// <summary>A program debugged prints 100,000 lines each in a colour of its own, then a line in .NET's console colour
+    /// (with TERM set, as an IDE started from a terminal passes on): the Debug console keeps the end of them within its
+    /// limit, free of colour codes, each line in its colour, .NET's too where it writes colours into a pipe once told.</summary>
     [AvaloniaFact]
-    public void Debugging_a_program_that_prints_100000_coloured_lines_leaves_the_console_free_of_colour_codes_within_its_limit()
+    public void Debugging_a_program_that_prints_100000_coloured_lines_shows_them_in_their_colours_free_of_colour_codes_within_its_limit()
     {
-        Write("Program.cs", "for (int i = 0; i < 100_000; i++)\n{\n    Console.WriteLine($\"\\u001b[3{i % 7 + 1}mline {i}\\u001b[0m\");\n}\nConsole.WriteLine(\"printed\");\n");
+        Write("Program.cs", "Environment.SetEnvironmentVariable(\"TERM\", \"xterm-256color\");\n"
+            + "for (int i = 0; i < 100_000; i++)\n{\n    Console.WriteLine($\"\\u001b[3{i % 7 + 1}mline {i}\\u001b[0m\");\n}\n"
+            + "Console.ForegroundColor = ConsoleColor.DarkCyan;\nConsole.Write(\"printed\");\nConsole.ResetColor();\nConsole.WriteLine();\n");
         MainWindow window = Open();
         Passenger.App.ToolWindows.OutputView console = window.BottomPanel.Debug.Console;
         string Text() => console.Document.Snapshot.ToString();
@@ -2057,6 +2105,13 @@ public sealed class DebuggerTests : IClassFixture<DebuggerTests.Sum>, IClassFixt
             Assert.DoesNotContain("[0m", text, StringComparison.Ordinal);
             Assert.Contains("\nline 99999\nprinted\n", text, StringComparison.Ordinal);
             Assert.True(text.Length <= Passenger.App.ToolWindows.OutputView.DefaultLimitKb * 1024, $"The console kept {text.Length} characters");
+            Assert.Equal(TokenKeys.Terminal_Ansi5, ConsoleColoursTests.LookAt(console, "line 99999")?.Fore.Token);
+            Assert.Equal(TokenKeys.Terminal_Ansi4, ConsoleColoursTests.LookAt(console, "line 99998")?.Fore.Token);
+            if (!OperatingSystem.IsWindows())
+            {
+                // Windows' .NET sets a console's colours through the console alone, writing none into a pipe.
+                Assert.Equal(TokenKeys.Terminal_Ansi6, ConsoleColoursTests.LookAt(console, "printed")?.Fore.Token);
+            }
         }
         finally
         {
@@ -2110,31 +2165,28 @@ public sealed class DebuggerTests : IClassFixture<DebuggerTests.Sum>, IClassFixt
     {
         string started = Path.Combine(TestFolders.Create("debuggee-"), "program.pid");
         MainWindow window = OpenSleeper(started, languageServer: false);
-        int debuggee = 0;
-        int adapter = 0;
+        OwnProcess debuggee = default;
+        OwnProcess adapter = default;
         try
         {
             window.EditorArea.CodeEditor.GoTo(new TextPosition(1, 0));
             Ui.Run(window, AppActions.ToggleBreakpoint);
             StartDebugging(window);
             WaitDebugging(window, () => window.Debugger.Session?.State == DebugState.Paused, "the program to stop at the breakpoint");
-            debuggee = Running(window, started);
-            adapter = window.Debugger.Session!.AdapterProcessId;
+            debuggee = OwnProcess.Of(Running(window, started));
+            adapter = OwnProcess.Of(window.Debugger.Session!.AdapterProcessId);
 
             // The debugger alone, as a crash ends it: what it started is left to whatever ends it next.
-            using (Process debugger = Process.GetProcessById(adapter))
-            {
-                debugger.Kill();
-            }
+            adapter.Kill(alone: true);
             Ui.WaitFor(() => !window.Debugger.IsDebugging, "the session to end with its debugger");
-            Assert.True(Processes.Gone(debuggee), "The debugger died and the IDE left the program it launched running, held at its breakpoint, until the IDE closed");
+            Assert.True(Processes.Gone(debuggee.Id), "The debugger died and the IDE left the program it launched running, held at its breakpoint, until the IDE closed");
             Assert.Contains("the debugger itself stopped", window.Status, StringComparison.Ordinal);
             window.Close();
         }
         finally
         {
-            Processes.Kill(debuggee);
-            Processes.Kill(adapter);
+            debuggee.Kill();
+            adapter.Kill();
         }
     }
 
@@ -2144,27 +2196,27 @@ public sealed class DebuggerTests : IClassFixture<DebuggerTests.Sum>, IClassFixt
         string started = Path.Combine(TestFolders.Create("debuggee-"), "program.pid");
         // A server of the window's own, which its close is to end, not one it would leave for the next window.
         MainWindow window = OpenSleeper(started, languageServer: true);
-        int debuggee = 0;
-        int adapter = 0;
+        OwnProcess debuggee = default;
+        OwnProcess adapter = default;
         int server = window.CSharpService?.Session?.Server.ProcessId ?? throw new InvalidOperationException("The language server did not start");
         try
         {
             StartDebugging(window);
-            debuggee = Running(window, started);
+            debuggee = OwnProcess.Of(Running(window, started));
             Ui.WaitFor(() => window.Debugger.Session is { State: DebugState.Running }, "the session to say the program runs");
-            adapter = window.Debugger.Session!.AdapterProcessId;
+            adapter = OwnProcess.Of(window.Debugger.Session!.AdapterProcessId);
             window.Close();
 
             // The IDE's process waits for these before it ends, a few seconds at most.
             Assert.True(Ui.Ended(window), "The window closed without ending what it started within its limit, so the IDE's process would not end");
-            Assert.True(Processes.Gone(debuggee), "After the window closed, the program being debugged went on running");
-            Assert.True(Processes.Gone(adapter), "After the window closed, the debugger went on running");
+            Assert.True(Processes.Gone(debuggee.Id), "After the window closed, the program being debugged went on running");
+            Assert.True(Processes.Gone(adapter.Id), "After the window closed, the debugger went on running");
             Assert.True(Processes.Gone(server), "After the window closed, the language server went on running until the IDE's own end");
         }
         finally
         {
-            Processes.Kill(debuggee);
-            Processes.Kill(adapter);
+            debuggee.Kill();
+            adapter.Kill();
         }
     }
 
@@ -2184,12 +2236,12 @@ public sealed class DebuggerTests : IClassFixture<DebuggerTests.Sum>, IClassFixt
             }
         };
         TaskScheduler.UnobservedTaskException += finalized;
-        int debuggee = 0;
-        int adapter = 0;
+        OwnProcess debuggee = default;
+        OwnProcess adapter = default;
         try
         {
             // A failure comes back as the run's answer: thrown, it would end this test on the window's thread (below).
-            (int Program, int Debugger, Task? Ended, Exception? Failed) run = await HeadlessUnitTestSession.GetOrStartForAssembly(typeof(DebuggerTests).Assembly).Dispatch(() =>
+            (OwnProcess Program, OwnProcess Debugger, Task? Ended, Exception? Failed) run = await HeadlessUnitTestSession.GetOrStartForAssembly(typeof(DebuggerTests).Assembly).Dispatch(() =>
             {
                 // As every window test starts and ends (TestsLeaveNothingBehind), its window closed however the run ends.
                 BackgroundWork.Forget();
@@ -2199,11 +2251,11 @@ public sealed class DebuggerTests : IClassFixture<DebuggerTests.Sum>, IClassFixt
                     // No language server: nothing it starts on this dispatcher is left for a later window to take up.
                     MainWindow window = OpenSleeper(started, languageServer: false);
                     StartDebugging(window);
-                    int program = Running(window, started);
+                    OwnProcess program = OwnProcess.Of(Running(window, started));
                     Ui.WaitFor(() => window.Debugger.Session is { State: DebugState.Running }, "the session to say the program runs");
-                    int debugger = window.Debugger.Session!.AdapterProcessId;
+                    OwnProcess debugger = OwnProcess.Of(window.Debugger.Session!.AdapterProcessId);
                     // Stopped where it stands, it answers neither Stop nor the close, which kills both after its limit.
-                    Processes.Suspend(program, "The program");
+                    program.Suspend("The program");
                     window.Perform(AppActions.Stop);
                     window.Close();
                     return (program, debugger, window.Ended, (Exception?)null);
@@ -2211,7 +2263,7 @@ public sealed class DebuggerTests : IClassFixture<DebuggerTests.Sum>, IClassFixt
                 catch (Exception failed)
                 {
                     OpenWindows.CloseAll();
-                    return (0, 0, null, failed);
+                    return (default, default, null, failed);
                 }
             }, TestContext.Current.CancellationToken);
             // Off the window's thread, where the session ends a run: a test ending there holds it in the runner's wait for the next.
@@ -2225,8 +2277,8 @@ public sealed class DebuggerTests : IClassFixture<DebuggerTests.Sum>, IClassFixt
 
             Assert.True(await Waiting.Within(ended, MainWindow.EndLimit + TimeSpan.FromSeconds(5).Scaled(), TestContext.Current.CancellationToken, scaled: false),
                 "The window closed without ending what it started within its limit, so the IDE's process would not end");
-            Assert.True(Processes.Gone(adapter), "After the window closed, the debugger went on running");
-            Assert.True(Processes.Gone(debuggee), "After the window closed, the program being debugged went on running");
+            Assert.True(Processes.Gone(adapter.Id), "After the window closed, the debugger went on running");
+            Assert.True(Processes.Gone(debuggee.Id), "After the window closed, the program being debugged went on running");
             // A task nobody came back for is heard of when the collector finalizes it.
             for (int i = 0; i < 20; i++)
             {
@@ -2243,8 +2295,8 @@ public sealed class DebuggerTests : IClassFixture<DebuggerTests.Sum>, IClassFixt
         finally
         {
             TaskScheduler.UnobservedTaskException -= finalized;
-            Processes.Kill(debuggee);
-            Processes.Kill(adapter);
+            debuggee.Kill();
+            adapter.Kill();
         }
     }
 
@@ -2265,7 +2317,7 @@ public sealed class DebuggerTests : IClassFixture<DebuggerTests.Sum>, IClassFixt
         }
         finally
         {
-            Processes.Kill(host.Id);
+            ChildProcesses.Kill(host);
         }
     }
 
@@ -2337,7 +2389,7 @@ public sealed class DebuggerTests : IClassFixture<DebuggerTests.Sum>, IClassFixt
         }
         finally
         {
-            Processes.Kill(program.Id);
+            ChildProcesses.Kill(program);
         }
     }
 
@@ -2398,8 +2450,8 @@ public sealed class DebuggerTests : IClassFixture<DebuggerTests.Sum>, IClassFixt
         finally
         {
             File.Delete(left);
-            Processes.Kill(looping.Id);
-            Processes.Kill(other.Id);
+            ChildProcesses.Kill(looping);
+            ChildProcesses.Kill(other);
         }
     }
 
@@ -2411,7 +2463,7 @@ public sealed class DebuggerTests : IClassFixture<DebuggerTests.Sum>, IClassFixt
         ProcessStartInfo start = ChildProcesses.Command(Debugging.Helpers.Debuggees.Apphost("LoopingConsoleApp"), ["sleep"]);
         start.RedirectStandardOutput = true;
         using Process looping = ChildProcesses.Start(start);
-        int adapter = 0;
+        OwnProcess adapter = default;
         try
         {
             Assert.Equal("looping", looping.StandardOutput.ReadLine());
@@ -2422,17 +2474,17 @@ public sealed class DebuggerTests : IClassFixture<DebuggerTests.Sum>, IClassFixt
             dialog.Choose(looping.Id);
             dialog.Attach();
             Ui.WaitFor(() => window.Debugger.Session is { State: DebugState.Running }, "the debugger to attach to the program");
-            adapter = window.Debugger.Session!.AdapterProcessId;
+            adapter = OwnProcess.Of(window.Debugger.Session!.AdapterProcessId);
             window.Close();
 
             Assert.True(Ui.Ended(window), "The window closed without letting go of what it attached to within its limit");
-            Assert.True(Processes.Gone(adapter), "After the window closed, the debugger went on running");
+            Assert.True(Processes.Gone(adapter.Id), "After the window closed, the debugger went on running");
             Assert.False(looping.WaitForExit(TimeSpan.FromSeconds(2)), "Closing the window ended a program it had only attached to");
         }
         finally
         {
-            Processes.Kill(looping.Id);
-            Processes.Kill(adapter);
+            ChildProcesses.Kill(looping);
+            adapter.Kill();
         }
     }
 
@@ -2464,7 +2516,7 @@ public sealed class DebuggerTests : IClassFixture<DebuggerTests.Sum>, IClassFixt
         }
         finally
         {
-            Processes.Kill(program.Id);
+            ChildProcesses.Kill(program);
         }
     }
 
@@ -2559,6 +2611,50 @@ public sealed class DebuggerTests : IClassFixture<DebuggerTests.Sum>, IClassFixt
         window.Close();
     }
 
+    /// <summary>A program debugged with the Debug window's console that needs a terminal (Console.ReadKey refusing the
+    /// console's pipe) is offered one at the debugger's stop on the exception, read from the exception the debugger has
+    /// before the runtime writes it: the Debugger tab and the console say so, and Debug in the Terminal debugs it again in a
+    /// tab of the Terminal window, where it reads a key typed there, the configuration using the terminal from then on.</summary>
+    [AvaloniaFact]
+    public void A_program_debugged_needing_a_terminal_is_offered_one_at_its_stop_on_the_exception_and_reads_a_key_there()
+    {
+        Write("Program.cs", "Console.WriteLine(\"key?\");\nConsoleKeyInfo key = Console.ReadKey(intercept: true);\nConsole.WriteLine($\"key {key.KeyChar}\");\n");
+        MainWindow window = Open();
+        try
+        {
+            StartDebugging(window);
+            WaitDebugging(window, () => window.Debugger.Session is { State: DebugState.Paused or DebugState.Ended }, "the program to stop at ReadKey's exception");
+            DebugSession stopped = window.Debugger.Session!;
+            Assert.True(stopped.State == DebugState.Paused, $"The program did not stop at ReadKey's exception: {window.Status}");
+            DebugView debug = window.DebugWindow;
+            Ui.WaitFor(() => debug.Offered is not null, () => $"the Debugger tab to offer a terminal at the stop: {window.Status}");
+            const string said = "Sum needs a terminal for Console.ReadKey: the Debug window gives it pipes";
+            Assert.Equal(said, debug.Offered);
+            OutputView console = window.BottomPanel.Debug.Console;
+            Assert.True(stopped.State == DebugState.Paused && console.Offered == said,
+                $"The offer did not come at the stop, over the console too: {stopped.State}, the console offering {console.Offered ?? "nothing"}");
+            console.Flush();
+            Assert.DoesNotContain("Unhandled exception", console.Document.Snapshot.ToString(), StringComparison.Ordinal);
+
+            Ui.ClickButton(debug, "Debug in the Terminal");
+            WaitDebugging(window, () => window.Debugger.Session is { } next && next != stopped && next.Terminal is { } started && TerminalText(started).Contains("key?", StringComparison.Ordinal),
+                "the program debugged again in the terminal to ask for a key");
+            Passenger.App.Run.TerminalRun program = window.Debugger.Session!.Terminal!;
+            Assert.Equal(Passenger.App.Run.ConsoleKind.Terminal, window.Configuration?.Console);
+            Assert.True(debug.Offered is null && console.Offered is null, $"The offer taken is still made: {debug.Offered ?? console.Offered}");
+            window.ShowToolWindow(ToolWindowIds.Terminal);
+            window.TerminalPanel.FocusView();
+            Ui.WaitFor(() => window.TerminalPanel.View.IsFocused && window.TerminalPanel.ActiveTab?.Run == program, "the keys to go to the program's tab");
+            window.KeyTextInput("q");
+            Ui.WaitFor(() => TerminalText(program).Contains("key q", StringComparison.Ordinal), () => $"the program to read the key typed in the terminal; its tab shows:\n{TerminalText(program)}");
+            Ui.WaitFor(() => !window.Debugger.IsDebugging, "the program to end once it read its key");
+        }
+        finally
+        {
+            window.Close();
+        }
+    }
+
     /// <summary>A breakpoint set while the debugger still waits for the program's runtime (here held at its start, a
     /// diagnostic port of the test's own), the first in a file of its own, reaches the program once it runs and stops
     /// it.</summary>
@@ -2576,15 +2672,15 @@ public sealed class DebuggerTests : IClassFixture<DebuggerTests.Sum>, IClassFixt
             Environment = new Dictionary<string, string>(hold.Environment),
         }], "Sum held");
         Task<int> held = hold.Held(TimeSpan.FromMinutes(3));
-        int program = 0;
-        int adapter = 0;
+        OwnProcess program = default;
+        OwnProcess adapter = default;
         try
         {
             // Not settled: the start holds the window's background work for as long as the debugger waits for the program.
             Assert.True(window.Perform(AppActions.Debug), $"Debug did not start: {Ui.Said(window)}");
-            program = Ui.AwaitPumped(held, "the build, then the program's runtime to come to the hold", TimeSpan.FromMinutes(3));
+            program = OwnProcess.Of(Ui.AwaitPumped(held, "the build, then the program's runtime to come to the hold", TimeSpan.FromMinutes(3)));
             DebugSession starting = window.Debugger.Session ?? throw new InvalidOperationException($"No session while the program was held: {window.Status}");
-            adapter = starting.AdapterProcessId;
+            adapter = OwnProcess.Of(starting.AdapterProcessId);
             Assert.Equal(DebugState.Starting, starting.State);
             window.OpenFile(other);
             CodeEditor editor = window.EditorArea.CodeEditor;
@@ -2604,8 +2700,8 @@ public sealed class DebuggerTests : IClassFixture<DebuggerTests.Sum>, IClassFixt
         }
         finally
         {
-            Processes.Kill(program);
-            Processes.Kill(adapter);
+            program.Kill();
+            adapter.Kill();
         }
     }
 
@@ -2625,16 +2721,16 @@ public sealed class DebuggerTests : IClassFixture<DebuggerTests.Sum>, IClassFixt
             Environment = new Dictionary<string, string>(hold.Environment),
         }], "Sum held");
         Task<int> held = hold.Held(TimeSpan.FromMinutes(3));
-        int program = 0;
-        int adapter = 0;
+        OwnProcess program = default;
+        OwnProcess adapter = default;
         try
         {
             // Not settled: the start holds the window's background work for as long as the debugger waits for the program.
             Assert.True(window.Perform(AppActions.Debug), $"Debug did not start: {Ui.Said(window)}");
-            program = Ui.AwaitPumped(held, "the build, then the program's runtime to come to the hold", TimeSpan.FromMinutes(3));
+            program = OwnProcess.Of(Ui.AwaitPumped(held, "the build, then the program's runtime to come to the hold", TimeSpan.FromMinutes(3)));
             Assert.True(window.Debugger.Session is not null, $"The debugger waited for the program to start with no session for Stop to end: the status bar said \"{window.Status}\"");
             DebugSession starting = window.Debugger.Session!;
-            adapter = starting.AdapterProcessId;
+            adapter = OwnProcess.Of(starting.AdapterProcessId);
             Assert.Equal(DebugState.Starting, starting.State);
             Assert.True(window.FindControl<Button>("StopButton")!.IsEnabled, "The toolbar's Stop could not be clicked while the debugger waited for the program to start");
             Button stop = window.DebugWindow.GetVisualDescendants().OfType<Button>().First(b => ToolTip.GetTip(b) is string tip && tip.StartsWith("Stop", StringComparison.Ordinal));
@@ -2644,13 +2740,13 @@ public sealed class DebuggerTests : IClassFixture<DebuggerTests.Sum>, IClassFixt
             Ui.Click(stop, settle: false);
             try
             {
-                Ui.PumpUntil(() => window.Debugger.Session is null && !Processes.IsRunning(program), "Stop to end the starting session and its program", TimeSpan.FromSeconds(15));
+                Ui.PumpUntil(() => window.Debugger.Session is null && !Processes.IsRunning(program.Id), "Stop to end the starting session and its program", TimeSpan.FromSeconds(15));
             }
             catch (TimeoutException waited)
             {
                 throw new TimeoutException($"{waited.Message}. {Debugged(window)}", waited);
             }
-            Assert.True(Processes.Gone(adapter), $"Stop left the debugger running: {Processes.Describe(adapter)}");
+            Assert.True(Processes.Gone(adapter.Id), $"Stop left the debugger running: {Processes.Describe(adapter.Id)}");
             Assert.Equal("Debugging Sum held was stopped as it started", window.Status);
             Assert.Contains("Debugging Sum held was stopped as it started", window.BottomPanel.Debug.Console.Document.Snapshot.ToString(), StringComparison.Ordinal);
             Assert.False(window.FindControl<Button>("StopButton")!.IsEnabled, "The toolbar's Stop could still be clicked once the session ended");
@@ -2659,8 +2755,8 @@ public sealed class DebuggerTests : IClassFixture<DebuggerTests.Sum>, IClassFixt
         }
         finally
         {
-            Processes.Kill(program);
-            Processes.Kill(adapter);
+            program.Kill();
+            adapter.Kill();
         }
     }
 
@@ -2686,16 +2782,20 @@ public sealed class DebuggerTests : IClassFixture<DebuggerTests.Sum>, IClassFixt
         WaitDebugging(window, () => window.Debugger.Session?.State == DebugState.Paused, "the debugged program to stop at the breakpoint");
         DebugSession debugged = window.Debugger.Session!;
         int program = Ui.Await(debugged.ProcessStarted, "the adapter to say which process it started");
+        // Each as it is first read, while it runs: by the end the first has gone, and its id may be another program's.
+        List<OwnProcess> own = [OwnProcess.Of(program)];
         try
         {
             window.SetConfigurations(configurations, "Ran");
             Assert.True(window.Perform(AppActions.RunProgram), $"Run did not start: {Ui.Said(window)}");
             Ui.WaitFor(() => Runs().Length == 1, "Run's program to start", TimeSpan.FromMinutes(2));
             int first = Runs()[0];
+            own.Add(OwnProcess.Of(first));
 
             Button rerun = window.BottomPanel.Run.GetVisualDescendants().OfType<Button>().Single(b => ToolTip.GetTip(b) is string tip && tip.StartsWith("Rerun", StringComparison.Ordinal));
             Ui.Click(rerun);
             Ui.WaitFor(() => Runs().Length == 2, "Run's program to run again", TimeSpan.FromMinutes(2));
+            own.Add(OwnProcess.Of(Runs()[1]));
             Assert.True(Processes.Gone(first), $"Rerun left Run's first program going: {Processes.Describe(first)}");
             Assert.True(window.IsRunning, "The program Rerun started again is not running");
             Assert.True(window.Debugger.Session == debugged && debugged.State == DebugState.Paused,
@@ -2707,10 +2807,9 @@ public sealed class DebuggerTests : IClassFixture<DebuggerTests.Sum>, IClassFixt
         }
         finally
         {
-            Processes.Kill(program);
-            foreach (int ran in Runs())
+            foreach (OwnProcess left in own)
             {
-                Processes.Kill(ran);
+                left.Kill();
             }
         }
         window.Close();

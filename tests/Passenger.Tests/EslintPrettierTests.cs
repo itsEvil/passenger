@@ -1,4 +1,3 @@
-using System.Diagnostics;
 using Avalonia;
 using Avalonia.Controls;
 using Avalonia.Headless;
@@ -19,8 +18,9 @@ namespace Passenger.Tests;
 /// <summary>ESLint and Prettier through the window, on a project with its own eslint and prettier in node_modules (the
 /// tests' packages, pinned in NodePackages/ and put in place at build, never fetched from npm as the tests run) and its own
 /// eslint.config.js, .prettierrc and .prettierignore: problems as typed and their fixes, Fix ESLint Problems, Prettier on
-/// Reformat Code and on save, .prettierignore honoured, and the banner offering npm install for what is not installed.
-/// Each test opens its own window; one that cannot find Node.js skips, saying so.</summary>
+/// Reformat Code and on save, .prettierignore honoured, the banner offering npm install for what is not installed, and
+/// packages in a node_modules another user made above passed over. Each test opens its own window; one that cannot find
+/// Node.js skips, saying so.</summary>
 public sealed class EslintPrettierTests : IClassFixture<EslintPrettierTests.Project>
 {
     private const string PreferConst = "ESLint: 'total' is never reassigned. Use 'const' instead. (prefer-const)";
@@ -405,10 +405,7 @@ public sealed class EslintPrettierTests : IClassFixture<EslintPrettierTests.Proj
             CodeEditor editor = window.EditorArea.CodeEditor;
             editor.ApplyEdits([new TextEdit(editor.Document.Snapshot.Length, 0, "let  more = 2;\n")]);
             Assert.True(window.Perform(AppActions.Save), "Save did not run");
-            using (Process runner = Process.GetProcessById(Processes.WrittenId(Path.Combine(held, "started"), "Prettier to start formatting first.js")))
-            {
-                runner.Kill();
-            }
+            OwnProcess.Of(Processes.WrittenId(Path.Combine(held, "started"), "Prettier to start formatting first.js")).Kill(alone: true);
             Ui.WaitFor(() => !first.IsModified, "first.js saved, though Prettier's runner ended as it formatted it");
             Assert.Equal("const first = 1;\nlet  more = 2;\n", File.ReadAllText(path));
             Assert.StartsWith("Prettier: Prettier's runner ended", window.Status, StringComparison.Ordinal);
@@ -537,6 +534,57 @@ public sealed class EslintPrettierTests : IClassFixture<EslintPrettierTests.Proj
             ChildProcesses.Started -= Heard;
             window.ApplySettings(new AppSettings());
             window.Close();
+        }
+    }
+
+    /// <summary>A folder whose package.json lists ESLint and Prettier, installed only in the node_modules of the folder above
+    /// it: while another user owns that node_modules (as one made at a drive's root may be) they are passed over, the
+    /// banner saying they are not installed, and once it is the person's the parent's ESLint checks the folder's script.</summary>
+    [AvaloniaFact]
+    public void ESLint_and_Prettier_in_a_node_modules_another_user_made_above_are_passed_over_and_in_the_persons_own_check_the_script()
+    {
+        Project.SkipWithoutNode();
+        string app = PathNames.Canonical(project.AddFolder("app", ("package.json", Project.Package), ("app.js", Project.App)));
+        string modules = Path.Combine(PathNames.Canonical(project.Folder), "node_modules");
+        MainWindow window;
+        using (FoldersUp.HeldByAnother(modules))
+        {
+            window = Opened();
+            try
+            {
+                Ui.WaitFor(() => window.EditorArea.ActiveGroup.BannerText is not null, "the banner over the script");
+                Assert.Equal("ESLint and Prettier are not installed: package.json lists eslint and prettier, which are not in node_modules.",
+                    window.EditorArea.ActiveGroup.BannerText);
+            }
+            finally
+            {
+                window.Close();
+            }
+        }
+
+        window = Opened();
+        try
+        {
+            CodeEditor editor = window.EditorArea.CodeEditor;
+            OpenDocument document = window.EditorArea.Active!;
+            editor.ApplyEdits([new TextEdit(editor.Document.Snapshot.Length, 0, "let total = items.length;\nconsole.log(total);\n")]);
+            Ui.WaitFor(() => document.Markers.Any(m => m.Message == PreferConst), "the problem from the ESLint in the person's own parent folder");
+            Assert.Null(window.EditorArea.ActiveGroup.BannerText);
+        }
+        finally
+        {
+            window.Close();
+            // The window's servers worked in the folder it opened, which Windows deletes only once they have ended.
+            Ui.Ended(window);
+            project.Reset();
+        }
+
+        MainWindow Opened()
+        {
+            MainWindow opened = Ui.OpenFolder(app, autosaves: false);
+            opened.OpenFile(Path.Combine(app, "app.js"));
+            Ui.Settle();
+            return opened;
         }
     }
 

@@ -1,8 +1,11 @@
 using System.ComponentModel;
+using System.Diagnostics;
 using ModelContextProtocol.Server;
+using Passenger.App.Migrations;
 using Passenger.App.Packages;
 using Passenger.App.Profiling;
 using Passenger.App.Vcs;
+using Passenger.App.Workspace;
 using Passenger.Core;
 using Passenger.Packages;
 using Passenger.Terminal;
@@ -19,7 +22,7 @@ public sealed partial class PassengerTools
     // Version control
 
     [McpServerTool(Name = McpTools.VcsStatus, Title = "Changed files", ReadOnly = true), Description(
-        "The branch and the files changed since the last commit (modified, added, deleted, renamed, unversioned, conflicted), " +
+        "The branch (its upstream, and the commits it is ahead and behind as last fetched) and the files changed since the last commit (modified, added, deleted, renamed, unversioned, conflicted), " +
         "a folder of untracked files as one entry with how many it holds (files), as git status shows it; at most 200, more saying the rest. " +
         "While a merge, rebase, unstash or cherry-pick is stopped for conflicts, conflicts says what is under way, which " +
         "branches yours and theirs are (in a rebase yours is the branch being rebased) and whether each side modified or " +
@@ -64,7 +67,13 @@ public sealed partial class PassengerTools
             [.. vcs.Conflicts.Select(c => new VcsConflict(Relative(c.Path), sides.YoursHas(c) ? "modified" : "deleted", sides.TheirsHas(c) ? "modified" : "deleted"))]);
         (IReadOnlyList<ListedChange> listed, string? more) = AgentAnswers.Listed(AgentAnswers.Gathered(changes, untracked, scope), AgentAnswers.MostFiles,
             "change", "vcs_status with a folder's path lists its own");
-        return new VcsStatus(vcs.Branch, [.. listed.Select(Listed)], conflicts, vcs.Merge.UnderWay) { More = more };
+        return new VcsStatus(vcs.Branch, [.. listed.Select(Listed)], conflicts, vcs.Merge.UnderWay)
+        {
+            More = more,
+            Upstream = vcs.Upstream,
+            Ahead = vcs.Divergence?.Ahead,
+            Behind = vcs.Divergence?.Behind,
+        };
 
         VcsChange Listed(ListedChange c) => c.Files is { } files
             ? new VcsChange(Relative(c.Change.Path) + Path.DirectorySeparatorChar, "unversioned", null) { Files = files }
@@ -101,7 +110,7 @@ public sealed partial class PassengerTools
     /// <summary>vcs_status of a file: its changes since the last commit, as the repository was read just before.</summary>
     private async Task<string> VcsDiffAsync(string full, CancellationToken cancel)
     {
-        string name = Relative(full).Replace('\\', '/');
+        string name = Session.Folder is { } folder && PathNames.Relative(full, folder) is { } below ? below : full;
         // Git's own words for a change of mode come first, as its diff says it.
         string? mode = Session.Vcs.Changes.FirstOrDefault(c => PathNames.Same(c.Path, full))?.Mode?.Unified;
         if (await Session.Vcs.BinaryChangeAsync(full) is { } binary)
@@ -125,26 +134,67 @@ public sealed partial class PassengerTools
     [McpServerTool(Name = McpTools.VcsCommit, Title = "Commit", Destructive = true), Description(
         "Commits the paths given, else every changed file but the unversioned (saved first), with message; amend changes the " +
         "last commit (with paths [], its message alone), push pushes after; signed as git's config says and signed off as the Commit window's Sign-off is, " +
-        "as the window commits. Returns the commit and how the push went; a push the remote refuses is an error with " +
-        "git's reason, the commit made all the same.")]
-    public Task<string> VcsCommit(string message, IReadOnlyList<string>? paths = null, bool amend = false, bool push = false, CancellationToken cancel = default) => OnUi(cancel, async () =>
+        "as the window commits. lines maps a modified file to the lines of the changes of it to commit (\"3,12-14\", as vcs_status's diff " +
+        "numbers it now), each change they touch whole, the rest left uncommitted; with lines and no paths, only its files. With movesFirst, where git would no " +
+        "longer see a moved file as moved once committed with its edits, the moves go first in a commit of their own with that message, as the Commit window offers. " +
+        "Returns the commit (the moves' before it, where made) and how the push went; a push the remote refuses is an error with git's reason, the commit made all the same.")]
+    public Task<string> VcsCommit(string message, IReadOnlyList<string>? paths = null, Dictionary<string, string>? lines = null, bool amend = false, bool push = false,
+        string? movesFirst = null, CancellationToken cancel = default) => OnUi(cancel, async () =>
     {
+        if (movesFirst?.Trim().Length == 0)
+        {
+            throw new ArgumentException("movesFirst is empty: it is the message of the moves' own commit", nameof(movesFirst));
+        }
         VcsController vcs = Session.Vcs;
         await vcs.Opened;
         await vcs.RefreshAsync();
-        IReadOnlyList<FileChange> chosen = paths is null
-            ? [.. vcs.Changes.Where(c => c.Kind is not ChangeKind.Unversioned && c.Uncommittable is null)]
-            : [.. paths.Select(Resolve).Select(p => vcs.Changes.FirstOrDefault(c => c.Path == p) ?? throw new ArgumentException($"{Relative(p)} has no changes to commit"))];
-        AgentCall.Say($"Committing {Plural.Of(chosen.Count, "file")}{(push ? " and pushing" : string.Empty)}");
-        CommitResult result = await vcs.CommitAsync(chosen, message, amend, push, ask: false, signing: new CommitSigning(SignOff: vcs.SignOff));
+        // Every changed file by default, but those no commit takes here, each said with why.
+        List<FileChange> passed = paths is null && lines is not { Count: > 0 } ? [.. vcs.Changes.Where(c => c.Kind is not ChangeKind.Unversioned && c.Uncommittable is not null)] : [];
+        List<FileChange> chosen = paths is null
+            ? lines is { Count: > 0 } ? [] : [.. vcs.Changes.Where(c => c.Kind is not ChangeKind.Unversioned && c.Uncommittable is null)]
+            : [.. paths.Select(given => Resolve(given)).Select(p => vcs.Changes.FirstOrDefault(c => c.Path == p) ?? throw new ArgumentException($"{Relative(p)} has no changes to commit"))];
+        Dictionary<string, PartialCommit> partial = new(PathNames.Comparer);
+        List<string> left = [.. passed.Select(c => $"{Relative(c.Path)} ({c.Uncommittable})")];
+        foreach ((string given, string ranges) in lines ?? [])
+        {
+            string full = Resolve(given);
+            FileChange change = vcs.Changes.FirstOrDefault(c => PathNames.Same(c.Path, full)) ?? throw new ArgumentException($"{Relative(full)} has no changes to commit");
+            if (change.Uncommittable is { } uncommittable)
+            {
+                throw new ArgumentException(uncommittable);
+            }
+            if (!chosen.Contains(change))
+            {
+                chosen.Add(change);
+            }
+            if (await ChosenChangesAsync(vcs, change, ranges) is { } some)
+            {
+                partial[full] = some;
+                int rest = some.Diff.Hunks.Count - some.Hunks.Count;
+                left.Add($"{Plural.Of(rest, "change")} of {Relative(full)}");
+            }
+        }
+        // The moves go first only where git would lose one, as the Commit window offers it.
+        string? first = movesFirst is not null && !amend && (await vcs.LostMovesAsync(chosen, partial)).Count > 0 ? movesFirst : null;
+        AgentCall.Say($"Committing {Plural.Of(chosen.Count, "file")}{(first is null ? string.Empty : ", their moves first")}{(push ? " and pushing" : string.Empty)}");
+        CommitResult result = await vcs.CommitAsync(chosen, message, amend, push, ask: false, signing: new CommitSigning(SignOff: vcs.SignOff), partial: partial, movesFirst: first);
         if (!result.Commit.Succeeded)
         {
             // A rebase stopped for conflicts goes on by its own action, which an agent runs by its id.
             throw new InvalidOperationException(vcs.Merge is { Operation: MergeOperation.Rebase, Stop: null }
                 ? $"{result.Commit.Message} (ide_action {AppActions.ContinueRebase} and {AppActions.AbortRebase})"
+                : chosen.Count == 0 && passed.Count > 0 && result.Commit.Message == Refusals.NoFilesChosenToCommit ? $"{result.Commit.Message}: {Plural.Listed(left)}"
                 : result.Commit.Message);
         }
         string made = result.Made is { } head ? $"{head.Short} {head.Subject}" : result.Commit.Message;
+        if (result.Moves is { } moves)
+        {
+            made = $"{moves.Short} {moves.Subject} (the moves), then {made}";
+        }
+        if (left.Count > 0)
+        {
+            made = $"{made}; left uncommitted: {Plural.Listed(left)}";
+        }
         return result.Push switch
         {
             null => made,
@@ -153,13 +203,38 @@ public sealed partial class PassengerTools
         };
     });
 
+    /// <summary>The changes of a file that vcs_commit's lines touch, as the Commit window's partial commit chooses them, of
+    /// the file's text as the editor holds it (saved before the commit): null where they touch all of them. Refused, saying
+    /// why, where the file's changes cannot go in apart or the lines touch none of them.</summary>
+    private async Task<PartialCommit?> ChosenChangesAsync(VcsController vcs, FileChange change, string ranges)
+    {
+        string name = Relative(change.Path);
+        if (change.Kind is not (ChangeKind.Modified or ChangeKind.Renamed) || change.Mode is not null || change.Submodule != SubmoduleChange.None
+            || await vcs.BinaryChangeAsync(change.Path) is not null)
+        {
+            throw new ArgumentException($"{name} is {change.Kind.ToString().ToLowerInvariant()}{(change.Mode is null ? string.Empty : ", its mode changed")}: "
+                + "only a modified text file's changes go in apart; commit it whole with paths");
+        }
+        OpenDocument? open = Editors.Find(change.Path) is { HoldsText: true } held ? held : null;
+        FileDiff? diff = open is null ? null : await vcs.DiffAsync(open);
+        if (diff is null)
+        {
+            string head = await vcs.HeadTextAsync(change.Path) ?? string.Empty;
+            TextSnapshot text = open?.Text.Snapshot ?? new TextDocument(Passenger.App.Editors.EditorArea.ReadText(change.Path) ?? string.Empty).Snapshot;
+            diff = await BackgroundWork.Run(() => FileDiff.Compare(head, text));
+        }
+        (IReadOnlyList<DiffHunk> hunks, string? why) = PartialCommit.Touched(diff, ranges);
+        return why is not null ? throw new ArgumentException($"{name}: {why} (vcs_status {name} shows them)")
+            : hunks.Count == diff.Hunks.Count ? null : new PartialCommit(diff, hunks, change.From);
+    }
+
     [McpServerTool(Name = McpTools.VcsLog, Title = "The history", ReadOnly = true), Description(
         "The newest commits (count of them, at most 500) of every branch, with their branches and tags and a signed one's signature (good, unverified, bad or " +
         "expired, by whom and with which key). With a path, Show History's: the commits from HEAD " +
         "that changed that file (followed through renames) or folder, each with what it did there; with startLine and endLine " +
-        "too, those that changed those lines.")]
-    public Task<IReadOnlyList<VcsCommit>> VcsLog(int count = 20, string? path = null, int? startLine = null, int? endLine = null,
-        CancellationToken cancel = default) => OnUi(cancel, async () =>
+        "too, those that changed those lines. before, a commit an answer listed, reads on: the commits after it, in the same order.")]
+    public Task<ModelContextProtocol.Protocol.CallToolResult> VcsLog(int count = 20, string? path = null, int? startLine = null, int? endLine = null,
+        string? before = null, CancellationToken cancel = default) => OnUi(cancel, async () =>
     {
         await Session.Vcs.Opened;
         Git repository = Session.Vcs.Repository ?? throw new InvalidOperationException(Session.Vcs.NoRepository);
@@ -174,12 +249,14 @@ public sealed partial class PassengerTools
             (int first, int last) when path is not null && first >= 1 && last >= first => (first - 1, last - 1),
             _ => throw new ArgumentException("startLine and endLine come together, with a path, from 1 and the last at or after the first"),
         };
+        string? after = before is null ? null : await repository.CommitNamedAsync(before)
+            ?? throw new ArgumentException($"before names {before}, which is no commit here: it takes the hash of a commit vcs_log listed", nameof(before));
         IReadOnlyDictionary<string, CommitSignature?> signatures;
         if (path is null)
         {
-            IReadOnlyList<CommitInfo> commits = await repository.LogAsync(most);
+            IReadOnlyList<CommitInfo> commits = After(await repository.LogAsync(await ReadingAsync(null)), c => c.Hash);
             signatures = await Session.Vcs.Signatures.ReadAsync(repository, [.. commits.Select(c => c.Hash)]);
-            return (IReadOnlyList<VcsCommit>)[.. commits.Select(c => Commit(c, null))];
+            return Held([.. commits.Select(c => Commit(c, null))], "commit", "a path narrows them to a file's or folder's", readOn: ReadOn);
         }
         string full = Resolve(path);
         // Lines past the file's end are no lines at all, never ones not committed yet.
@@ -192,21 +269,51 @@ public sealed partial class PassengerTools
         // Read now, so a rename made a moment ago is followed to where the last commit has the file.
         await Session.Vcs.RefreshAsync();
         HistoryScope scope = await window.HistoryScopeAsync(full, lines);
-        IReadOnlyList<HistoryCommit> history = await repository.HistoryAsync(scope, most);
+        IReadOnlyList<HistoryCommit> history = After(await repository.HistoryAsync(scope, await ReadingAsync(["HEAD"])), h => h.Commit.Hash);
         signatures = await Session.Vcs.Signatures.ReadAsync(repository, [.. history.Select(h => h.Commit.Hash)]);
-        return [.. history.Select(h => Commit(h.Commit, h.Changes))];
+        return Held([.. history.Select(h => Commit(h.Commit, h.Changes))], "commit", "a path within narrows them to its own", readOn: ReadOn);
 
-        VcsCommit Commit(CommitInfo commit, IReadOnlyList<FileChange>? changes) => new(
-            commit.Short,
-            commit.Subject,
-            commit.Author,
-            commit.Time.ToLocalTime().ToString("yyyy-MM-dd HH:mm", System.Globalization.CultureInfo.InvariantCulture),
-            commit.Refs,
-            changes?.Select(c => new VcsChange(Relative(c.Path), c.Kind.ToString().ToLowerInvariant(), c.From is { } from ? Relative(from) : null)).ToList())
+        // How many commits to read: count's, and with before every one that may come before it in the log of those revisions.
+        async Task<int> ReadingAsync(IReadOnlyList<string>? revisions) => after is null ? most
+            : await repository.LogDepthAsync(after, revisions) is int depth ? depth + most
+            : throw new ArgumentException($"before names {before}, which is no commit here", nameof(before));
+
+        // The commits after before's, at most count of them; those read where none is asked.
+        IReadOnlyList<T> After<T>(IReadOnlyList<T> read, Func<T, string> hash)
         {
-            Signature = signatures.GetValueOrDefault(commit.Hash)?.Said,
-        };
+            if (after is null)
+            {
+                return read;
+            }
+            for (int at = 0; at < read.Count; at++)
+            {
+                if (hash(read[at]) == after)
+                {
+                    return [.. read.Skip(at + 1).Take(most)];
+                }
+            }
+            throw new ArgumentException($"{before} is no commit of the history vcs_log lists{(path is null ? string.Empty : $" of {path}{(lines is null ? string.Empty : $" lines {startLine} to {endLine}")}")}", nameof(before));
+        }
+
+        static string ReadOn(VcsCommit last) => $"before {last.Hash} reads on";
+
+        VcsCommit Commit(CommitInfo commit, IReadOnlyList<FileChange>? changes)
+        {
+            (IReadOnlyList<FileChange> listed, string? more) = changes is null ? ([], null)
+                : AgentAnswers.Listed(changes, MostCommitFiles, "file", "vcs_log with a path within lists its own");
+            return new(commit.Short, commit.Subject, commit.Author,
+                commit.Time.ToLocalTime().ToString("yyyy-MM-dd HH:mm", System.Globalization.CultureInfo.InvariantCulture),
+                commit.Refs,
+                changes is null ? null : [.. listed.Select(c => new VcsChange(Relative(c.Path), c.Kind.ToString().ToLowerInvariant(), c.From is { } from ? Relative(from) : null))])
+            {
+                Signature = signatures.GetValueOrDefault(commit.Hash)?.Said,
+                More = more,
+            };
+        }
     });
+
+    /// <summary>How many of a commit's files vcs_log names with a path.</summary>
+    private const int MostCommitFiles = 20;
 
     [McpServerTool(Name = McpTools.VcsCheckout, Title = "Check out a branch", Destructive = true), Description(
         "Checks out a branch (with create, a new one from the head), as the branch menu does; open files take what is on disk after.")]
@@ -220,6 +327,11 @@ public sealed partial class PassengerTools
         {
             string[] locals = [.. refs.Where(r => r.Kind == RefKind.Local).Select(r => r.Name)];
             throw new InvalidOperationException($"No branch {branch} is here: create true makes it from the head; the local branches are {AgentAnswers.Named(locals, "branch", "vcs_log lists every branch's commits")}");
+        }
+        // Refused before anything is saved: a checkout writing out a file git stores through a filter that cannot run here.
+        if (!create && await vcs.WhyNotCheckoutAsync(branch) is { } refused)
+        {
+            throw new InvalidOperationException(refused);
         }
         AgentCall.Say($"Checking out {branch}");
         VcsOutcome switched = create ? await vcs.NewBranchAsync(branch) : await vcs.CheckoutAsync(branch);
@@ -264,6 +376,15 @@ public sealed partial class PassengerTools
                     ? $"No stash in the list has commit {commit}: it was popped or dropped since the list was read, or never was a stash"
                     : $"No stash {index}; there are {before.Count}");
             }
+            // Refused before anything is saved: a stash or unstash of a file stored through a filter that cannot run here.
+            if (action == "push")
+            {
+                await vcs.RefreshAsync();
+            }
+            if ((action == "push" ? vcs.WhyNotStash : action is "pop" or "apply" ? await vcs.WhyNotUnstashAsync(stash!) : null) is { } refused)
+            {
+                throw new InvalidOperationException(refused);
+            }
             await SaveLandedAsync(cancel);
             VcsOutcome done = action switch
             {
@@ -284,21 +405,115 @@ public sealed partial class PassengerTools
 
     [McpServerTool(Name = McpTools.NugetSearch, Title = "Search NuGet", ReadOnly = true), Description(
         "Packages a query finds on the feeds of the folder's nuget.config files (every enabled one, or feed), each with its " +
-        "newest version, downloads and the feeds that have it. A feed that does not answer fails the search only when none " +
-        "does.")]
-    public Task<IReadOnlyList<PackageSummary>> NuGetSearch(string query, bool prerelease = false,
+        "newest version, downloads, the feeds that have it, and of that version and those the projects have, each vulnerable " +
+        "or deprecated one with why. A feed that does not answer fails the search only when none does.")]
+    public Task<IReadOnlyList<PackageFound>> NuGetSearch(string query, bool prerelease = false,
         [Description("A feed's name, as the NuGet window lists it")] string? feed = null,
-        CancellationToken cancel = default) => OnUi(cancel, async () =>
-        await (await Session.Packages.FeedAsync(feed)).SearchAsync(query, prerelease, cancel));
+        CancellationToken cancel = default) => OnUi<IReadOnlyList<PackageFound>>(cancel, async () =>
+    {
+        FolderPackages packages = Session.Packages;
+        IReadOnlyList<PackageSummary> found = await (await packages.FeedAsync(feed)).SearchAsync(query, prerelease, cancel);
+        Dictionary<string, Dictionary<string, IReadOnlyList<InstalledVersion>>> installed = await packages.InstalledAsync();
+        Dictionary<string, string> names = packages.Projects.ToDictionary(p => p.Path, p => p.Name, PathNames.Comparer);
+        // Each version asked of a package, with the projects that have it: the newest found, and the projects' own.
+        Dictionary<string, List<(string Version, List<string> Projects)>> asked = new(StringComparer.OrdinalIgnoreCase);
+        foreach (PackageSummary package in found)
+        {
+            List<(string Version, List<string> Projects)> versions = asked[package.Id] = [(package.Version, [])];
+            foreach ((string path, IReadOnlyList<InstalledVersion> at) in installed.GetValueOrDefault(package.Id) ?? [])
+            {
+                foreach (string version in at.Select(v => v.Version).OfType<string>().Distinct(StringComparer.OrdinalIgnoreCase))
+                {
+                    int i = versions.FindIndex(v => v.Version.Equals(version, StringComparison.OrdinalIgnoreCase));
+                    if (i < 0)
+                    {
+                        versions.Add((version, []));
+                        i = versions.Count - 1;
+                    }
+                    versions[i].Projects.Add(names.GetValueOrDefault(path) ?? Path.GetFileNameWithoutExtension(path));
+                }
+            }
+        }
+        AgentCall.Say("Reading which of the versions found are vulnerable or deprecated");
+        VulnerabilityData known = await packages.VulnerabilitiesAsync();
+        (string Id, string Version)[] each = [.. asked.SelectMany(a => a.Value.Select(v => (a.Key, v.Version)))];
+        await packages.DeprecationsReadAsync(each);
+        AgentCall.Say(null);
+        IReadOnlyList<string> unread = packages.DeprecationsUnknown(each);
+        return [.. found.Select(p => Found(p, asked[p.Id], known, unread, packages))];
+    });
+
+    /// <summary>A package found as nuget_search answers it: each version asked with a known vulnerability, or its owner
+    /// deprecated, said with the projects that have it, and the feeds that could not say.</summary>
+    private static PackageFound Found(PackageSummary package, List<(string Version, List<string> Projects)> versions, VulnerabilityData known,
+        IReadOnlyList<string> unread, FolderPackages packages)
+    {
+        static string Of((string Version, List<string> Projects) at) => at.Projects.Count == 0 ? at.Version : $"{at.Version} ({string.Join(", ", at.Projects)})";
+        List<string> vulnerable = [];
+        List<string> deprecated = [];
+        foreach ((string Version, List<string> Projects) at in versions)
+        {
+            if (known.Of(package.Id, at.Version) is { Count: > 0 } advisories)
+            {
+                vulnerable.Add($"{Of(at)}: {Vulnerability(advisories)}");
+            }
+            if (packages.DeprecationOf(package.Id, at.Version) is { } deprecation)
+            {
+                deprecated.Add($"{Of(at)}: {Deprecated(deprecation)}");
+            }
+        }
+        return new PackageFound(package.Id, package.Version, package.Description, package.Authors, package.Downloads, package.Feeds)
+        {
+            Vulnerable = vulnerable.Count > 0 ? vulnerable : null,
+            Deprecated = deprecated.Count > 0 ? deprecated : null,
+            Unknown = Unknown(known, unread),
+        };
+    }
+
+    /// <summary>A vulnerable version's word, as the package tools say it: its gravest advisory's severity and page, and how
+    /// many more advisories there are.</summary>
+    private static string Vulnerability(IReadOnlyList<Advisory> advisories) =>
+        $"{advisories[0].Severity.ToString().ToLowerInvariant()} severity, {advisories[0].Address}"
+            + (advisories.Count > 1 ? $" (and {Plural.Of(advisories.Count - 1, "more advisory", "more advisories")})" : string.Empty);
+
+    /// <summary>A deprecated version's word, as the package tools say it: why, what to use instead and its owner's words.</summary>
+    private static string Deprecated(Deprecation deprecation) => deprecation.Why
+        + (deprecation.Instead is { } instead ? $"; use {instead} instead" : string.Empty)
+        + (deprecation.Message.Length > 0 ? $"; {deprecation.Message}" : string.Empty);
+
+    /// <summary>The feeds that could not say whether a version is vulnerable or deprecated; null where all said.</summary>
+    private static string? Unknown(VulnerabilityData known, IReadOnlyList<string> unread)
+    {
+        List<string> unknown = [];
+        if (known.Failed.Count > 0)
+        {
+            unknown.Add($"vulnerabilities: {string.Join(", ", known.Failed.Select(f => f.Feed))} did not answer");
+        }
+        if (unread.Count > 0)
+        {
+            unknown.Add($"deprecations: {string.Join(", ", unread)} did not answer");
+        }
+        return unknown.Count > 0 ? string.Join("; ", unknown) : null;
+    }
 
     [McpServerTool(Name = McpTools.NugetInstall, Title = "Install or remove a package", Destructive = true), Description(
         "Adds a package to a project (its name or .csproj) at a version (else the newest on the folder's enabled feeds), or " +
         "moves it to that version, through dotnet add package as the NuGet window does, restoring from the folder's " +
-        "nuget.config feeds; with remove, takes it out through dotnet remove package. Answers the version installed and the " +
-        "files it changed (the project, its packages.lock.json, and Directory.Packages.props under central package management).")]
-    public Task<PackageChange> NuGetInstall(string project, string id, string? version = null, bool remove = false, CancellationToken cancel = default) => OnUi(cancel, async () =>
+        "nuget.config feeds; with remove, takes it out through dotnet remove package. Answers the version installed, the " +
+        "files it changed (the project, its packages.lock.json, and Directory.Packages.props under central package management), " +
+        "and as nuget_search says them whether that version is vulnerable, with the version that fixes it, or deprecated. " +
+        "Moving one of EF Core's packages moves the project's others with it (with); another maker's provider it leaves behind " +
+        "stays as it is, said with the version that fits. With framework, a reference in that framework alone, as fixing a " +
+        "vulnerable version it gets through other packages does, the others' references as they were.")]
+    public Task<PackageChange> NuGetInstall(string project, string id, string? version = null, bool remove = false,
+        [Description("A framework the project builds for, or several separated by ;")] string? framework = null, CancellationToken cancel = default) => OnUi(cancel, async () =>
     {
         ProjectModel chosen = Project(project);
+        string[] frameworks = framework?.Split([';', ','], StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries) ?? [];
+        if (remove && frameworks.Length > 0)
+        {
+            throw new ArgumentException("remove takes the package out of every framework: omit framework");
+        }
         if (remove)
         {
             AgentCall.Follow(window.Actions.Work, FolderPackages.Changing);
@@ -306,12 +521,55 @@ public sealed partial class PassengerTools
         }
         AgentCall.Say($"Finding {id} on the folder's feeds");
         IPackageFeed feeds = await Session.Packages.FeedAsync(null);
-        string at = version ?? (await feeds.VersionsAsync(id, prerelease: false, cancel)).FirstOrDefault()
-            ?? throw new ArgumentException($"{feeds.Name} has no package {id}");
+        IReadOnlyList<string>? offered = version is null ? await feeds.VersionsAsync(id, prerelease: false, cancel) : null;
+        string at = version ?? offered?.FirstOrDefault() ?? throw new ArgumentException($"{feeds.Name} has no package {id}");
         AgentCall.Say(null);
         AgentCall.Follow(window.Actions.Work, FolderPackages.Changing);
-        return new PackageChange(id, at, chosen.Name, Changed(await Session.Packages.InstallAsync(chosen, id, at)));
+        if (frameworks.Length > 0)
+        {
+            return await WarnedAsync(new PackageChange(id, at, chosen.Name, Changed(await Session.Packages.InstallAsync(chosen, id, at, frameworks: frameworks))), feeds, offered, cancel);
+        }
+        EfUpdate weighed = await window.Migrations.UpdateAsync(chosen, id, at, null, cancel);
+        PackageChange done = weighed.AsAsked
+            ? new PackageChange(id, at, chosen.Name, Changed(await Session.Packages.InstallAsync(chosen, id, at))) { Said = weighed.Said }
+            : weighed.Outcome is { } made ? new PackageChange(id, at, chosen.Name, Changed(made)) { With = weighed.With.Count > 0 ? weighed.With : null, Said = weighed.Said }
+            : throw new InvalidOperationException(weighed.Said ?? Refusals.SolutionClosed);
+        return await WarnedAsync(done, feeds, offered, cancel);
     });
+
+    /// <summary>A package put in, with what nuget_search says of its version: its gravest known advisory and the least
+    /// version above it that none affects, why its owner deprecated it, and the feeds that could not say.</summary>
+    private async Task<PackageChange> WarnedAsync(PackageChange done, IPackageFeed feeds, IReadOnlyList<string>? offered, CancellationToken cancel)
+    {
+        FolderPackages packages = Session.Packages;
+        (string Id, string Version)[] put = [(done.Package, done.Version!)];
+        AgentCall.Say($"Reading whether {done.Package} {done.Version} is vulnerable or deprecated");
+        VulnerabilityData known = await packages.VulnerabilitiesAsync();
+        await packages.DeprecationsReadAsync(put);
+        string? vulnerable = null;
+        if (known.Of(done.Package, done.Version!) is { Count: > 0 } advisories)
+        {
+            string fixedIn;
+            try
+            {
+                fixedIn = known.FixedVersion(done.Package, done.Version!, offered ?? await feeds.VersionsAsync(done.Package, prerelease: false, cancel)) is { } fix
+                    ? $"fixed in {fix}" : "no version without a known vulnerability is offered";
+            }
+            catch (Exception failed) when (FeedSet.IsFeedFailure(failed))
+            {
+                // The package is in: a feed failing now leaves the fix unsaid, never the change unanswered.
+                fixedIn = $"the versions that may fix it could not be read: {failed.Message}";
+            }
+            vulnerable = $"{Vulnerability(advisories)}; {fixedIn}";
+        }
+        AgentCall.Say(null);
+        return done with
+        {
+            Vulnerable = vulnerable,
+            Deprecated = packages.DeprecationOf(done.Package, done.Version!) is { } deprecation ? Deprecated(deprecation) : null,
+            Unknown = Unknown(known, packages.DeprecationsUnknown(put)),
+        };
+    }
 
     /// <summary>The files a package change wrote, named as the answer names them (the window's change took them into the
     /// editors and read the projects again); one refused, or that dotnet failed, is an error saying why and what became of
@@ -322,6 +580,10 @@ public sealed partial class PassengerTools
         : throw new InvalidOperationException(string.Join('\n', [.. outcome.Said.TakeLast(15), .. outcome.Left is { } left ? [left] : Array.Empty<string>()]));
 
     // The profiler
+
+    /// <summary>Why profile takes no memory snapshot without seconds: it is read from the program as it runs.</summary>
+    public const string MemoryWithoutSeconds = "A memory snapshot is read from the program as it runs, once seconds have passed; "
+        + "without seconds the profile lasts until the program ends, when there is no heap to read: give seconds with memory";
 
     [McpServerTool(Name = McpTools.Profile, Title = "Profile a configuration", Destructive = true), Description(
         "Profiles a configuration from its start, as Profile does, until it ends or for seconds (then the snapshot; it runs on " +
@@ -340,12 +602,21 @@ public sealed partial class PassengerTools
         bool attach = false,
         string? container = null,
         string? resource = null,
+        bool? terminal = null,
         CancellationToken cancel = default) => OnUi(cancel, async () =>
     {
         ProjectSession current = Session;
         if (resource is not null && container is not null)
         {
             throw new ArgumentException("Name resource or container, not both");
+        }
+        if (resource is not null)
+        {
+            NoTerminalFor(terminal);
+        }
+        if (attach && terminal is not null)
+        {
+            throw new ArgumentException("An attached profiler profiles the program already running where it runs: omit terminal");
         }
         if (attach && (arguments is not null || configuration is not null && resource is null))
         {
@@ -355,9 +626,14 @@ public sealed partial class PassengerTools
         {
             throw new ArgumentException("A container's program is profiled as it runs: give attach with container");
         }
-        if (!attach && resource is null)
+        if (memory && seconds is null)
         {
-            Choose(configuration);
+            throw new ArgumentException(MemoryWithoutSeconds);
+        }
+        using Choosing? choice = !attach && resource is null ? Choose(configuration) : null;
+        if (choice is not null)
+        {
+            UseTerminal(Session.Configurations.Chosen?.Name ?? string.Empty, terminal);
         }
         AgentCall.Follow(window.Actions.Work, AppActions.Profile, AppActions.Build, AppActions.AttachProfiler, AppActions.RunProgram, AppActions.MemorySnapshot);
         using (LaunchBuild built = new(Builds))
@@ -371,6 +647,7 @@ public sealed partial class PassengerTools
                 throw new InvalidOperationException(WithBuildErrors(problem, built.Ended));
             }
         }
+        choice?.Began = true;
         if (resource is not null && (Session != current || current.IsEnded))
         {
             throw new InvalidOperationException("The workspace changed while starting the resource profiler");
@@ -385,7 +662,11 @@ public sealed partial class PassengerTools
         {
             await When(() => running.HasExited, TimeSpan.FromSeconds(Math.Clamp(limit, 1, 3600)), cancel, Ends(running.ExitedAsync()), Ends(running.PutAway));
             CheckProfileTarget();
-            if (memory && !running.HasExited)
+            if (memory && running.HasExited)
+            {
+                heapNote = "The program ended before its memory snapshot, which is taken once seconds have passed";
+            }
+            else if (memory)
             {
                 (Passenger.Profiler.MemorySnapshot? taken, heapNote) = await window.MemorySnapshotUnaskedAsync(cancel);
                 if (taken is not null)
@@ -433,10 +714,14 @@ public sealed partial class PassengerTools
             heap)
         {
             HeapNote = heapNote,
-            Frames = snapshot.Place is { } elsewhere && snapshot.HotSpots.Any(h => h.Module.StartsWith("Avalonia", StringComparison.Ordinal))
+            CutShort = snapshot.CutShort is null ? null : read.Message,
+            Frames = snapshot.Place is { } elsewhere && Passenger.Profiler.UiFrames.RanAvalonia(snapshot.HotSpots)
                 ? new UiFramesInfo(0, 0, 0, 0, 0, []) { Why = Profiling.FramesView.InContainer(elsewhere.Where) }
                 : UiFramesOf(snapshot.UiFrames, Math.Clamp(top, 1, 200), inspected),
             Godot = GameFramesOf(snapshot, Math.Clamp(top, 1, 200)),
+            // A program Profile started that said it needs a terminal, as the Profiler window offers one.
+            NeedsTerminal = Builds.RunNeed is { Profiled: true } need && !attach
+                ? $"{need.Said}: {McpTools.Profile} with terminal true profiles it in a Terminal tab" : null,
         };
 
         ProfileFrame Frame(string method, int total, int self) =>
@@ -594,7 +879,7 @@ public sealed partial class PassengerTools
         (TerminalSession shell, SemaphoreSlim turn) = await TerminalTurnAsync(cancel);
         try
         {
-            return await TypedAsync(shell, command, waitSeconds, cancel);
+            return Masked(await TypedAsync(shell, command, waitSeconds, cancel));
         }
         finally
         {
@@ -643,22 +928,22 @@ public sealed partial class PassengerTools
         int version = screen.Version;
         shell.Write(command + "\r");
         AgentCall.Say($"Waiting up to {Math.Clamp(waitSeconds, 1, 600)} s for the terminal's command to finish");
-        DateTime until = DateTime.UtcNow.AddSeconds(Math.Clamp(waitSeconds, 1, 600));
-        DateTime last = DateTime.UtcNow;
+        Deadline until = Deadline.In(TimeSpan.FromSeconds(Math.Clamp(waitSeconds, 1, 600)));
+        long last = Stopwatch.GetTimestamp();
         bool answered = false;
-        while (DateTime.UtcNow < until)
+        while (!until.Passed)
         {
             await Task.Delay(100, cancel);
             if (screen.Version != version)
             {
                 version = screen.Version;
-                last = DateTime.UtcNow;
+                last = Stopwatch.GetTimestamp();
                 answered = true;
                 continue;
             }
             // Its prompt back below it ends a command; one that leaves another prompt (a cd) or none (a server) ends once quiet.
             bool prompted = prompt.Length > 0 && screen.ScreenTop + screen.CursorRow > before && ToolWindows.TerminalPanel.Prompt(screen) == prompt;
-            if (answered && DateTime.UtcNow - last > (prompted ? TimeSpan.FromMilliseconds(200) : TimeSpan.FromSeconds(2)))
+            if (answered && Stopwatch.GetElapsedTime(last) > (prompted ? TimeSpan.FromMilliseconds(200) : TimeSpan.FromSeconds(2)))
             {
                 break;
             }
@@ -698,12 +983,33 @@ public sealed partial class PassengerTools
         return problem is null ? shell : throw new InvalidOperationException(problem);
     }
 
+    /// <summary>One of the folder's projects, by its name, else by its path.</summary>
     private ProjectModel Project(string project)
     {
         IReadOnlyList<ProjectModel> projects = Session.Projects;
+        if (projects.FirstOrDefault(p => p.Name.Equals(project, StringComparison.OrdinalIgnoreCase)) is { } named)
+        {
+            return named;
+        }
         string full = Resolve(project);
-        return projects.FirstOrDefault(p => p.Path == full || p.Name.Equals(project, StringComparison.OrdinalIgnoreCase))
+        return projects.FirstOrDefault(p => p.Path == full)
             ?? throw new ArgumentException($"No project {project}; the folder has {string.Join(", ", projects.Select(p => p.Name))}");
+    }
+
+    /// <summary>The project file find_in_files' project scope names: one of the folder's projects, else one of the solution's
+    /// shared projects, by its name, else by its path.</summary>
+    private string SearchedProject(string project)
+    {
+        IReadOnlyList<string> shared = Session.Workspace?.SharedProjects ?? [];
+        if ((Session.Projects.FirstOrDefault(p => p.Name.Equals(project, StringComparison.OrdinalIgnoreCase))?.Path
+            ?? shared.FirstOrDefault(p => Path.GetFileNameWithoutExtension(p).Equals(project, StringComparison.OrdinalIgnoreCase))) is { } named)
+        {
+            return named;
+        }
+        string full = Resolve(project);
+        return Session.Projects.FirstOrDefault(p => p.Path == full)?.Path
+            ?? shared.FirstOrDefault(p => p == full)
+            ?? throw new ArgumentException($"No project {project}; the folder has {string.Join(", ", [.. Session.Projects.Select(p => p.Name), .. shared.Select(Path.GetFileNameWithoutExtension)])}");
     }
 }
 
@@ -712,6 +1018,15 @@ public sealed record VcsStatus(string? Branch, IReadOnlyList<VcsChange> Changes,
 {
     /// <summary>How many changes past the first ones listed were left out, and how to read them.</summary>
     public string? More { get; init; }
+
+    /// <summary>The upstream the branch tracks (origin/main), if any.</summary>
+    public string? Upstream { get; init; }
+
+    /// <summary>The commits the branch has that its upstream lacks, as last fetched; none where its upstream is gone.</summary>
+    public int? Ahead { get; init; }
+
+    /// <summary>The commits its upstream has that the branch lacks, as last fetched.</summary>
+    public int? Behind { get; init; }
 }
 
 /// <summary>What stopped for conflicts, the branches yours and theirs are, and the files in conflict.</summary>
@@ -730,6 +1045,9 @@ public sealed record VcsChange(string Path, string Kind, string? From, string? U
 /// <summary>A commit as vcs_log lists it; with a path, what it did there.</summary>
 public sealed record VcsCommit(string Hash, string Subject, string Author, string Date, IReadOnlyList<string> Refs, IReadOnlyList<VcsChange>? Changes = null)
 {
+    /// <summary>How many more of its files there were left out, and how to read them.</summary>
+    public string? More { get; init; }
+
     /// <summary>Its signature in a sentence that begins with what it is worth (Good, Unverified, Bad, Expired); null where
     /// it is unsigned.</summary>
     public string? Signature { get; init; }
@@ -744,6 +1062,13 @@ public sealed record ProfileInfo(double DurationMs, int Samples, int Threads, IR
     /// <summary>Why there is no heap when a memory snapshot was asked for, what taking it put into the program's output, or
     /// what a snapshot read from the runtime's own heap dump lacks.</summary>
     public string? HeapNote { get; init; }
+
+    /// <summary>That the program's trace stops short of the run's end (its program ended before its session did: crashed or
+    /// killed), what it holds coming before; null for a whole trace.</summary>
+    public string? CutShort { get; init; }
+
+    /// <summary>What the program said it needs a terminal for, and how to give it one; null where it said nothing of one.</summary>
+    public string? NeedsTerminal { get; init; }
 
     /// <summary>An Avalonia app's frames, as the Frames page shows them; null for any other program.</summary>
     public UiFramesInfo? Frames { get; init; }
@@ -818,9 +1143,40 @@ public sealed record ControlLayoutInfo(string Control, int Measures, double Meas
 /// <summary>A type on the heap of a memory snapshot: its live objects and their bytes.</summary>
 public sealed record HeapTypeInfo(string Type, int Count, long Bytes);
 
+/// <summary>A package nuget_search found: what the feeds say of it, and of its newest version and those the projects have,
+/// each with a known vulnerability (its gravest advisory) or that its owner deprecated (why, what to use instead and their
+/// words), with the projects that have it.</summary>
+public sealed record PackageFound(string Id, string Version, string Description, string Authors, long Downloads, IReadOnlyList<string> Feeds)
+{
+    /// <summary>Null for none.</summary>
+    public IReadOnlyList<string>? Vulnerable { get; init; }
+
+    /// <summary>Null for none.</summary>
+    public IReadOnlyList<string>? Deprecated { get; init; }
+
+    /// <summary>The feeds that could not say whether a version is vulnerable or deprecated; null where all said.</summary>
+    public string? Unknown { get; init; }
+}
+
 /// <summary>What nuget_install did: the package, the version installed (none for a removal), the project, and
 /// the files it changed.</summary>
-public sealed record PackageChange(string Package, string? Version, string Project, IReadOnlyList<string> Changed);
+public sealed record PackageChange(string Package, string? Version, string Project, IReadOnlyList<string> Changed)
+{
+    /// <summary>The packages that moved with it, each with its version: the rest of EF Core's set; null for none.</summary>
+    public IReadOnlyList<string>? With { get; init; }
+
+    /// <summary>What the change says beyond its files: what moved with it, and a provider of EF Core it left behind.</summary>
+    public string? Said { get; init; }
+
+    /// <summary>The version's gravest known advisory and the version that fixes it; null for none.</summary>
+    public string? Vulnerable { get; init; }
+
+    /// <summary>Why its owner deprecated the version, what to use instead and their words; null where they did not.</summary>
+    public string? Deprecated { get; init; }
+
+    /// <summary>The feeds that could not say whether the version is vulnerable or deprecated; null where all said.</summary>
+    public string? Unknown { get; init; }
+}
 
 /// <summary>A stash as the vcs_stash tool lists it: its place, its commit (short), what it says and when it was made.</summary>
 public sealed record StashSummary(int Index, string Commit, string Message, DateTimeOffset Time);

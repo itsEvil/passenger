@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.IO.Enumeration;
 using Passenger.Core;
 using Passenger.Text;
@@ -50,12 +51,15 @@ public abstract class WatchedTree : IDisposable
     /// for one gone), so its own change heard late is not handed over twice.</summary>
     private readonly Dictionary<string, (DateTime Written, DateTime At)> handed = new(StringComparer.Ordinal);
 
-    /// <summary>The changes heard in each batch handed over in the last <see cref="Burst"/>, and in the one gathering.</summary>
-    private readonly Queue<(DateTime At, int Heard)> batches = new();
+    /// <summary>The changes heard in each batch handed over in the last <see cref="Burst"/>, and in the one gathering, each by
+    /// when it was handed over, a timestamp of <see cref="Stopwatch.GetTimestamp"/>'s.</summary>
+    private readonly Queue<(long At, int Heard)> batches = new();
     private int heardInBatch;
 
-    /// <summary>When the last change was heard, and the first after a quiet <see cref="Burst"/> before it.</summary>
-    private DateTime lastHeard;
+    /// <summary>When the last change was heard, a timestamp of <see cref="Stopwatch.GetTimestamp"/>'s, which measures the quiet;
+    /// and the first after a quiet <see cref="Burst"/> before it, on the wall clock, as the record's moments and files' writes
+    /// it is set against are.</summary>
+    private long lastHeard;
     private DateTime burstBegan;
 
     /// <summary>The record, by kept folder: its entries' names and its stamp as last listed. Read and changed only by
@@ -68,7 +72,14 @@ public abstract class WatchedTree : IDisposable
 
     /// <summary>The changes to which folders are watched, made one at a time in the order they were seen.</summary>
     private Task following = Task.CompletedTask;
+
+    /// <summary>How many walks apart (<see cref="WalksApart"/>) are queued or under way: work queued behind one is held as
+    /// background work only once it runs.</summary>
+    private int walksApart;
     private bool rewalking;
+
+    /// <summary>The look (<see cref="LookAgainAsync"/>) asked for and not yet begun, done once it has run.</summary>
+    private TaskCompletionSource? looking;
     private bool lost;
     private bool overflowed;
 
@@ -80,13 +91,19 @@ public abstract class WatchedTree : IDisposable
     private Action? meanwhile;
 
     /// <summary>A burst at risk is looked at once more when it has been quiet a moment, for what it lost after its last
-    /// look: whether that look is due, and asked for now, when the burst was last at risk and when it began.</summary>
+    /// look: whether that look is due, and asked for now, when the burst was last at risk (a timestamp of
+    /// <see cref="Stopwatch.GetTimestamp"/>'s) and when it began.</summary>
     private bool recheckDue;
     private bool recheck;
-    private DateTime lastRisk;
+    private long lastRisk;
     private DateTime riskBegan;
     private bool pending;
     private bool disposed;
+
+    /// <summary>Whether a look for what the system's watcher, behind, has not handed over is asked for and not yet begun, and
+    /// when the last such look began on the wall clock (<see cref="OnBehind"/>).</summary>
+    private bool lookingBehind;
+    private DateTime? lookedBehind;
 
     /// <summary>The tree under <paramref name="folder"/> (canonical), watched the system's way, or each kept folder on its own
     /// (<paramref name="eachFolder"/>); nothing is watched until <see cref="Begin"/>.</summary>
@@ -108,6 +125,10 @@ public abstract class WatchedTree : IDisposable
     /// <summary>Whether the watcher handed over, from its first walk, whatever was written since before it watched, so a burst
     /// begun before its record was made, or made again, is listed against the record rather than taken for lost.</summary>
     protected virtual bool FoundFromStart => false;
+
+    /// <summary>Whether the walks that make the record hold no background work, nor what waits behind them until it runs: a
+    /// folder nothing the window shows waits on, whose walk on a cold disk can go on for minutes.</summary>
+    protected virtual bool WalksApart => false;
 
     /// <summary>The watcher as the IDE's log names it.</summary>
     protected virtual string Shown => $"The watcher of {Top}";
@@ -142,24 +163,43 @@ public abstract class WatchedTree : IDisposable
         }
     }
 
-    /// <summary>Starts watching, the folders walked off the calling thread (a large tree has thousands to start watching);
-    /// <paramref name="walked"/> runs once the first walk is done, as the same work.</summary>
-    protected void Begin(Action? walked = null)
+    /// <summary>Starts watching, the folders walked off the calling thread (a large tree has thousands to start watching),
+    /// once <paramref name="after"/> ends (a test's hold); <paramref name="walked"/> runs once the first walk is done, as the
+    /// same work, with each file it found written from <paramref name="since"/> on, whatever its name, read from the same
+    /// listings.</summary>
+    protected void Begin(DateTime? since = null, Action<List<string>>? walked = null, Task? after = null)
     {
         Start(Top, recursive: !eachFolder);
-        Follow(() =>
+        FollowWalk(() =>
         {
-            Record(() => WatchFrom(Top));
-            walked?.Invoke();
-        });
+            List<string> written = [];
+            Record(() => WatchFrom(Top, written: since is { } from ? (from, written) : null));
+            walked?.Invoke(written);
+        }, after);
         lock (gate)
         {
             Ready = following;
+        }
+        WatchLag.Behind += OnBehind;
+    }
+
+    /// <summary>Once disposed, done when what it had queued has run: a walk under way stops at the next folder and nothing
+    /// is queued after, so nothing of it reads its folders from then on, which Windows would refuse a move or delete of
+    /// one above them for.</summary>
+    public Task Stopped
+    {
+        get
+        {
+            lock (gate)
+            {
+                return following;
+            }
         }
     }
 
     public virtual void Dispose()
     {
+        WatchLag.Behind -= OnBehind;
         List<FileSystemWatcher> stopped;
         lock (gate)
         {
@@ -335,7 +375,7 @@ public abstract class WatchedTree : IDisposable
         }
         watcher.Created += (_, e) => OnCreated(e.FullPath, made: true);
         watcher.Deleted += (_, e) => OnDeleted(e.FullPath);
-        watcher.Changed += (_, e) => Note(e.FullPath, created: false);
+        watcher.Changed += (_, e) => OnChanged(e.FullPath);
         watcher.Renamed += (_, e) =>
         {
             OnDeleted(e.OldFullPath);
@@ -374,6 +414,10 @@ public abstract class WatchedTree : IDisposable
     /// in as found.</summary>
     private void OnCreated(string path, bool made)
     {
+        if (IsUnheard(path))
+        {
+            return;
+        }
         if (eachFolder && Kept(path) && Directory.Exists(path))
         {
             Follow(() =>
@@ -391,12 +435,41 @@ public abstract class WatchedTree : IDisposable
 
     private void OnDeleted(string path)
     {
+        if (IsUnheard(path))
+        {
+            return;
+        }
         if (eachFolder && IsWatched(path))
         {
             Follow(() => Unwatch(path));
         }
         Note(path, created: true);
     }
+
+    private void OnChanged(string path)
+    {
+        if (!IsUnheard(path))
+        {
+            Note(path, created: false);
+        }
+    }
+
+    /// <summary>The variable naming a file whose changes every watcher passes over as the system drops one without a word,
+    /// by its name in whatever folder: a test's hold, for what finds such a change otherwise.</summary>
+    [IdentifierHome]
+    public const string UnheardVariable = "PASSENGER_UNHEARD";
+
+    /// <summary>The name <see cref="UnheardVariable"/> gives, or null; a value that is more than a file's name is fatal, as a
+    /// malformed flag is.</summary>
+    private static readonly string? Unheard = Environment.GetEnvironmentVariable(UnheardVariable) switch
+    {
+        null or "" => null,
+        { } name when name.AsSpan().IndexOfAny(PathNames.Separators) < 0 && name is not ("." or "..") => name,
+        { } other => throw new FormatException($"{UnheardVariable} is \"{other}\": it must be a file's name, or unset"),
+    };
+
+    /// <summary>Whether a change heard is one <see cref="UnheardVariable"/> has passed over.</summary>
+    private static bool IsUnheard(string path) => Unheard is { } name && Path.GetFileName(path.AsSpan()).Equals(name, StringComparison.Ordinal);
 
     private void OnError(FileSystemWatcher source, Exception error)
     {
@@ -434,22 +507,67 @@ public abstract class WatchedTree : IDisposable
     }
 
     /// <summary>Changes which folders are watched off the thread that saw why, after those already asked for, held as
-    /// background work until it is done, since a file made in a folder only watched from then on shows only then. A
-    /// change that fails is reported as it fails, and those after it still run.</summary>
-    private void Follow(Action change)
+    /// background work until it is done, since a file made in a folder only watched from then on shows only then; behind
+    /// a walk apart, held only once it runs. A change that fails is reported as it fails, and those after it still run.
+    /// False, nothing queued, once the watcher is disposed.</summary>
+    private bool Follow(Action change)
     {
-        IDisposable held = BackgroundWork.Scope();
         lock (gate)
         {
+            if (disposed)
+            {
+                return false;
+            }
+            bool behind = walksApart > 0;
+            IDisposable? held = behind ? null : BackgroundWork.Scope();
             following = following.ContinueWith(_ =>
             {
+                IDisposable? running = behind ? BackgroundWork.Scope() : null;
                 try
                 {
                     change();
                 }
                 finally
                 {
-                    held.Dispose();
+                    held?.Dispose();
+                    running?.Dispose();
+                }
+            }, TaskScheduler.Default);
+            IdeErrors.Observe(following);
+        }
+        return true;
+    }
+
+    /// <summary>Makes the record anew in turn as <see cref="Follow"/> does, once <paramref name="after"/> ends (a test's
+    /// hold): held as background work as other changes are, unless the watcher walks apart.</summary>
+    private void FollowWalk(Action walk, Task? after = null)
+    {
+        bool apart = WalksApart;
+        lock (gate)
+        {
+            if (disposed)
+            {
+                return;
+            }
+            IDisposable? held = apart ? null : BackgroundWork.Scope();
+            walksApart += apart ? 1 : 0;
+            Task before = after is null ? following : following.ContinueWith(_ => after.Ended(), TaskScheduler.Default).Unwrap();
+            following = before.ContinueWith(_ =>
+            {
+                try
+                {
+                    walk();
+                }
+                finally
+                {
+                    held?.Dispose();
+                    if (apart)
+                    {
+                        lock (gate)
+                        {
+                            walksApart--;
+                        }
+                    }
                 }
             }, TaskScheduler.Default);
             IdeErrors.Observe(following);
@@ -468,7 +586,7 @@ public abstract class WatchedTree : IDisposable
             }
             rewalking = true;
         }
-        Follow(() =>
+        FollowWalk(() =>
         {
             lock (gate)
             {
@@ -513,18 +631,20 @@ public abstract class WatchedTree : IDisposable
 
     /// <summary>Watches (where each folder is watched on its own) and records a kept folder and the kept folders under it,
     /// each watched before what is in it is read, so a folder or file made meanwhile is either read here or heard of from
-    /// its own folder; each file in them is given to <paramref name="found"/>.</summary>
-    private void WatchFrom(string top, Action<string>? found = null)
+    /// its own folder; each file in them is given to <paramref name="found"/>, and each written from <paramref
+    /// name="written"/>'s time on, whatever its name, added to its files. The folder itself is looked at first; one under
+    /// it is taken as its parent's listing found it, a folder and no link.</summary>
+    private void WatchFrom(string top, Action<string>? found = null, (DateTime From, List<string> Files)? written = null)
     {
+        if (IsDisposed || !Directory.Exists(top) || new DirectoryInfo(top).LinkTarget is not null)
+        {
+            return;
+        }
         Stack<string> folders = new([top]);
         while (folders.Count > 0 && !IsDisposed && (eachFolder || recorded <= RecordLimit))
         {
             string at = folders.Pop();
-            if (!Directory.Exists(at) || new DirectoryInfo(at).LinkTarget is not null || eachFolder && !Start(at, recursive: false))
-            {
-                continue;
-            }
-            if (Listing(at, written: false) is not { } entries)
+            if (eachFolder && !Start(at, recursive: false) || Listing(at, written: written is not null, since: written?.From) is not { } entries)
             {
                 continue;
             }
@@ -537,28 +657,37 @@ public abstract class WatchedTree : IDisposable
                 {
                     folders.Push(path);
                 }
-                else if (!entry.Folder && found is not null)
+                else if (!entry.Folder)
                 {
-                    found(path);
+                    if (entry.Passed)
+                    {
+                        found?.Invoke(path);
+                    }
+                    if (written is { } since && entry.Written >= since.From)
+                    {
+                        since.Files.Add(path);
+                    }
                 }
             }
         }
     }
 
     /// <summary>What is in a folder now, its stamp read first so a change made while it is listed moves it past the one
-    /// kept, and each file's last write when <paramref name="written"/> (a look at each file's own record); the system's
-    /// own files, a save's temporary file and what the watcher never records (<see cref="Passes"/>) passed over, as every
-    /// walk does, with no string made for them. Null when it is gone.</summary>
-    private (DateTime Stamp, List<Entry> Entries)? Listing(string at, bool written)
+    /// kept, and each file's last write when <paramref name="written"/> (read with the listing on Windows, a look at each
+    /// file's own record elsewhere); the system's own files, a save's temporary file and what the watcher never records
+    /// (<see cref="Passes"/>) passed over, as every walk does, with no string made for them, but a file written from
+    /// <paramref name="since"/> on. Null when it is gone.</summary>
+    private (DateTime Stamp, List<Entry> Entries)? Listing(string at, bool written, DateTime? since = null)
     {
         DateTime stamp = Directory.GetLastWriteTimeUtc(at);
         try
         {
             FileSystemEnumerable<Entry> entries = new(at, (ref FileSystemEntry entry) => new Entry(entry.FileName.ToString(), entry.IsDirectory,
-                entry.IsDirectory && (entry.Attributes & FileAttributes.ReparsePoint) != 0, written && !entry.IsDirectory ? entry.LastWriteTimeUtc.UtcDateTime : default), Everything)
+                entry.IsDirectory && (entry.Attributes & FileAttributes.ReparsePoint) != 0, written && !entry.IsDirectory ? entry.LastWriteTimeUtc.UtcDateTime : default,
+                since is null || Passes(entry.FileName, entry.IsDirectory)), Everything)
             {
                 ShouldIncludePredicate = (ref FileSystemEntry entry) => !PathNames.IsSystemFile(entry.FileName) && !FileText.IsSaving(entry.FileName)
-                    && Passes(entry.FileName, entry.IsDirectory),
+                    && (Passes(entry.FileName, entry.IsDirectory) || since is { } from && !entry.IsDirectory && entry.LastWriteTimeUtc.UtcDateTime >= from),
             };
             return (stamp, [.. entries]);
         }
@@ -569,12 +698,13 @@ public abstract class WatchedTree : IDisposable
     }
 
     /// <summary>The entries of a folder's listing the record keeps.</summary>
-    private List<Entry> Recorded(string at, List<Entry> entries) => [.. entries.Where(entry => Records(at, entry.Name, entry.Folder))];
+    private List<Entry> Recorded(string at, List<Entry> entries) => [.. entries.Where(entry => entry.Passed && Records(at, entry.Name, entry.Folder))];
 
     private static readonly EnumerationOptions Everything = new() { AttributesToSkip = 0, IgnoreInaccessible = false, RecurseSubdirectories = false };
 
-    /// <summary>A folder's entry as listed: its name, whether it is a folder and a link, and a file's last write.</summary>
-    private readonly record struct Entry(string Name, bool Folder, bool Link, DateTime Written);
+    /// <summary>A folder's entry as listed: its name, whether it is a folder and a link, a file's last write, and whether
+    /// it is one the watcher may record (<see cref="Passes"/>), not listed for its time alone.</summary>
+    private readonly record struct Entry(string Name, bool Folder, bool Link, DateTime Written, bool Passed);
 
     /// <summary>A folder as the record last had it.</summary>
     private sealed record Listed(HashSet<string> Names, DateTime Stamp);
@@ -662,14 +792,151 @@ public abstract class WatchedTree : IDisposable
             Lose();
             return;
         }
-        HashSet<string> listing = new(folders.Where(record.ContainsKey), StringComparer.Ordinal);
+        HashSet<string> listing = StampsMoved();
+        listing.UnionWith(folders.Where(record.ContainsKey));
+        if (ListAgain(listing, since, heard) is not { } found)
+        {
+            Lose();
+            return;
+        }
+        IdeErrors.Write($"{Shown} listed {Plural.Of(listing.Count, "folder")} again after a burst of changes at risk of some lost unsaid: "
+            + $"{Plural.Of(found.Found, "change")} found, {found.Unheard} at a path neither heard nor found in its last moments ({Plural.Of(heard.Count, "path")})");
+    }
+
+    /// <summary>Lists again, after the changes already asked for, each recorded folder whose stamp moved since it was listed:
+    /// a name come or gone that the system dropped without a word (macOS's watcher passes over its word that it did) is
+    /// found against the record and handed over. A file written in place, which moves no folder's stamp, is left to its own
+    /// change. Asked again before a look begins, it adds none.</summary>
+    public void LookAgain() => IdeErrors.Observe(LookAgainAsync());
+
+    /// <summary><see cref="LookAgain"/>, done once the look has run and what it found was handed over (<see cref="Hand"/>).
+    /// While the first walk, or a walk apart, is under way none is asked: the walk reads what is there itself, and one
+    /// apart can go on for minutes.</summary>
+    public Task LookAgainAsync()
+    {
+        TaskCompletionSource asked;
+        lock (gate)
+        {
+            if (disposed || !Ready.IsCompleted || walksApart > 0)
+            {
+                return Task.CompletedTask;
+            }
+            if (looking is { } waiting)
+            {
+                return waiting.Task;
+            }
+            asked = looking = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        }
+        if (!Follow(() => Look(asked)))
+        {
+            // Disposed meanwhile: there is nothing to look at.
+            asked.TrySetResult();
+        }
+        return asked.Task;
+    }
+
+    /// <summary>The look <see cref="LookAgainAsync"/> asks for, in turn: what it found handed over at once rather than
+    /// gathered a moment, so the caller waiting on it reads it next.</summary>
+    private void Look(TaskCompletionSource asked)
+    {
+        lock (gate)
+        {
+            looking = null;
+        }
+        try
+        {
+            if (recordedAt is null || IsDisposed || StampsMoved() is not { Count: > 0 } listing)
+            {
+                return;
+            }
+            if (ListAgain(listing, since: null, new Dictionary<string, DateTime>(StringComparer.Ordinal)) is not { } found)
+            {
+                Lose();
+            }
+            else if (found.Found > 0)
+            {
+                IdeErrors.Write($"{Shown} found {Plural.Of(found.Found, "change")} it never heard, looking again at {Plural.Of(listing.Count, "folder")} whose stamp moved");
+            }
+            else
+            {
+                return;
+            }
+            HandOver();
+        }
+        finally
+        {
+            asked.TrySetResult();
+        }
+    }
+
+    /// <summary>The system's watcher is behind (<see cref="WatchLag"/>): the folders whose stamp moved are listed again, as
+    /// <see cref="LookAgain"/> lists them, each file there written since the last such look (from <paramref name="since"/>
+    /// at first) and not heard of after it taken in too, in turn, one look asked at a time. Not while the first walk, or a
+    /// walk apart, is under way, which reads what is there itself.</summary>
+    private void OnBehind(DateTime since)
+    {
+        DateTime from;
+        lock (gate)
+        {
+            if (disposed || lookingBehind || !Ready.IsCompleted || walksApart > 0)
+            {
+                return;
+            }
+            lookingBehind = true;
+            // A moment before the last look began, for a write its listing of the folder may have just missed.
+            from = lookedBehind is { } last && last - Lag > since ? last - Lag : since;
+        }
+        Follow(() => LookBehind(from));
+    }
+
+    /// <summary>The look <see cref="OnBehind"/> asks for, in turn: what it found handed over at once.</summary>
+    private void LookBehind(DateTime since)
+    {
+        Dictionary<string, DateTime> heard;
+        lock (gate)
+        {
+            lookingBehind = false;
+            lookedBehind = DateTime.UtcNow;
+            heard = new Dictionary<string, DateTime>(heardAt, StringComparer.Ordinal);
+        }
+        if (recordedAt is null || IsDisposed || StampsMoved() is not { Count: > 0 } listing)
+        {
+            return;
+        }
+        if (ListAgain(listing, since, heard) is not { } found)
+        {
+            Lose();
+        }
+        else if (found.Found > 0)
+        {
+            IdeErrors.Write($"{Shown} found {Plural.Of(found.Found, "change")} the system's watcher, behind, had not handed over, looking at {Plural.Of(listing.Count, "folder")} whose stamp moved");
+        }
+        else
+        {
+            return;
+        }
+        HandOver();
+    }
+
+    /// <summary>The recorded folders whose stamp moved since they were listed.</summary>
+    private HashSet<string> StampsMoved()
+    {
+        HashSet<string> moved = new(StringComparer.Ordinal);
         foreach ((string at, Listed listed) in record)
         {
             if (Directory.GetLastWriteTimeUtc(at) != listed.Stamp)
             {
-                listing.Add(at);
+                moved.Add(at);
             }
         }
+        return moved;
+    }
+
+    /// <summary>Lists recorded folders again against the record, taking in each name come or gone and, from <paramref
+    /// name="since"/> when given, each file written then and not heard of after it: how many changes were found, and how many
+    /// of those at a path not heard; null past the record's limit, where changes are taken for lost.</summary>
+    private (int Found, int Unheard)? ListAgain(HashSet<string> listing, DateTime? since, Dictionary<string, DateTime> heard)
+    {
         int read = 0;
         int found = 0;
         int unheard = 0;
@@ -680,7 +947,7 @@ public abstract class WatchedTree : IDisposable
             {
                 continue;
             }
-            if (Listing(at, written: true) is not { } now)
+            if (Listing(at, written: since is not null) is not { } now)
             {
                 if (at == Top && !Directory.Exists(at))
                 {
@@ -691,8 +958,7 @@ public abstract class WatchedTree : IDisposable
             read += now.Entries.Count;
             if (read > RecordLimit)
             {
-                Lose();
-                return;
+                return null;
             }
             List<Entry> entries = Recorded(at, now.Entries);
             HashSet<string> names = new(entries.Select(e => e.Name), StringComparer.Ordinal);
@@ -714,14 +980,13 @@ public abstract class WatchedTree : IDisposable
                         WatchFrom(path, file => Find(file, created: true));
                     }
                 }
-                else if (!entry.Folder && entry.Written >= since && !(heard.TryGetValue(PathNames.Canonical(path), out DateTime last) && last >= entry.Written))
+                else if (!entry.Folder && since is { } from && entry.Written >= from && !(heard.TryGetValue(PathNames.Canonical(path), out DateTime last) && last >= entry.Written))
                 {
                     Find(path, created: false);
                 }
             }
         }
-        IdeErrors.Write($"{Shown} listed {Plural.Of(listing.Count, "folder")} again after a burst of changes at risk of some lost unsaid: "
-            + $"{Plural.Of(found, "change")} found, {unheard} at a path neither heard nor found in its last moments ({Plural.Of(heard.Count, "path")})");
+        return (found, unheard);
 
         void Find(string path, bool created)
         {
@@ -735,6 +1000,10 @@ public abstract class WatchedTree : IDisposable
     /// <summary>Takes in a change found by listing or walking rather than heard, marked handed over, so its own change heard
     /// later is not handed over twice.</summary>
     private void Found(string path, bool created) => Found(path, PathNames.Canonical(path), created);
+
+    /// <summary>Takes in a file written as it stands, as one found rather than heard: one the watcher knows of before the
+    /// system's watcher says so (a save of the IDE's own), which may be minutes behind.</summary>
+    protected void TakeWritten(string path) => Found(path, created: false);
 
     /// <inheritdoc cref="Found(string, bool)"/>
     private void Found(string path, string canonical, bool created)
@@ -762,7 +1031,7 @@ public abstract class WatchedTree : IDisposable
         }
         else
         {
-            Follow(() => Record(() => WatchFrom(Top)));
+            FollowWalk(() => Record(() => WatchFrom(Top)));
         }
     }
 
@@ -835,11 +1104,12 @@ public abstract class WatchedTree : IDisposable
                 }
                 if (heard)
                 {
-                    if (now - lastHeard > Burst)
+                    long ticks = Stopwatch.GetTimestamp();
+                    if (Stopwatch.GetElapsedTime(lastHeard, ticks) > Burst)
                     {
                         burstBegan = now;
                     }
-                    lastHeard = now;
+                    lastHeard = ticks;
                     heardInBatch++;
                     if (Path.GetDirectoryName((notice.Canonical ?? path).AsSpan()) is { IsEmpty: false } holder)
                     {
@@ -905,7 +1175,7 @@ public abstract class WatchedTree : IDisposable
             bool begin = false;
             lock (gate)
             {
-                again = DateTime.UtcNow - lastRisk < Burst && !disposed;
+                again = Stopwatch.GetElapsedTime(lastRisk) < Burst && !disposed;
                 if (!again)
                 {
                     recheckDue = false;
@@ -934,9 +1204,10 @@ public abstract class WatchedTree : IDisposable
         lock (gate)
         {
             DateTime now = DateTime.UtcNow;
-            batches.Enqueue((now, heardInBatch));
+            long ticks = Stopwatch.GetTimestamp();
+            batches.Enqueue((ticks, heardInBatch));
             heardInBatch = 0;
-            while (batches.Peek().At < now - Burst)
+            while (Stopwatch.GetElapsedTime(batches.Peek().At, ticks) > Burst)
             {
                 batches.Dequeue();
             }
@@ -961,7 +1232,7 @@ public abstract class WatchedTree : IDisposable
             if (risky)
             {
                 riskBegan = unlooked ? since : burstBegan;
-                lastRisk = now;
+                lastRisk = ticks;
                 recheckDue = true;
             }
             unlooked = false;

@@ -45,6 +45,50 @@ public sealed class McpMigrationsTests : McpRig
         Assert.Contains("CREATE TABLE \"Products\"", File.ReadAllText(file), StringComparison.Ordinal);
     }
 
+    /// <summary>An agent's choice of the environment dotnet ef runs in, by ide_action with its name as input: none answers
+    /// the one in force and those offered, a name chooses it for every command after, and one that names no environment is
+    /// refused saying why.</summary>
+    [Fact]
+    public async Task An_agent_chooses_the_environment_dotnet_ef_runs_in_by_name_and_one_that_names_none_is_refused()
+    {
+        string folder = await ShopApp.MakeAsync(design: true, tool: ShopApp.Version);
+        await using McpClient client = await Start(["--mcp", folder], languageServer: false);
+
+        string environments = Text(await Call(client, McpTools.IdeAction, new() { ["action"] = AppActions.MigrationsEnvironment }));
+        Assert.True(environments.Contains("Offered: Development;", StringComparison.Ordinal) && environments.Contains("started from Shop in Development (the default)", StringComparison.Ordinal),
+            $"The environment action with no input answered: {environments}");
+        string staging = Text(await Call(client, McpTools.IdeAction, new() { ["action"] = AppActions.MigrationsEnvironment, ["input"] = "Staging" }));
+        Assert.True(staging.StartsWith("dotnet ef runs Shop in Staging\n", StringComparison.Ordinal) && staging.Contains("started from Shop in Staging:", StringComparison.Ordinal),
+            $"Choosing Staging answered: {staging}");
+        Assert.Contains("started from Shop in Staging:", Text(await Call(client, McpTools.IdeAction, new() { ["action"] = AppActions.MigrationsRefresh })), StringComparison.Ordinal);
+        CallToolResult unnamed = await Result(client, McpTools.IdeAction, new() { ["action"] = AppActions.MigrationsEnvironment, ["input"] = "Staging Two" });
+        Assert.True(unnamed.IsError == true && Text(unnamed).Contains("\"Staging Two\" names no environment", StringComparison.Ordinal), $"A name with a space answered: {Text(unnamed)}");
+    }
+
+    /// <summary>An agent's nuget_install of one of EF Core's packages is never asked about: it moves the project's others with
+    /// it, as the window's update does, and leaves the provider it leaves behind as it was, its answer naming what moved and
+    /// the provider's version that supports the EF Core asked.</summary>
+    [Fact]
+    public async Task An_agents_update_of_one_of_EF_Cores_packages_moves_the_set_and_says_which_provider_it_left_behind()
+    {
+        string folder = await ShopApp.MakeAsync(design: true, tool: null, provider: "1.0.0",
+            providers: [("1.0.0", $"[{ShopApp.Older}]"), ("2.0.0", $"[{ShopApp.Version}]")], ef: ShopApp.Older, relational: true);
+        await using McpClient client = await Start(["--mcp", folder], languageServer: false);
+        const string Sqlite = "Microsoft.EntityFrameworkCore.Sqlite";
+        JsonElement installed = await Call(client, McpTools.NugetInstall, new() { ["project"] = "Shop", ["id"] = Sqlite, ["version"] = ShopApp.Version });
+        string[] with = installed.TryGetProperty("with", out JsonElement moved) && moved.ValueKind == JsonValueKind.Array ? [.. moved.EnumerateArray().Select(m => m.GetString()!)] : [];
+        Assert.True(with.Order(StringComparer.Ordinal).SequenceEqual([$"Microsoft.EntityFrameworkCore.Design {ShopApp.Version}", $"Microsoft.EntityFrameworkCore.Relational {ShopApp.Version}"]),
+            $"nuget_install of {Sqlite} answered that [{string.Join(", ", with)}] moved with it, not the rest of EF Core's set: {installed}");
+        string said = installed.TryGetProperty("said", out JsonElement words) ? words.GetString() ?? string.Empty : string.Empty;
+        Assert.True(said.Contains($"{ShopApp.Provider} 1.0.0 left behind, supporting EF Core {ShopApp.Older}: {ShopApp.Provider} 2.0.0 supports EF Core {ShopApp.Version}", StringComparison.Ordinal),
+            $"nuget_install's answer does not tell the agent the provider it left behind and the version of it that fits: {installed}");
+        string project = File.ReadAllText(Path.Combine(folder, "Shop.csproj"));
+        Assert.True(project.Contains($"Include=\"{Sqlite}\" Version=\"{ShopApp.Version}\"", StringComparison.Ordinal)
+            && project.Contains($"Include=\"Microsoft.EntityFrameworkCore.Design\" Version=\"{ShopApp.Version}\"", StringComparison.Ordinal)
+            && project.Contains($"Include=\"{ShopApp.Provider}\" Version=\"1.0.0\"", StringComparison.Ordinal),
+            $"nuget_install left the project's EF Core set at two versions, or moved the provider no one asked to move:\n{project}");
+    }
+
     /// <summary>An agent giving up on a Migrations call held behind a run's build stops that call alone: the run whose
     /// build it waits behind goes on, built and run once its hold is let go.</summary>
     [Fact]

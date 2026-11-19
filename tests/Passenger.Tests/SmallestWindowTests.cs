@@ -2,10 +2,14 @@ using Avalonia;
 using Avalonia.Controls;
 using Avalonia.Headless;
 using Avalonia.Headless.XUnit;
+using Avalonia.Controls.Primitives;
 using Avalonia.Input;
 using Avalonia.LogicalTree;
 using Avalonia.VisualTree;
 using Passenger.App;
+using Passenger.App.Docking;
+using Passenger.App.Editors;
+using Passenger.App.Settings;
 using Passenger.App.ToolWindows;
 using Passenger.App.Vcs;
 
@@ -13,8 +17,11 @@ namespace Passenger.Tests;
 
 /// <summary>At the smallest window (MainWindow.SmallestWidth wide and SmallestHeight tall) everything shown can be read
 /// and reached: the Welcome page scrolls to each of its tiles, Find in Files stands inside the window, the toolbar's long
-/// names give way with an ellipsis and never draw over each other, what the status bar says stands whole in front of
-/// the file's path, and the Commit window sharing its column draws nothing over its form.</summary>
+/// names give way with an ellipsis and never draw over each other or the window's buttons, what the status bar says
+/// stands whole in front of the file's path, the Commit window sharing its column draws nothing over its form, the empty
+/// editors' words stand inside them, editor tabs down a side leave the code its room, a Markdown file's preview stands
+/// under its file, a tool window dropped on the editors is a tab there, and a stripe with no icon gives its room to the
+/// editors but while a window is dragged.</summary>
 public sealed class SmallestWindowTests
 {
     [AvaloniaFact]
@@ -28,7 +35,7 @@ public sealed class SmallestWindowTests
             window.Start(LaunchOptions.Empty);
             Ui.Settle();
             Button[] tiles = [.. window.Welcome.GetVisualDescendants().OfType<Button>().Where(b => b.Classes.Contains(StyleClasses.WelcomeAction))];
-            Assert.Equal(4, tiles.Length);
+            Assert.Equal(5, tiles.Length);
             TextBox search = window.Welcome.GetVisualDescendants().OfType<TextBox>().Single(t => t.Classes.Contains(StyleClasses.WelcomeSearch));
             foreach (Button tile in tiles)
             {
@@ -91,8 +98,10 @@ public sealed class SmallestWindowTests
             {
                 window.Width = width;
                 Ui.Settle();
+                // The window's own buttons too (Windows' and Linux's), whose clicks a part drawn over them would take.
                 Control[] parts = [.. ((Panel)Named(window, "ToolbarStart")).Children.Concat(((Panel)Named(window, "ToolbarEnd")).Children)
-                    .Where(c => c.IsEffectivelyVisible && c.Bounds.Width > 0)];
+                    .Concat(((Panel)Named(window, "WindowButtons")).Children)
+                    .Where(c => c.IsEffectivelyVisible && c.Bounds.Width > 0 && !ShrinkingRow.HasGone(c))];
                 foreach (Control one in parts)
                 {
                     foreach (Control other in parts.Where(o => o != one && Placed(window, o).Left > Placed(window, one).Left))
@@ -211,6 +220,207 @@ public sealed class SmallestWindowTests
         static ScrollViewer Form(CommitView commit) =>
             commit.GetLogicalDescendants().OfType<CheckBox>().Single(c => c.Content as string == "Amend").FindLogicalAncestorOfType<ScrollViewer>()!;
     }
+
+    /// <summary>At the smallest width with no file open, the empty editors' hint wraps inside them and a folder's long name
+    /// ends in an ellipsis there, where both ran past the editors' edge, cut mid-word; at a wide window the hint is one line.</summary>
+    [AvaloniaFact]
+    public void At_the_smallest_width_the_empty_editors_hint_wraps_inside_them_and_a_long_folder_name_ends_in_an_ellipsis()
+    {
+        string folder = TestFolders.Create("smallest-hint-Contoso.Inventory.Management.Service.Api-");
+        File.WriteAllText(Path.Combine(folder, "Program.cs"), "System.Console.WriteLine(1);\n");
+        MainWindow window = Ui.OpenFolder(folder, width: MainWindow.SmallestWidth, height: MainWindow.SmallestHeight, languageServer: false, autosaves: false);
+        try
+        {
+            Rect editors = Placed(window, window.EditorArea);
+            TextBlock hint = window.EditorArea.GetVisualDescendants().OfType<TextBlock>().Single(t => t.Text?.StartsWith("Open a file from the Explorer", StringComparison.Ordinal) == true);
+            TextBlock title = window.EditorArea.GetVisualDescendants().OfType<TextBlock>().Single(t => t.Text == Path.GetFileName(folder));
+            foreach (TextBlock words in (TextBlock[])[title, hint])
+            {
+                Rect at = Placed(window, words);
+                Assert.True(words.IsEffectivelyVisible && at.Left >= editors.Left && at.Right <= editors.Right && words.TextLayout.TextLines.All(l => l.Width <= at.Width + 0.5),
+                    $"'{words.Text}' stands at {at}, {words.TextLayout.Width:0.#} wide, past the editors at {editors}: it is cut at their edge");
+            }
+            Assert.True(hint.TextLayout.TextLines.Count > 1 && hint.TextLayout.TextLines.All(l => !l.HasCollapsed),
+                $"The hint is {hint.TextLayout.TextLines.Count} line(s) in editors {editors.Width:0.#} wide: it is cut, never wrapped");
+            Assert.True(title.TextLayout.TextLines is [{ HasCollapsed: true }], $"The folder's name '{title.Text}', wider than the editors, does not end in an ellipsis");
+
+            window.Width = 1400;
+            Ui.Settle();
+            Assert.True(hint.TextLayout.TextLines.Count == 1, $"At a wide window the hint is {hint.TextLayout.TextLines.Count} lines where one holds it");
+        }
+        finally
+        {
+            window.Close();
+            TestFolders.Delete(folder);
+        }
+    }
+
+    /// <summary>Editor tabs down a side take at most a third of a narrow group, the code the rest, where their column kept its
+    /// 220 units at the smallest width with the Explorer open and left the code its line numbers alone; at a wide window
+    /// the column is 220 wide.</summary>
+    [AvaloniaFact]
+    public void At_the_smallest_width_editor_tabs_down_a_side_leave_the_code_two_thirds_of_its_group()
+    {
+        string folder = TestFolders.Create("smallest-side-tabs-");
+        foreach (string name in (string[])["One.cs", "Two.cs"])
+        {
+            File.WriteAllText(Path.Combine(folder, name), $"class {Path.GetFileNameWithoutExtension(name)} {{ }}\n");
+        }
+        MainWindow window = Ui.OpenFolder(folder, width: MainWindow.SmallestWidth, height: MainWindow.SmallestHeight, languageServer: false, autosaves: false);
+        try
+        {
+            window.ApplySettings(window.Settings with { EditorTabs = EditorTabsPlace.Left });
+            window.OpenFile(Path.Combine(folder, "One.cs"));
+            window.OpenFile(Path.Combine(folder, "Two.cs"));
+            Ui.Settle();
+            Assert.True(window.DockHost.IsShown(ToolWindowIds.Explorer), "The Explorer is not open beside the editors: the test no longer reaches a narrow group");
+            EditorGroup group = window.EditorArea.ActiveGroup;
+            double across = group.Bounds.Width;
+            // Within a unit, as the layout rounds to whole pixels.
+            Assert.True(group.TabStrip.Bounds.Width <= (across / 3) + 1 && Placed(window, group.Editor).Width >= (across * 2 / 3) - 1,
+                $"In a group {across:0.#} wide the tabs down its side take {group.TabStrip.Bounds.Width:0.#} and leave the code {Placed(window, group.Editor).Width:0.#}");
+
+            window.Width = 1400;
+            Ui.Settle();
+            Assert.True(Math.Abs(group.TabStrip.Bounds.Width - 220) < 0.5, $"At a wide window the tabs down the side are {group.TabStrip.Bounds.Width:0.#} wide, not 220");
+        }
+        finally
+        {
+            window.ApplySettings(new AppSettings());
+            window.Close();
+            TestFolders.Delete(folder);
+        }
+    }
+
+    /// <summary>At the smallest width with the Explorer open, a Markdown file's preview stands under its file, each as wide
+    /// as the group and about half its height, where beside it each kept half of a narrow group and the file wrapped every
+    /// few letters; at a wide window the preview stands beside the file again, each half the group's width.</summary>
+    [AvaloniaFact]
+    public void At_the_smallest_width_a_Markdown_files_preview_stands_under_it_each_as_wide_as_the_group()
+    {
+        string folder = TestFolders.Create("smallest-markdown-");
+        File.WriteAllText(Path.Combine(folder, "README.md"),
+            "# People\n\nA small page listing **people**, with a [link](https://example.com).\n\n| Name | Age |\n|------|-----|\n| Ada  | 36  |\n\n- one\n- two\n");
+        MainWindow window = Ui.OpenFolder(folder, width: MainWindow.SmallestWidth, height: MainWindow.SmallestHeight, languageServer: false, autosaves: false);
+        try
+        {
+            window.OpenFile(Path.Combine(folder, "README.md"));
+            Ui.Settle();
+            Assert.True(window.DockHost.IsShown(ToolWindowIds.Explorer), "The Explorer is not open beside the editors: the test no longer reaches a narrow group");
+            EditorGroup group = window.EditorArea.ActiveGroup;
+            MarkdownPreview preview = group.Markdown ?? throw new Xunit.Sdk.XunitException("README.md shows no preview at the smallest width");
+            Rect editor = Placed(window, group.Editor);
+            Rect page = Placed(window, preview);
+            double across = group.Bounds.Width;
+            Assert.True(group.SideUnder && page.Top >= editor.Bottom - 0.5,
+                $"In a group {across:0.#} wide README.md's editor stands at {editor} and its preview at {page}, beside it: each keeps half the width");
+            Assert.True(editor.Width >= across - 1 && page.Width >= across - 1,
+                $"Under each other in a group {across:0.#} wide, the editor is {editor.Width:0.#} wide and the preview {page.Width:0.#}");
+            Assert.True(Math.Abs(editor.Height - page.Height) <= 2,
+                $"The editor is {editor.Height:0.#} tall and the preview under it {page.Height:0.#}: one starts with more than its half");
+
+            window.Width = 1400;
+            Ui.Settle();
+            editor = Placed(window, group.Editor);
+            page = Placed(window, preview);
+            Assert.True(!group.SideUnder && page.Left >= editor.Right - 0.5 && Math.Abs(editor.Width - page.Width) <= 2,
+                $"At a wide window README.md's editor stands at {editor} and its preview at {page}, not side by side in halves");
+        }
+        finally
+        {
+            window.Close();
+            TestFolders.Delete(folder);
+        }
+    }
+
+    /// <summary>At the smallest width with the Explorer open, a tool window dropped on the right half of the editors opens
+    /// among them as a tab, as the overlay says over them, where the frame's right quarter reached into the editors and
+    /// docked it on the right; one dropped on the Explorer docks on the left beside it, where the Explorer's right part took
+    /// no drop.</summary>
+    [AvaloniaFact]
+    public void At_the_smallest_width_a_tool_window_dropped_on_the_editors_right_half_is_an_editor_tab_and_on_the_Explorer_docks_left()
+    {
+        string folder = TestFolders.Create("smallest-drop-");
+        File.WriteAllText(Path.Combine(folder, "One.cs"), "class One { }\n");
+        MainWindow window = Ui.OpenFolder(folder, width: MainWindow.SmallestWidth, height: MainWindow.SmallestHeight, languageServer: false, autosaves: false);
+        try
+        {
+            window.OpenFile(Path.Combine(folder, "One.cs"));
+            Ui.Settle();
+            DockHost dock = window.DockHost;
+            Assert.True(dock.IsShown(ToolWindowIds.Explorer), "The Explorer is not open beside the editors: the test no longer reaches narrow editors");
+            Rect editors = Placed(window, window.EditorArea);
+            Point onEditors = new(editors.Left + (editors.Width * 0.7), editors.Top + (editors.Height * 0.4));
+            Ui.Drag(window, Ui.Centre(StripeIcon(window, ToolWindowIds.Tests), window), onEditors);
+            Assert.True(dock[ToolWindowIds.Tests] is { Mode: ToolMode.Editor, IsShown: true },
+                $"Unit Tests dropped at {onEditors} on the editors at {editors} stands {dock[ToolWindowIds.Tests].Mode} at {dock[ToolWindowIds.Tests].Anchor}, not among them as a tab");
+
+            Point onExplorer = new(editors.Left - 30, editors.Top + 60);
+            Ui.Drag(window, Ui.Centre(StripeIcon(window, ToolWindowIds.Problems), window), onExplorer);
+            Assert.True(dock[ToolWindowIds.Problems] is { Mode: ToolMode.Docked, Anchor: ToolAnchor.LeftTop },
+                $"Problems dropped at {onExplorer}, on the Explorer, stands {dock[ToolWindowIds.Problems].Mode} at {dock[ToolWindowIds.Problems].Anchor}, not on the left");
+        }
+        finally
+        {
+            window.Close();
+            TestFolders.Delete(folder);
+        }
+    }
+
+    /// <summary>Under Cubicle at the smallest width no stripe stands, titled tabs naming every window, so the editors take
+    /// the room a stripe would; a window dragged by its titled tab brings none back, and dropped on the left edge it docks
+    /// at the left as its tab.</summary>
+    [AvaloniaFact]
+    public void Under_Cubicle_at_the_smallest_width_no_stripe_stands_even_while_a_window_is_dragged_to_the_left_edge()
+    {
+        string folder = TestFolders.Create("smallest-stripe-");
+        File.WriteAllText(Path.Combine(folder, "One.cs"), "class One { }\n");
+        MainWindow window = Ui.OpenFolder(folder, width: MainWindow.SmallestWidth, height: MainWindow.SmallestHeight, languageServer: false, autosaves: false);
+        try
+        {
+            window.ApplySettings(window.Settings with { Look = SourcedTheme.BuiltIn("Cubicle") });
+            window.OpenFile(Path.Combine(folder, "One.cs"));
+            Ui.Settle();
+            DockHost dock = window.DockHost;
+            Assert.True(dock.ColumnDefinitions[0].ActualWidth == 0 && !StripeBars(window).Any(b => b.IsEffectivelyVisible) && Placed(window, window.EditorArea).Left < 1,
+                $"Under Cubicle a stripe takes {dock.ColumnDefinitions[0].ActualWidth:0.#} units, the editors starting at {Placed(window, window.EditorArea).Left:0.#}");
+
+            ToolWindow build = dock[ToolWindowIds.Build];
+            Border tab = dock.GetVisualDescendants().OfType<Border>().FirstOrDefault(b => b.Classes.Contains(StyleClasses.Tab) && Equals(b.Tag, build.Id) && b.IsEffectivelyVisible)
+                ?? throw new Xunit.Sdk.XunitException("Cubicle shows no titled tab for Build");
+            Point from = Ui.Centre(tab, window);
+            window.MouseDown(from, MouseButton.Left);
+            for (int step = 1; step <= 4; step++)
+            {
+                window.MouseMove(from + new Point(0, -20 * step), RawInputModifiers.LeftMouseButton);
+            }
+            Ui.Settle();
+            Assert.True(dock.ColumnDefinitions[0].ActualWidth == 0 && !StripeBars(window).Any(b => b.IsEffectivelyVisible),
+                $"With Build dragged, a stripe takes {dock.ColumnDefinitions[0].ActualWidth:0.#} units under Cubicle");
+            Rect editors = Placed(window, window.EditorArea);
+            Point onEdge = new(editors.Left + 4, editors.Top + 60);
+            window.MouseMove(onEdge, RawInputModifiers.LeftMouseButton);
+            window.MouseUp(onEdge, MouseButton.Left);
+            Ui.Settle();
+            Assert.True(build.Anchor is ToolAnchor.LeftTop or ToolAnchor.LeftBottom && dock.ColumnDefinitions[0].ActualWidth == 0
+                && !StripeBars(window).Any(b => b.IsEffectivelyVisible),
+                $"Build dropped on the left edge stands at {build.Anchor}, a stripe {dock.ColumnDefinitions[0].ActualWidth:0.#} wide");
+        }
+        finally
+        {
+            window.ApplySettings(new AppSettings());
+            window.Close();
+            TestFolders.Delete(folder);
+        }
+    }
+
+    private static ToggleButton StripeIcon(MainWindow window, string id) =>
+        window.DockHost.GetVisualDescendants().OfType<ToggleButton>().FirstOrDefault(b => Equals(b.Tag, id))
+            ?? throw new Xunit.Sdk.XunitException($"No stripe shows {id}'s icon");
+
+    /// <summary>The stripes, the left one first.</summary>
+    private static Border[] StripeBars(MainWindow window) =>
+        [.. window.DockHost.GetVisualDescendants().OfType<Border>().Where(b => b.Classes.Contains(StyleClasses.StripeBar)).OrderBy(b => Grid.GetColumn(b))];
 
     private static Control Named(MainWindow window, string name) =>
         window.GetVisualDescendants().OfType<Control>().FirstOrDefault(c => c.Name == name) ?? throw new Xunit.Sdk.XunitException($"The window has no {name}");

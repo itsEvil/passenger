@@ -29,6 +29,67 @@ public partial class MainWindow
         }
     };
 
+    /// <summary>How long after an agent's call began its next looks again first (<see cref="AgentCalling"/>): long enough for
+    /// the agent to have worked through its own shell meanwhile, as a person comes back from a terminal.</summary>
+    public static readonly TimeSpan AgentAway = TimeSpan.FromSeconds(1);
+
+    /// <summary>When an agent's call last began, a timestamp of <see cref="System.Diagnostics.Stopwatch.GetTimestamp"/>'s, or
+    /// none yet; and the look the calls since wait for.</summary>
+    private long agentCalled;
+    private Task agentLook = Task.CompletedTask;
+
+    /// <summary>Back from another program, the window looks again (<see cref="LookAgainAsync"/>). It holds the system's
+    /// watcher's beat (<see cref="WatchLag.Hold"/>) while it is in front, or, nobody seeing it, while it is open: in the
+    /// background, the look as it comes in front finds what went unheard meanwhile.</summary>
+    private void AddLookingAgain()
+    {
+        IDisposable? beat = null;
+        // A window's coming in front the system posted before it closed may land after: it holds nothing then.
+        bool closed = false;
+        Opened += (_, _) => beat ??= Unseen && !closed ? WatchLag.Hold() : null;
+        Activated += (_, _) =>
+        {
+            beat ??= closed ? null : WatchLag.Hold();
+            IdeErrors.Observe(LookAgainAsync());
+        };
+        Deactivated += (_, _) =>
+        {
+            if (!Unseen)
+            {
+                beat?.Dispose();
+                beat = null;
+            }
+        };
+        Closed += (_, _) =>
+        {
+            closed = true;
+            beat?.Dispose();
+            beat = null;
+        };
+    }
+
+    /// <summary>An agent's call begins: its first, and one coming <see cref="AgentAway"/> or more after the last, looks again
+    /// first, as the window coming in front does, which an agent's own IDE never does; a call meanwhile waits for the same
+    /// look. The look to wait for, done once what it found was handed to the window's thread.</summary>
+    public Task AgentCalling()
+    {
+        UiThread.Check();
+        long now = System.Diagnostics.Stopwatch.GetTimestamp();
+        if (agentCalled == 0 || System.Diagnostics.Stopwatch.GetElapsedTime(agentCalled, now) >= AgentAway)
+        {
+            agentLook = LookAgainAsync();
+        }
+        agentCalled = now;
+        return agentLook;
+    }
+
+    /// <summary>The open folder's watcher, those of Git's folders outside it and the language server's own look again, off the
+    /// window's thread, for what the system dropped without a word (macOS's watcher passes over its word that it did): each
+    /// folder they recorded whose stamp moved is listed again, and what came or went there is handed over as heard, which
+    /// the task waits for.</summary>
+    private Task LookAgainAsync() => Task.WhenAll(session.Watcher?.LookAgainAsync() ?? Task.CompletedTask, session.Vcs.WatchersLookAgainAsync(),
+        session.CSharp?.Watching?.LookAgainAsync() ?? Task.CompletedTask);
+
     /// <summary>How the folders opened from now on are watched: the system's way, unless another is chosen.</summary>
     public FolderWatching Watching { get; set; } = FolderWatching.Platform;
 
@@ -41,22 +102,27 @@ public partial class MainWindow
         {
             return;
         }
-        session.LocalHistory?.Noticed(changes.Paths);
+        // Lost changes may have brought anything.
+        session.LocalHistory?.Noticed(changes.Paths, changes.Lost ? changes.Paths : changes.ComeOrGone);
         Godot.GodotScripts.FolderChanged(changes);
         session.DesignTimeBuilds.FolderChanged(changes);
         session.FilesChanged(changes);
         session.Debug.FilesChanged(changes.Paths);
-        (bool programsMade, bool programsWritten) = ProgramsChanged(changes.Paths);
+        // What came or went is the index's to weigh against what the folder's read found (ProjectSession.ProjectsCameOrWent).
+        string[] written = [.. changes.Written];
+        (bool programsMade, bool programsWritten) = ProgramsChanged(written);
         // Lost changes may have made or moved anything in the folder.
         IReadOnlyCollection<string> cameOrWent = changes.Lost ? [folder] : changes.ComeOrGone;
-        if (changes.Projects || changes.Lost || programsMade)
+        bool readAgain = changes.Lost || programsMade || written.Any(FolderWatcher.IsReadFor);
+        if (readAgain)
         {
             // Lost changes may have been a project's or the solution's: read again, which shows the whole Explorer anew.
             session.CameOrWent(cameOrWent, readAgain: true);
         }
         else if (changes.Structure)
         {
-            Explorer.RefreshFolders(changes.Paths.Select(Path.GetDirectoryName).OfType<string>());
+            // Only what came or went changes a folder's rows: Windows names a folder too as what is in it changes.
+            Explorer.RefreshFolders(changes.ComeOrGone.Select(Path.GetDirectoryName).OfType<string>());
             // A file come or gone may be one a project's wildcards take in (its folder's stamp says which), or a project's own.
             session.CameOrWent(cameOrWent);
         }
@@ -65,9 +131,15 @@ public partial class MainWindow
             // A restore writes what a project imports; a program's directives make its project; a global.json may name an SDK there is.
             session.Evaluate();
         }
-        if (changes.LaunchProfiles && !(changes.Projects || changes.Lost))
+        // A Docker Compose project is never evaluated: what it holds and how it runs are read from its text as written.
+        IReadOnlyList<ProjectModel> composed = readAgain ? [] : ComposeProjectsWritten(changes.Paths);
+        if (composed.Count > 0)
         {
-            // Only the run configurations are made of launch profiles, so the solution and the Explorer stay as they are.
+            Explorer.UpdateProjects(session.Workspace!, composed);
+        }
+        if ((changes.LaunchProfiles || composed.Count > 0) && !readAgain)
+        {
+            // Only the run configurations are made of launch profiles and compose projects, so the solution stays as it is.
             session.Configurations.Configure(Projects);
         }
         // A Godot project's page shows its export presets and plugins as their files say.
@@ -76,7 +148,9 @@ public partial class MainWindow
             Editors.GodotPages?.Refresh();
         }
         // A C# file written may have gained or lost the AppHost SDK's line; one come or gone is the index's to find.
-        session.AspireFiles.Changed(changes.Paths, every: changes.Lost);
+        session.AspireFiles.Changed(changes.Paths, changes.ComeOrGone, every: changes.Lost);
+        // A package.json or lockfile written: the packages' scripts and managers are read again.
+        session.NodeFiles.FilesChanged(changes.Paths, every: changes.Lost);
         if (changes.Lost)
         {
             session.Index.Build(folder);
@@ -85,6 +159,7 @@ public partial class MainWindow
         {
             session.Index.Apply(folder, changes.ComeOrGone);
         }
+        session.EditorConfigs.FilesChanged(changes.Paths, every: changes.Lost);
         // An .editorconfig written, made or deleted: each open file follows what the ones over it say now.
         if (changes.Paths.Any(p => Path.GetFileName(p) == EditorConfig.FileName))
         {
@@ -95,7 +170,7 @@ public partial class MainWindow
             IdeErrors.Observe(OfferGodotTemplatesAsync());
         }
         // A settings file, a launch profile or a compose file written: the reads of keys nothing gave are looked at again.
-        if (changes.Lost || changes.LaunchProfiles || changes.Paths.Any(p => ConfigurationFiles.IsSettings(p) || Containers.ComposeFiles.IsCompose(p)))
+        if (changes.Lost || changes.LaunchProfiles || changes.Paths.Any(p => AppSettingsFiles.Is(p) || Containers.ComposeFiles.IsCompose(p)))
         {
             session.CSharp?.ConfigurationChanged();
         }
@@ -113,6 +188,7 @@ public partial class MainWindow
         session.GodotScenes.CameOrWent(changes.ComeOrGone, every: changes.Lost);
         session.GodotScenes.FilesChanged(changes.Paths);
         session.MSBuild.FilesChanged(changes.Paths, changes.Structure);
+        session.MSBuild.Restored(changes.Restored);
         session.Web?.FilesChanged(changes.Paths);
         session.Stylesheets.FilesChanged([.. changes.Paths, .. changes.ComeOrGone, .. changes.Restored], every: changes.Lost || changes.Overflowed);
         EndpointFilesChanged(changes);
@@ -123,9 +199,15 @@ public partial class MainWindow
         }
     }
 
-    /// <summary>What the C# files written, come or gone change of the folder's file-based programs: one that is a program
-    /// now and was not, or the reverse, has the folder read again; one a program compiles (its own file, or one it
-    /// includes) has the projects evaluated again, its directives being its project's.</summary>
+    /// <summary>The solution's Docker Compose projects (.dcproj) among the files written.</summary>
+    private IReadOnlyList<ProjectModel> ComposeProjectsWritten(IReadOnlySet<string> paths) =>
+        session.Workspace?.Solution is { } solution && paths.Any(WorkspaceModel.IsComposeProject)
+            ? [.. solution.Projects.Where(p => WorkspaceModel.IsComposeProject(p.Path) && paths.Any(written => PathNames.Same(written, p.Path)))]
+            : [];
+
+    /// <summary>What the C# files written in place change of the folder's file-based programs: one that is a program now and
+    /// was not, or the reverse, has the folder read again; one a program compiles (its own file, or one it includes) has the
+    /// projects evaluated again, its directives being its project's.</summary>
     private (bool Made, bool Written) ProgramsChanged(IEnumerable<string> paths)
     {
         if (session.Workspace is not { } workspace)
@@ -137,11 +219,7 @@ public partial class MainWindow
         foreach (string path in paths.Where(Passenger.Host.ProgramFiles.IsProgram))
         {
             bool known = projects.Any(p => p.IsProgram && PathNames.Same(p.Path, path));
-            bool now = File.Exists(path)
-                && !projects.Any(p => p.IsProgram ? !PathNames.Same(p.Path, path) && p.Holds(path) : PathNames.Within(path, p.Folder))
-                && (workspace.IsProgramFile(path)
-                    || projects.Any(p => p.IsProgram && p.ProjectReferences.Contains(path, PathNames.Comparer)));
-            if (known != now)
+            if (known != workspace.IsProgramNow(path, projects))
             {
                 return (true, false);
             }
@@ -294,17 +372,18 @@ public partial class MainWindow
     }
 
     /// <summary>File Cache Conflict: the disk's version, or the edits made here, written over the disk's. Until it is
-    /// answered the file is never saved, so the answer is the person's.</summary>
+    /// answered the file is never saved, so the answer is the person's: closed unanswered, both stay as they are, and the
+    /// file's next save asks again.</summary>
     private async Task ResolveConflictAsync(OpenDocument document)
     {
         try
         {
-            bool fromDisk = await AskConflict(document);
-            if (fromDisk)
+            bool? fromDisk = await AskConflict(document);
+            if (fromDisk == true)
             {
                 document.Reload(overUnsaved: true);
             }
-            else
+            else if (fromDisk == false)
             {
                 Editors.SaveOver(document);
             }
@@ -315,14 +394,24 @@ public partial class MainWindow
         }
     }
 
-    /// <summary>The question itself: true for Load File System Changes.</summary>
-    public Func<OpenDocument, Task<bool>> AskConflict
+    private const string LoadDisk = "Load File System Changes";
+    private const string KeepMemory = "Keep Memory Changes";
+
+    /// <summary>The question itself: true for Load File System Changes, false for Keep Memory Changes, null once closed
+    /// unanswered. It comes on its own as another program writes the file, and either answer loses something, so no key
+    /// typed for the editor answers it: Enter and Escape are Cancel.</summary>
+    public Func<OpenDocument, Task<bool?>> AskConflict
     {
-        get => askConflict ?? (document => new ConfirmDialog("File Cache Conflict",
-            $"Changes have been made to {document.Name} in memory and on disk. Load the version on disk, losing the changes made here, or keep the changes made here, writing them over it?",
-            "Load File System Changes", "Keep Memory Changes").ShowDialog<bool>(this));
+        get => askConflict ?? (async document => await Choose("File Cache Conflict",
+            $"Changes have been made to {document.Name} in memory and on disk. Load the version on disk, losing the changes made here, or keep the changes made here, writing them over it? Cancel leaves both as they are, asking again when the file is next saved.",
+            [LoadDisk, KeepMemory], chosen: null) switch
+        {
+            LoadDisk => true,
+            KeepMemory => false,
+            _ => null,
+        });
         set => askConflict = value;
     }
 
-    private Func<OpenDocument, Task<bool>>? askConflict;
+    private Func<OpenDocument, Task<bool?>>? askConflict;
 }

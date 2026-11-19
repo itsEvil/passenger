@@ -35,8 +35,9 @@ public sealed class LanguageServer : IAsyncDisposable
     /// <summary>Servers running in this process, for a test's words on what each was doing as a wait gave up.</summary>
     private static readonly System.Collections.Concurrent.ConcurrentDictionary<LanguageServer, byte> Live = new();
 
-    /// <summary>The check: the folding ranges of a document never opened, which Roslyn answers with none.</summary>
-    private static readonly FoldingRangeParams Check = new(new TextDocumentIdentifier("file:///passenger-is-the-server-answering.cs"));
+    /// <summary>The check: the folding ranges of a document never opened, which Roslyn answers with none, finding no
+    /// document. Its URI is no file's, so no server takes it in as a loose file to load, on any system.</summary>
+    private static readonly FoldingRangeParams Check = new(new TextDocumentIdentifier("passenger:is-the-server-answering.cs"));
 
     /// <summary>Servers started in this IDE, for the handshake salt of each one's MSBuild nodes.</summary>
     private static int started;
@@ -62,10 +63,10 @@ public sealed class LanguageServer : IAsyncDisposable
     private long changes;
 
     /// <summary>A count of what may have changed the server's answers since it started: each notification it was sent (an
-    /// open, a change or close of a document, files changed on disk, options), each of Passenger's own project
-    /// requests, each time it said its projects loaded or its diagnostics changed, and each change it made that nothing
-    /// said (<see cref="AnswersMoved"/>). Roslyn's server watches nothing itself, so an answer pulled at one count stands
-    /// while the count does.</summary>
+    /// open, a change or close of a document, files changed on disk, options), each project it was given, each time it said
+    /// its projects loaded or its diagnostics changed, and each change it made as it was asked that nothing said
+    /// (<see cref="AnswersMoved"/>); never a request that only reads (a completion list, a symbol's lookup, a pull).
+    /// Roslyn's server watches nothing itself, so an answer pulled at one count stands while the count does.</summary>
     public long Changes => Interlocked.Read(ref changes);
 
     /// <summary>Counts a change the server has made as it was asked, which it says only seconds later, if at all.</summary>
@@ -242,6 +243,11 @@ public sealed class LanguageServer : IAsyncDisposable
     /// then is in what it loads. Raised on the answering thread, before the answer goes.</summary>
     public event EventHandler<ProjectGiven>? ProjectGiven;
 
+    /// <summary>Passenger's project loader in the server asked for a project's design-time builds (as it named the project),
+    /// which it loads once given: raised on the answering thread before they are looked for, <see cref="ProjectGiven"/>
+    /// following once they go.</summary>
+    public event EventHandler<string>? ProjectAsked;
+
     /// <summary>The server's colours moved in a way only it knows (a project reloaded, a file changed elsewhere): the
     /// semantic tokens should be asked for again. Raised on any thread.</summary>
     public event EventHandler? ColoursRefreshRequested;
@@ -264,8 +270,9 @@ public sealed class LanguageServer : IAsyncDisposable
     /// with nothing. Raised on any thread.</summary>
     public event EventHandler<ServerMessage>? Said;
 
-    /// <summary>The TypeScript server says which TypeScript it runs: its version, and where it is from (<c>workspace</c>,
-    /// the project's own node_modules; <c>bundled</c>, the one carried beside it). Raised on any thread.</summary>
+    /// <summary>The TypeScript server says which TypeScript it runs: its version, and where it is from (<c>user-setting</c>,
+    /// the one it was named; <c>workspace</c>, the project's own node_modules; <c>bundled</c>, the one carried beside it).
+    /// Raised on any thread.</summary>
     public event EventHandler<(string Version, string? Source)>? TypeScriptVersion;
 
     /// <summary>The TypeScript the server last said it runs, null until it has (or for another server).</summary>
@@ -281,11 +288,21 @@ public sealed class LanguageServer : IAsyncDisposable
 
     public string LogFolder { get; }
 
+    /// <summary>The file this server's log is written to, in <see cref="LogFolder"/>.</summary>
+    public string LogPath => log.FilePath;
+
     /// <summary>The files the server asked the client to watch for it, rather than watch them itself.</summary>
     public WatchedFiles WatchedFiles { get; }
 
     /// <summary>A line of the client's own in the server's log, timed as the server's are.</summary>
     internal void Note(string line) => log.Write($"{DateTime.Now:HH:mm:ss.fff} {line}");
+
+    /// <summary>What the server's log notes as the server says its projects loaded.</summary>
+    public const string LoadedNote = "The server said its projects loaded";
+
+    /// <summary>What the server's log notes as the server says its diagnostics may have changed, every pull before it standing
+    /// for nothing (<see cref="Changes"/>).</summary>
+    public const string RefreshedNote = "The server said its diagnostics may have changed";
 
     /// <summary>Why Passenger's extension to the server (<see cref="RoslynExtension"/>) cannot be asked, or null when every
     /// handler of it is active.</summary>
@@ -360,11 +377,14 @@ public sealed class LanguageServer : IAsyncDisposable
         Notify(LspMethods.DidChangeConfiguration, new { settings = new { } });
     }
 
-    /// <summary>Every document's diagnostics from one source, as the solution-wide analysis has them, each report given to
-    /// <paramref name="streamed"/> as the server sends it, since Roslyn holds the pull open until the source next changes.
-    /// The answer's own reports are given back; none is given to <paramref name="streamed"/> after it.</summary>
+    /// <summary>Every document's diagnostics from one source, each report given to <paramref name="streamed"/> as the server
+    /// sends it, since Roslyn holds the pull open until the source next changes; the answer's own are given back. Given
+    /// <paramref name="frameworks"/>, Passenger's extension answers, each multi-targeted project analysed in its framework
+    /// alone and every report naming its project, and <paramref name="analysed"/> is called once it has analysed every
+    /// source, after the reports it found, before it holds the pull open.</summary>
     public async Task<IReadOnlyList<WorkspaceDocumentDiagnosticReport>> WorkspaceDiagnosticsAsync(string? source, IReadOnlyList<PreviousResultId> previous,
-        Action<IReadOnlyList<WorkspaceDocumentDiagnosticReport>> streamed, CancellationToken cancel = default)
+        Action<IReadOnlyList<WorkspaceDocumentDiagnosticReport>> streamed, CancellationToken cancel = default, IReadOnlyDictionary<string, string>? frameworks = null,
+        Action? analysed = null)
     {
         string token = $"passenger-workspace-diagnostic-{Interlocked.Increment(ref partialResults)}";
         client.Partials[token] = report =>
@@ -373,11 +393,16 @@ public sealed class LanguageServer : IAsyncDisposable
             {
                 streamed(report.Items);
             }
+            else if (report is not null && frameworks is not null)
+            {
+                analysed?.Invoke();
+            }
         };
         try
         {
             // How long it is held says nothing of the server, nor is it work in flight.
-            return (await InvokeAsync<WorkspaceDiagnosticReport>(LspMethods.WorkspaceDiagnostic, new WorkspaceDiagnosticParams(source, previous, token), cancel, inFlight: false))?.Items ?? [];
+            string method = frameworks is null ? LspMethods.WorkspaceDiagnostic : Roslyn.Extension.ExtensionMethods.WorkspaceDiagnostic;
+            return (await InvokeAsync<WorkspaceDiagnosticReport>(method, new WorkspaceDiagnosticParams(source, previous, token, frameworks), cancel, inFlight: false))?.Items ?? [];
         }
         finally
         {
@@ -442,9 +467,19 @@ public sealed class LanguageServer : IAsyncDisposable
             arguments.AddRange(["--extension", RoslynExtension.Assembly]);
         }
         // On the runtime Passenger runs on, whatever the machine has: with no .NET at all, a lone file still has its help.
-        ProcessStartInfo start = ChildProcesses.ConservingMemory(ChildProcesses.NamingDotnet(ChildProcesses.HelperCommand(server, arguments)));
+        ProcessStartInfo start = ChildProcesses.ConservingMemory(ChildProcesses.NamingDotnet(ChildProcesses.HelperCommand(server, arguments), folder));
         // A server's MSBuild nodes are its own: a restart ends them, which would cut short a build that took one up.
         start.Environment[MSBuildNames.NodeHandshakeSalt] += $"-server-{Interlocked.Increment(ref started)}";
+        // A temporary folder of its own, where no other server takes away the library code it writes for Go to Declaration.
+        if (stateCache is not null && RoslynServerFolder.TemporaryOf(stateCache) is { } temporary)
+        {
+            start.Environment[RoslynServerFolder.TemporaryVariable] = temporary;
+            // NuGet's scratch stays where Passenger's own restores take it, its extraction locks shared with them.
+            if (!(start.Environment.TryGetValue(NuGetScratch.Variable, out string? named) && !string.IsNullOrEmpty(named)) && NuGetScratch.Shared() is { } scratch)
+            {
+                start.Environment[NuGetScratch.Variable] = scratch;
+            }
+        }
         // The server's restore takes no properties, and off Windows a WPF project restores only with this (NETSDK1100).
         if (!OperatingSystem.IsWindows() && !start.Environment.ContainsKey(MSBuildNames.EnableWindowsTargeting))
         {
@@ -580,7 +615,7 @@ public sealed class LanguageServer : IAsyncDisposable
                 }
                 if (Stopwatch.GetElapsedTime(began) > limit)
                 {
-                    throw new LanguageServerFailed($"it did not listen on port {port} in {limit.TotalSeconds:0} s", LspMethods.Initialize, refused);
+                    throw new LanguageServerFailed($"it did not listen on port {port} in {Durations.Said(limit)}", LspMethods.Initialize, refused);
                 }
             }
             finally
@@ -643,7 +678,7 @@ public sealed class LanguageServer : IAsyncDisposable
         Task errorsHeard, string folder, string logFolder, JsonElement capabilities, object? initializationOptions, IReadOnlyDictionary<string, object>? options,
         Func<string?, object?>? configure, Func<string, CancellationToken, Task<string>>? content, bool rootPath, CancellationToken cancel)
     {
-        SystemTextJsonFormatter formatter = new() { JsonSerializerOptions = Json.Options };
+        EnvelopeFormatter formatter = new(Json.Options);
         CountedMessages handler = new(input, output, formatter);
         ClientTarget client = new();
         // One at a time, in order: a progress report handled after its end would leave the load showing.
@@ -745,15 +780,11 @@ public sealed class LanguageServer : IAsyncDisposable
 
     /// <summary>A request someone waits for the answer to: one still waiting after <see cref="SlowRequest"/> has the
     /// server checked, and raises <see cref="NotResponding"/> if that goes unanswered too; <paramref name="about"/> names
-    /// what it asks where the method alone does not (an extension handler's). A <see cref="LanguageServerFailed"/> when the
-    /// server does not answer it.</summary>
+    /// what it asks where the method alone does not (an extension handler's, a diagnostic pull's source). A
+    /// <see cref="LanguageServerFailed"/> when the server does not answer it.</summary>
     public async Task<T?> RequestAsync<T>(string method, object parameters, CancellationToken cancel = default, string? about = null)
     {
         long id = Interlocked.Increment(ref requests);
-        if (method.StartsWith("passenger/", StringComparison.Ordinal))
-        {
-            Changing(method);
-        }
         lock (waiting)
         {
             waiting[id] = (about is null ? method : $"{method} ({about[(about.LastIndexOf('.') + 1)..]})", Stopwatch.GetTimestamp());
@@ -812,9 +843,9 @@ public sealed class LanguageServer : IAsyncDisposable
         return hold.Holding.Task;
     }
 
-    /// <summary>Sends the next request of a method whose parameters <paramref name="which"/> takes and holds its answer until
-    /// <paramref name="until"/> ends, as one the server worked out before what goes on meanwhile, for a test of that. Done
-    /// once the answer has come and is held.</summary>
+    /// <summary>Holds the next answer to come of a method whose parameters <paramref name="which"/> takes until
+    /// <paramref name="until"/> ends, as one the server worked out before what goes on meanwhile, for a test of that: a
+    /// request let go before its answer came leaves it to the next. Done once an answer is held.</summary>
     public Task HoldNextAnswer(string method, Func<object, bool> which, Task until)
     {
         Hold hold = new(method, which, until, Answered: true, new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously));
@@ -828,11 +859,11 @@ public sealed class LanguageServer : IAsyncDisposable
     /// <summary>A request a test holds: unsent, or its answer once it has come; <see cref="Holding"/> done once it is held.</summary>
     private sealed record Hold(string Method, Func<object, bool> Which, Task Until, bool Answered, TaskCompletionSource Holding);
 
-    private Hold? Held(string method, object parameters)
+    private Hold? Held(string method, object parameters, bool answered)
     {
         lock (holding)
         {
-            int at = holding.FindIndex(h => h.Method == method && h.Which(parameters));
+            int at = holding.FindIndex(h => h.Method == method && h.Answered == answered && h.Which(parameters));
             if (at < 0)
             {
                 return null;
@@ -869,20 +900,19 @@ public sealed class LanguageServer : IAsyncDisposable
             {
                 throw new LanguageServerFailed("the language server refused it: as a test asked", method);
             }
-            Hold? held = Held(method, parameters);
-            if (held is { Answered: false })
+            if (Held(method, parameters, answered: false) is { } unsent)
             {
-                held.Holding.TrySetResult();
-                await held.Until.WaitAsync(cancel).ConfigureAwait(false);
+                unsent.Holding.TrySetResult();
+                await unsent.Until.WaitAsync(cancel).ConfigureAwait(false);
             }
             Task<T?> answer = rpc.InvokeWithParameterObjectAsync<T?>(method, parameters, cancel);
             try
             {
                 T? answered = await answer.WaitAsync(cancel).ConfigureAwait(false);
-                if (held is { Answered: true })
+                if (Held(method, parameters, answered: true) is { } kept)
                 {
-                    held.Holding.TrySetResult();
-                    await held.Until.WaitAsync(cancel).ConfigureAwait(false);
+                    kept.Holding.TrySetResult();
+                    await kept.Until.WaitAsync(cancel).ConfigureAwait(false);
                 }
                 return answered;
             }
@@ -951,7 +981,7 @@ public sealed class LanguageServer : IAsyncDisposable
     {
         try
         {
-            if (Held(method, parameters) is { Answered: false } held)
+            if (Held(method, parameters, answered: false) is { } held)
             {
                 held.Holding.TrySetResult();
                 await held.Until.ConfigureAwait(false);
@@ -970,6 +1000,8 @@ public sealed class LanguageServer : IAsyncDisposable
         disposing = true;
         killed = true;
         Live.TryRemove(this, out _);
+        // Its callback holds the server, and through it what the client gave it, for as long as the timer runs.
+        watch.Dispose();
         socket?.Dispose();
         // Its tree and its process group, so a BuildHost it was loading with goes too.
         if (process is not null)
@@ -1022,7 +1054,7 @@ public sealed class LanguageServer : IAsyncDisposable
             if (!disposing)
             {
                 hung = true;
-                NotResponding?.Invoke(this, $"{slowest} waited {waited.TotalSeconds:0} s, then a check went unanswered for {ResponseLimit.TotalSeconds:0} s");
+                NotResponding?.Invoke(this, $"{slowest} waited {Durations.Said(waited)}, then a check went unanswered for {Durations.Said(ResponseLimit)}");
             }
         }
         finally
@@ -1066,7 +1098,7 @@ public sealed class LanguageServer : IAsyncDisposable
             return;
         }
         (string method, TimeSpan longest) = past.MaxBy(p => p.Age);
-        LongWait wait = new($"{method} has waited {longest.TotalSeconds:0} s{(past.Count > 1 ? $", with {past.Count - 1} more past {Patience.TotalSeconds:0} s" : string.Empty)}",
+        LongWait wait = new($"{method} has waited {Durations.Said(longest)}{(past.Count > 1 ? $", with {past.Count - 1} more past {Durations.Said(Patience)}" : string.Empty)}",
             Conversation());
         Note($"{wait.Asked}: {wait.Conversation}");
         Waited?.Invoke(this, wait);
@@ -1089,11 +1121,11 @@ public sealed class LanguageServer : IAsyncDisposable
         List<string> parts =
         [
             asking.Count == 0 ? "no request waits on it" : $"{Plural.Of(asking.Count, "request")} {Plural.Agreeing(asking.Count, "waits", "wait")} on it ("
-                + string.Join(", ", asking.Take(6).Select(a => $"{a.Method} {a.Age.TotalSeconds:0} s")) + (asking.Count > 6 ? ", …" : string.Empty) + ")",
-            check == 0 ? "it has answered no check" : $"it answered Passenger's check {Stopwatch.GetElapsedTime(check).TotalSeconds:0} s ago",
-            heard == 0 ? "it has sent nothing" : $"it last sent a message {Stopwatch.GetElapsedTime(heard).TotalSeconds:0} s ago",
+                + string.Join(", ", asking.Take(6).Select(a => $"{a.Method} {Durations.Said(a.Age)}")) + (asking.Count > 6 ? ", …" : string.Empty) + ")",
+            check == 0 ? "it has answered no check" : $"it answered Passenger's check {Durations.Said(Stopwatch.GetElapsedTime(check))} ago",
+            heard == 0 ? "it has sent nothing" : $"it last sent a message {Durations.Said(Stopwatch.GetElapsedTime(heard))} ago",
             unanswered.Count == 0 ? "Passenger owes it no answer"
-                : "Passenger has not yet answered its " + string.Join(", ", unanswered.Take(4).Select(u => $"{u.Method} ({Stopwatch.GetElapsedTime(u.Since).TotalSeconds:0} s)")),
+                : "Passenger has not yet answered its " + string.Join(", ", unanswered.Take(4).Select(u => $"{u.Method} ({Durations.Said(Stopwatch.GetElapsedTime(u.Since))})")),
             unsent == 0 ? "every message Passenger wrote has reached it" : $"{unsent} of Passenger's messages have not yet reached its input",
         ];
         return $"{who}: {string.Join("; ", parts)}. Its last messages: {string.Join(", ", messages.Recent())}";
@@ -1318,6 +1350,8 @@ public sealed class LanguageServer : IAsyncDisposable
 
         private readonly StreamWriter writer = new(new FileStream(path, FileMode.Append, FileAccess.Write, FileShare.ReadWrite | FileShare.Delete)) { AutoFlush = true };
         private bool closed;
+
+        public string FilePath { get; } = path;
 
         /// <summary>A new server's log, named by when it began, so the names sort oldest first, and by its process, the id
         /// the IDE's log names when it ends; the oldest logs past <see cref="Kept"/> are deleted, but those of servers
@@ -1698,8 +1732,8 @@ public sealed class LanguageServer : IAsyncDisposable
         [JsonRpcMethod(LspMethods.ProjectInitializationComplete)]
         public void ProjectsLoaded(JsonElement? message = null)
         {
+            Owner?.Note(LoadedNote);
             Owner?.Changing(LspMethods.ProjectInitializationComplete);
-            Owner?.WatchedFiles.Loaded();
             Owner?.ProjectsLoaded?.Invoke(Owner, EventArgs.Empty);
         }
 
@@ -1715,6 +1749,7 @@ public sealed class LanguageServer : IAsyncDisposable
             }
             DateTime at = DateTime.UtcNow;
             owner.Changing(Roslyn.Extension.ProjectMethods.Info);
+            owner.ProjectAsked?.Invoke(owner, asked.Path);
             FedProject fed = await feed.InfoAsync(asked.Path, CancellationToken.None).ConfigureAwait(false);
             owner.WatchedFiles.Tell(fed.Changed);
             owner.ProjectGiven?.Invoke(owner, new ProjectGiven(asked.Path, at, fed.Changed.Count > 0));
@@ -1732,6 +1767,7 @@ public sealed class LanguageServer : IAsyncDisposable
         [JsonRpcMethod(LspMethods.DiagnosticRefresh)]
         public object? RefreshDiagnostics(JsonElement? request = null)
         {
+            Owner?.Note(RefreshedNote);
             Owner?.Changing(LspMethods.DiagnosticRefresh);
             Owner?.DiagnosticsRefreshRequested?.Invoke(Owner, EventArgs.Empty);
             return null;

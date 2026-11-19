@@ -8,13 +8,14 @@ namespace Passenger.App.CSharp;
 
 /// <summary>The files a language server registered to hear of (<see cref="WatchedFiles"/>), watched for it: those of the
 /// open folder by the folder's own watcher (<see cref="Heard"/>), the rest by watchers of this one's own, each folder once:
-/// outside the folder, inside a folder the folder's watcher passes over, and the build output in a folder registered with
-/// what is under it; with no folder watcher, every folder registered. Each is watched as the folder's watcher watches its
-/// folder (<see cref="WatchedTree"/>), recorded only as deep as the registrations over it reach and only the files they
-/// match, so what a burst lost is found. A watcher starts as its registration comes, and what was written in its folder
-/// since the server, or a design-time build it was given, may have read it is told then (<see cref="WatchedFiles.Since"/>).
-/// What changed reaches the server from the thread pool, one notification for each batch, in the order each watcher saw
-/// it. The folders watched, and any that cannot be, are said in the IDE's log.</summary>
+/// outside the folder, inside a folder the folder's watcher passes over, and the build output however deep under a folder
+/// registered with what is under it; with no folder watcher, every folder registered. Each is watched as the folder's
+/// watcher watches its folder (<see cref="WatchedTree"/>), recorded only as deep as the registrations over it reach and
+/// only the files they match, so what a burst lost is found. A watcher starts as its registration comes, and what was
+/// written in its folder since the server, or a design-time build it was given, may have read it is told once its first
+/// walk has listed it (<see cref="WatchedFiles.Since"/>). What changed reaches the server from the thread pool, one
+/// notification for each batch, in the order each watcher saw it, each watcher in a turn of its own. The folders watched,
+/// and any that cannot be, are said in the IDE's log.</summary>
 public sealed class ServerWatches : IDisposable
 {
     /// <summary>How far a file system's clock may round a file's time down: one written as the server, or a build, began
@@ -33,6 +34,13 @@ public sealed class ServerWatches : IDisposable
     /// again in a moment is another folder to Linux's and Windows' watchers.</summary>
     private readonly HashSet<string> renewed = new(PathNames.Comparer);
 
+    /// <summary>The build output found under each folder registered with what is under it (<see cref="BuildOutput"/>), kept
+    /// until what the folder's watcher hears may have moved it (<see cref="Heard"/>).</summary>
+    private readonly Dictionary<string, IReadOnlyList<string>> outputs = new(PathNames.Comparer);
+
+    /// <summary>How many times <see cref="outputs"/> was let go of, so a walk that ran meanwhile is not kept.</summary>
+    private int outputsDropped;
+
     /// <summary>The folders a watcher could not be started for, said once each.</summary>
     private readonly HashSet<string> unwatchable = new(PathNames.Comparer);
 
@@ -46,12 +54,10 @@ public sealed class ServerWatches : IDisposable
     private bool refreshAgain;
     private bool disposed;
 
-    /// <summary>What the watchers of this one's own saw is told the server one batch after another in the order they were
-    /// seen, so a file made and then deleted is never told the other way round, a watcher's walk as it starts among them.</summary>
-    private Task telling = Task.CompletedTask;
-
-    /// <summary>What the folder's watcher saw, told in a turn of its own: none of its files is another watcher's, so a walk
-    /// of a large folder watched apart from it (the references' packs) never holds what was written in the folder.</summary>
+    /// <summary>What the folder's watcher saw, told one batch after another in the order they were seen, so a file made and
+    /// then deleted is never told the other way round; in a turn of its own, as each of this one's watchers tells in its own
+    /// (<see cref="Watched.Telling"/>): none of their files is another's, so a walk of a large folder (the references' packs)
+    /// never holds what the others tell.</summary>
     private Task tellingHeard = Task.CompletedTask;
 
     /// <summary>The first walk of a watcher a test holds (<see cref="HoldNextWalk"/>): of which folder, what it waits for, and
@@ -98,12 +104,14 @@ public sealed class ServerWatches : IDisposable
         lock (gate)
         {
             this.folder = folder;
+            DropOutputs();
         }
         RefreshNow();
     }
 
     /// <summary>What the folder's watcher saw: each file told as made, changed or gone, every file of the folder too when
-    /// what changed was lost; and a passed-over folder come or gone watched or let go of.</summary>
+    /// what changed was lost; and the build output looked for again where a project, a restore or a passed-over folder came,
+    /// went or changed, a passed-over folder come or gone watched anew or let go of.</summary>
     public void Heard(FolderChanges changes)
     {
         string? open;
@@ -118,17 +126,44 @@ public sealed class ServerWatches : IDisposable
         if (changes.Lost || changes.Paths.Count > 0)
         {
             watched.Hearing(changes.Paths);
-            InTurn(() => Tell(changes, open, recursive: true, IgnoredFolders.Is), heard: true);
+            InTurn(() =>
+            {
+                watched.Tell(Events(changes, open, recursive: true, IgnoredFolders.Is));
+                return Task.CompletedTask;
+            }, of: null);
         }
-        List<string> outputs = [.. changes.ComeOrGone.Where(IgnoredFolders.Is)];
-        if (outputs.Count > 0)
+        List<string> passedOver = [.. changes.ComeOrGone.Where(IgnoredFolders.Is)];
+        // A project's folder moved in, out or within brings its project file; Godot.NET.Sdk's output comes with its first restore.
+        if (passedOver.Count > 0 || changes.Projects || changes.Restored.Count > 0 || changes.Lost)
         {
             lock (gate)
             {
-                renewed.UnionWith(outputs);
+                renewed.UnionWith(passedOver);
+                DropOutputs();
             }
             Refresh();
         }
+    }
+
+    /// <summary>Has each of this one's watchers look again for what the system dropped without a word (<see
+    /// cref="WatchedTree.LookAgainAsync"/>), as the folder's watcher does: worth a stat for each folder they record, kept to
+    /// what the registrations reach (for Passenger's own solution, its packs and packages, about 2,700 folders in 470
+    /// watchers, under 10 ms in all). Done once what they found is handed on to be told in turn.</summary>
+    public Task LookAgainAsync()
+    {
+        List<Watched> all;
+        lock (gate)
+        {
+            all = [.. own.Values];
+        }
+        return Task.WhenAll(all.Select(w => w.LookAgainAsync()));
+    }
+
+    /// <summary>Lets go of the build output found, to be looked for again; under the gate.</summary>
+    private void DropOutputs()
+    {
+        outputs.Clear();
+        outputsDropped++;
     }
 
     public void Dispose()
@@ -148,9 +183,11 @@ public sealed class ServerWatches : IDisposable
     private void OnRegistered(object? sender, EventArgs e) => Refresh();
 
     /// <summary>Stops watching what is under folders about to go or move (deleted, renamed or moved by the IDE), and starts
-    /// nothing there until disposed, when what the registrations need is watched again: Windows moves and deletes no folder
-    /// with a folder inside it watched. Done once no refresh still starts a watcher there.</summary>
-    public IDisposable LetGo(IReadOnlyList<string> folders)
+    /// nothing there until disposed (<c>Held</c>), when what the registrations need is watched again: Windows moves and
+    /// deletes no folder with a folder inside it watched, or a file or folder inside it open. Returns once no refresh still
+    /// starts a watcher there; <c>Stopped</c> is done once the watchers stopped have run what they had queued, so none of
+    /// them still lists a folder there.</summary>
+    public (IDisposable Held, Task Stopped) LetGo(IReadOnlyList<string> folders)
     {
         List<Watched> stopped;
         // Taken as a refresh takes it, so none starts a watcher under them after this.
@@ -170,7 +207,7 @@ public sealed class ServerWatches : IDisposable
             IdeErrors.Write($"C# language server (process {server.ProcessId}): no longer watched for it, as {Plural.Listed([.. folders])} {Plural.Agreeing(folders.Count, "goes or moves", "go or move")}: "
                 + string.Join(", ", stopped.Select(w => w.Top)));
         }
-        return new LettingGo(this, folders);
+        return (new LettingGo(this, folders), Task.WhenAll(stopped.Select(w => w.Stopped)));
     }
 
     /// <summary>Whether a folder is under one about to go or move; asked under the gate.</summary>
@@ -193,14 +230,15 @@ public sealed class ServerWatches : IDisposable
                 {
                     watches.going.Remove(folder);
                 }
+                watches.DropOutputs();
             }
             watches.Refresh();
         }
     }
 
     /// <summary>Holds the first walk of the next watcher started apart from the folder's for a folder <paramref name="which"/>
-    /// takes, in its turn of telling the server, until <paramref name="until"/> ends, as a large folder's walk goes on a while
-    /// on a busy machine, for a test of what is told meanwhile. Done once it is held.</summary>
+    /// takes until <paramref name="until"/> ends, as a large folder's walk goes on a while on a cold or busy machine, for a
+    /// test of what is told meanwhile. Done once the walk waits.</summary>
     public Task HoldNextWalk(Func<string, bool> which, Task until)
     {
         TaskCompletionSource holding = new(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -211,8 +249,7 @@ public sealed class ServerWatches : IDisposable
         return holding.Task;
     }
 
-    /// <summary>What a watcher's first walk of a folder waits for in its turn: a test's hold of it (<see cref="HoldNextWalk"/>),
-    /// else nothing.</summary>
+    /// <summary>What a watcher's first walk of a folder waits for: a test's hold of it (<see cref="HoldNextWalk"/>), else nothing.</summary>
     private Task WalkHeld(string top)
     {
         lock (gate)
@@ -243,10 +280,10 @@ public sealed class ServerWatches : IDisposable
         }
     }
 
-    /// <summary>What changed in a folder, each file told as made, changed or gone; with changes lost there, every other file
-    /// in it (and in the folders under it when <paramref name="recursive"/>, but those <paramref name="passedOver"/> names)
-    /// told as changed.</summary>
-    private void Tell(FolderChanges changes, string top, bool recursive, Func<string, bool> passedOver)
+    /// <summary>What changed in a folder, each file as made, changed or gone; with changes lost there, every other file in it
+    /// (and in the folders under it when <paramref name="recursive"/>, but those <paramref name="passedOver"/> names) as
+    /// changed.</summary>
+    private static List<FileEvent> Events(FolderChanges changes, string top, bool recursive, Func<string, bool> passedOver)
     {
         List<FileEvent> events = new(changes.Paths.Count);
         foreach (string path in changes.Paths)
@@ -257,33 +294,21 @@ public sealed class ServerWatches : IDisposable
         if (changes.Lost)
         {
             HashSet<string> named = new(changes.Paths, PathNames.Comparer);
-            events.AddRange(Every(top, recursive, passedOver, since: null).Where(change => !named.Contains(change.Path)));
-        }
-        watched.Tell(events);
-    }
-
-    /// <summary>The files in a folder, each as changed: in the folders under it too when <paramref name="recursive"/>, but
-    /// those <paramref name="passedOver"/> names; every one, or those written <paramref name="since"/>.</summary>
-    private static List<FileEvent> Every(string top, bool recursive, Func<string, bool> passedOver, DateTime? since)
-    {
-        List<FileEvent> events = [];
-        foreach ((string _, IReadOnlyList<string> files) in PathNames.FilesUnder(top, sub => recursive && !passedOver(sub)))
-        {
-            events.AddRange(files.Where(file => since is not { } after || Written(file) >= after).Select(file => new FileEvent(file, FileChangeType.Changed)));
+            events.AddRange(Every(top, recursive, passedOver).Where(change => !named.Contains(change.Path)));
         }
         return events;
     }
 
-    private static DateTime Written(string file)
+    /// <summary>The files in a folder, each as changed: in the folders under it too when <paramref name="recursive"/>, but
+    /// those <paramref name="passedOver"/> names.</summary>
+    private static List<FileEvent> Every(string top, bool recursive, Func<string, bool> passedOver)
     {
-        try
+        List<FileEvent> events = [];
+        foreach ((string _, IReadOnlyList<string> files) in PathNames.FilesUnder(top, sub => recursive && !passedOver(sub)))
         {
-            return File.GetLastWriteTimeUtc(file);
+            events.AddRange(files.Select(file => new FileEvent(file, FileChangeType.Changed)));
         }
-        catch (Exception error) when (error is IOException or UnauthorizedAccessException)
-        {
-            return DateTime.MinValue;
-        }
+        return events;
     }
 
     /// <summary>Watches anew what the registrations need, at once on the thread pool, a burst of registrations (a load
@@ -322,7 +347,8 @@ public sealed class ServerWatches : IDisposable
     }
 
     /// <summary>Starts the watchers the registrations need, has those kept walk again what the registrations over them reach
-    /// now, stops those no longer needed once the new ones watch every folder they keep, and says what changed.</summary>
+    /// now, stops those no longer needed once the new ones in their place watch every folder they keep (<see cref="Retire"/>),
+    /// and says what changed.</summary>
     private void RefreshNow()
     {
         lock (refreshing)
@@ -332,12 +358,14 @@ public sealed class ServerWatches : IDisposable
             List<(string Folder, bool Recursive)> starting;
             List<Watched> renewing = [];
             List<Watched> kept;
+            string? beside;
             lock (gate)
             {
                 if (disposed)
                 {
                     return;
                 }
+                beside = folder;
                 foreach ((string Folder, bool Recursive) made in own.Keys.Where(k => renewed.Any(r => PathNames.Within(k.Folder, r))).ToList())
                 {
                     renewing.Add(own[made]);
@@ -355,7 +383,7 @@ public sealed class ServerWatches : IDisposable
             List<Watched> started = [];
             foreach ((string at, bool recursive) in starting)
             {
-                Watched tree = new(this, at, recursive, Concerning(at, watches));
+                Watched tree = new(this, at, recursive, Concerning(at, watches), apart: beside is null || !PathNames.Within(at, beside));
                 bool taken = false;
                 lock (gate)
                 {
@@ -389,16 +417,10 @@ public sealed class ServerWatches : IDisposable
                 {
                     retiring.UnionWith(stopped);
                 }
-                // Where each folder is watched on its own, the new watchers' folders are watched as their first walk goes.
-                IdeErrors.Observe(BackgroundWork.Run(async () =>
+                foreach (Watched old in stopped)
                 {
-                    await Task.WhenAll(started.Select(tree => tree.Ready));
-                    stopped.ForEach(w => w.Dispose());
-                    lock (gate)
-                    {
-                        retiring.ExceptWith(stopped);
-                    }
-                }));
+                    Retire(old, [.. started.Where(tree => PathNames.Within(tree.Top, old.Top) || PathNames.Within(old.Top, tree.Top))]);
+                }
             }
             if (started.Count > 0 || stopped.Count > 0)
             {
@@ -407,6 +429,24 @@ public sealed class ServerWatches : IDisposable
                     + (stopped.Count > 0 ? $"; no longer {string.Join(", ", stopped.Select(w => w.Top))}" : string.Empty));
             }
         }
+    }
+
+    /// <summary>Stops a watcher no longer needed once those started over or under its folder have walked them, since where
+    /// each folder is watched on its own a folder is watched only as the walk reaches it; held as background work until it
+    /// has stopped.</summary>
+    private void Retire(Watched old, List<Watched> replacing)
+    {
+        async Task StopAsync()
+        {
+            await Task.WhenAll(replacing.Select(tree => tree.Ready));
+            old.Dispose();
+            lock (gate)
+            {
+                retiring.Remove(old);
+            }
+        }
+        // Not held behind a walk apart: it can go on for minutes, and nothing drawn waits for the old watcher to go.
+        IdeErrors.Observe(replacing.Any(tree => tree.Apart) ? BackgroundWork.Unheld(StopAsync) : BackgroundWork.Run(StopAsync));
     }
 
     /// <summary>The registrations that may match a path in a folder: those of a folder in it, over it, or of no folder.</summary>
@@ -419,10 +459,14 @@ public sealed class ServerWatches : IDisposable
     private HashSet<(string Folder, bool Recursive)> Needed()
     {
         string? beside;
+        List<string> leaving;
         lock (gate)
         {
             beside = folder;
+            leaving = [.. going];
         }
+        // Nothing under a folder about to go or move is looked at: Windows refuses the move while a file or folder there is open.
+        bool Leaving(string at) => leaving.Any(g => PathNames.Within(at, g));
         List<(string Folder, bool Recursive)> wanted = [];
         foreach (FileWatch watch in watched.Watches.DistinctBy(w => (w.Folder, w.Recursive)))
         {
@@ -431,20 +475,24 @@ public sealed class ServerWatches : IDisposable
                 // A glob over whole paths: the folder's watcher's changes are matched against it, and nothing more is known of where.
                 continue;
             }
+            if (Leaving(at))
+            {
+                continue;
+            }
             if (beside is null || !PathNames.Within(at, beside) || IgnoredFolders.AnyIn(beside, PathNames.Below(at, beside)))
             {
                 wanted.Add((at, watch.Recursive));
             }
             else if (watch.Recursive)
             {
-                wanted.AddRange(BuildOutput(at).Select(output => (output, true)));
+                wanted.AddRange(OutputUnder(at, Leaving).Select(output => (output, true)));
             }
         }
         HashSet<(string Folder, bool Recursive)> needed = [];
         List<string> whole = [.. wanted.Where(w => w.Recursive).Select(w => w.Folder)];
         foreach ((string at, bool recursive) in wanted)
         {
-            if (whole.Any(above => PathNames.IsUnder(at, above) || (!recursive && PathNames.Same(at, above))))
+            if (whole.Any(above => PathNames.IsUnder(at, above) || (!recursive && PathNames.Same(at, above))) || Leaving(at))
             {
                 continue;
             }
@@ -460,14 +508,67 @@ public sealed class ServerWatches : IDisposable
         return needed;
     }
 
-    /// <summary>The passed-over folders in a folder the folder's watcher hears that a build writes (a project's obj, with the
-    /// sources it generates, its bin, artifacts): neither version control's and other IDEs' (hidden) nor dependencies'
-    /// (node_modules), which hold no project's files and would take a watch for each of their many folders on Linux.</summary>
-    private static IEnumerable<string> BuildOutput(string at)
+    /// <summary>The build output under a folder (<see cref="BuildOutput"/>), as found before unless it may have moved since;
+    /// none walked under a folder <paramref name="leaving"/> takes, as about to go or move.</summary>
+    private IReadOnlyList<string> OutputUnder(string at, Func<string, bool> leaving)
+    {
+        int asOf;
+        lock (gate)
+        {
+            if (outputs.TryGetValue(at, out IReadOnlyList<string>? found))
+            {
+                return found;
+            }
+            asOf = outputsDropped;
+        }
+        IReadOnlyList<string> walked = BuildOutput(at, leaving);
+        lock (gate)
+        {
+            if (outputsDropped == asOf)
+            {
+                outputs[at] = walked;
+            }
+        }
+        return walked;
+    }
+
+    /// <summary>The passed-over folders a build writes in a folder the folder's watcher hears, and in each project's folder
+    /// it hears under it through no link, however deep: a project's obj, with the sources it generates, its bin, artifacts,
+    /// Godot.NET.Sdk's .godot/mono/temp. Neither version control's and other IDEs' (hidden) nor dependencies' (node_modules),
+    /// which hold no project's files and would take a watch for each of their many folders on Linux.</summary>
+    private static List<string> BuildOutput(string at, Func<string, bool> leaving) =>
+        [.. PathNames.FoldersUnder(at, sub => !IgnoredFolders.Is(sub) && !leaving(sub) && (File.GetAttributes(sub) & FileAttributes.ReparsePoint) == 0)
+            .SelectMany(folder => BuildOutputIn(folder, registered: PathNames.Same(folder, at)))];
+
+    /// <summary>The build output in one folder the folder's watcher hears (<see cref="BuildOutput"/>): in the folder
+    /// <paramref name="registered"/>, else only if it holds a project, so no other program's bin under it is watched.</summary>
+    private static List<string> BuildOutputIn(string folder, bool registered)
     {
         try
         {
-            return [.. Directory.EnumerateDirectories(at).Where(sub => IgnoredFolders.Is(sub) && Path.GetFileName(sub) is not ['.', ..] and not "node_modules")];
+            List<string> passedOver = [.. Directory.EnumerateDirectories(folder).Where(IgnoredFolders.Is)];
+            if (passedOver.Count == 0 || !registered && !ProjectFolders.HoldsProject(folder))
+            {
+                return [];
+            }
+            List<string> found = [];
+            foreach (string sub in passedOver)
+            {
+                string name = Path.GetFileName(sub);
+                if (name == IgnoredFolders.GodotCache)
+                {
+                    string godot = Path.Join(sub, "mono", "temp");
+                    if (Directory.Exists(godot))
+                    {
+                        found.Add(godot);
+                    }
+                }
+                else if (name is not ['.', ..] and not "node_modules")
+                {
+                    found.Add(sub);
+                }
+            }
+            return found;
         }
         catch (Exception error) when (error is IOException or UnauthorizedAccessException)
         {
@@ -487,21 +588,14 @@ public sealed class ServerWatches : IDisposable
         IdeErrors.Write($"C# language server (process {server.ProcessId}): {at} cannot be watched for it, so it hears nothing changed there: {why}");
     }
 
-    /// <summary>Tells the server on the thread pool after what was told before from the same watchers, the folder's
-    /// (<paramref name="heard"/>) or this one's own, held as background work until it has.</summary>
-    private void InTurn(Action tell, bool heard = false) => InTurn(() =>
-    {
-        tell();
-        return Task.CompletedTask;
-    }, heard);
-
-    /// <summary>As <see cref="InTurn(Action, bool)"/>, the next told once what <paramref name="tell"/> waits for has ended.</summary>
-    private void InTurn(Func<Task> tell, bool heard = false)
+    /// <summary>Tells the server on the thread pool after what was told before from the same watcher, the folder's (none)
+    /// or one of this one's own, held as background work until it has.</summary>
+    private void InTurn(Func<Task> tell, Watched? of)
     {
         IDisposable held = BackgroundWork.Scope();
         lock (gate)
         {
-            Task next = (heard ? tellingHeard : telling).ContinueWith(async _ =>
+            Task next = (of is null ? tellingHeard : of.Telling).ContinueWith(async _ =>
             {
                 try
                 {
@@ -512,13 +606,13 @@ public sealed class ServerWatches : IDisposable
                     held.Dispose();
                 }
             }, TaskScheduler.Default).Unwrap();
-            if (heard)
+            if (of is null)
             {
                 tellingHeard = next;
             }
             else
             {
-                telling = next;
+                of.Telling = next;
             }
             IdeErrors.Observe(next);
         }
@@ -527,8 +621,10 @@ public sealed class ServerWatches : IDisposable
     /// <summary>A folder watched for the server as the folder's watcher watches the open folder, kept to the folders the
     /// registrations over it reach and recording only the files they match: a change the server never asked for (a
     /// build's churn) counts toward a burst but is never told; what was written since the server, or a build it was given,
-    /// may have read it is told as it starts; and with changes lost there, every file in it is told, those its record held
-    /// now gone too.</summary>
+    /// may have read it is told as its first walk ends, from the walk's own listings; and with changes lost there, every
+    /// file in it is told, those its record held now gone too. One outside the open folder walks apart from the IDE's
+    /// quiet: it holds nothing the window shows, and on a cold disk the walk of one as large as the references' packs
+    /// went on for minutes.</summary>
     private sealed class Watched : WatchedTree
     {
         private readonly ServerWatches owner;
@@ -536,30 +632,37 @@ public sealed class ServerWatches : IDisposable
         private readonly HashSet<string> came = new(PathNames.Comparer);
         private IReadOnlyList<FileWatch> concerning;
 
-        public Watched(ServerWatches owner, string top, bool recursive, IReadOnlyList<FileWatch> concerning)
+        public Watched(ServerWatches owner, string top, bool recursive, IReadOnlyList<FileWatch> concerning, bool apart)
             : base(top, FolderWatching.Platform, FolderWatching.Platform.EachFolder || !recursive)
         {
             this.owner = owner;
             this.concerning = concerning;
             Recursive = recursive;
-            Begin(walked: () =>
+            Apart = apart;
+            long began = System.Diagnostics.Stopwatch.GetTimestamp();
+            Begin(owner.watched.Since - Rounding, walked: written =>
             {
-                (int folders, int entries) = RecordSize;
-                IdeErrors.Write($"{Shown} records {Plural.Of(folders, "folder")} and {Plural.Of(entries, "entry", "entries")}");
-            });
-            if (Watches.Count > 0)
-            {
-                // Told whether or not a registration matches them yet: one the server's load sends later takes those kept for it.
-                DateTime since = owner.watched.Since - Rounding;
-                owner.InTurn(async () =>
+                if (IsDisposed)
                 {
-                    await owner.WalkHeld(top);
-                    owner.watched.Tell(Every(top, recursive, _ => false, since));
-                });
-            }
+                    return;
+                }
+                (int folders, int entries) = RecordSize;
+                IdeErrors.Write($"{Shown} records {Plural.Of(folders, "folder")} and {Plural.Of(entries, "entry", "entries")} "
+                    + $"{Durations.Said(System.Diagnostics.Stopwatch.GetElapsedTime(began))} after it started{(apart ? ", apart from the IDE's quiet" : string.Empty)}");
+                // Told whether or not a registration matches them yet: one the server's load sends later takes those kept for it.
+                owner.InTurn(() => TellAsync([.. written.Select(file => new FileEvent(file, FileChangeType.Changed))]), this);
+            }, after: owner.WalkHeld(top));
         }
 
         public bool Recursive { get; }
+
+        /// <summary>Whether the folder is outside the open one, or there is none, so its walks hold no background work.</summary>
+        public bool Apart { get; }
+
+        /// <summary>What this watcher's batches are told in, one after another (<see cref="InTurn"/>); under the owner's gate.</summary>
+        public Task Telling { get; set; } = Task.CompletedTask;
+
+        protected override bool WalksApart => Apart;
 
         protected override string Shown => $"C# language server (process {owner.server.ProcessId}): the watcher of {Top}";
 
@@ -646,13 +749,22 @@ public sealed class ServerWatches : IDisposable
         protected override void Hand(FolderChanges changes)
         {
             owner.watched.Hearing(changes.Paths);
-            owner.InTurn(() =>
+            owner.InTurn(() => IsDisposed ? Task.CompletedTask : TellAsync(Events(changes, Top, Recursive, _ => false)), this);
+        }
+
+        /// <summary>Tells the server what changed here, but an assembly of a folder it watches whole that no project
+        /// references (<see cref="WatchedFiles.ReferencedAsync"/>), unless the watcher was disposed meanwhile.</summary>
+        private async Task TellAsync(List<FileEvent> changes)
+        {
+            if (IsDisposed)
             {
-                if (!IsDisposed)
-                {
-                    owner.Tell(changes, Top, Recursive, _ => false);
-                }
-            });
+                return;
+            }
+            IReadOnlyList<FileEvent> told = await owner.watched.ReferencedAsync(changes, CancellationToken.None);
+            if (!IsDisposed)
+            {
+                owner.watched.Tell(told);
+            }
         }
 
         /// <summary>Said of the folder itself, and of any the system's watches ran out for; a folder under it gone as it was

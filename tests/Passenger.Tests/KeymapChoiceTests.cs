@@ -552,7 +552,8 @@ public sealed class KeymapChoiceTests : IDisposable
             Ui.Settle();
             Assert.Equal("Rerun", RunTips(window.BottomPanel.Build)[0]);
 
-            // Neither keymap gives Telemetry's two actions keys.
+            // Neither keymap gives Telemetry's two actions keys: the Aspire window's, which this folder's projects bring none of.
+            Ui.ServeEveryWindow(window);
             window.ShowToolWindow(ToolWindowIds.Aspire);
             window.AspireWindow.ShowTelemetry(TelemetryPage.Logs);
             Ui.Settle();
@@ -603,10 +604,10 @@ public sealed class KeymapChoiceTests : IDisposable
     }
 
     /// <summary>Duplicate, Compare Files, Show Diff, Parameter Info, Toggle Case, Generate, Clone Caret, the moves, Context
-    /// Help (with External Documentation's), Show Usages and Quick Evaluate Expression have in each keymap the keys and
-    /// gestures Rider's of that preset here resolves them to (<see cref="RiderKeymaps"/>), the Mac's Cmd+Up and Down too in
-    /// Visual Studio's and IntelliJ IDEA's. A key Rider gives several by place has one action, the rest taking it there
-    /// (<see cref="AppActions.KeysIn"/>); Rider's New is New Item.</summary>
+    /// Help (with External Documentation's), Show Usages, Quick Evaluate Expression, Open Solution and Open File have in
+    /// each keymap the keys and gestures Rider's of that preset here resolves them to (<see cref="RiderKeymaps"/>), the
+    /// Mac's Cmd+Up and Down too in Visual Studio's and IntelliJ IDEA's. A key Rider gives several by place has one
+    /// action, the rest taking it there (<see cref="AppActions.KeysIn"/>); Rider's New is New Item.</summary>
     [AvaloniaFact]
     public void Each_keymaps_keys_for_Duplicate_Parameter_Info_Toggle_Case_and_Generate_are_those_Riders_keymap_resolves_them_to()
     {
@@ -630,6 +631,7 @@ public sealed class KeymapChoiceTests : IDisposable
                 (EditorActions.TextEnd, "EditorTextEnd", mac && !vsCode ? ["meta DOWN"] : []),
                 (AppActions.ContextHelp, "ContextHelp", [.. RiderKeymaps.Resolve(rider, "ExternalJavaDoc").Select(s => s.Notation())]),
                 (AppActions.ShowUsages, "ShowUsages", []), (AppActions.QuickEvaluate, "QuickEvaluateExpression", []),
+                (AppActions.OpenSolution, "RiderOpenSolution", []), (AppActions.OpenFile, "OpenFile", []),
             ];
             foreach ((string action, string riders, string[] besides) in checks)
             {
@@ -654,6 +656,31 @@ public sealed class KeymapChoiceTests : IDisposable
             string[] riderNew = [.. RiderKeymaps.Resolve(rider, "NewElement").Except(RiderKeymaps.Resolve(rider, "Generate")).Select(s => s.Notation()).Order(StringComparer.Ordinal)];
             Assert.True(newItem.SequenceEqual(riderNew),
                 $"In {DefaultKeymaps.NameOf(preset)}'s keymap New Item runs from [{string.Join("; ", newItem)}], where Rider's New (NewElement) has [{string.Join("; ", riderNew)}] that Generate does not take");
+        }
+    }
+
+    /// <summary>The Switcher has in each keymap the keys Rider's of that preset here resolves its Switcher to, Ctrl+Tab going
+    /// on and Ctrl+Shift+Tab going back (Control on the Mac too), and no other action has them.</summary>
+    [AvaloniaFact]
+    public void Each_keymaps_Switcher_keys_are_those_Riders_keymap_resolves_them_to()
+    {
+        foreach (KeymapPreset preset in SettingsDialog.KeymapChoices)
+        {
+            AppActions.Choose(preset, new Dictionary<string, string[]>());
+            Keymap keymap = AppActions.Keymap();
+            string rider = RiderKeymaps.Of(preset);
+            IReadOnlyList<Shortcut> theirs = RiderKeymaps.Resolve(rider, "Switcher");
+            foreach ((string action, bool back) in new[] { (AppActions.Switcher, false), (AppActions.SwitcherBackward, true) })
+            {
+                string[] ours = [.. keymap.ShortcutsFor(action).Select(s => s.Notation()).Order(StringComparer.Ordinal)];
+                string[] expected = [.. theirs.Where(s => s.First.Modifiers.HasFlag(KeyModifiers.Shift) == back).Select(s => s.Notation()).Order(StringComparer.Ordinal)];
+                Assert.True(expected.Length > 0 && ours.SequenceEqual(expected),
+                    $"In {DefaultKeymaps.NameOf(preset)}'s keymap {action} runs from [{string.Join("; ", ours)}], where Rider's {rider} gives its Switcher [{string.Join("; ", expected)}]");
+                foreach (Shortcut key in keymap.ShortcutsFor(action))
+                {
+                    Assert.True(keymap.ActionFor(key) == action, $"In {DefaultKeymaps.NameOf(preset)}'s keymap {key.Notation()} runs {keymap.ActionFor(key)}, not {action}");
+                }
+            }
         }
     }
 
@@ -685,9 +712,9 @@ public sealed class KeymapChoiceTests : IDisposable
             Ui.Settle();
             Ui.ClickRow(window, window.ExplorerView.Tree.Rows.First(r => r.Path == Passenger.Core.PathNames.Canonical(lines)));
             Ui.Press(window, $"{Cmd} D");
-            Ui.Landed(() => window.Frontmost is Passenger.App.Vcs.DiffWindow, "the diff of lines.txt and other.txt");
-            Assert.Equal("lines.txt vs other.txt", window.Frontmost.Title);
-            window.Frontmost.Close();
+            Passenger.App.Vcs.IDiffHost diff = OpenDiffs.Landed(window, "the diff of lines.txt and other.txt");
+            Assert.Equal("lines.txt vs other.txt", OpenDiffs.TitleOf(diff));
+            diff.Close();
             Ui.Settle();
             Assert.True(Text(window) == Duplicated, $"{Cmd} D in the Explorer changed the editor's text to \"{Text(window)}\", where it compares files there");
         }

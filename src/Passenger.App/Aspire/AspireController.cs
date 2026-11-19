@@ -2,6 +2,7 @@ using Passenger.App.Debugging;
 using Passenger.App.LiveTree;
 using Passenger.App.Run;
 using Passenger.App.ToolWindows;
+using Passenger.App.Workspace;
 using Passenger.Core;
 using Passenger.Profiler;
 using System.Diagnostics;
@@ -173,7 +174,7 @@ public sealed partial class AspireController(ProjectSession workspace, string st
         {
             return null;
         }
-        if (selection.Resource.State is not ("Running" or "Starting"))
+        if (selection.Resource.State is not (AspireStates.Running or AspireStates.Starting))
         {
             return null;
         }
@@ -225,7 +226,7 @@ public sealed partial class AspireController(ProjectSession workspace, string st
             app.Choose(unstarted, debugging);
             return;
         }
-        if (selection.Resource.State is not ("NotStarted" or "Exited" or "Finished" or "FailedToStart")
+        if (!AspireStates.IsStopped(selection.Resource.State)
             || selection.Resource.Uid is not { Length: > 0 } uid
             || !app.OwnedResourceIdentities.TryGetValue(uid, out (string Name, string Project, string IdentityKey)? remembered) || remembered is not { } identity
             || identity.Name != selection.Resource.Name || selection.Resource.Source is not { } source
@@ -264,11 +265,12 @@ public sealed partial class AspireController(ProjectSession workspace, string st
     }
 
     /// <summary>Starts an Aspire configuration's AppHosts, each built first as it says (<paramref name="build"/> told what to do
-    /// as the build saves the files), and once each is connected to answers null, else why not. <paramref name="https"/> is
+    /// as the build saves the files, and the workspace whose build configuration it builds as: each AppHost's configuration's
+    /// own, <see cref="ProjectSession.WorkspaceOfAsync"/>), and once each is connected to answers null, else why not. <paramref name="https"/> is
     /// how its HTTPS is served, as the start worked out before: over HTTP, the AppHosts' own addresses and the services they
     /// start serve HTTP for this run.</summary>
     public async Task<string?> StartAsync(RunConfiguration configuration, RunStart mode,
-        Func<BuildStep, Action?, Task<BuildOutcome>> build, CancellationToken cancellation = default, HttpsChoice? https = null)
+        Func<BuildStep, Action?, WorkspaceModel?, Task<BuildOutcome>> build, CancellationToken cancellation = default, HttpsChoice? https = null)
     {
         UiThread.Check();
         ObjectDisposedException.ThrowIf(disposed, this);
@@ -376,18 +378,24 @@ public sealed partial class AspireController(ProjectSession workspace, string st
     }
 
     private async Task<AspireAppRun> StartAppAsync(RunConfiguration configuration, RunStart mode, string group,
-        Func<BuildStep, Action?, Task<BuildOutcome>> build, CancellationToken cancellation, (string AppHost, string Name)? profileTarget, HttpsChoice https,
+        Func<BuildStep, Action?, WorkspaceModel?, Task<BuildOutcome>> build, CancellationToken cancellation, (string AppHost, string Name)? profileTarget, HttpsChoice https,
         IReadOnlyList<string> said)
     {
         // Followed from the save of the AppHost's build, which builds the services it starts: each start's session copies them.
         BuiltEdits? followed = null;
         AspireAppRun app;
         LaunchPlan plan;
+        // What the AppHost and the services it starts build and run as, its configuration's own build configuration where it names one.
+        (WorkspaceModel? configured, string? unconfigured) = await workspace.WorkspaceOfAsync(configuration);
+        if (unconfigured is not null)
+        {
+            throw new LaunchException(unconfigured);
+        }
         try
         {
             IReadOnlyList<ProjectModel> projects = workspace.Projects;
             BuiltInputs.Listing began = await BackgroundWork.Run(() => BuiltInputs.Listed(configuration.Project, projects));
-            plan = await ResolveAppHostAsync(configuration, BuildAsync, cancellation);
+            plan = await ResolveAppHostAsync(configuration, configured, BuildAsync, cancellation);
             if (plan.Build is { } step && await BuildAsync(step) is { Succeeded: false } failed)
             {
                 throw new LaunchException(failed.Message);
@@ -403,6 +411,7 @@ public sealed partial class AspireController(ProjectSession workspace, string st
             }
             app = new(configuration, mode, group)
             {
+                Configured = configured,
                 ProfileTarget = profileTarget,
                 BuildBegan = began,
                 OverHttp = https.OverHttp is not null,
@@ -455,7 +464,7 @@ public sealed partial class AspireController(ProjectSession workspace, string st
                 environment[name] = value;
             }
             environment.Remove(AspireVariables.DebugSessionCertificate);
-            environment[AspireVariables.DebugSessionRunMode] = mode == RunStart.Debug ? "Debug" : "NoDebug";
+            environment[AspireVariables.DebugSessionRunMode] = mode == RunStart.Debug ? AspireRunModes.Debug : AspireRunModes.NoDebug;
             environment["AppHost__FilePath"] = configuration.Project;
             environment[AspireVariables.TelemetryOptOut] = "1";
             chosen = ConfigureResourceService(app, environment);
@@ -530,7 +539,7 @@ public sealed partial class AspireController(ProjectSession workspace, string st
         {
             followed?.Dispose();
             followed = workspace.Debug.Kept();
-        });
+        }, configured);
     }
 
     /// <summary>The run's resources followed from its connection until it stops, whatever the window shows: each container
@@ -763,7 +772,8 @@ public sealed partial class AspireController(ProjectSession workspace, string st
         }
     }
 
-    private async Task<LaunchPlan> ResolveAppHostAsync(RunConfiguration configuration, Func<BuildStep, Task<BuildOutcome>> build, CancellationToken cancellation)
+    private async Task<LaunchPlan> ResolveAppHostAsync(RunConfiguration configuration, WorkspaceModel? configured, Func<BuildStep, Task<BuildOutcome>> build,
+        CancellationToken cancellation)
     {
         if (!Path.GetExtension(configuration.Project).Equals(".cs", StringComparison.OrdinalIgnoreCase))
         {
@@ -771,7 +781,7 @@ public sealed partial class AspireController(ProjectSession workspace, string st
             {
                 throw new LaunchException("Owned Aspire AppHosts must launch the project's built target; clear Exe path");
             }
-            return await LaunchPlan.ResolveAsync(configuration, workspace.Projects, workspace.Workspace, stateFolder, cancellation);
+            return await LaunchPlan.ResolveAsync(configuration, workspace.Projects, configured, stateFolder, cancellation);
         }
         if (configuration.Program.Length > 0 || configuration.Framework.Length > 0)
         {
@@ -783,7 +793,7 @@ public sealed partial class AspireController(ProjectSession workspace, string st
         {
             if (!AspireAppHosts.IsSingleFile(configuration.Project))
             {
-                throw new LaunchException("The selected C# file does not declare the Aspire AppHost SDK");
+                throw new LaunchException($"The selected C# file names neither {Passenger.Host.AspireHosts.Sdk} nor {Passenger.Host.AspireHosts.Package} in its directives, so it is no Aspire AppHost");
             }
             if (AspireAppHosts.SingleFileWhyNot(configuration.Project, Directory.EnumerateFiles(folder, "*", SearchOption.TopDirectoryOnly)) is { } unsupported)
             {
@@ -799,9 +809,11 @@ public sealed partial class AspireController(ProjectSession workspace, string st
             throw new LaunchException(failed.Message);
         }
         cancellation.ThrowIfCancellationRequested();
-        ChildResult evaluated = await ChildProcesses.RunAsync(ChildProcesses.DotnetCommand(
-            ["build", configuration.Project, "--output", output, "--no-restore", "--nologo", $"-getProperty:{Passenger.Host.CarriedProperties.TargetPath}"], folder), cancel: cancellation);
-        string target = evaluated.Output.Trim();
+        MSBuildQuestion built = new([]) { Properties = [Passenger.Host.CarriedProperties.TargetPath] };
+        MSBuildAnswer evaluated = new(await ChildProcesses.RunAsync(ChildProcesses.DotnetCommand(
+            ["build", configuration.Project, "--output", output, "--no-restore", "--nologo", .. configured?.BuildArgumentsFor(configuration.Project) ?? [], .. built.Asking],
+            folder), cancel: cancellation), built.Alone);
+        string target = evaluated.Property(Passenger.Host.CarriedProperties.TargetPath) ?? string.Empty;
         if (!evaluated.Succeeded || !Path.IsPathFullyQualified(target) || !await BackgroundWork.Run(() => File.Exists(target), cancellation))
         {
             throw new LaunchException($"MSBuild could not resolve the built single-file AppHost {Passenger.Host.CarriedProperties.TargetPath}");
@@ -818,7 +830,7 @@ public sealed partial class AspireController(ProjectSession workspace, string st
         return new LaunchPlan
         {
             Name = configuration.Name,
-            Program = target.EndsWith(".dll", StringComparison.OrdinalIgnoreCase) ? Dotnet.Host() : target,
+            Program = target.EndsWith(".dll", StringComparison.OrdinalIgnoreCase) ? Dotnet.Host(folder) : target,
             Arguments = [.. target.EndsWith(".dll", StringComparison.OrdinalIgnoreCase) ? new[] { target } : [],
                 .. CommandLine.Split(Expand(configuration.Arguments))],
             WorkingDirectory = configuration.WorkingDirectory.Length == 0 ? folder : PathNames.Canonical(Path.Combine(folder, Expand(configuration.WorkingDirectory))),
@@ -892,7 +904,7 @@ public sealed partial class AspireController(ProjectSession workspace, string st
         app.ProfileClaimed = true;
         string service = name ?? Path.GetFileNameWithoutExtension(path);
         TimeSpan limit = Waits.Of(ProfileLimit);
-        string past = $"{service} did not start under the profiler within {limit.TotalSeconds:0.##} s of its AppHost asking for it";
+        string past = $"{service} did not start under the profiler within {Durations.Said(limit)} of its AppHost asking for it";
         app.ProfileDue = (Stopwatch.GetTimestamp(), limit, past);
         app.ProfileAsked.TrySetResult(service);
         Task due = Task.Delay(limit, app.Lifetime.Token);
@@ -905,6 +917,12 @@ public sealed partial class AspireController(ProjectSession workspace, string st
             CancellationToken.None, TaskContinuationOptions.OnlyOnRanToCompletion | TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default));
         return true;
     }
+
+    /// <summary>The launch profile a Functions app runs in, as its AppHost takes one for it: the AppHost's own profile's name
+    /// where the app has one of it, else its first that runs a program; null for none.</summary>
+    private static LaunchProfile? FunctionsProfile(IReadOnlyList<LaunchProfile> profiles, string? appHosts) =>
+        profiles.FirstOrDefault(p => p.Name == appHosts)
+        ?? profiles.FirstOrDefault(p => string.IsNullOrEmpty(p.Command) || p.RunsProject || p.Is(LaunchProfile.ExecutableCommand));
 
     private async Task<AspireProjectSession> StartRequestedAsync(AspireAppRun app, AspireProjectLaunch request, bool profiling, CancellationToken cancellation)
     {
@@ -920,18 +938,33 @@ public sealed partial class AspireController(ProjectSession workspace, string st
         }
         ProjectModel? known = workspace.Projects.FirstOrDefault(project => PathNames.Same(project.Path, path));
         bool referenced = workspace.Projects.Any(project => project.ProjectReferences.Any(reference => PathNames.Same(reference, path)));
-        if (!WorkspaceModel.IsProject(path) || (known is null && !referenced && (workspace.Folder is null || !PathNames.IsUnder(path, workspace.Folder))))
+        if (!WorkspaceModel.IsProject(path))
         {
             throw new LaunchException("DCP requested a project outside this workspace and its project references");
         }
+        // One the folder holds, or reaches as its solution's and its AppHosts' projects beside it (lent its trust), or one referenced.
+        if (known is null && !referenced && !workspace.Reaches(path))
+        {
+            string refused = workspace.WhyNotReached(path);
+            Say(app, refused);
+            throw new LaunchException(refused);
+        }
         ProjectModel project = known ?? ProjectModel.Unevaluated(path);
         string? profileName = request.DisableLaunchProfile ? null : request.LaunchProfile ?? app.Configuration.LaunchProfile;
-        // The project and its launch profiles are read off the UI thread.
-        (bool exists, LaunchProfile? profile) = await BackgroundWork.Run(() => (File.Exists(path),
-            profileName is null ? null : LaunchProfile.Read(project).FirstOrDefault(candidate => candidate.Name == profileName)), cancellation);
+        // What the request loads into the service is the person's own: in the run's folders, the home folder or the system's.
+        string[] own = [.. new[] { workspace.Folder, Path.GetDirectoryName(path), Path.GetDirectoryName(app.Configuration.Project) }.OfType<string>(), .. LoadingVariables.PersonsFolders()];
+        // The project, its launch profiles and the files the request loads are read off the UI thread.
+        (bool exists, LaunchProfile? profile, string? loads) = await BackgroundWork.Run(() => (File.Exists(path),
+            request.Functions ? FunctionsProfile(LaunchProfile.Read(project), profileName)
+            : profileName is null ? null : LaunchProfile.Read(project).FirstOrDefault(candidate => candidate.Name == profileName),
+            LoadingVariables.WhyNot(request.Environment.Select(variable => (variable.Name, variable.Value)), own)), cancellation);
         if (!exists)
         {
             throw new LaunchException("DCP requested a project outside this workspace and its project references");
+        }
+        if (loads is not null)
+        {
+            throw new LaunchException(Refusals.LoadsOthersCode(project.Name, loads));
         }
         if (app.Stopping || workspace.IsEnded || disposed)
         {
@@ -942,7 +975,7 @@ public sealed partial class AspireController(ProjectSession workspace, string st
             : RunConfiguration.From(project, profile) with { Name = project.Name };
         configuration = configuration with { BuildBeforeLaunch = false, LaunchBrowser = false, Console = ConsoleKind.Internal };
         LaunchPlan plan = await LaunchPlan.ResolveAsync(configuration,
-            known is null ? [.. workspace.Projects, project] : workspace.Projects, workspace.Workspace, stateFolder, cancellation);
+            known is null ? [.. workspace.Projects, project] : workspace.Projects, app.Workspace ?? workspace.Workspace, stateFolder, cancellation);
         Dictionary<string, string> environment = new(plan.Environment, StringComparer.Ordinal);
         foreach (AspireEnvironmentVariable variable in request.Environment)
         {
@@ -960,6 +993,12 @@ public sealed partial class AspireController(ProjectSession workspace, string st
             ? [.. plan.Arguments.Take(plan.Leading), .. given]
             : plan.Arguments;
         plan = plan with { Name = $"{app.Configuration.Name} / {project.Name}", Environment = environment, Arguments = arguments };
+        // A project not loaded in the folder, whose evaluation has not said it is a Functions app.
+        if (request.Functions && !plan.Functions)
+        {
+            string func = await BackgroundWork.Run(FunctionsHost.Func, cancellation) ?? throw new LaunchException(Refusals.NoFunc(project.Name));
+            plan = FunctionsHost.Plan(plan, func, [.. plan.Arguments.Skip(plan.Leading)]);
+        }
         LaunchPlan stamped = plan;
         string stamp = await BackgroundWork.Run(() => AspireResourceRun.ReadBuiltStamp(stamped), cancellation);
         cancellation.ThrowIfCancellationRequested();
@@ -987,15 +1026,25 @@ public sealed partial class AspireController(ProjectSession workspace, string st
             // Held as the run decides from its first start (FirstHold); the one Profile records, for the profiler.
             RunStart? chosen = app.Starting(resource, () => FirstHold(app, resource, request));
             RunStart? held = profiling ? RunStart.Profile : chosen;
-            resource.Inspection = LiveApp.For(plan, workspace.Overlays);
+            if (request.Functions)
+            {
+                // A Functions app's worker, which func starts, is debugged alone: never recorded, nor attached to quietly.
+                held = held == RunStart.Profile ? throw new LaunchException(Refusals.FunctionsUnprofiled(serviceName)) : held == RunStart.Debug ? held : null;
+            }
+            resource.Inspection = request.Functions ? null : LiveApp.For(plan, workspace.Overlays);
             if (resource.Inspection is { } inspection)
             {
                 inspection.BindingFailed += (_, _) => BindingsFailed();
                 Inspected?.Invoke(inspection);
             }
             LaunchPlan inspected = resource.Inspection?.Plan ?? plan;
+            LaunchPlan unheld = inspected;
+            if (request.Functions && held is not null)
+            {
+                inspected = FunctionsHost.Debugged(inspected);
+            }
             // Held until what attaches lets it go, never where nothing can; the profiler's gets no changeable code to measure.
-            if (held is not null && AspireAppRun.DiagnosticsOff(inspected.Environment) is null)
+            else if (held is not null && AspireAppRun.DiagnosticsOff(inspected.Environment) is null)
             {
                 Dictionary<string, string> holding = new(inspected.Environment, StringComparer.Ordinal);
                 foreach ((string name, string value) in HeldStart.Variables(changeable: held != RunStart.Profile))
@@ -1025,18 +1074,12 @@ public sealed partial class AspireController(ProjectSession workspace, string st
                 // Those the AppHost marks sensitive are known secrets before its command line is echoed and logged.
                 await ArgumentsSaidAsync(app, resource, cancellation);
             }
-            ProcessRunner runner = resource.Runner = new ProcessRunner(resource.Console, takesInput: true);
-            runner.OutputReceived += (_, output) => app.Execution?.NotifyServiceLog(request.DcpInstanceId, request.SessionId, output.Text, output.IsError);
-            runner.Exited += (_, code) => Finished(app, resource, code);
-            string? refused = await runner.StartAsync(inspected.Start(), inspected.Environment);
-            if (refused is not null)
-            {
-                throw new LaunchException(refused);
-            }
-            resource.ProcessId = runner.ProcessId;
+            await StartedAsync(inspected);
             resource.Held = held == RunStart.Profile ? null : held;
-            // The run of services' one attach to this start, whose session (or recording) lets it go.
-            if (held is { } purpose && await (AttachStart ?? throw new LaunchException("The debugger is unavailable"))(app, resource, purpose, cancellation) is { } unattached)
+            // The run of services' one attach to this start, whose session (or recording) lets it go: a Functions app's to its worker.
+            if (held is { } purpose && (request.Functions && (resource.Worker = await FunctionsHost.StartedWorkerAsync(resource.ProcessId ?? throw new LaunchException(BuildRunController.StoppedStarting(serviceName)), cancellation)) is null
+                ? FunctionsHost.NoWorker
+                : await (AttachStart ?? throw new LaunchException("The debugger is unavailable"))(app, resource, purpose, cancellation)) is { } unattached)
             {
                 if (purpose == RunStart.Profile)
                 {
@@ -1045,10 +1088,16 @@ public sealed partial class AspireController(ProjectSession workspace, string st
                 // Held for a debugger that could not reach it, it would wait for good: it runs on unheld, said.
                 await app.HoldAsync(resource, null, CancellationToken.None);
                 resource.Held = null;
-                await LetGoAsync(resource.ProcessId);
-                string said = $"{serviceName} of {app.Name} runs without the debugger, which could not attach: {unattached}";
-                app.Console.Append(said + "\n", error: true);
-                RunsUndebugged?.Invoke(this, said);
+                if (request.Functions)
+                {
+                    await UnheldFunctionsAsync(unheld);
+                }
+                else
+                {
+                    await LetGoAsync(resource.ProcessId);
+                }
+                Say(app, $"{serviceName} of {app.Name} runs without the debugger, which could not attach: {unattached}"
+                    + (request.Functions ? "; func was started again, its worker not held for one" : string.Empty));
             }
             cancellation.ThrowIfCancellationRequested();
             if (profiling)
@@ -1068,10 +1117,53 @@ public sealed partial class AspireController(ProjectSession workspace, string st
         {
             app.Landed(resource, failure);
         }
+
+        // The resource's program started from the plan, its runner the resource's: only the runner it has now ends it.
+        async Task StartedAsync(LaunchPlan started)
+        {
+            ProcessRunner runner = resource.Runner = new ProcessRunner(resource.Console, takesInput: true);
+            runner.OutputReceived += (_, output) => app.Execution?.NotifyServiceLog(request.DcpInstanceId, request.SessionId, output.Text, output.IsError);
+            runner.Exited += (_, code) =>
+            {
+                if (resource.Runner == runner)
+                {
+                    Finished(app, resource, code);
+                }
+            };
+            if (await runner.StartAsync(started.Start(), started.Environment) is { } refused)
+            {
+                throw new LaunchException(refused);
+            }
+            resource.ProcessId = runner.ProcessId;
+        }
+
+        // A held worker, and each func's host starts as the last times out, waits for a debugger: func starts again unheld.
+        async Task UnheldFunctionsAsync(LaunchPlan unheld)
+        {
+            if (resource.Runner is not { } held)
+            {
+                return;
+            }
+            resource.Runner = null;
+            resource.Worker = null;
+            held.Stop();
+            await held.Ended;
+            held.Dispose();
+            cancellation.ThrowIfCancellationRequested();
+            await StartedAsync(unheld);
+        }
     }
 
-    /// <summary>A service held at its start for a debugger that could not reach it, which then runs on unheld: said.</summary>
-    public event EventHandler<string>? RunsUndebugged;
+    /// <summary>What a service's start says of itself the person is to hear, said in the window: a service held at its start
+    /// for a debugger that could not reach it, which then runs on unheld; a start refused before it began.</summary>
+    public event EventHandler<string>? Said;
+
+    /// <summary>Says what a service's start says of itself (<see cref="Said"/>), written in its AppHost's console too.</summary>
+    private void Say(AspireAppRun app, string said)
+    {
+        app.Console.Append(said + "\n", error: true);
+        Said?.Invoke(this, said);
+    }
 
     /// <summary>How long a start DCP gave arguments waits for its AppHost to say them (<see cref="ArgumentsSaidAsync"/>).</summary>
     private static readonly TimeSpan ArgumentsWait = TimeSpan.FromSeconds(5);
@@ -1104,7 +1196,7 @@ public sealed partial class AspireController(ProjectSession workspace, string st
         {
             if (waiting.IsCancellationRequested)
             {
-                IdeLog.Write(IdeLog.Ide, $"Aspire: {((IRunService)resource).Name} starts with arguments its AppHost had not said within {Waits.Of(ArgumentsWait).TotalSeconds:0} s");
+                IdeLog.Write(IdeLog.Ide, $"Aspire: {((IRunService)resource).Name} starts with arguments its AppHost had not said within {Durations.Said(Waits.Of(ArgumentsWait))}");
             }
         }
         catch (IOException)
@@ -1134,7 +1226,7 @@ public sealed partial class AspireController(ProjectSession workspace, string st
         }
         bool marked = app.Configuration.ServiceActions.Values.Contains(ServiceStart.Debug);
         bool debugging = Chosen?.Invoke(app.Configuration.Name, ((IRunService)resource).Name)
-            ?? (marked ? ResourceAction(app.Configuration, resource) == ServiceStart.Debug : request.Mode == "Debug");
+            ?? (marked ? ResourceAction(app.Configuration, resource) == ServiceStart.Debug : request.Mode == AspireRunModes.Debug);
         return debugging ? RunStart.Debug : app.Mode == RunStart.HotReload ? RunStart.HotReload : null;
     }
 
@@ -1290,6 +1382,9 @@ public sealed partial class AspireController(ProjectSession workspace, string st
             foreach (AspireResourceRun resource in resources)
             {
                 resource.Inspection?.Dispose();
+                // A hook no debugger took waits for its program, held or ended, until it is let go; one a debugger took goes with it too.
+                resource.Handlers?.Dispose();
+                resource.Browser?.Dispose();
             }
             captured.Add((app, resources, debuggers));
             app.Resources.Clear();
@@ -1404,6 +1499,11 @@ public sealed class AspireAppRun : ServiceRun
     private readonly Dictionary<string, TaskCompletionSource<string?>> nextStarts = new(StringComparer.Ordinal);
 
     private long started;
+
+    /// <summary>The workspace it was started in, whose build configuration it and the services it starts build and run as.</summary>
+    public WorkspaceModel? Configured { get; init; }
+
+    public override WorkspaceModel? Workspace => Configured;
 
     internal AspireAppRun(RunConfiguration configuration, RunStart mode, string group)
     {
@@ -1620,13 +1720,13 @@ public sealed class AspireAppRun : ServiceRun
     /// <summary>Nothing to write: a service's next start reads its hold.</summary>
     protected override Task HoldsChangedAsync(CancellationToken cancel) => Task.CompletedTask;
 
-    /// <summary>A service's program on this machine: the newest start of its replica (<see cref="Newest"/>), with its
-    /// inspected app, open to Hot Reload when it started held (with DOTNET_MODIFIABLE_ASSEMBLIES=debug).</summary>
+    /// <summary>A service's program on this machine: the newest start of its replica (<see cref="Newest"/>), a Functions
+    /// app's worker, with its inspected app, open to Hot Reload when it started held (with DOTNET_MODIFIABLE_ASSEMBLIES=debug).</summary>
     public override Task<ServiceProgram?> ProgramAsync(IRunService service, Task up, CancellationToken stop) =>
         Newest(service) is { ProcessId: int id } running
-            ? Task.FromResult<ServiceProgram?>(new ServiceProgram(id, null, null)
+            ? Task.FromResult<ServiceProgram?>(new ServiceProgram(running.Worker ?? id, null, null)
             {
-                HotReload = running.Held is not null,
+                HotReload = running.Held is not null && running.Worker is null,
                 App = running.Inspection,
                 Handlers = running.Handlers,
                 Browser = running.Browser,
@@ -1689,7 +1789,7 @@ public sealed class AspireAppRun : ServiceRun
                 }
                 catch (TimeoutException)
                 {
-                    return $"{name} did not start again within {limit.TotalMinutes:0.#} minutes of its restart";
+                    return $"{name} did not start again within {Durations.Said(limit)} of its restart";
                 }
             }
         }
@@ -1747,7 +1847,7 @@ public sealed class AspireAppRun : ServiceRun
     public bool IsLeftUnstarted(AspireResource resource) => UnstartedName(resource) is not null;
 
     /// <summary>The name of the service a resource is that the run left unstarted (<see cref="IsLeftUnstarted"/>), or null.</summary>
-    public string? UnstartedName(AspireResource resource) => resource.State == "FailedToStart" ? unstarted.FirstOrDefault(name =>
+    public string? UnstartedName(AspireResource resource) => resource.State == AspireStates.FailedToStart ? unstarted.FirstOrDefault(name =>
         resource.IsNamed(name)) : null;
 
     /// <summary>A resource's state as Passenger says it everywhere: <see cref="NotStarted"/> for one the run left unstarted,
@@ -1777,7 +1877,8 @@ public sealed class AspireAppRun : ServiceRun
     /// <summary>The service's start the session attached to keeps its tab (which the Aspire window chooses) and session.</summary>
     public override void Attached(IRunService service, ServiceProgram program, DebugTab? tab, DebugSession? debugged)
     {
-        if (Resources.Values.FirstOrDefault(resource => resource.ProcessId == program.Id) is not { } run)
+        // A Functions app's program is its worker, which func (the resource's process) started.
+        if (Resources.Values.FirstOrDefault(resource => (resource.Worker ?? resource.ProcessId) == program.Id) is not { } run)
         {
             return;
         }
@@ -1850,6 +1951,11 @@ public sealed class AspireResourceRun(string id, string instanceId, string proje
     internal string? SessionName { get; set; }
 
     public int? ProcessId { get; internal set; }
+
+    /// <summary>For a Functions app, its worker, which func (<see cref="ProcessId"/>) started and a debugger attaches to;
+    /// null for any other start, and before func started it.</summary>
+    public int? Worker { get; internal set; }
+
     public DebugTab? DebugTab { get; internal set; }
 
     /// <summary>The session attached to this start (in its tab, or quietly for Hot Reload), which its end lets go.</summary>

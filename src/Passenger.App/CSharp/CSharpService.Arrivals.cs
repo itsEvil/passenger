@@ -12,7 +12,8 @@ namespace Passenger.App.CSharp;
 /// the solution leaves them out. Each is heard by the folder's watcher or found written a moment ago (<see
 /// cref="WrittenNow"/>), and let go of once the server holds it, or once a load of its project that read the disk after it
 /// came has ended without it (a file the project leaves out). An open one is opened in the server only then. What waits
-/// for them waits only for those that can change its answer (<see cref="ReachOfAsync"/>).</summary>
+/// for them waits only for those that can change its answer (<see cref="ReachOfAsync"/>, <see cref="SeenFrom"/>). A project
+/// the server is asked to load again is waited for so too, by its own file (<see cref="Reloading"/>).</summary>
 public sealed partial class CSharpService
 {
     /// <summary>How long after a write a file may be on disk unheard by the folder's watcher.</summary>
@@ -27,6 +28,10 @@ public sealed partial class CSharpService
     /// <summary>When the server last asked for each project's design-time builds, by the project.</summary>
     private readonly Dictionary<string, DateTime> given = new(PathNames.Comparer);
 
+    /// <summary>When the server had last asked for each project's design-time builds as a load of it failed, by the project:
+    /// a load asked for since may take a file in.</summary>
+    private readonly Dictionary<string, DateTime> failedAsked = new(PathNames.Comparer);
+
     /// <summary>Done at the next load report, and made anew: what waits for a file to be taken in looks again then.</summary>
     private TaskCompletionSource reportHeard = new(TaskCreationOptions.RunContinuationsAsynchronously);
 
@@ -34,10 +39,15 @@ public sealed partial class CSharpService
     private CancellationTokenSource? holding;
 
     /// <summary>A file come under a project (<paramref name="Project"/>), when it was on disk by (heard, or written as found),
-    /// and whether a load of the project that read the disk since then has ended, after which the server holds it or never will.</summary>
+    /// and whether a load of the project that read the disk since then has ended, or the project's last load failed with
+    /// none asked for since, after which the server holds it or never will.</summary>
     private sealed record Arrival(string Project, DateTime Heard)
     {
         public bool Decided { get; set; }
+
+        /// <summary>Until when an open file it holds back waits: <see cref="Patience.Limit"/> after <see cref="Heard"/>, a moment
+        /// of the wall clock as a file's write time is, what is left of it counted on Stopwatch's clock.</summary>
+        public Deadline HeldUntil { get; } = Deadline.In(Patience.Limit - (DateTime.UtcNow - Heard));
     }
 
     /// <summary>Whether a C# file come under one of the folder's projects may not be in it in the server yet.</summary>
@@ -54,8 +64,8 @@ public sealed partial class CSharpService
     /// <summary>The C# files of the folder's projects the server may not hold in their projects yet that <paramref
     /// name="counted"/> names by path and project (null: all), with <paramref name="looking"/> those written a moment ago the
     /// watcher may not have heard (an agent's), waited for up to <paramref name="within"/>: none once each is held or left
-    /// out, else the rest; none from a server not loaded or without Passenger's extension. At once, on the thread, when none
-    /// is waited for or looked for; <paramref name="waiting"/> is told the first waited for, and null once a wait is over.</summary>
+    /// out, else the rest, first come first; none from a server not loaded or without Passenger's extension. At once, on the
+    /// thread, when none is waited for or looked for; <paramref name="waiting"/> is told the first come, null once it is over.</summary>
     public async Task<IReadOnlyList<(string Path, string Project)>> UnplacedAsync(TimeSpan within, bool looking, Func<string, string, bool>? counted, Action<string?>? waiting,
         CancellationToken cancel)
     {
@@ -114,7 +124,9 @@ public sealed partial class CSharpService
                 {
                     ConnectLoaded(running);
                 }
-                List<(string Path, string Project)> left = [.. asked.Where(p => arriving.TryGetValue(p, out Arrival? a) && Counts(p, a.Project)).Select(p => (p, arriving[p].Project))];
+                // First come first: the table keeps a new one in a place an earlier one left.
+                List<(string Path, string Project)> left = [.. asked.Where(p => arriving.TryGetValue(p, out Arrival? a) && Counts(p, a.Project))
+                    .OrderBy(p => arriving[p].Heard).Select(p => (p, arriving[p].Project))];
                 TimeSpan spent = Stopwatch.GetElapsedTime(began);
                 if (left.Count == 0 || spent >= within)
                 {
@@ -144,6 +156,23 @@ public sealed partial class CSharpService
     public Task<IReadOnlyList<(string Path, string Project)>> PlacedAsync(string path, TimeSpan within, bool looking, Action<string?>? waiting, CancellationToken cancel) =>
         UnplacedAsync(within, looking, (file, _) => PathNames.Same(file, path), waiting, cancel);
 
+    /// <summary>Which C# files come under the folder's projects can change what the server says of a file, by their paths and
+    /// projects: the file itself, and those of its project and of every project it references, through others too, whose
+    /// declarations its compilation reads.</summary>
+    public Func<string, string, bool> SeenFrom(string path)
+    {
+        UiThread.Check();
+        string file = PathNames.Canonical(path);
+        HashSet<string> seen = new(PathNames.Comparer);
+        if (workspace is { } opened && HolderOf(file) is { } project)
+        {
+            IReadOnlyList<ProjectModel> projects = ProjectsNow?.Invoke() ?? opened.Projects;
+            seen.Add(project);
+            seen.UnionWith(projects.FirstOrDefault(p => PathNames.Same(p.Path, project))?.WithReferenced(projects).Select(p => p.Path) ?? []);
+        }
+        return (arrived, holder) => PathNames.Same(arrived, file) || seen.Contains(holder);
+    }
+
     /// <summary>Waits, for a change at an offset of an open file, until the server holds in their projects the C# files come
     /// under the projects it reaches (<see cref="ReachOfAsync"/>), the file itself first, for up to <paramref name="within"/>
     /// in all: worked out before, the change leaves each it holds in none out (a rename its callers there). The rest when
@@ -165,7 +194,10 @@ public sealed partial class CSharpService
     /// (<see cref="ReachOfAsync"/>) that the server has not taken into them yet, looked at once: an answer given now says
     /// it went without them.</summary>
     public async Task<IReadOnlyList<(string Path, string Project)>> UntakenAsync(OpenDocument document, int offset, CancellationToken cancel) =>
-        Arriving ? await UnplacedAsync(TimeSpan.Zero, looking: false, await ReachOfAsync(document, offset, cancel), null, cancel) : [];
+        Arriving ? [.. (await UnplacedAsync(TimeSpan.Zero, looking: false, await ReachOfAsync(document, offset, cancel), null, cancel)).Where(u => !IsReload(u))] : [];
+
+    /// <summary>Whether what is waited for is a project to load again (<see cref="Reloading"/>), not a file come under it.</summary>
+    public static bool IsReload((string Path, string Project) waited) => PathNames.Same(waited.Path, waited.Project);
 
     /// <summary>Which C# files come under the folder's projects can change what the server says of the symbol at an offset
     /// of an open file, by their paths and projects: those of the project that declares it (the file's own where the
@@ -330,17 +362,71 @@ public sealed partial class CSharpService
     }
 
     /// <summary>A file waited for, as first on disk while undecided (a load that read the disk after that read it), and
-    /// again once decided only if it came since.</summary>
+    /// again once decided only if it came since; decided as it comes under a project whose last load failed, which no load
+    /// asked for since may take it into.</summary>
     private void Arrive(string path, string project, DateTime heard)
     {
         if (arriving.TryGetValue(path, out Arrival? was) && (was.Decided ? heard <= was.Heard : heard >= was.Heard))
         {
             return;
         }
-        arriving[path] = new Arrival(project, heard);
+        arriving[path] = new Arrival(project, heard)
+        {
+            Decided = LoadFailed(project) && given.GetValueOrDefault(project, DateTime.MinValue) <= failedAsked.GetValueOrDefault(project, DateTime.MinValue),
+        };
     }
 
-    /// <summary>A server asked for a project's design-time builds, from its thread.</summary>
+    /// <summary>Whether the server's last load of a project failed (<see cref="ProjectLoadProblem.FailedLoad"/>): it took in
+    /// none of the files come under it, and none until a load of it succeeds.</summary>
+    private bool LoadFailed(string project) => FailedLoadOf(project) is not null;
+
+    /// <summary>The first error of the server's last load of a project where that load failed, taking in nothing of it
+    /// (<see cref="ProjectLoadProblem.FailedLoad"/>); null where it loaded.</summary>
+    public ProjectLoadProblem? FailedLoadOf(string project) =>
+        loadProblems.TryGetValue(project, out List<ProjectLoadProblem>? met) ? met.FirstOrDefault(p => p.FailedLoad) : null;
+
+    /// <summary>Projects a loaded server fed by the window is asked to load again: what it says of them is of their load before
+    /// until it has, so each is waited for by its own file as a file come under it is, since now, until a load of it asked
+    /// for after has ended; but one MSBuild does not evaluate, whose load fails taking nothing in. A server building its
+    /// own, or still loading, is waited for otherwise.</summary>
+    private void Reloading(IReadOnlyList<string> projects)
+    {
+        if (session is not { IsLoaded: true, Fed: true } || workspace is not { } opened)
+        {
+            return;
+        }
+        IReadOnlyList<ProjectModel> evaluated = ProjectsNow?.Invoke() ?? opened.Projects;
+        DateTime now = DateTime.UtcNow;
+        foreach (string project in projects)
+        {
+            string path = PathNames.Canonical(project);
+            if (evaluated.FirstOrDefault(p => PathNames.Same(p.Path, path))?.Evaluated is not { Problem: not null })
+            {
+                arriving[path] = new Arrival(path, now);
+            }
+        }
+    }
+
+    /// <summary>Projects the server lets go of, whose load again nothing waits for any more.</summary>
+    private void LetGoOfReloads(IReadOnlyList<string> projects)
+    {
+        foreach (string project in projects)
+        {
+            arriving.Remove(PathNames.Canonical(project));
+        }
+    }
+
+    /// <summary>A server asked for a project's design-time builds, from its thread: its load waits on them.</summary>
+    private void OnProjectAsked(LanguageServer from) => UiThread.Post(() =>
+    {
+        if (session?.Server == from)
+        {
+            LetGoOfQuietRestores();
+            buildsAsked++;
+        }
+    });
+
+    /// <summary>A server was given a project's design-time builds it asked for, from its thread.</summary>
     private void OnProjectGiven(LanguageServer from, ProjectGiven built)
     {
         string project = PathNames.Canonical(built.Project);
@@ -348,22 +434,37 @@ public sealed partial class CSharpService
         {
             if (session?.Server == from)
             {
+                LetGoOfQuietRestores();
+                // Given, the load goes on, which the server reports in its own time.
+                buildsAsked = Math.Max(0, buildsAsked - 1);
+                loadSaid = Stopwatch.GetTimestamp();
                 given[project] = given.GetValueOrDefault(project) > built.Asked ? given[project] : built.Asked;
             }
         });
     }
 
     /// <summary>A project's load ended, as its report said: each file come under it before its design-time builds were asked
-    /// for is in it now or never will be (a server that builds its own projects asks none, so any load counts).</summary>
+    /// for is in it now or never will be (a server that builds its own projects asks none, so any load counts), and every
+    /// one where the load failed, having taken none in.</summary>
     private void Decide(string project)
     {
         bool fed = session?.Fed != false;
         DateTime asked = given.GetValueOrDefault(project, DateTime.MinValue);
-        foreach (Arrival arrival in arriving.Values)
+        bool failed = LoadFailed(project);
+        if (failed)
         {
-            if (!arrival.Decided && PathNames.Same(arrival.Project, project) && (!fed || asked > arrival.Heard))
+            failedAsked[project] = asked;
+        }
+        foreach ((string path, Arrival arrival) in arriving)
+        {
+            if (!arrival.Decided && PathNames.Same(arrival.Project, project) && (failed || !fed || asked > arrival.Heard))
             {
                 arrival.Decided = true;
+                if (!failed && IsReload((path, arrival.Project)))
+                {
+                    // Its generators run again a moment after, as after a restore's load: their code is waited for too.
+                    WaitForGenerators();
+                }
             }
         }
         TaskCompletionSource heard = reportHeard;
@@ -380,7 +481,7 @@ public sealed partial class CSharpService
         {
             return false;
         }
-        left = Patience.Limit - (DateTime.UtcNow - arrival.Heard);
+        left = arrival.HeldUntil.Left;
         return left > TimeSpan.Zero;
     }
 
@@ -435,6 +536,8 @@ public sealed partial class CSharpService
         arriving.Clear();
         leftOut.Clear();
         given.Clear();
+        failedAsked.Clear();
+        buildsAsked = 0;
         HoldBack(null);
     }
 }

@@ -14,9 +14,10 @@ export MSBUILDUSESERVER := "0"
 # The checkout as the disk names it, for recipes' shells and dotnet, which take a PWD naming their folder as its path.
 export PWD := justfile_directory()
 
-# Build everything (Debug). Warnings are errors.
+# Build everything (Debug). Warnings are errors. Its MSBuild nodes end with it, as several worktrees' idle ones held
+# gigabytes between builds.
 build:
-    dotnet build
+    dotnet build -nodeReuse:false
 
 # The suite dealt to several test processes at once, then the Alone classes in one (tools/test-run.py; results in
 # artifacts/test-results/local). PROCESSES is PASSENGER_TEST_PROCESSES by default, else a quarter of the processors, at
@@ -59,8 +60,8 @@ screenshot path *args:
     dotnet run --project {{app}} -- --screenshot {{path}} {{args}}
 
 # As the packages publish it, at the release's version (tools/release-common.sh): precompiled with ReadyToRun for startup,
-# only the packages the lock files pin. No Intel Mac build ships. The inner sh is named publish, which its failures say.
-# A self-contained Release build for one platform: just publish osx-arm64 | win-x64 | win-arm64 | linux-x64 | linux-arm64
+# only the packages the lock files pin. The inner sh is named publish, which its failures say.
+# A self-contained Release build for one platform: just publish osx-arm64 | osx-x64 | win-x64 | win-arm64 | linux-x64 | linux-arm64
 [unix]
 publish rid:
     sh -c '. tools/release-common.sh && version=$(release_version .) && publish_app . "$1" "$version"' publish {{ quote(rid) }}
@@ -83,9 +84,17 @@ container-tools *args:
 container-tools *args:
     $sh = (Get-Command sh -ErrorAction SilentlyContinue).Source; if (-not $sh) { $sh = Join-Path (Split-Path (Split-Path (Get-Command git).Source)) 'bin\sh.exe' }; & $sh tools/container-tools.sh {{args}}
 
+# Passenger's debug relay for Android (arm64, x64) and iOS (devices, Apple Silicon simulators) into
+# artifacts/debug-relay/<rid>/, which the app carries under debugger/relay/; macOS with Xcode and the Android workload.
+# just debug-relay [android] [apple]
+[unix]
+debug-relay *args:
+    tools/debug-relay.sh {{args}}
+
 # The app signed ad hoc, or with PASSENGER_SIGN_IDENTITY and then, with PASSENGER_NOTARY_PROFILE, the app and the image
 # notarized and stapled, and checked mounted; --dry-run writes what those two would run instead.
-# The macOS disk image, artifacts/package/Passenger-macos-arm64.dmg (Apple Silicon): just package-mac [osx-arm64] [--dry-run]
+# The macOS disk image, artifacts/package/Passenger-macos-arm64.dmg (Apple Silicon) or -x64.dmg (Intel, checked under
+# Rosetta on Apple Silicon): just package-mac [osx-arm64|osx-x64] [--dry-run]
 package-mac *args:
     tools/package-mac.sh {{args}}
 
@@ -113,9 +122,13 @@ package-linux rid="linux-x64":
 app-icon:
     tools/app-icon.sh
 
-# Rewrite the generated themes (Theme/Sorbet.axaml and the rest) from the palettes in tools/themes.py, contrast checked.
-themes:
-    python3 -I tools/themes.py
+# Rewrite the generated themes (Sorbet.json and the rest) from the palettes in tools/themes.py, contrast checked, into a
+# source's folder, their pictures too: a checkout of Zaneris/passenger-themes, or the tests' copy (tests/Passenger.Tests/Themes);
+# and the themes Passenger carries (Cubicle) into its built-in source.
+themes folder="tests/Passenger.Tests/Themes":
+    python3 -I tools/themes.py {{ quote(folder) }}
+    python3 -I tools/theme-pictures.py {{ quote(folder) }}
+    python3 -I tools/themes.py src/Passenger.App/Theme/BuiltIn
 
 # Rewrite src/Passenger.Workspace/GodotShaderTypes.json, Godot's shading language as its sources at one commit say it
 # (tools/godot-shader-types.py).
@@ -153,7 +166,8 @@ notices:
 unicode-widths:
     python3 -I tools/unicode-widths.py
 
-# Rewrite the tables a GDScript identifier's spoof check reads from Unicode's security and character data (tools/unicode-identifiers.py).
+# Rewrite the tables a GDScript identifier is read by, its characters and its spoof check, from Unicode's security and
+# character data (tools/unicode-identifiers.py).
 unicode-identifiers:
     python3 -I tools/unicode-identifiers.py
 
@@ -179,3 +193,9 @@ godot-sweep *args:
 [unix]
 site-shots *scenes:
     tools/site-shots/shots.sh {{scenes}}
+
+# Retake the first start's pictures of each theme Passenger carries, src/Passenger.App/Assets/FirstStart, after just build
+# (macOS), as the version moves: just first-start-shots
+[unix]
+first-start-shots:
+    tools/site-shots/shots.sh first-start

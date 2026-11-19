@@ -22,7 +22,7 @@ public sealed record TemplateCatalog(string Sdk, IReadOnlyList<TemplateFamily> F
     private static string ShapeOf(string sdk, IReadOnlyList<TemplateFamily> families, IReadOnlyList<string> formats, string format, IReadOnlyList<ProjectTemplate> items)
     {
         static string Variant(TemplateVariant v) =>
-            $"{v.Identity}:{v.Language}:{string.Join(',', v.Frameworks)}:{v.DefaultFramework}:{v.Description}:"
+            $"{v.Identity}:{v.Language}:{string.Join(',', v.Frameworks)}:{v.DefaultFramework}:{v.OutputType}:{v.Description}:"
             + string.Join(',', v.Options.Select(o => $"{o.Name}={o.Default}/{o.Label}/{o.Kind}/{o.Choices.Count}/{o.EnabledWhen}/{o.Through}"));
         static string Type(string family, ProjectTemplate t) =>
             $"{family}|{t.TypeName}|{t.Name}|{string.Join(',', t.ShortNames)}|{t.IsSolution}|{t.Pack?.Id}|{t.DefaultName}|{string.Join(';', t.Variants.Select(Variant))}";
@@ -91,6 +91,14 @@ public sealed record TemplateVariant(string Identity, string? Language, int Prec
 {
     /// <summary>The option that keeps dotnet new from restoring what it made (skipRestore's), when the template restores.</summary>
     public string? SkipRestoreOption { get; init; }
+
+    /// <summary>Whether dotnet new restores what it made, by the template's restore post action, unless told not to
+    /// (<see cref="SkipRestoreOption"/>), which runs the MSBuild files of the folders above it.</summary>
+    public bool Restores { get; init; }
+
+    /// <summary>The output type of the projects it makes, where their files say it alike (Exe, Library); null where an SDK
+    /// of their own or a choice decides it, or it makes no project read here.</summary>
+    public string? OutputType { get; init; }
 }
 
 public enum TemplateOptionKind
@@ -138,6 +146,9 @@ public static partial class ProjectTemplates
     /// <summary>A member's name read in any letter case, as ide.host.json files write them both ways.</summary>
     private const bool AnyCase = true;
 
+    /// <summary>The template engine's post action that restores what a template made.</summary>
+    private static readonly Guid RestorePostAction = new("210D431B-A78B-4D2F-B762-4ED3E3EA9025");
+
     /// <summary>What the dialog asks or sets for itself: the name, the framework, the language, the restore, the host.</summary>
     private static readonly HashSet<string> NotShown = new(StringComparer.OrdinalIgnoreCase)
     {
@@ -161,9 +172,14 @@ public static partial class ProjectTemplates
         }
     }
 
+    /// <summary>Whether dotnet new lists the templates the .NET SDK and its workloads carry: false only for a test, with a
+    /// <see cref="Hive"/> of its own, standing in for a .NET that lacks a workload's (its <c>--debug:disable-sdk-templates</c>).</summary>
+    public static bool SdkTemplates { get; set; } = true;
+
     /// <summary>The .NET command line's arguments for <c>dotnet new</c> with these, in the IDE's hive.</summary>
     public static IReadOnlyList<string> New(IEnumerable<string> arguments) =>
-        ["new", .. arguments, .. Hive is { } hive ? ["--debug:custom-hive", hive] : Array.Empty<string>()];
+        ["new", .. arguments, .. Hive is { } hive ? ["--debug:custom-hive", hive] : Array.Empty<string>(),
+            .. SdkTemplates ? Array.Empty<string>() : ["--debug:disable-sdk-templates"]];
 
     /// <summary><c>dotnet new</c> with these arguments in a folder, in the IDE's hive.</summary>
     public static System.Diagnostics.ProcessStartInfo NewCommand(IEnumerable<string> arguments, string folder) =>
@@ -171,10 +187,14 @@ public static partial class ProjectTemplates
 
     /// <summary><c>dotnet restore</c> of a project a template made, run in a folder, with EnableWindowsTargeting for one that
     /// targets Windows off it (<paramref name="windowsTargeting"/>), as its builds have it: null once restored, else what
-    /// dotnet said why not.</summary>
+    /// dotnet said why not, or why it was not run (in a folder not trusted, whose MSBuild files it would run).</summary>
     public static async Task<string?> RestoreAsync(string project, string folder, CancellationToken cancel = default, bool windowsTargeting = false)
     {
-        IReadOnlyList<string> arguments = windowsTargeting ? ["restore", project, $"-p:{MSBuildNames.EnableWindowsTargeting}=true"] : ["restore", project];
+        if (!WorkspaceTrust.Trusts(project))
+        {
+            return Refusals.Untrusted;
+        }
+        IReadOnlyList<string> arguments = windowsTargeting ? ["restore", project, PropertySwitch.Of(MSBuildNames.EnableWindowsTargeting, "true")] : ["restore", project];
         Task<ChildResult> restore = ChildProcesses.RunAsync(ChildProcesses.DotnetCommand(arguments, folder), limit: TimeSpan.FromMinutes(10), cancel: cancel);
         BackgroundWork.Track(restore);
         ChildResult restored = await restore;
@@ -197,7 +217,7 @@ public static partial class ProjectTemplates
         {
             TemplateCatalog catalog = await once.Value;
             Newest[key] = catalog;
-            Watch();
+            Watch(await InstallOfAsync(folder));
             return catalog;
         }
         catch
@@ -229,7 +249,7 @@ public static partial class ProjectTemplates
         string root = TemplateRoot(custom)
             ?? throw new InvalidOperationException("Neither DOTNET_CLI_HOME nor the home folder is set, so dotnet new keeps no templates to read");
         string cache = CacheFile(root, sdk) ?? throw new InvalidOperationException($"dotnet new keeps no templates at {Path.Combine(root, "dotnetcli", sdk, "templatecache.json")}");
-        return await ParseAsync(cache, sdk);
+        return await ParseAsync(cache, sdk, folder);
     }
 
     /// <summary>The cache dotnet new keeps of an SDK's templates, when it keeps one.</summary>
@@ -242,8 +262,9 @@ public static partial class ProjectTemplates
         custom ?? (Dotnet.CliHome() is { } home ? Path.Combine(home, ".templateengine") : null);
 
     /// <summary>The templates in dotnet new's cache, each one's options from its parameters with its ide.host.json's over
-    /// them, the project templates with the known packages' kinds it has not got, in families, and the item templates.</summary>
-    private static async Task<TemplateCatalog> ParseAsync(string cache, string sdk)
+    /// them, the project templates with the known packages' kinds it has not got (as the .NET a folder's projects take builds
+    /// them), in families, and the item templates.</summary>
+    private static async Task<TemplateCatalog> ParseAsync(string cache, string sdk, string folder)
     {
         using JsonDocument document = await ReadSharedAsync(cache);
         List<JsonElement> all = JsonMembers.Value(document.RootElement, "TemplateInfo") is { ValueKind: JsonValueKind.Array } listed
@@ -253,7 +274,8 @@ public static partial class ProjectTemplates
         List<ProjectTemplate> templates = Groups(all.Where(t => Tag(t, "type") is "project" or "solution" && Usable(t)), ide);
         List<ProjectTemplate> items = Groups(all.Where(t => Tag(t, "type") == "item" && Usable(t)), ide);
         (IReadOnlyList<string> formats, string format) = SolutionFormats(all);
-        return new TemplateCatalog(sdk, TemplateFamilies.Of([.. templates, .. TemplatePacks.Offered(templates)]), formats, format, items);
+        IEnumerable<ProjectTemplate> offered = TemplatePacks.Offered(templates, await Mobile.AndroidHosts.UnbuiltAsync(folder));
+        return new TemplateCatalog(sdk, TemplateFamilies.Of([.. templates, .. offered]), formats, format, items);
     }
 
     /// <summary>Templates as groups, each of its templates a variant, newest first.</summary>
@@ -397,6 +419,8 @@ public static partial class ProjectTemplates
             frameworkOption, frameworks, defaultFramework, options)
         {
             SkipRestoreOption = parameters.ContainsKey("skipRestore") ? LongName(cli, "skipRestore") : null,
+            Restores = JsonMembers.Texts(template, "PostActions", AnyCase).Any(a => Guid.TryParse(a, out Guid action) && action == RestorePostAction),
+            OutputType = Tag(template, "type") == "project" ? ide.OutputType(template) : null,
         };
     }
 
@@ -596,11 +620,12 @@ public static partial class ProjectTemplates
     /// <summary>A whole number as dotnet new's files write it, a number or its text; 0 when it is neither.</summary>
     private static int Int(JsonElement? element, string name) => int.TryParse(JsonMembers.Scalar(element, name, AnyCase), out int value) ? value : 0;
 
-    /// <summary>A template's own files, beside its template.json in its package (or folder): its ide.host.json and the
-    /// computed symbols of its template.json, each package opened once.</summary>
+    /// <summary>A template's own files in its package (or folder): its ide.host.json, the computed symbols of its
+    /// template.json and the output type of the projects it makes, each package opened once and each template.json read once.</summary>
     private sealed class HostFiles : IDisposable
     {
         private readonly Dictionary<string, ZipArchive?> packages = new(StringComparer.Ordinal);
+        private readonly Dictionary<string, JsonElement?> parsed = new(StringComparer.Ordinal);
         private readonly List<JsonDocument> read = [];
 
         public JsonElement? Read(JsonElement template) => Parsed(template, "ide.host.json");
@@ -612,9 +637,62 @@ public static partial class ProjectTemplates
                     .Select(s => JsonMembers.Scalar(s.Value, "value", AnyCase)).OfType<string>()]
                 : [];
 
+        /// <summary>The output type of the projects among its template.json's primary outputs, where their files say one
+        /// alike (<see cref="TemplateProjects.OutputType"/>); null where it names none, or one leaves it to its SDK or cannot be read.</summary>
+        public string? OutputType(JsonElement template)
+        {
+            List<string?> types = [];
+            foreach (JsonElement output in JsonMembers.Items(Parsed(template, null), "primaryOutputs", AnyCase))
+            {
+                if (JsonMembers.Scalar(output, "path", AnyCase) is not { } path || !TemplateProjects.IsProject(path))
+                {
+                    continue;
+                }
+                string inside = path.Replace('\\', '/');
+                while (inside.StartsWith("./", StringComparison.Ordinal))
+                {
+                    inside = inside[2..];
+                }
+                // A primary output is named from the folder holding .template.config, where its files are.
+                types.Add(inside.Split('/').Contains("..") ? null
+                    : Text(template, config => $"{Folder(Folder(config))}{inside}") is { } project ? TemplateProjects.OutputType(project) : null);
+            }
+            return types is [{ } first, ..] && types.All(t => string.Equals(t, first, StringComparison.OrdinalIgnoreCase)) ? first : null;
+        }
+
+        /// <summary>A path's folder with its slash, or nothing for a path in none.</summary>
+        private static string Folder(string path) => path[..(path.TrimEnd('/').LastIndexOf('/') + 1)];
+
         /// <summary>A file beside the template's template.json (the template.json itself given null), parsed; null where
         /// it is not there or cannot be read.</summary>
         private JsonElement? Parsed(JsonElement template, string? beside)
+        {
+            string key = $"{JsonMembers.Scalar(template, "MountPointUri", AnyCase)}\n{JsonMembers.Scalar(template, "ConfigPlace", AnyCase)}\n{beside}";
+            if (parsed.TryGetValue(key, out JsonElement? known))
+            {
+                return known;
+            }
+            JsonElement? found = null;
+            if (Text(template, config => beside is null ? config : $"{Folder(config)}{beside}") is { } text)
+            {
+                try
+                {
+                    JsonDocument document = JsonDocument.Parse(text, LenientJson.Document);
+                    read.Add(document);
+                    found = document.RootElement;
+                }
+                catch (JsonException)
+                {
+                    found = null;
+                }
+            }
+            parsed[key] = found;
+            return found;
+        }
+
+        /// <summary>One of the template's files, by its path in the package (or folder) from that of its template.json; null
+        /// where it is not there or cannot be read.</summary>
+        private string? Text(JsonElement template, Func<string, string> entryOf)
         {
             if (JsonMembers.Scalar(template, "MountPointUri", AnyCase) is not { } mount || JsonMembers.Scalar(template, "ConfigPlace", AnyCase) is not { } place)
             {
@@ -624,30 +702,22 @@ public static partial class ProjectTemplates
             {
                 mount = uri.LocalPath;
             }
-            string config = place.TrimStart('/');
-            string entry = beside is null ? config : $"{config[..(config.LastIndexOf('/') + 1)]}{beside}";
+            string entry = entryOf(place.TrimStart('/'));
             try
             {
-                string? text = null;
                 if (Directory.Exists(mount))
                 {
                     string file = Path.Combine(mount, entry);
-                    text = File.Exists(file) ? File.ReadAllText(file) : null;
+                    return File.Exists(file) ? File.ReadAllText(file) : null;
                 }
-                else if (Package(mount)?.GetEntry(entry) is { } zipped)
+                if (Package(mount)?.GetEntry(entry) is { } zipped)
                 {
                     using StreamReader reader = new(zipped.Open());
-                    text = reader.ReadToEnd();
+                    return reader.ReadToEnd();
                 }
-                if (text is null)
-                {
-                    return null;
-                }
-                JsonDocument host = JsonDocument.Parse(text, LenientJson.Document);
-                read.Add(host);
-                return host.RootElement;
+                return null;
             }
-            catch (Exception error) when (error is IOException or InvalidDataException or JsonException or UnauthorizedAccessException)
+            catch (Exception error) when (error is IOException or InvalidDataException or UnauthorizedAccessException)
             {
                 return null;
             }

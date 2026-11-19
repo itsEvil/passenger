@@ -14,9 +14,10 @@ public partial class MainWindow
     /// language server to end as asked; each kills its own process when it will not go.</summary>
     public static readonly TimeSpan EndLimit = TimeSpan.FromSeconds(5);
 
-    /// <summary>Finishes when what the window started has ended, or <see cref="EndLimit"/> after it closed; null while it
-    /// is open. It needs no UI thread, so the process waits for it once the window's loop has stopped (Program, the MCP
-    /// host, a screenshot). A logout does not wait: macOS ends the process, after the programs' and builds' kills.</summary>
+    /// <summary>Finishes when what the window started has ended, or <see cref="EndLimit"/> after it closed (its apps' ends on
+    /// devices <see cref="Run.Devices.DeviceLaunches.EndLimit"/>); null while it is open. It needs no UI thread, so the
+    /// process waits for it once the window's loop has stopped (Program, the MCP host, a screenshot). A logout does not
+    /// wait: macOS ends the process, after the programs' and builds' kills.</summary>
     public Task? Ended { get; private set; }
 
     private const string ClosingSolution = "closing the solution";
@@ -26,12 +27,33 @@ public partial class MainWindow
 
     private void AddShutdown()
     {
-        Closed += (_, _) => EndChildren();
-        actions!.Add(new IdeAction(AppActions.CloseSolution, "Close Solution", "IDE", _ => CloseSolution())
+        Closed += (_, _) =>
+        {
+            EndChildren();
+            Editors.LetGoOfFiles();
+        };
+        actions!.Add(new IdeAction(AppActions.CloseSolution, "Close Solution", "IDE", c => CloseSolution(asks: !c.ByAgent))
         {
             WhyNot = c => Folder is null ? Refusals.NoFolder : c.ByAgent ? WhyNotLeave(ClosingSolution) : null,
             Menus = [new MenuPlace("File", 0, 5)],
         });
+    }
+
+    /// <summary>File, Exit: Passenger quits (<see cref="PassengerApp.Quit"/>), asking first where Confirm before closing says
+    /// (<see cref="PassengerApp.QuitAskedAsync"/>), but for an attached agent's input into the window (<see
+    /// cref="RefusedToAgentsInput"/>); an agent's own Passenger, which ends with its agent, quits as it asks.</summary>
+    private void Exit()
+    {
+        if (!AgentsOwn && RefusedToAgentsInput(Refusals.QuitIsThePersons))
+        {
+            return;
+        }
+        if (ConfirmsQuit)
+        {
+            IdeErrors.Observe(PassengerApp.QuitAskedAsync(this));
+            return;
+        }
+        PassengerApp.Quit();
     }
 
     /// <summary>The session's programs and builds go now, so a server lets go of its port; the rest are asked to end.</summary>
@@ -44,11 +66,11 @@ public partial class MainWindow
     }
 
     /// <summary>Close Solution: its changed files saved as closing the window saves them (one that cannot be keeps it
-    /// open, with why), its editors and layout kept with it and the solution at the top of the recent ones, everything
-    /// it runs ended (programs, builds, the debugger, tests, its terminals, the language server), and the Welcome
-    /// screen in the editors' place; a program Hot Reload changed that this would stop is asked about first, the solution
-    /// closed once it has stopped (<see cref="StopHeldAskedAsync"/>). Null once it is closed, else why not.</summary>
-    public string? CloseSolution()
+    /// open), its editors and layout kept with it, all it runs ended, and the Welcome screen in the editors' place; a
+    /// program Hot Reload changed that this would stop is asked about first, the solution closed once it has stopped
+    /// (<see cref="StopHeldAskedAsync"/>), and where the person <paramref name="asks"/>, the containers of runs Detach let
+    /// go of (<see cref="LetGoAskedAsync"/>). Null once it is closed, else why not.</summary>
+    public string? CloseSolution(bool asks = true)
     {
         UiThread.Check();
         if (Folder is null)
@@ -59,6 +81,11 @@ public partial class MainWindow
         {
             IdeErrors.Observe(CloseSolutionAskedAsync(held));
             return HeldWords(held, ClosingSolution);
+        }
+        if (asks && AsksOfLetGo)
+        {
+            IdeErrors.Observe(CloseSolutionLetGoAsync());
+            return "The solution closes once you answer whether to stop the containers of the runs Detach let go of";
         }
         if (!Autosave())
         {
@@ -82,11 +109,11 @@ public partial class MainWindow
         AgentsGoTo(null, null);
         ProjectName.Text = "No solution";
         ProjectBadge.IsVisible = false;
-        Editors.ShowWelcome(welcome);
-        welcome.Say(null);
+        SayOnWelcome(null);
+        Editors.ShowWelcome(Welcome);
         ShowRecent();
         UpdateStatus();
-        welcome.FocusSearch();
+        Welcome.FocusSearch();
         return null;
     }
 
@@ -163,7 +190,7 @@ public partial class MainWindow
         }
         else if (stopped)
         {
-            Close();
+            CloseAsAnswered();
         }
     }
 

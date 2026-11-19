@@ -13,9 +13,10 @@ namespace Passenger.Tests;
 /// <summary>A GDScript read by Passenger's own parser and analyzer while Godot's server for it has not started (held at its
 /// start where a Godot is found, never started where none is): the types inferred where none is written are shown after
 /// their names (an operator's from the engine's API, so where a Godot is found to dump it), a member completes after
-/// <c>self.</c> and a local by its first letters, and Go to Declaration reaches a function of the script; Godot's warnings
-/// and errors are marked as the project's settings ask and each is fixed as one command of Undo. A Godot editor of its own
-/// each where one is found, so run alone.</summary>
+/// <c>self.</c> and a local by its first letters, and Go to Declaration reaches a function of the script, or of another
+/// as the editor holds it unsaved; Godot's warnings and errors are marked as the project's settings ask and each is fixed
+/// as one command of Undo; and a script opened before its project is read as the project's alone once it opens. A Godot
+/// editor of its own each where one is found, so run alone.</summary>
 [Collection(Alone.Name)]
 public sealed class GDScriptTypesTests
 {
@@ -90,6 +91,44 @@ public sealed class GDScriptTypesTests
             Ui.Press(window, Ui.Shortcut(AppActions.GoToDeclaration), settle: false);
             int declared = Script.Split('\n').ToList().FindIndex(l => l.StartsWith("func grow", StringComparison.Ordinal));
             Ui.PumpUntil(() => editor.CaretPosition.Line == declared, $"the caret at grow's declaration, line {declared + 1}", TimeSpan.FromSeconds(30));
+        }
+        finally
+        {
+            window.Close();
+            release.SetResult();
+        }
+    }
+
+    /// <summary>Another script open with lines typed above its function and not saved: Go to Declaration of a call of the
+    /// function lands on it where the editor holds that script, not where the disk has it.</summary>
+    [AvaloniaFact]
+    public void Go_to_declaration_of_another_open_scripts_function_lands_on_it_as_the_editor_holds_that_script()
+    {
+        TestFolders.Write(folder, "helper.gd", "class_name Helper\nextends RefCounted\n\n\nfunc assist() -> int:\n\treturn 1\n");
+        TestFolders.Write(folder, "user.gd", "extends Node\n\n\nfunc _ready() -> void:\n\tHelper.new().assist()\n");
+        (MainWindow window, OpenDocument helper, TaskCompletionSource release) = Open("helper.gd");
+        try
+        {
+            CodeEditor editor = window.EditorArea.CodeEditor;
+            Ui.PlaceAfter(editor, "extends RefCounted\n");
+            editor.Focus();
+            foreach (string line in (string[])["var first := 1", "var second := 2", "var third := 3"])
+            {
+                window.KeyTextInput(line);
+                Ui.Press(window, "ENTER", settle: false);
+            }
+            string held = helper.Text.Snapshot.ToString();
+            Assert.Contains("extends RefCounted\nvar first := 1\nvar second := 2\nvar third := 3\n\n\nfunc assist", held, StringComparison.Ordinal);
+            int declared = held.Split('\n').ToList().FindIndex(l => l.StartsWith("func assist", StringComparison.Ordinal));
+
+            Assert.Null(window.OpenFile(Path.Combine(folder, "user.gd")));
+            Ui.PlaceAfter(window.EditorArea.CodeEditor, ".assi");
+            Ui.Press(window, Ui.Shortcut(AppActions.GoToDeclaration), settle: false);
+            bool landed = Ui.Pumped(() => window.EditorArea.Active == helper && window.EditorArea.CodeEditor.CaretPosition == new TextPosition(declared, "func ".Length),
+                TimeSpan.FromSeconds(30));
+            Assert.True(landed, $"Go to Declaration of assist should land on its name, line {declared + 1}, as the editor holds helper.gd unsaved; it went to "
+                + $"{window.EditorArea.Active?.Name} line {window.EditorArea.CodeEditor.CaretPosition.Line + 1}, column {window.EditorArea.CodeEditor.CaretPosition.Column + 1}");
+            Assert.True(window.Session.Web?.For(helper) is not { Serving: true }, "Godot's server answered: the test's hold of its start did not hold");
         }
         finally
         {
@@ -225,6 +264,73 @@ public sealed class GDScriptTypesTests
             release.SetResult();
         }
     }
+
+    /// <summary>A script opened in a window with no folder is read as a script of no project: another script's class unknown,
+    /// a variable warned of that the project's settings say nothing of. Once its project opens, the project's reading is its
+    /// one reading: the class's type shown after the name and the warning gone, as typing pauses too, and its names coloured
+    /// by that reading alone over the grammar's.</summary>
+    [AvaloniaFact]
+    public void A_script_opened_before_its_project_is_read_as_the_projects_alone_once_the_project_is_open()
+    {
+        TestFolders.Write(folder, "project.godot", "; Engine configuration file.\nconfig_version=5\n\n[application]\n\nconfig/name=\"Types\"\n\n[debug]\n\n"
+            + "gdscript/warnings/unused_variable=0\n");
+        TestFolders.Write(folder, "helper.gd", "class_name Helper\nextends RefCounted\n");
+        TestFolders.Write(folder, "early.gd", "extends Node\n\nvar helper := Helper.new()\n\n\nfunc _ready() -> void:\n\tvar unused := 1\n\tprint(helper)\n");
+        MainWindow window = new() { Width = 1200, Height = 800, StartsLanguageServer = false, GodotEnvironment = GodotTests.Game.Home(folder + "-home") };
+        window.Show();
+        try
+        {
+            Assert.Null(window.OpenFile(Path.Combine(folder, "early.gd")));
+            OpenDocument document = window.EditorArea.Active!;
+            static bool Unused(Marker m) => m.Message.StartsWith("UNUSED_VARIABLE:", StringComparison.Ordinal);
+            Ui.PumpUntil(() => document.Markers.Any(Unused), "the script read with no folder as one of no project, its unused variable warned of", TimeSpan.FromSeconds(60));
+
+            window.OpenFolder(folder);
+            Ui.Settle();
+            int named = document.Text.Snapshot.ToString().IndexOf("helper :=", StringComparison.Ordinal) + "helper".Length;
+            bool Typed(IReadOnlyList<InlayHint> hints) => hints.Any(h => h.Offset == named && h.Label == ": Helper" && h.Kind == InlayHintKind.Type);
+            Ui.PumpUntil(() => Typed(document.InlayHints), "helper typed as the project's Helper once the project opened", TimeSpan.FromSeconds(60));
+            List<string> hinted = [];
+            List<string> marked = [];
+            document.Decorations.Changed += (_, kind) =>
+            {
+                if (kind == DecorationKind.InlayHints)
+                {
+                    hinted.Add(string.Join(" ", document.InlayHints.Select(h => h.Label)));
+                }
+                else if (kind == DecorationKind.Markers)
+                {
+                    marked.Add(string.Join(" | ", document.Markers.Select(m => m.Message)));
+                }
+            };
+            CodeEditor editor = window.EditorArea.CodeEditor;
+            editor.Focus();
+            editor.Selections = SelectionSet.Single(editor.Document.Snapshot.Length);
+            Ui.Press(window, "enter");
+            Ui.Settle();
+
+            Assert.True(Typed(document.InlayHints) && hinted.All(h => h.Contains(": Helper", StringComparison.Ordinal)),
+                $"helper's type went as typing paused, the window with no folder's reading of the script still landing (hints set in turn: {string.Join("; ", hinted)})");
+            Assert.True(!document.Markers.Any(Unused) && !marked.Any(m => m.Contains("UNUSED_VARIABLE", StringComparison.Ordinal)),
+                $"The project turns the unused variable's warning off, yet it is marked from the reading with no folder (marks set in turn: {string.Join("; ", marked)}; "
+                + $"now: {string.Join(" | ", document.Markers.Select(m => m.Message))})");
+            Assert.True(editor.Highlighter is Passenger.Languages.ColourLayer { Syntax: not Passenger.Languages.ColourLayer },
+                $"The script's names are coloured by more than the project's reading: the reading with no folder's colours lie under it ({Layers(editor.Highlighter)})");
+            Assert.Equal(TokenKind.Class, GDScriptColoursTests.KindAt(editor, "Helper.new", "Helper".Length));
+        }
+        finally
+        {
+            window.Close();
+        }
+    }
+
+    /// <summary>The colours an editor draws, layer under layer.</summary>
+    private static string Layers(IHighlighter? colours) => colours switch
+    {
+        Passenger.Languages.ColourLayer layer => $"{nameof(Passenger.Languages.ColourLayer)} over {Layers(layer.Syntax)}",
+        null => "none",
+        _ => colours.GetType().Name,
+    };
 
     private const string Unformatted = "extends Node\nvar speed:=2.0\nfunc _ready():\n    var party = [\n        \"Godot\",\n        \"Godette\"\n    ]\n"
         + "    print (party,speed*2)\nfunc heal(amount):\n    speed+=amount\n";

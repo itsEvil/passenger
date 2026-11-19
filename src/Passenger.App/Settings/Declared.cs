@@ -1,3 +1,4 @@
+using Passenger.Languages;
 using Passenger.Vcs;
 using Passenger.Workspace.GDScript;
 using Passenger.Xaml.Features;
@@ -13,8 +14,14 @@ public static class Declared
     /// <summary>Every declaration, each adding itself as it is made, so this comes before them.</summary>
     internal static readonly List<Setting> All = [];
 
-    public static readonly ChoiceSetting<Look> Look = new(s => s.Look, (s, v) => s with { Look = v }, D.LookChoices,
-        new(D.Appearance, "Theme", "colour color theme look palette " + string.Join(" ", D.LookChoices.Select(c => c.Name.ToLowerInvariant()))));
+    /// <summary>Every declaration, in the order made.</summary>
+    public static IReadOnlyList<Setting> Every => All;
+
+    /// <summary>The settings with every value a theme gives filled in as it stands where the person gave none.</summary>
+    public static AppSettings InForce(AppSettings settings) => All.Aggregate(settings, (filled, setting) => setting.FilledIn(filled));
+
+    public static readonly ThemeSetting Look = new(code: false, s => s.Look, (s, v) => s with { Look = v },
+        new(D.Appearance, "Theme", "colour color theme look palette source repository passenger-themes " + string.Join(" ", ThemeSource.FormerlyCarried.Select(n => n.ToLowerInvariant()))));
 
     public static readonly ChoiceSetting<ThemeChoice> Theme = new(s => s.Theme, (s, v) => s with { Theme = v },
         [(ThemeChoice.System, "System"), (ThemeChoice.Dark, "Dark"), (ThemeChoice.Light, "Light")],
@@ -25,19 +32,61 @@ public static class Declared
             "The font of the window's words: menus, tool windows, tabs, dialogs and popups. The system font is Segoe UI on Windows, "
             + "San Francisco on macOS and the desktop's sans-serif on Linux. Code keeps the editor's font."));
 
+    public static readonly SizeSetting DisplayScale = new(s => s.DisplayScale, (s, v) => s with { DisplayScale = double.IsFinite(v) ? v : 1 }, [1, 1.25, 1.5, 1.75, 2, 2.5, 3],
+        new(D.Appearance, "Display scale", "display scale zoom font size bigger larger interface ui accessibility dpi hidpi 4k monitor percent",
+            "How large the window draws everything: menus, tool windows, tabs, dialogs, popups, editors and icons, on top of the "
+            + "system's own display scaling. 100% is Passenger's own size; 125% or 150% suits a dense screen."));
+
     public static readonly ToggleSetting MainMenuBar = new(s => s.MainMenuBar, (s, v) => s with { MainMenuBar = v },
         new(D.Appearance, "Show main menu as a menu bar", "main menu bar hamburger file edit view toolbar ribbon menus",
             "File, Edit, View and the rest side by side on the toolbar rather than behind its button. Those the toolbar has no room for go behind the button after them."));
+
+    public static readonly ThemedChoiceSetting<EditorTabsPlace> EditorTabs = new(s => s.EditorTabs, s => s.TabsPlace(), (s, v) => s with { EditorTabs = v },
+        [(EditorTabsPlace.Top, "Top"), (EditorTabsPlace.Left, "Left"), (EditorTabsPlace.Right, "Right")],
+        new(D.Appearance, "Editor tabs", "editor tabs tab well strip placement position vertical side left right top layout arrangement",
+            "Where each editor's tabs stand: a row across its top, or a column down its left or right side, which fits more of them."));
+
+    public static readonly ThemedChoiceSetting<ToolWindowLook> ToolWindowLook = new(s => s.ToolWindowLook, s => s.ToolWindowsAs(), (s, v) => s with { ToolWindowLook = v },
+        [(Passenger.App.ToolWindowLook.StripeIcons, "Stripe icons"), (Passenger.App.ToolWindowLook.TitledTabs, "Titled tabs")],
+        new(D.Appearance, "Tool windows", "tool windows docked tabs titles names stripe icons wells side bottom panels layout arrangement",
+            "How tool windows are named and gone between: by their icons on the stripes down the window's sides, or by tabs with "
+            + "their names, no stripe standing: a place's windows along its foot, and a hidden one along the window's edge, a click "
+            + "on which opens it over the editors until you work elsewhere. A drag on an icon, a tab or a header moves the window."));
+
+    public static readonly ThemedChoiceSetting<ClosedToolWindows> ClosedToolWindows = new(s => s.ClosedToolWindows, s => s.ClosedWindows(),
+        (s, v) => s with { ClosedToolWindows = v },
+        [(Passenger.App.ClosedToolWindows.KeepIcons, "Keep their icons or tabs"), (Passenger.App.ClosedToolWindows.LeaveStripe, "Leave until opened again")],
+        new(D.Appearance, "Closed tool windows", "tool windows close closed hide remove declutter stripe icons wells view menu reopen layout arrangement",
+            "Whether a tool window closed by its × keeps its icon on the stripe (or its tab, under titled tabs), or leaves until it is "
+            + "opened again from View | Tool Windows, Find Action or its keys. Hide always keeps it."));
+
+    public static readonly ThemedChoiceSetting<FindResults> FindResults = new(s => s.FindResults, s => s.FindResultsIn(), (s, v) => s with { FindResults = v },
+        [(Passenger.App.FindResults.Popup, "In its popup"), (Passenger.App.FindResults.FindWindow, "Kept in the Find window")],
+        new(D.Appearance, "Find in Files results", "find in files search results matches occurrences find window docked keep kept popup tool window layout arrangement",
+            "Where Find in Files' matches stay once one is gone to: in its popup, which closes, or kept in the Find window as well, "
+            + "a tab of their own to go back to; kept there, the places Go to Declaration, Go to Implementation and the like find "
+            + "to choose from are listed there too. Open in Find Window in the popup puts the matches there either way."));
 
     public static readonly ToggleSetting ReopenProjectsOnStartup = new(s => s.ReopenProjectsOnStartup, (s, v) => s with { ReopenProjectsOnStartup = v },
         new(D.SystemPage, "Reopen projects on startup", "reopen last solution project folder startup start launch welcome screen recent"));
 
     public static readonly ChoiceSetting<OpenProjectIn> OpenProjectIn = new(s => s.OpenProjectIn, (s, v) => s with { OpenProjectIn = v }, D.OpenProjectChoices);
 
+    public static readonly ChoiceSetting<ConfirmClosing> ConfirmBeforeClosing = new(s => s.ConfirmBeforeClosing, (s, v) => s with { ConfirmBeforeClosing = v },
+        [(ConfirmClosing.Never, "Never"), (ConfirmClosing.WhenQuitting, "When quitting"), (ConfirmClosing.EveryWindow, "Every window")],
+        new(D.SystemPage, "Confirm before closing", "confirm ask prompt question before closing close quit exit window are you sure accidental",
+            $"Whether Passenger asks you before it quits ({(OperatingSystem.IsMacOS() ? "Quit Passenger" : "File | Exit")} or closing its last "
+            + "window) or before any of its windows closes. The question's Don't ask again sets this back to Never."));
+
     public static readonly ToggleSetting SaveOnDeactivation = new(s => s.SaveOnDeactivation, (s, v) => s with { SaveOnDeactivation = v },
         new(D.SystemPage, "Save when leaving the IDE", "autosave files switching to a different application or the built-in terminal focus frame deactivation"));
 
     public static readonly NumberSetting IdleSeconds = new(s => s.IdleSeconds, (s, v) => s with { IdleSeconds = (int)v }, 1, 3600, 1);
+
+    public static readonly NumberSetting ChordWaitSeconds = new(s => s.ChordWaitSeconds, (s, v) => s with { ChordWaitSeconds = v }, 1, 60, 1,
+        new(D.KeymapPage, "Wait for a shortcut's second key", "keymap shortcut chord prefix first second key keystroke wait time timeout slow accessibility",
+            "How long the first key of a shortcut of two keys waits for the second before it is forgotten, the status bar saying what the second can run meanwhile."),
+        "seconds");
 
     public static readonly ToggleSetting CheckForUpdates = new(s => s.CheckForUpdates, (s, v) => s with { CheckForUpdates = v },
         new(D.UpdatesPage, "Check for updates", "updates check new version release newer download github automatic install restart",
@@ -61,19 +110,25 @@ public static class Declared
             "A file whose name carries another's, as Counter.razor.cs carries Counter.razor, shows under it in the Solution view. "
             + "File Nesting… in the Explorer's options lists the rules."));
 
-    public static readonly ChoiceSetting<ColourScheme> ColourScheme = new(s => s.ColourScheme, (s, v) => s with { ColourScheme = v }, D.ColourSchemeChoices,
-        new(D.EditorPage, "Colour scheme", "colour color scheme syntax highlighting code colours rider keywords strings comments",
-            "The colours the code is drawn in: the theme's own, or Rider's, Dark or Light as the theme is. The editor keeps the theme's background."));
+    public static readonly ThemeSetting ColourScheme = new(code: true, s => s.ColourScheme, (s, v) => s with { ColourScheme = v },
+        new(D.Appearance, "Colour scheme", "colour color scheme syntax highlighting code colours editor keywords strings comments " + ThemeSource.FormerScheme.ToLowerInvariant(),
+            "The colours the code is drawn in: the theme's own, or a code colour scheme's, Dark or Light as the theme is. The editor keeps the theme's background."));
 
     public static readonly FontSetting EditorFontFamily = new(nameof(AppSettings.EditorFontFamily), s => s.EditorFontFamily, (s, v) => s with { EditorFontFamily = v }, null,
         FontChoices.Code, new(D.EditorPage, "Font family", "font family typeface monospace monospaced code",
             "The font code is shown in: the editor's, the terminal's unless it has its own, and code's in popups and tool windows."));
 
-    public static readonly NumberSetting EditorFontSize = new(s => s.EditorFontSize, (s, v) => s with { EditorFontSize = v },
-        AppSettings.MinFontSize, AppSettings.MaxFontSize, 1, new(D.EditorPage, "Font size", "font size text"));
+    public static readonly NumberSetting EditorFontSize = new(s => s.CodeSize(), (s, v) => s with { EditorFontSize = v },
+        AppSettings.MinFontSize, AppSettings.MaxFontSize, 1, new(D.EditorPage, "Font size", "font size text",
+            "The code's size in points. Until you set one, the theme's size, else 13; View | Active Editor | Reset Font Size goes back to it."),
+        given: s => s.EditorFontSize is not null);
 
     public static readonly NumberSetting EditorLineSpacing = new(s => s.EditorLineSpacing, (s, v) => s with { EditorLineSpacing = v }, 0.8, 3, 0.1,
         new(D.EditorPage, "Line spacing", "font line height"));
+
+    public static readonly NumberSetting CaretWidth = new(s => s.CaretWidth, (s, v) => s with { CaretWidth = v }, 1, 8, 1,
+        new(D.EditorPage, "Caret width", "caret cursor insertion point text cursor width thickness thick broad bold visibility accessibility terminal",
+            "How broad the editor's caret is, and the terminal's Line and Underline cursors."), "px");
 
     public static readonly ToggleSetting Ligatures = new(s => s.Ligatures, (s, v) => s with { Ligatures = v }, new(D.EditorPage, "Enable ligatures", "font arrows"));
 
@@ -83,8 +138,20 @@ public static class Declared
     public static readonly ToggleSetting RainbowBraces = new(s => s.RainbowBraces, (s, v) => s with { RainbowBraces = v },
         new(D.EditorPage, "Rainbow braces", "brackets parentheses colour color nesting"));
 
+    public static readonly ToggleSetting VimMode = new(s => s.VimMode, (s, v) => s with { VimMode = v },
+        new(D.EditorPage, "Vim mode", "vim vi modal normal insert keys emulation"));
+
+    public static readonly VimKeysSetting VimKeysToKeymap = new(nameof(AppSettings.VimKeysToKeymap), s => s.VimKeysToKeymap, (s, v) => s with { VimKeysToKeymap = v },
+        new(D.EditorPage, "Vim mode's Ctrl keys", "vim keys ctrl control conflict keymap redo visual block jump back forward older newer",
+            "Each key does what Vim mode does with it, or what the keymap does.") { When = new(s => s.VimMode, "Vim mode is off") });
+
     public static readonly ToggleSetting CloseTags = new(s => s.CloseTags, (s, v) => s with { CloseTags = v },
         new(D.EditorPage, "Close tags on '>' and '</'", "auto close closing end tags markup xml xaml html razor blazor msbuild elements"));
+
+    public static readonly ToggleSetting CompletionParentheses = new(s => s.CompletionParentheses, (s, v) => s with { CompletionParentheses = v },
+        new(D.EditorPage, "Add parentheses to a method chosen from completion", "completion parentheses brackets call method invocation arguments autocomplete",
+            "A C# method chosen by Enter, Tab or a click is written as a call, the caret between its parentheses where it takes "
+            + "arguments. Where the code asks for the method itself, as an event's handler or a delegate, it stays a name."));
 
     public static readonly ToggleSetting XamlWorkspace = new(s => s.XamlWorkspace, (s, v) => s with { XamlWorkspace = v },
         new(D.EditorPage, "Open XAML files in the XAML workspace",
@@ -111,6 +178,19 @@ public static class Declared
         new(D.EditorPage, OperatingSystem.IsMacOS() ? "Change font size with Command+Mouse Wheel" : "Change font size with Ctrl+Mouse Wheel",
             "zoom font size mouse wheel scroll ctrl control command cmd"));
 
+    public static readonly ToggleSetting ReformatOnSave = new(s => s.ReformatOnSave, (s, v) => s with { ReformatOnSave = v },
+        new(D.EditorPage, "Reformat on save", "save actions on save format on save reformat code formatting layout c# xaml",
+            "File, Save and Save All reformat each changed file first, as Reformat Code does, as one undoable edit; autosave never "
+            + "does. A file Prettier's Run on save covers is Prettier's alone, and GDScript's own Reformat on save (Code Style: "
+            + "GDScript) turns this on for scripts alone."));
+
+    public static readonly ToggleSetting EnsureFinalLineBreak = new(s => s.EnsureFinalLineBreak, (s, v) => s with { EnsureFinalLineBreak = v },
+        new(D.EditorPage, "Ensure a final line break on save", "save actions on save final line break newline end of file eol",
+            "Every save, autosave too, ends a file with a line break; an insert_final_newline of false saves a file with none.")
+        {
+            Over = new(["insert_final_newline"]),
+        });
+
     public static readonly ToggleSetting FoldFileHeader = new(s => s.FoldFileHeader, (s, v) => s with { FoldFileHeader = v },
         new(D.CodeFoldingPage, "File header", $"{D.FoldingWords} comments licence license copyright top",
             "Fold by default: what folds as a file opens. A file keeps the folds it was closed with, after a restart too."));
@@ -136,102 +216,147 @@ public static class Declared
     public static readonly ChoiceSetting<XamlAttributeStyle> AttributeStyle = new(s => s.XamlFormat.AttributeStyle, (s, v) => s with { XamlFormat = s.XamlFormat with { AttributeStyle = v } },
         Named<XamlAttributeStyle>(D.AttributeStyles),
         new(D.XamlCodeStylePage, "Attributes format", $"{D.XamlWords} attributes format separate lines single line first attribute do not touch",
-            "Reformat Code lays out .axaml and .xaml by these, Rider's own. A file's .editorconfig overrides each by Rider's key: "
-            + "xml_attribute_style, xml_attribute_indent, xml_indent_child_elements, max_line_length and the rest, with "
-            + "xaml_enable_attribute_reordering, xaml_attribute_ordering_rule_groups and xaml_remove_ending_tag_of_empty_element."));
+            "Reformat Code and Code Cleanup lay out .axaml and .xaml by these.") { Over = Xml("attribute_style") });
 
     public static readonly ChoiceSetting<XamlAttributeIndent> AttributeIndent = new(s => s.XamlFormat.AttributeIndent, (s, v) => s with { XamlFormat = s.XamlFormat with { AttributeIndent = v } },
         Named<XamlAttributeIndent>(D.AttributeIndents),
-        new(D.XamlCodeStylePage, "Attributes indenting", $"{D.XamlWords} attributes indenting indent align first attribute single double"));
+        new(D.XamlCodeStylePage, "Attributes indenting", $"{D.XamlWords} attributes indenting indent align first attribute single double")
+        {
+            Over = Xml("attribute_indent"),
+        });
 
     public static readonly ToggleSetting SpacesAroundEquals = new(s => s.XamlFormat.SpacesAroundEquals, (s, v) => s with { XamlFormat = s.XamlFormat with { SpacesAroundEquals = v } },
-        new(D.XamlCodeStylePage, "Spaces around '=' in attribute", $"{D.XamlWords} spaces equals"));
+        new(D.XamlCodeStylePage, "Spaces around '=' in attribute", $"{D.XamlWords} spaces equals") { Over = Xml("spaces_around_eq_in_attribute") });
 
     public static readonly ToggleSetting SpaceAfterLastAttribute = new(s => s.XamlFormat.SpaceAfterLastAttribute,
         (s, v) => s with { XamlFormat = s.XamlFormat with { SpaceAfterLastAttribute = v } },
-        new(D.XamlCodeStylePage, "Space after last attribute", $"{D.XamlWords} space tag header"));
+        new(D.XamlCodeStylePage, "Space after last attribute", $"{D.XamlWords} space tag header") { Over = Xml("space_after_last_attribute") });
 
     public static readonly ToggleSetting SpaceBeforeSelfClosing = new(s => s.XamlFormat.SpaceBeforeSelfClosing,
         (s, v) => s with { XamlFormat = s.XamlFormat with { SpaceBeforeSelfClosing = v } },
-        new(D.XamlCodeStylePage, "Space before '/>'", $"{D.XamlWords} space self closing empty"));
+        new(D.XamlCodeStylePage, "Space before '/>'", $"{D.XamlWords} space self closing empty") { Over = Xml("space_before_self_closing") });
 
     public static readonly ToggleSetting KeepLineBreaks = new(s => s.XamlFormat.KeepLineBreaks, (s, v) => s with { XamlFormat = s.XamlFormat with { KeepLineBreaks = v } },
-        new(D.XamlCodeStylePage, "Keep existing line breaks", $"{D.XamlWords} line breaks keep user"));
+        new(D.XamlCodeStylePage, "Keep existing line breaks", $"{D.XamlWords} line breaks keep user") { Over = Xml("keep_user_linebreaks") });
 
     public static readonly NumberSetting MaxBlankLines = new(s => s.XamlFormat.MaxBlankLines, (s, v) => s with { XamlFormat = s.XamlFormat with { MaxBlankLines = (int)v } },
-        0, XamlFormatSettings.MostBlankLines, 1, new(D.XamlCodeStylePage, "Maximum blank lines between tags", $"{D.XamlWords} blank lines empty"));
+        0, XamlFormatSettings.MostBlankLines, 1, new(D.XamlCodeStylePage, "Maximum blank lines between tags", $"{D.XamlWords} blank lines empty")
+        {
+            Over = Xml("max_blank_lines_between_tags"),
+        });
 
     public static readonly ToggleSetting MultilineElementsOnNewLine = new(s => s.XamlFormat.MultilineElementsOnNewLine,
         (s, v) => s with { XamlFormat = s.XamlFormat with { MultilineElementsOnNewLine = v } },
-        new(D.XamlCodeStylePage, "Place multiline elements on a new line", $"{D.XamlWords} tags line breaks multiline"));
+        new(D.XamlCodeStylePage, "Place multiline elements on a new line", $"{D.XamlWords} tags line breaks multiline")
+        {
+            Over = Xml("linebreak_before_multiline_elements"),
+        });
 
     public static readonly ToggleSetting SinglelineElementsOnNewLine = new(s => s.XamlFormat.SinglelineElementsOnNewLine,
         (s, v) => s with { XamlFormat = s.XamlFormat with { SinglelineElementsOnNewLine = v } },
-        new(D.XamlCodeStylePage, "Place single-line elements on a new line", $"{D.XamlWords} tags line breaks single line"));
+        new(D.XamlCodeStylePage, "Place single-line elements on a new line", $"{D.XamlWords} tags line breaks single line")
+        {
+            Over = Xml("linebreak_before_singleline_elements"),
+        });
 
     public static readonly ToggleSetting BreaksInsideElementsWithChildren = new(s => s.XamlFormat.BreaksInsideElementsWithChildren,
         (s, v) => s with { XamlFormat = s.XamlFormat with { BreaksInsideElementsWithChildren = v } },
         new(D.XamlCodeStylePage, "Line breaks after start-tag and before end-tag in elements that contain other elements and no text",
-            $"{D.XamlWords} tag content line breaks children"));
+            $"{D.XamlWords} tag content line breaks children") { Over = Xml("linebreaks_inside_tags_for_elements_with_child_elements") });
 
     public static readonly ToggleSetting BreaksInsideMultilineElements = new(s => s.XamlFormat.BreaksInsideMultilineElements,
         (s, v) => s with { XamlFormat = s.XamlFormat with { BreaksInsideMultilineElements = v } },
-        new(D.XamlCodeStylePage, "Line breaks after start-tag and before end-tag in multiline elements", $"{D.XamlWords} tag content line breaks multiline"));
+        new(D.XamlCodeStylePage, "Line breaks after start-tag and before end-tag in multiline elements", $"{D.XamlWords} tag content line breaks multiline")
+        {
+            Over = Xml("linebreaks_inside_tags_for_multiline_elements"),
+        });
 
     public static readonly ChoiceSetting<XamlContentIndent> ChildIndent = new(s => s.XamlFormat.ChildIndent, (s, v) => s with { XamlFormat = s.XamlFormat with { ChildIndent = v } },
         Named<XamlContentIndent>(D.ContentIndents),
-        new(D.XamlCodeStylePage, "Indent inside element that does not contain text", $"{D.XamlWords} indent children elements tag content"));
+        new(D.XamlCodeStylePage, "Indent inside element that does not contain text", $"{D.XamlWords} indent children elements tag content")
+        {
+            Over = Xml("indent_child_elements"),
+        });
 
     public static readonly ChoiceSetting<XamlContentIndent> TextIndent = new(s => s.XamlFormat.TextIndent, (s, v) => s with { XamlFormat = s.XamlFormat with { TextIndent = v } },
         Named<XamlContentIndent>(D.ContentIndents),
-        new(D.XamlCodeStylePage, "Indent inside element that contains text", $"{D.XamlWords} indent text tag content"));
+        new(D.XamlCodeStylePage, "Indent inside element that contains text", $"{D.XamlWords} indent text tag content") { Over = Xml("indent_text") });
 
     public static readonly ToggleSetting BlankLineAfterProcessingInstructions = new(s => s.XamlFormat.BlankLineAfterProcessingInstructions,
         (s, v) => s with { XamlFormat = s.XamlFormat with { BlankLineAfterProcessingInstructions = v } },
-        new(D.XamlCodeStylePage, "Blank line after processing instructions", $"{D.XamlWords} processing instructions xml declaration blank line"));
+        new(D.XamlCodeStylePage, "Blank line after processing instructions", $"{D.XamlWords} processing instructions xml declaration blank line")
+        {
+            Over = Xml("blank_line_after_pi"),
+        });
 
     public static readonly ToggleSetting WrapTags = new(s => s.XamlFormat.WrapTags, (s, v) => s with { XamlFormat = s.XamlFormat with { WrapTags = v } },
-        new(D.XamlCodeStylePage, "Wrap tags and processing instructions", $"{D.XamlWords} wrap long lines tags margin"));
+        new(D.XamlCodeStylePage, "Wrap tags and processing instructions", $"{D.XamlWords} wrap long lines tags margin")
+        {
+            Over = Xml("wrap_tags_and_pi"),
+        });
 
     public static readonly ToggleSetting WrapAroundElements = new(s => s.XamlFormat.WrapAroundElements, (s, v) => s with { XamlFormat = s.XamlFormat with { WrapAroundElements = v } },
-        new(D.XamlCodeStylePage, "Wrap before and after elements", $"{D.XamlWords} wrap long lines elements margin"));
+        new(D.XamlCodeStylePage, "Wrap before and after elements", $"{D.XamlWords} wrap long lines elements margin")
+        {
+            Over = Xml("wrap_around_elements"),
+        });
 
     public static readonly NumberSetting RightMargin = new(s => s.XamlFormat.RightMargin, (s, v) => s with { XamlFormat = s.XamlFormat with { RightMargin = (int)v } },
         0, XamlFormatSettings.WidestMargin, 1,
         new(D.XamlCodeStylePage, "Right margin (columns)", $"{D.XamlWords} right margin columns wrap hard max line length")
         {
             When = new(s => s.XamlFormat.WrapTags || s.XamlFormat.WrapAroundElements, "Wrap tags and processing instructions and Wrap before and after elements are both off"),
+            Over = Xml("max_line_length", "max_line_length"),
+        });
+
+    public static readonly ToggleSetting ReorderAttributes = new(s => s.XamlFormat.ReorderAttributes,
+        (s, v) => s with { XamlFormat = s.XamlFormat with { ReorderAttributes = v } },
+        new(D.XamlCodeStylePage, "Reorder attributes", $"{D.XamlWords} attributes order ordering sort reorder xaml styler x:name grid",
+            "XAML Styler's Enable attribute reordering: each attribute in the group below that names it most nearly, a group to a line.")
+        {
+            Over = new(["xaml_enable_attribute_reordering"], Language.Xaml),
+        });
+
+    public static readonly LinesSetting AttributeOrder = new(s => s.XamlFormat.AttributeOrder, (s, v) => s with { XamlFormat = s.XamlFormat with { AttributeOrder = v } },
+        ';', 210, new(D.XamlCodeStylePage, "Attribute ordering rule groups", $"{D.XamlWords} attributes order ordering rule groups xaml styler")
+        {
+            When = new(s => s.XamlFormat.ReorderAttributes, "Reorder attributes is off"),
+            Over = new(["xaml_attribute_ordering_rule_groups"], Language.Xaml),
         });
 
     public static readonly ToggleSetting CollapseEmptyElements = new(s => s.XamlFormat.CollapseEmptyElements,
         (s, v) => s with { XamlFormat = s.XamlFormat with { CollapseEmptyElements = v } },
-        new(D.XamlCodeStylePage, "Remove ending tag of empty element", $"{D.XamlWords} empty element end tag self closing collapse xaml styler"));
+        new(D.XamlCodeStylePage, "Remove ending tag of empty element", $"{D.XamlWords} empty element end tag self closing collapse xaml styler")
+        {
+            Over = new(["xaml_remove_ending_tag_of_empty_element"], Language.Xaml),
+        });
 
     public static readonly ToggleSetting GDScriptWrapLongLines = new(s => s.GDScriptFormat.WrapLongLines,
         (s, v) => s with { GDScriptFormat = s.GDScriptFormat with { WrapLongLines = v } },
         new(D.GDScriptCodeStylePage, "Wrap long lines inside brackets", $"{D.GDScriptWords} wrap long lines line length brackets arguments arrays multiline",
             "Reformat Code lays a .gd script out by Godot's GDScript style guide, indented by its .editorconfig, else with "
-            + "Godot's tabs. A line past the line length breaks inside its brackets in the guide's multiline forms. A file's "
-            + ".editorconfig says over this by max_line_length: off leaves long lines as they are."));
+            + "Godot's tabs. A line past the line length breaks inside its brackets in the guide's multiline forms; a "
+            + "max_line_length of off leaves long lines as they are.") { Over = GDScript("max_line_length") });
 
     public static readonly NumberSetting GDScriptLineLength = new(s => s.GDScriptFormat.LineLength,
         (s, v) => s with { GDScriptFormat = s.GDScriptFormat with { LineLength = (int)v } },
         GDScriptFormatSettings.ShortestLine, GDScriptFormatSettings.LongestLine, 1,
         new(D.GDScriptCodeStylePage, "Line length (columns)", $"{D.GDScriptWords} line length columns max right margin hard wrap 100 80",
-            "The style guide's is 100. A file's .editorconfig says over this by max_line_length.")
+            "The style guide's is 100.")
         {
             When = new(s => s.GDScriptFormat.WrapLongLines, "Wrap long lines inside brackets is off, so no line is wrapped"),
+            Over = GDScript("max_line_length"),
         });
 
     public static readonly NumberSetting GDScriptBlankLines = new(s => s.GDScriptFormat.BlankLinesAroundFunctions,
         (s, v) => s with { GDScriptFormat = s.GDScriptFormat with { BlankLinesAroundFunctions = (int)v } }, 1, 2, 1,
         new(D.GDScriptCodeStylePage, "Blank lines around functions and classes", $"{D.GDScriptWords} blank lines empty functions classes methods",
-            "The style guide's is 2. A file's .editorconfig says over this by gdscript_blank_lines_around_functions."));
+            "The style guide's is 2.") { Over = GDScript("gdscript_blank_lines_around_functions") });
 
     public static readonly ToggleSetting GDScriptTrailingCommas = new(s => s.GDScriptFormat.TrailingCommas,
         (s, v) => s with { GDScriptFormat = s.GDScriptFormat with { TrailingCommas = v } },
         new(D.GDScriptCodeStylePage, "Trailing comma in multi-line arrays, dictionaries and enums", $"{D.GDScriptWords} trailing comma arrays dictionaries enums",
-            "A file's .editorconfig says over this by gdscript_trailing_comma. A comma already written stays."));
+            "A comma already written stays.") { Over = GDScript("gdscript_trailing_comma") });
 
     public static readonly ToggleSetting GDScriptFormatOnSave = new(s => s.GDScriptFormatOnSave, (s, v) => s with { GDScriptFormatOnSave = v },
         new(D.GDScriptCodeStylePage, "Reformat on save", $"{D.GDScriptWords} save actions on save format on save",
@@ -313,11 +438,13 @@ public static class Declared
     public static readonly ProgramSetting TerminalShell = new(s => s.TerminalShell, (s, v) => s with { TerminalShell = v },
         () => Passenger.Terminal.TerminalSession.DefaultShell().App, new(D.TerminalPage, "Shell path", "shell zsh bash powershell program"));
 
-    public static readonly ProgramSetting DebugBrowser = new(s => s.DebugBrowser, (s, v) => s with { DebugBrowser = v },
-        () => Core.ChromiumBrowsers.Find(null) is { } found ? found.Program : "Not found",
-        new(D.RunPage, Debugging.BrowserDebugging.BrowserRow, "browser chrome edge chromium brave blazor webassembly wasm debug debugger page",
-            "The Chromium browser Debug opens a Blazor app's page in, to debug its WebAssembly components, on a profile of Passenger's own, with any arguments "
-            + "to give each start after it. Empty, it is the first of Chrome, Edge, Chromium and Brave found where they install, else on the PATH."));
+    public static readonly ProgramSetting Browser = new(s => s.Browser, (s, v) => s with { Browser = v },
+        () => Run.PageBrowsers.SystemDefault,
+        new(D.RunPage, Run.PageBrowsers.Row, "browser browsers chrome edge firefox safari chromium brave open page url launch web app blazor webassembly wasm debug debugger",
+            "The browser a web app's page opens in once it listens, as its launch profile's launchBrowser asks: a program (on macOS an app bundle too) "
+            + "with any arguments to give it before the page's address; a run configuration may name its own. Debug drives it, on a profile of "
+            + "Passenger's own, to debug a Blazor app's WebAssembly components, which takes a Chromium browser. Empty, pages open in the system's "
+            + "default browser, and Debug drives the first of Chrome, Edge, Chromium and Brave found where they install, else on the PATH."));
 
     public static readonly ProgramSetting GodotExecutable = new(s => s.GodotExecutable, (s, v) => s with { GodotExecutable = v },
         () => Run.GodotLaunch.Found(null) is { Exists: true } found ? found.Executable : "Not found",
@@ -361,8 +488,9 @@ public static class Declared
     public static readonly ToggleSetting McpServer = new(s => s.McpServer, (s, v) => s with { McpServer = v },
         new(D.McpPage, "Enable MCP Server", D.McpWords,
             "Agents started with passenger --mcp-attach can use this window without asking to: read and change files, build, run and "
-            + "debug, use Git, NuGet and the terminal. Off, the window asks before letting each agent in. Either way, an agent asks "
-            + "before it first uses each tool that changes anything beyond saving, stopping and stepping."));
+            + "debug, use Git, NuGet and the terminal. Off, the window asks before letting each agent in. Either way, the window asks "
+            + "before each call of a tool that changes anything beyond saving, stopping and stepping, unless you allowed that tool, or every "
+            + "tool at the agent's request, for the agent's session."));
 
     public static readonly ChoiceSetting<DiscordShown> DiscordShows = new(s => s.DiscordShows, (s, v) => s with { DiscordShows = v },
         Named<DiscordShown>(D.DiscordChoices));
@@ -384,7 +512,7 @@ public static class Declared
     public static readonly ChoiceSetting<Passenger.Editor.KeymapPreset> Keymap = new(s => s.Keymap, (s, v) => s with { Keymap = v });
 
     public static readonly ChoiceSetting<DiffPlace> OpenDiffsIn = new(s => s.OpenDiffsIn, (s, v) => s with { OpenDiffsIn = v },
-        [(DiffPlace.Window, "A separate window"), (DiffPlace.Tab, "An editor tab")],
+        [(DiffPlace.Tab, "An editor tab"), (DiffPlace.Window, "A separate window")],
         new(D.VersionControlPage, "Open diffs in", "diff diffs show diff compare with revision branch commit log files window tab editor separate git vcs",
             "Where Show Diff, Compare With, a commit's file in the Git log and Compare Files show the two versions. Changed, the "
             + "diffs open now move there."));
@@ -393,6 +521,13 @@ public static class Declared
         Vcs.DiffView.HighlightingWays,
         new(D.VersionControlPage, "Highlighting differences", "diff highlight highlighting differences words characters lines inline changed git vcs",
             "What a diff marks inside the lines that changed. A diff's own Settings changes it too."));
+
+    /// <summary>The keys XAML's layout is said over by: the XML formatter's (<c>xml_</c>, read under <c>resharper_xml_</c>
+    /// too), and any <paramref name="more"/> after it.</summary>
+    private static EditorConfigOver Xml(string key, params string[] more) => new(["xml_" + key, .. more], Language.Xaml) { Aliases = ["resharper_xml_" + key] };
+
+    /// <summary>A key a script's layout is said over by.</summary>
+    private static EditorConfigOver GDScript(string key) => new([key], Language.GDScript);
 
     /// <summary>An enum's values with the names Settings gives them, in the enum's order.</summary>
     private static (T Value, string Name)[] Named<T>(string[] names) where T : struct, Enum => [.. Enum.GetValues<T>().Zip(names)];

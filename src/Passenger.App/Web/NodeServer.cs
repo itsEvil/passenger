@@ -34,6 +34,10 @@ internal sealed class NodeServer
     /// <summary>The package.json whose <c>engines.node</c> says which Node.js the server needs.</summary>
     public required string Package { get; init; }
 
+    /// <summary>The Node.js Passenger's preload for the server needs beside what its package says, as npm writes a range;
+    /// null for a server run with none that needs more.</summary>
+    public string? PreloadNeeds { get; init; }
+
     /// <summary>How it starts on the Node.js at the path given.</summary>
     public required Func<string, ServerStart> Command { get; init; }
 
@@ -148,7 +152,7 @@ internal sealed class NodeServer
                 Session = own;
                 State = $"{Name} ready";
                 IdeErrors.Write($"{Name} language server ({(own.Server.ProcessId == 0 ? "the person's editor" : $"process {own.Server.ProcessId}")}) started for {folder} "
-                    + $"in {Stopwatch.GetElapsedTime(began).TotalSeconds:0.00} s");
+                    + $"in {Durations.Said(Stopwatch.GetElapsedTime(began))}");
                 Started?.Invoke(own);
                 return own;
             }
@@ -163,7 +167,7 @@ internal sealed class NodeServer
                 Fail(none, runtime.Path is null || !File.Exists(runtime.Path) ? "no Node.js" : "Node.js could not run");
                 return null;
             }
-            if (runtime.TooOldFor(Package, $"the {Name} language server") is { } old)
+            if (runtime.TooOldFor(Package, $"the {Name} language server", PreloadNeeds) is { } old)
             {
                 Fail(old, "Node.js too old");
                 return null;
@@ -204,7 +208,7 @@ internal sealed class NodeServer
             Session = started;
             Runtime = runtime;
             State = $"{Name} ready";
-            IdeErrors.Write($"{Name} language server (process {started.Server.ProcessId}) started for {folder} on Node.js {runtime.Version} in {Stopwatch.GetElapsedTime(began).TotalSeconds:0.00} s");
+            IdeErrors.Write($"{Name} language server (process {started.Server.ProcessId}) started for {folder} on Node.js {runtime.Version} in {Durations.Said(Stopwatch.GetElapsedTime(began))}");
             Started?.Invoke(started);
             return started;
         }

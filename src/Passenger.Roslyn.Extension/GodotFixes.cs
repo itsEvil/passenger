@@ -4,6 +4,7 @@ using Microsoft.CodeAnalysis.CSharp.Syntax;
 using Microsoft.CodeAnalysis.Editing;
 using Microsoft.CodeAnalysis.Extensions;
 using Microsoft.CodeAnalysis.Formatting;
+using Passenger.Workspace;
 using static Passenger.Roslyn.Extension.SyntaxReads;
 
 namespace Passenger.Roslyn.Extension;
@@ -55,7 +56,7 @@ internal static partial class GodotSource
     private static async Task<Refactored> HandlerAsync(Solution solution, Document holder, SemanticModel model, ClassDeclarationSyntax declaration, INamedTypeSymbol type,
         Compilation compilation, Engine engine, GodotFixRequest asked, CancellationToken cancel)
     {
-        if (!Changes.IsName(asked.Name))
+        if (!RefactoringChecks.IsName(asked.Name))
         {
             return Changes.Refused($"'{asked.Name}' is not a name C# takes for a method");
         }
@@ -90,7 +91,7 @@ internal static partial class GodotSource
     private static async Task<Refactored> ExportAsync(Solution solution, Document holder, SemanticModel model, ClassDeclarationSyntax declaration, INamedTypeSymbol type,
         Compilation compilation, Engine engine, GodotFixRequest asked, CancellationToken cancel)
     {
-        if (!Changes.IsName(asked.Name))
+        if (!RefactoringChecks.IsName(asked.Name))
         {
             return Changes.Refused($"'{asked.Name}' is not a name C# takes for a property");
         }
@@ -182,7 +183,7 @@ internal static partial class GodotSource
         {
             return null;
         }
-        if (godot.StartsWith("res://", StringComparison.Ordinal))
+        if (godot.StartsWith(GodotResPaths.Scheme, StringComparison.Ordinal))
         {
             return ScriptClass(compilation, godot, cancel);
         }

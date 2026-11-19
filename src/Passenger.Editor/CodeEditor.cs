@@ -2,10 +2,12 @@ using Avalonia;
 using Avalonia.Controls;
 using Avalonia.Controls.Primitives;
 using Avalonia.Input;
+using Avalonia.Interactivity;
 using Avalonia.Layout;
 using Avalonia.Media;
 using Avalonia.Media.TextFormatting;
 using Avalonia.Threading;
+using Passenger.Core;
 using Passenger.Text;
 
 namespace Passenger.Editor;
@@ -30,10 +32,17 @@ public sealed partial class CodeEditor : Control
     public static readonly StyledProperty<FontFamily> FontFamilyProperty =
         AvaloniaProperty.Register<CodeEditor, FontFamily>(nameof(FontFamily), CodeFont);
 
+    public static readonly StyledProperty<CaretBlink> CaretBlinkProperty =
+        AvaloniaProperty.Register<CodeEditor, CaretBlink>(nameof(CaretBlink), CaretBlink.Default);
+
+    public static readonly StyledProperty<double> CaretWidthProperty =
+        AvaloniaProperty.Register<CodeEditor, double>(nameof(CaretWidth), Carets.DefaultWidth);
+
     /// <summary>Space between the gutter's edge and the line numbers, and after them.</summary>
     private const double GutterPadLeft = 14;
     private const double GutterPadRight = 22;
-    private const double TextPadLeft = 6;
+    /// <summary>The room between the gutter and the text, the theme's <c>Passenger.EditorTextPadding</c>.</summary>
+    private double TextPadLeft => palette.TextPadding;
 
     /// <summary>Drawn by the host's ScrollBar theme; "stripe" marks the bar that carries the error stripe.</summary>
     private readonly ScrollBar vertical = new() { Orientation = Orientation.Vertical, AllowAutoHide = false, Classes = { StyleClasses.Stripe } };
@@ -88,11 +97,12 @@ public sealed partial class CodeEditor : Control
         vertical.PropertyChanged += OnScrollBarChanged;
         horizontal.PropertyChanged += OnScrollBarChanged;
         // Started only while focused: a timer running holds the editor, and all it shows, from the dispatcher.
-        blink = new DispatcherTimer(DispatcherPriority.Background) { Interval = TimeSpan.FromMilliseconds(530) };
+        blink = new DispatcherTimer(DispatcherPriority.Background) { Interval = CaretBlink.Default.Shown };
         blink.Tick += (_, _) =>
         {
             caretOn = !caretOn;
             Blinks++;
+            blink.Interval = CaretBlink.While(caretOn);
             RedrawOverlay();
         };
         decorations = new DocumentDecorations(document);
@@ -118,6 +128,8 @@ public sealed partial class CodeEditor : Control
             RunWith(palette.LineNumber));
         annotationRuns = (ItalicRunWith(palette.Annotation), ItalicRunWith(palette.Error));
         CodeFonts.Follow(this, FontFamilyProperty);
+        Carets.FollowBlink(this, CaretBlinkProperty);
+        Carets.FollowWidth(this, CaretWidthProperty);
     }
 
     /// <summary>Raised when the view scrolls.</summary>
@@ -218,6 +230,7 @@ public sealed partial class CodeEditor : Control
             }
             decorations = shown;
             decorations.Changed += OnDecorationsChanged;
+            ForgetLinks();
         }
         ownsDecorations = owned;
         wrappedHints = decorations.InlayHints;
@@ -251,8 +264,12 @@ public sealed partial class CodeEditor : Control
                 FollowInputMethod();
                 break;
         }
-        // The gutter's columns read change marks and bookmarks, which a row's key leaves to them; a fold moves rows.
-        if (kind is DecorationKind.ChangeMarks or DecorationKind.Bookmarks or DecorationKind.Folds)
+        if (kind == DecorationKind.Links)
+        {
+            ForgetLinks();
+        }
+        // The gutter's columns read change marks and bookmarks; a fold moves rows; a row's key holds no address found in it.
+        if (kind is DecorationKind.ChangeMarks or DecorationKind.Bookmarks or DecorationKind.Folds or DecorationKind.Links)
         {
             Redraw();
         }
@@ -295,6 +312,20 @@ public sealed partial class CodeEditor : Control
     {
         get => GetValue(FontSizeProperty);
         set => SetValue(FontSizeProperty, value);
+    }
+
+    /// <summary>How the caret blinks while the editor has the keys: the one in force (<see cref="Carets"/>) unless given.</summary>
+    public CaretBlink CaretBlink
+    {
+        get => GetValue(CaretBlinkProperty);
+        set => SetValue(CaretBlinkProperty, value);
+    }
+
+    /// <summary>The line caret's width: the one in force (<see cref="Carets"/>) unless given.</summary>
+    public double CaretWidth
+    {
+        get => GetValue(CaretWidthProperty);
+        set => SetValue(CaretWidthProperty, value);
     }
 
     public double LineSpacing
@@ -371,6 +402,16 @@ public sealed partial class CodeEditor : Control
     public bool ClosesTags { get; set; } = true;
 
     public bool IsReadOnly { get; set; }
+
+    /// <summary>Why the text refuses changes while <see cref="IsReadOnly"/>, in the host's words, which Vim mode says as it
+    /// refuses one; null for none.</summary>
+    public string? ReadOnlyWhy { get; set; }
+
+    /// <summary>Raised from the editor, bubbling to its window, as it refuses text typed while <see cref="IsReadOnly"/> (a
+    /// key's, an input method's), so the host says <see cref="ReadOnlyWhy"/> as it does for a key changing the
+    /// text.</summary>
+    public static readonly RoutedEvent<RoutedEventArgs> TypingRefusedEvent =
+        RoutedEvent.Register<CodeEditor, RoutedEventArgs>("TypingRefused", RoutingStrategies.Bubble);
 
     /// <summary>Whether the gutter shows line numbers; a console's output goes without.</summary>
     public bool ShowLineNumbers { get; set; } = true;
@@ -615,10 +656,19 @@ public sealed partial class CodeEditor : Control
         get
         {
             int count = document.Snapshot.LineCount;
-            int firstRow = Math.Max(0, (int)(scroll.Y / metrics.LineHeight));
-            int lastRow = Math.Max(firstRow, (int)((scroll.Y + Math.Max(Bounds.Height, metrics.LineHeight)) / metrics.LineHeight));
+            (int firstRow, int lastRow) = RowsInView;
             RowMap rows = Rows;
             return (Math.Clamp(rows.LineOfRow(firstRow).Line, 0, Math.Max(0, count - 1)), Math.Clamp(rows.LineOfRow(lastRow).Line, 0, Math.Max(0, count - 1)));
+        }
+    }
+
+    /// <summary>The first and last rows (from zero) the view reaches, the last perhaps past the text's.</summary>
+    private (int First, int Last) RowsInView
+    {
+        get
+        {
+            int first = Math.Max(0, (int)(scroll.Y / metrics.LineHeight));
+            return (first, Math.Max(first, (int)((scroll.Y + Math.Max(Bounds.Height, metrics.LineHeight)) / metrics.LineHeight)));
         }
     }
 
@@ -685,6 +735,15 @@ public sealed partial class CodeEditor : Control
                 RefreshStyle();
             });
         }
+        else if (change.Property == CaretBlinkProperty)
+        {
+            RestartBlink();
+            RedrawOverlay();
+        }
+        else if (change.Property == CaretWidthProperty)
+        {
+            RedrawOverlay();
+        }
     }
 
     protected override void OnAttachedToVisualTree(VisualTreeAttachmentEventArgs e)
@@ -692,7 +751,14 @@ public sealed partial class CodeEditor : Control
         base.OnAttachedToVisualTree(e);
         RefreshStyle();
         RestartBlink();
+        // A modifier pressed or let go anywhere in the window may begin or end a gesture held over the text of any split.
+        keysHeard = TopLevel.GetTopLevel(this);
+        keysHeard?.AddHandler(KeyDownEvent, HeardKeys, RoutingStrategies.Tunnel, handledEventsToo: true);
+        keysHeard?.AddHandler(KeyUpEvent, HeardKeys, RoutingStrategies.Tunnel, handledEventsToo: true);
     }
+
+    /// <summary>The window whose keys the editor hears while it is shown in it.</summary>
+    private TopLevel? keysHeard;
 
     /// <summary>Gone from the screen (its popup, dialog or window closed), it stops its timers, which would hold it from the
     /// dispatcher for as long as they ran.</summary>
@@ -701,6 +767,11 @@ public sealed partial class CodeEditor : Control
         base.OnDetachedFromVisualTree(e);
         blink.Stop();
         hover?.Stop();
+        keysHeard?.RemoveHandler(KeyDownEvent, HeardKeys);
+        keysHeard?.RemoveHandler(KeyUpEvent, HeardKeys);
+        keysHeard = null;
+        pointer = null;
+        DropReach();
     }
 
     protected override void OnGotFocus(FocusChangedEventArgs e)
@@ -715,6 +786,8 @@ public sealed partial class CodeEditor : Control
     {
         base.OnLostFocus(e);
         blink.Stop();
+        // A gesture's key let go while another window has the keys goes unheard.
+        DropReach();
         ownKeys?.Reset();
         document.BreakUndoGroup();
         Redraw();
@@ -733,7 +806,7 @@ public sealed partial class CodeEditor : Control
             value = SelectionSet.Create([.. value.Items.Skip(from).Take(SelectionSet.MaxCount)], value.PrimaryIndex - from);
             CaretLimitReached?.Invoke(this, EventArgs.Empty);
         }
-        SelectionSet clamped = value.Clamp(document.Snapshot.Length);
+        SelectionSet clamped = VimSettled(value.Clamp(document.Snapshot.Length));
         leaning = nextLeaning ?? Emptied(leaning);
         nextLeaning = null;
         wrapLeaning = nextWrapLeaning ?? Emptied(wrapLeaning);
@@ -798,9 +871,10 @@ public sealed partial class CodeEditor : Control
     private void RestartBlink()
     {
         caretOn = true;
-        if (IsFocused)
+        blink.Stop();
+        if (IsFocused && CaretBlink.Blinks)
         {
-            blink.Stop();
+            blink.Interval = CaretBlink.Shown;
             blink.Start();
         }
     }
@@ -825,7 +899,11 @@ public sealed partial class CodeEditor : Control
             ScrollWithinRows();
         }
         widestStale = true;
-        InvalidateArrange();
+        // An arrange draws the ground again, and so every row; what it lays out moves with the line count alone (gutter, extent).
+        if (e.After.LineCount != e.Before.LineCount)
+        {
+            InvalidateArrange();
+        }
         RedrawChanged();
     }
 

@@ -13,11 +13,13 @@ namespace Passenger.App.Testing;
 public static class TestsAtCaret
 {
     /// <summary>The frameworks' own attributes that make a method a test, as written less "Attribute": xUnit's (and its
-    /// culture's, STA's, WPF's and Avalonia's), NUnit's and TUnit's, and MSTest's (its STA and UI threads' too).</summary>
+    /// culture's, STA's, WPF's, Avalonia's and Xunit.SkippableFact's, which Reqnroll's xUnit v2 code-behind writes), NUnit's
+    /// and TUnit's, and MSTest's (its STA and UI threads' too).</summary>
     private static readonly HashSet<string> TestAttributes = new(StringComparer.Ordinal)
     {
         "Fact", "Theory", "CulturedFact", "CulturedTheory", "StaFact", "StaTheory", "WpfFact", "WpfTheory", "UIFact", "UITheory",
-        "AvaloniaFact", "AvaloniaTheory", "Test", "TestCase", "TestCaseSource", "TestMethod", "DataTestMethod", "STATestMethod", "UITestMethod",
+        "AvaloniaFact", "AvaloniaTheory", "SkippableFact", "SkippableTheory", "Test", "TestCase", "TestCaseSource", "TestMethod", "DataTestMethod",
+        "STATestMethod", "UITestMethod",
     };
 
     /// <summary>The test the caret's line (from zero, the editor's line, which Roslyn may count as several) is in: its
@@ -110,7 +112,12 @@ public static class TestsAtCaret
                 any = true;
                 typeTraits ??= Traits(type.AttributeLists);
                 tests.Add(new DeclaredTest(name, method.Identifier.ValueText, syntax.Text.GetLineFromOffset(method.Identifier.SpanStart),
-                    [.. typeTraits, .. Traits(method.AttributeLists)], inherited) { Cases = Cases(method.AttributeLists), Code = TestCode.Of(method) });
+                    [.. typeTraits, .. Traits(method.AttributeLists)], inherited)
+                {
+                    Cases = Cases(method.AttributeLists),
+                    Code = TestCode.Of(method),
+                    Written = syntax.Root.ContainsDirectives ? WrittenAt(method) : null,
+                });
             }
             if (any)
             {
@@ -118,6 +125,23 @@ public static class TestsAtCaret
             }
         }
         return new FileTests(types, tests, methods) { Attributes = attributes };
+    }
+
+    /// <summary>Where a test's first statement shown to a debugger is written, when a <c>#line</c> directive names another file
+    /// for it (a Reqnroll scenario's code-behind: its .feature file, at the scenario's line); null otherwise.</summary>
+    private static (string File, int Line)? WrittenAt(MethodDeclarationSyntax method)
+    {
+        SyntaxTree tree = method.SyntaxTree;
+        foreach (StatementSyntax statement in method.Body?.Statements ?? [])
+        {
+            if (tree.GetLineVisibility(statement.SpanStart) != LineVisibility.Visible)
+            {
+                continue;
+            }
+            FileLinePositionSpan mapped = tree.GetMappedLineSpan(statement.Span);
+            return mapped.HasMappedPath && mapped.Path.Length > 0 ? (mapped.Path, mapped.StartLinePosition.Line) : null;
+        }
+        return null;
     }
 
     /// <summary>A file not open in an editor, parsed on its own with its project's symbols (<see cref="CSharpParsing"/>),

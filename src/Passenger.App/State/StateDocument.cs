@@ -36,9 +36,10 @@ public interface IStateDocument<TSelf> where TSelf : class, IStateDocument<TSelf
 }
 
 /// <summary>One file of the store, read the first time it is wanted and clamped. A change is written a moment later,
-/// off the UI thread, through a temporary file flushed to disk and moved over the old one; it is merged over what the
-/// file holds then, so a value this build does not know, or one another Passenger changed, stays. A write that fails
-/// keeps its change waiting and is tried again. A value of a kind its property cannot take is passed over alone; a file
+/// off the UI thread, or as Passenger ends where that comes first (<see cref="StateStore.LandWaiting"/>), through a temporary
+/// file flushed to disk and moved over the old one; it is merged over what the file holds then, so a value this build does
+/// not know, or one another Passenger changed, stays. The file is read and written under the lock every Passenger on the
+/// same state honours (<see cref="StateFile.Hold"/>). A write that fails keeps its change waiting and is tried again. A value of a kind its property cannot take is passed over alone; a file
 /// that does not read is set aside as <c>.bad</c>, never written over; each logged and said in a window keeping its state
 /// there.</summary>
 public sealed class StateDocument<T> where T : class, IStateDocument<T>, new()
@@ -48,8 +49,8 @@ public sealed class StateDocument<T> where T : class, IStateDocument<T>, new()
     private static readonly TimeSpan Delay = TimeSpan.FromMilliseconds(500);
 
     /// <summary>The waits before a write that failed is tried again, each longer, as Windows refuses a move over a file
-    /// another program holds a moment without sharing its deletion; past the last, the change waits for the next one or
-    /// <see cref="Flush"/>.</summary>
+    /// another program has open a moment sharing no deletion; past the last, the change waits for the next one,
+    /// <see cref="Flush"/> or Passenger's end (<see cref="StateStore.LandWaiting"/>).</summary>
     private static readonly TimeSpan[] Again = [.. new[] { 250, 500, 1000, 2000, 4000, 8000 }.Select(ms => TimeSpan.FromMilliseconds(ms))];
 
     private readonly string? formerly;
@@ -74,6 +75,13 @@ public sealed class StateDocument<T> where T : class, IStateDocument<T>, new()
 
     private bool readOnly;
 
+    /// <summary>The write Passenger's end makes of a change still waiting, given how long it may wait for the lock.</summary>
+    private readonly Action<TimeSpan> landing;
+
+    /// <summary>Whether Passenger's end holds this side's change as waiting (<see cref="StateFile.Waits"/>), under
+    /// <see cref="gate"/>.</summary>
+    private bool landsAtEnd;
+
     /// <summary>A document at a path; <paramref name="formerly"/> is the file an older build kept the same value in, read
     /// while this one does not exist yet and left where it is.</summary>
     internal StateDocument(string path, string? formerly = null)
@@ -81,6 +89,7 @@ public sealed class StateDocument<T> where T : class, IStateDocument<T>, new()
         Path = path;
         this.formerly = formerly;
         writing = StateFile.Lock(path);
+        landing = left => Write(heldFor: left);
     }
 
     public string Path { get; }
@@ -105,8 +114,16 @@ public sealed class StateDocument<T> where T : class, IStateDocument<T>, new()
         }
     }
 
-    /// <summary>Keeps a value, written a moment later unless it is the one kept already and written, or being tried
-    /// again.</summary>
+    /// <summary>The value the file keeps as read and clamped now, on any thread, as <see cref="Value"/> reads it: null where
+    /// none is kept (no file, or one that did not read). The document takes none of it in.</summary>
+    public T? KeptNow()
+    {
+        (T found, bool isKept, _) = ReadNow();
+        return isKept ? found : null;
+    }
+
+    /// <summary>Keeps a value, written a moment later, or as Passenger ends where that comes first, unless it is the one
+    /// kept already and written, or being tried again.</summary>
     public void Set(T next)
     {
         Load();
@@ -122,6 +139,7 @@ public sealed class StateDocument<T> where T : class, IStateDocument<T>, new()
             latest = text;
             pending = text;
             failed = 0;
+            LandsAtEnd();
             if (scheduled)
             {
                 return;
@@ -137,9 +155,9 @@ public sealed class StateDocument<T> where T : class, IStateDocument<T>, new()
     public void Flush() => Write(flushing: true);
 
     /// <summary>A change of this side's about to be put in the file's place, holding this side's value and nothing it has not
-    /// read: the written file's last write and length, by which a look at the file later knows it holds nothing new. Raised
-    /// on the writing thread, under the document's lock.</summary>
-    public event Action<(DateTime Written, long Length)>? Wrote;
+    /// read: the written file's stamp, by which a look at the file later knows it holds nothing new. Raised on the writing
+    /// thread, under the document's lock.</summary>
+    public event Action<FileStamp>? Wrote;
 
     /// <summary>Reads the file again, once a change still waiting is written: what another Passenger wrote since comes
     /// in. A change that could not be written, a file gone or one not reading leaves the value as it is (this is no first
@@ -161,7 +179,7 @@ public sealed class StateDocument<T> where T : class, IStateDocument<T>, new()
             T read;
             try
             {
-                read = StateFile.Read<T>(Path, Upgraded(File.ReadAllText(Path)).Document).Clamped();
+                read = StateFile.Read<T>(Path, Upgraded(StateFile.ReadHeld(Path)).Document).Clamped();
             }
             catch (Exception error) when (error is IOException or UnauthorizedAccessException)
             {
@@ -189,26 +207,32 @@ public sealed class StateDocument<T> where T : class, IStateDocument<T>, new()
     /// <summary>The file's value as read and clamped now, on any thread, without taking it in.</summary>
     public T Peek() => ReadNow().Value;
 
-    /// <summary>Changes the value as the file holds it now and writes the change at once, merged over the file as a
-    /// <see cref="Set"/>'s is, on any thread: for a document no window keeps. A document a window keeps is changed through
-    /// <see cref="Set"/>.</summary>
+    /// <summary>Changes the value as the file holds it now, with this side's change still waiting (one whose write was
+    /// refused) over it, and writes the change at once, merged over the file as a <see cref="Set"/>'s is, on any thread:
+    /// for a document no window keeps. A document a window keeps is changed through <see cref="Set"/>.</summary>
     public void ChangeNow(Func<T, T> change)
     {
         lock (writing)
         {
             (T read, _, string text) = ReadNow();
-            known = text;
-            string mine = JsonSerializer.Serialize(change(read).Clamped(), StateFile.Options);
-            if (mine == text)
-            {
-                return;
-            }
+            string? waiting;
             lock (gate)
             {
-                pending = mine;
+                waiting = pending;
+            }
+            // The change waiting is in no file yet, so this one, which takes its place, is made over it.
+            T from = waiting is null ? read : StateFile.Read<T>(path: null, StateFile.Merged((JsonObject)JsonNode.Parse(text)!, T.Upgrades.Count, known, waiting, T.Sets)).Clamped();
+            known = text;
+            string mine = JsonSerializer.Serialize(change(from).Clamped(), StateFile.Options);
+            lock (gate)
+            {
+                pending = mine == text ? null : mine;
                 failed = 0;
             }
-            Write();
+            if (mine != text)
+            {
+                Write();
+            }
         }
     }
 
@@ -267,7 +291,7 @@ public sealed class StateDocument<T> where T : class, IStateDocument<T>, new()
     {
         try
         {
-            return StateFile.Read<T>(file, Upgraded(File.ReadAllText(file)).Document);
+            return StateFile.Read<T>(file, Upgraded(file == Path ? StateFile.ReadHeld(file) : File.ReadAllText(file)).Document);
         }
         catch (Exception error) when (error is IOException or UnauthorizedAccessException)
         {
@@ -284,11 +308,17 @@ public sealed class StateDocument<T> where T : class, IStateDocument<T>, new()
 
     private void WriteAfter(TimeSpan wait) => IdeErrors.Observe(Task.Delay(wait).ContinueWith(_ => Write(), TaskScheduler.Default));
 
-    /// <summary>Writes the change waiting, if there is one, merged over the file as it is now. Whether none waits after:
-    /// one whose write failed waits again (<see cref="Failed"/>).</summary>
-    private bool Write(bool flushing = false)
+    /// <summary>Writes the change waiting, if there is one, merged over the file as it is now. Given
+    /// <paramref name="heldFor"/>, it waits no longer than that for a try of this side's own or for another Passenger's
+    /// lock; else as long as its own takes and <see cref="StateFile.HeldFor"/> for the lock. Whether none waits after: one
+    /// whose write failed, or that was not tried in time, waits again (<see cref="Failed"/>).</summary>
+    private bool Write(bool flushing = false, TimeSpan? heldFor = null)
     {
-        lock (writing)
+        if (!Monitor.TryEnter(writing, heldFor ?? Timeout.InfiniteTimeSpan))
+        {
+            return false;
+        }
+        try
         {
             string? mine;
             int tries;
@@ -301,18 +331,21 @@ public sealed class StateDocument<T> where T : class, IStateDocument<T>, new()
             }
             if (mine is null || readOnly)
             {
+                Landed();
                 return true;
             }
             try
             {
-                using FileStream held = StateFile.Hold(Path, StateFile.HeldFor);
+                using FileStream held = StateFile.Hold(Path, heldFor ?? StateFile.HeldFor);
                 if (OnDisk() is not { } disk)
                 {
+                    Landed();
                     return true;
                 }
                 JsonObject merged = StateFile.Merged(disk.Document, Math.Max(disk.Version, T.Upgrades.Count), known, mine, T.Sets);
                 StateFile.Replace(Path, merged, Wrote is { } told && Holds(merged, mine) ? told : null);
                 known = mine;
+                Landed();
                 if (tries > 0)
                 {
                     lock (gate)
@@ -329,11 +362,38 @@ public sealed class StateDocument<T> where T : class, IStateDocument<T>, new()
                 return false;
             }
         }
+        finally
+        {
+            Monitor.Exit(writing);
+        }
+    }
+
+    /// <summary>Has Passenger's end write this side's change waiting, if it ends first. Under <see cref="gate"/>.</summary>
+    private void LandsAtEnd()
+    {
+        if (!landsAtEnd)
+        {
+            landsAtEnd = true;
+            StateFile.Waits(this, Path, landing);
+        }
+    }
+
+    /// <summary>Passenger's end has nothing of this side's to write, unless a change was set while the last was written.</summary>
+    private void Landed()
+    {
+        lock (gate)
+        {
+            if (pending is null)
+            {
+                landsAtEnd = false;
+                StateFile.Landed(this);
+            }
+        }
     }
 
     /// <summary>A change whose write failed waits again, unless one set since holds it, and is tried after the next of
-    /// <see cref="Again"/>'s waits, a flush's from the first; the log says so at its first failure, once its tries are
-    /// spent, and at a flush, past which it is lost if the process ends before a try lands.</summary>
+    /// <see cref="Again"/>'s waits, a flush's from the first, and as Passenger ends; the log says so at its first failure,
+    /// once its tries are spent, and at a flush.</summary>
     private void Failed(string mine, Exception error, bool flushing)
     {
         TimeSpan? wait = null;
@@ -348,14 +408,15 @@ public sealed class StateDocument<T> where T : class, IStateDocument<T>, new()
                 wait = Again[tries - 1];
                 scheduled = true;
             }
+            LandsAtEnd();
         }
         if (flushing)
         {
-            StateFile.Log($"{Path} could not be written as it was flushed ({error.Message}): its change is lost if Passenger ends before a later try lands");
+            StateFile.Log($"{Path} could not be written as it was flushed ({error.Message}): it is tried again while Passenger runs, and as it ends");
         }
         else if (tries == 1)
         {
-            StateFile.Log($"{Path} could not be written ({error.Message}): it is tried again, {Again.Length} times over {Again.Sum(a => a.TotalSeconds)} s at most");
+            StateFile.Log($"{Path} could not be written ({error.Message}): it is tried again, {Again.Length} times over {Durations.Said(Again.Aggregate(TimeSpan.Zero, (all, one) => all + one))} at most");
         }
         else if (tries == Again.Length + 1)
         {
@@ -469,7 +530,82 @@ internal static class StateFile
         }
     }
 
+    /// <summary>Whether a refusal of <see cref="Hold"/> is another Passenger's holding the file, as an IOException's HResult
+    /// says it: Windows' sharing or lock violation, EWOULDBLOCK's number on Linux and on macOS; not a disk's refusal.</summary>
+    public static bool HeldElsewhere(IOException refused) => OperatingSystem.IsWindows()
+        ? refused.HResult is SharingViolation or LockViolation
+        : refused.HResult == (OperatingSystem.IsMacOS() ? MacWouldBlock : LinuxWouldBlock);
+
+    private const int SharingViolation = unchecked((int)0x80070020);
+    private const int LockViolation = unchecked((int)0x80070021);
+    private const int LinuxWouldBlock = 11;
+    private const int MacWouldBlock = 35;
+
+    /// <summary>A document's file read whole under its <see cref="Hold"/>, so the read is never in the way of another
+    /// Passenger's write (Windows refuses a move over a file a program has open sharing no deletion, as this read does, and
+    /// any move where the file system has no POSIX semantics); read without it where it is not had in time, or where its
+    /// lock file cannot be made (a folder closed to writes, which no Passenger writes).</summary>
+    public static string ReadHeld(string path)
+    {
+        FileStream? held = null;
+        try
+        {
+            held = Hold(path, HeldFor);
+        }
+        catch (IOException refused)
+        {
+            Log($"{path} is read without its lock, which another Passenger held past {Durations.Said(HeldFor)} ({refused.Message})");
+        }
+        catch (UnauthorizedAccessException)
+        {
+        }
+        using (held)
+        {
+            return File.ReadAllText(path);
+        }
+    }
+
     public static void Log(string line) => IdeErrors.Write($"State: {line}");
+
+    /// <summary>The documents whose change waits, not yet written or after a write that failed, each with its file and the
+    /// write that tries it again.</summary>
+    private static readonly ConcurrentDictionary<object, (string Path, Action<TimeSpan> Write)> Unwritten = new();
+
+    /// <summary>How long Passenger's end tries again the changes still waiting, <see cref="LandingPause"/> apart.</summary>
+    private static readonly TimeSpan LandingLimit = TimeSpan.FromSeconds(2);
+    private static readonly TimeSpan LandingPause = TimeSpan.FromMilliseconds(50);
+
+    /// <summary>A document's change waiting, not yet written or after a write that failed, written as Passenger ends by
+    /// <paramref name="write"/>, given how long it may wait for another Passenger's lock.</summary>
+    public static void Waits(object document, string path, Action<TimeSpan> write) => Unwritten[document] = (path, write);
+
+    /// <summary>A document with no change waiting.</summary>
+    public static void Landed(object document) => Unwritten.TryRemove(document, out _);
+
+    /// <summary>Writes each change waiting, one not yet written or after a write that failed, <see cref="LandingPause"/>
+    /// apart, until all have landed or <see cref="LandingLimit"/> has passed, a write waiting for another Passenger's lock
+    /// only as long as is left of it, and logs those still waiting as lost.</summary>
+    public static void LandWaiting()
+    {
+        long began = Stopwatch.GetTimestamp();
+        while (!Unwritten.IsEmpty)
+        {
+            foreach ((string _, Action<TimeSpan> write) in Unwritten.Values)
+            {
+                TimeSpan left = LandingLimit - Stopwatch.GetElapsedTime(began);
+                write(left > TimeSpan.Zero ? left : TimeSpan.Zero);
+            }
+            if (Unwritten.IsEmpty || Stopwatch.GetElapsedTime(began) >= LandingLimit)
+            {
+                break;
+            }
+            Thread.Sleep(LandingPause);
+        }
+        foreach ((string path, Action<TimeSpan> _) in Unwritten.Values)
+        {
+            Log($"{path} could not be written before Passenger ended: its change is lost");
+        }
+    }
 
     /// <summary>Whether an exception is a file's not reading: its JSON, its shape, or a value of the wrong kind.</summary>
     public static bool DoesNotRead(Exception error) =>
@@ -660,8 +796,8 @@ internal static class StateFile
     /// <summary>Writes a document through a temporary file beside it, flushed to disk and moved over it, so a crash or
     /// a full disk leaves the old file whole; a symlink (settings.json kept in a dotfiles folder) is written through to
     /// its target, which keeps its permissions, rather than replaced by a file of its own. <paramref name="placing"/> is
-    /// told the written file's last write and length just before it is moved over the old one.</summary>
-    public static void Replace(string path, JsonObject document, Action<(DateTime Written, long Length)>? placing = null)
+    /// told the written file's stamp just before it is moved over the old one.</summary>
+    public static void Replace(string path, JsonObject document, Action<FileStamp>? placing = null)
     {
         Directory.CreateDirectory(Path.GetDirectoryName(path)!);
         string target = AtomicFile.Target(path);
@@ -673,12 +809,11 @@ internal static class StateFile
         UnixFileMode? mode = !OperatingSystem.IsWindows() && File.Exists(target) ? File.GetUnixFileMode(target) : null;
         AtomicFile.Write(target, Encoding.UTF8.GetBytes(document.ToJsonString(Options) + "\n"), mode, AtomicFile.Temporary, (temporary, at) =>
         {
-            if (placing is not null)
+            if (placing is not null && FileStamp.Of(temporary) is { } written)
             {
-                FileInfo written = new(temporary);
-                placing((written.LastWriteTimeUtc, written.Length));
+                placing(written);
             }
-            File.Move(temporary, at, overwrite: true);
+            AtomicFile.Move(temporary, at);
         });
     }
 

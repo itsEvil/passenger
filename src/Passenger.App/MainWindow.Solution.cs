@@ -12,9 +12,9 @@ namespace Passenger.App;
 /// and the Explorer, Build, Run and the language server read the solution again.</summary>
 public partial class MainWindow
 {
-    /// <summary>Asks the person for files (Existing Project, Existing Item, Compare With, an Aspire AppHost's file
-    /// input), by a title, the types it takes (any file with none) and whether it takes several, in the system's own
-    /// dialog.</summary>
+    /// <summary>Asks the person for files (Open Solution, Open File, Existing Project, Existing Item, Compare With, an
+    /// Aspire AppHost's file input), by a title, the types it takes (any file with none) and whether it takes several, in
+    /// the system's own dialog, in the open folder or, with none, beside the folder opened last.</summary>
     public Func<string, IReadOnlyList<FilePickerFileType>?, bool, Task<IReadOnlyList<string>>> PickFiles
     {
         get => pickFiles ?? PickFilesAsync;
@@ -29,7 +29,7 @@ public partial class MainWindow
         {
             Title = title,
             AllowMultiple = several,
-            SuggestedStartLocation = Folder is null ? null : await StorageProvider.TryGetFolderFromPathAsync(Folder),
+            SuggestedStartLocation = await StorageProvider.TryGetFolderFromPathAsync(Folder ?? BesideLast()),
             FileTypeFilter = types,
         });
         return [.. picked.Select(f => f.TryGetLocalPath()).OfType<string>()];
@@ -111,7 +111,7 @@ public partial class MainWindow
     {
         string where = into is null ? "the Solution" : $"Solution Folder '{FolderName(into)}'";
         IReadOnlyList<string> picked = await PickFiles($"Add Existing Project to {where}",
-            [new FilePickerFileType("Projects") { Patterns = ["*.csproj", "*.fsproj", "*.vbproj"] }], true);
+            [new FilePickerFileType("Projects") { Patterns = ["*.csproj", "*.fsproj", "*.vbproj", "*" + SharedProjects.Extension] }], true);
         if (picked.Count == 0)
         {
             return;
@@ -193,8 +193,9 @@ public partial class MainWindow
     /// <summary>Makes one change to the open solution's file and, once it has landed, reads the solution again: null when it
     /// was made, else why not, which the status bar says too. The projects it takes out (<paramref name="leaving"/>) leave
     /// the solution filter open too, both files changed in one command Undo takes back whole, named
-    /// <paramref name="command"/>.</summary>
-    private async Task<string?> EditSolutionAsync(Func<string, string?> edit, string done, IReadOnlyCollection<string>? leaving = null, string? command = null)
+    /// <paramref name="command"/>, or in the command given (<paramref name="into"/>).</summary>
+    private async Task<string?> EditSolutionAsync(Func<string, string?> edit, string done, IReadOnlyCollection<string>? leaving = null, string? command = null,
+        CommandHistory.Recording? into = null)
     {
         if (Solution is not { } solution)
         {
@@ -211,7 +212,7 @@ public partial class MainWindow
             unfiltered = edited is null && filter is not null ? Change(() => SolutionEdits.RemoveFromFilter(filter, leaving!), Path.GetFileName(filter)) : null;
             return edited;
         }
-        string? refused = await (command is null ? ChangeFileAsync(writing, Write, null) : ChangeFileAsync(command, writing, Write));
+        string? refused = await (command is null ? ChangeFileAsync(writing, Write, into) : ChangeFileAsync(command, writing, Write, into));
         // The edit's own refusal says itself; the disk's is said as the solution's.
         string? problem = refused is null || refused == edited ? refused : $"{solution.Name} could not be changed: {refused}";
         if (problem is null)
@@ -239,7 +240,8 @@ public partial class MainWindow
     private void RunProjectTests(IReadOnlyList<string> projects, string what, bool debug)
     {
         HashSet<string> chosen = new(projects, StringComparer.Ordinal);
-        RunTests(() => session.Tests.RunMatchingAsync(Folder!, m => m.ProjectPath is { } project && chosen.Contains(project), $"No tests were found in {what}", debug));
+        RunTests(() => session.Tests.RunMatchingAsync(Folder!, m => m.ProjectPath is { } project && chosen.Contains(project),
+            unfound => $"No tests were found in {what}" + (unfound is null ? string.Empty : $": {unfound}"), debug));
     }
 
     private static SolutionFolder? FindFolder(IEnumerable<SolutionEntry> entries, string path)

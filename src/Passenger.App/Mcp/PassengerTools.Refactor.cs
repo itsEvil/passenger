@@ -57,8 +57,14 @@ public sealed partial class PassengerTools
     {
         string named = kind.Trim().ToLowerInvariant().Replace(' ', '_').Replace('-', '_');
         JsonElement? given = Options(options);
+        using AgentsChange naming = window.NameAgentsChange(Refactoring(named, null));
         if (path is not null && Godot.GodotScriptTypes.IsScript(Resolve(path)))
         {
+            if (line is { } scriptLine && column is { } scriptColumn)
+            {
+                OpenDocument script = await DocumentAsync(path, cancel);
+                naming.Names(Refactoring(named, NameAt(script, Offset(script, scriptLine, scriptColumn))));
+            }
             RefactorAnswer scripted = await GDScriptRefactorAsync(named, path, line, column, endLine, endColumn, given, describe, cancel);
             if (scripted.Files.Count > 0)
             {
@@ -81,7 +87,12 @@ public sealed partial class PassengerTools
             throw new ArgumentException($"{named} needs the place it works on: path, line and column", nameof(path));
         }
         (OpenDocument document, LspDocument lsp) = await CSharpOnly(path, named, cancel);
+        if (document.IsReadOnly)
+        {
+            throw new InvalidOperationException($"{Refactoring(named, null)} was not applied: {Refusals.ReadOnly(document.Name)}");
+        }
         int offset = Offset(document, line.Value, column.Value);
+        naming.Names(Refactoring(named, NameAt(document, offset)));
         bool describing = describe || (given is null && named is "change_signature" or "move" or "extract_interface" or "pull_members_up" or "push_members_down");
         RefactorAnswer answer = named switch
         {
@@ -99,6 +110,39 @@ public sealed partial class PassengerTools
         }
         return answer;
     }, AgentCall.Say, cancel));
+
+    /// <summary>What Local History names an agent's refactoring of a kind, as the window names the refactoring, with the
+    /// name it works on where one is at its place.</summary>
+    private static string Refactoring(string kind, string? subject)
+    {
+        (string title, string? on) = kind switch
+        {
+            "change_signature" => ("Change Signature", " of "),
+            "safe_delete" => ("Safe Delete", " "),
+            "move" => ("Move", " "),
+            "extract_interface" => ("Extract Interface", " from "),
+            "pull_members_up" => ("Pull Members Up", " from "),
+            "push_members_down" => ("Push Members Down", " from "),
+            "encapsulate_field" => ("Encapsulate Field", " "),
+            "inline" or "inline_variable" or "inline_function" => ("Inline", " "),
+            "introduce_field" => ("Introduce Field", null),
+            "introduce_parameter" => ("Introduce Parameter", null),
+            "extract_variable" or "introduce_variable" => ("Extract Variable", null),
+            "extract_function" or "extract_method" => ("Extract Function", null),
+            "optimize_imports" => ("Optimize Imports", null),
+            "code_cleanup" => ("Code Cleanup", null),
+            _ => (kind, null),
+        };
+        return on is not null && subject is not null ? title + on + subject : title;
+    }
+
+    /// <summary>The name written at an offset of a file, as Rename takes it there, or null where none is.</summary>
+    private string? NameAt(OpenDocument document, int offset)
+    {
+        TextSnapshot text = document.Text.Snapshot;
+        string name = text.GetText(window.Assist.Actions.RenamedAt(document, text, offset));
+        return name.Any(char.IsLetterOrDigit) ? name : null;
+    }
 
     /// <summary>A GDScript refactoring for an agent, through the window's own (<see cref="CSharp.CodeActions.GDScriptRefactorAsync"/>):
     /// at path, line and column, over a selection to endLine and endColumn for those that take one, with the name or the
@@ -314,19 +358,34 @@ public sealed partial class PassengerTools
                 type.Namespace,
                 File = type.FileName,
                 type.TypesInFile,
-                ToFile = new { File = type.TargetFileName },
-                ToNamespace = new { type.Namespace },
+                Options = new { File = type.TargetFileName, type.Namespace },
             });
         }
         JsonElement given = options!.Value;
         (string? file, string? space) = (JsonMembers.Text(given, "file"), JsonMembers.Text(given, "namespace"));
-        return (file, space) switch
+        // Each as described is left as it is: the one changed is the move, and the described file's where neither is.
+        StringComparer names = PathNames.NamesIn(Path.GetDirectoryName(document.Path)!);
+        bool toFile = file is not null && !names.Equals(file, type.TargetFileName);
+        bool toSpace = space is not null && space != type.Namespace;
+        if (toFile && toSpace)
         {
-            (null, null) => throw new ArgumentException("move takes file (a new file beside the type's) or namespace, as the window's Move to Another File and Move to Namespace do"),
-            ({ }, { }) => throw new ArgumentException("move takes file or namespace, one at a time, as the window's Move does: move it to the namespace, then to the file, in two calls"),
-            ({ } toFile, null) => Applied("move", await window.Assist.Actions.MoveTypeToFileAsync(document, offset, type, toFile, patience)),
-            _ => Applied("move", await window.Assist.Actions.MoveTypeToNamespaceAsync(document, offset, type, space!, patience)),
-        };
+            throw new ArgumentException("move takes file or namespace, one at a time, as the window's Move does: move it to the namespace, then to the file, in two calls");
+        }
+        if (toSpace)
+        {
+            return Applied("move", await window.Assist.Actions.MoveTypeToNamespaceAsync(document, offset, type, space!, patience));
+        }
+        if (file is not null && names.Equals(file, type.FileName))
+        {
+            throw new ArgumentException($"'{type.Name}' is in {type.FileName} already: move takes the file it goes to, or namespace");
+        }
+        if (file is not null)
+        {
+            return Applied("move", await window.Assist.Actions.MoveTypeToFileAsync(document, offset, type, file, patience));
+        }
+        throw new ArgumentException(space is null
+            ? "move takes file (a new file beside the type's) or namespace, as the window's Move to Another File and Move to Namespace do"
+            : $"{RefactoringChecks.InNamespaceAlready(type.Name, space)}: move takes the namespace it goes to, or file");
     }
 
     private async Task<RefactorAnswer> MembersAsync(OpenDocument document, LspDocument lsp, int offset, JsonElement? options, bool describing, bool up, Patience patience)
@@ -463,9 +522,13 @@ public sealed partial class PassengerTools
                     return new RefactorAnswer(kind, $"Code Cleanup would reformat {Relative(markup.Path)}", [], []);
                 }
                 CSharp.CodeActions.Reformatted formatted = await FormatXamlAsync(markup, name);
-                return new RefactorAnswer(kind, formatted.Said, formatted.Changed ? [new RefactorFile(Relative(markup.Path), "changed", [], formatted.Said)] : [], []);
+                return new RefactorAnswer(kind, formatted.Said, formatted.Changed ? [new RefactorFile(Relative(markup.Path), Words(RefactoredChange.Changed), [], formatted.Said)] : [], []);
             }
             (OpenDocument document, LspDocument lsp) = await CSharpOnly(path, kind, cancel);
+            if (document.IsReadOnly)
+            {
+                throw new InvalidOperationException($"{name} was not applied: {Refusals.ReadOnly(document.Name)}");
+            }
             if (describe)
             {
                 return new RefactorAnswer(kind, $"{name} would tidy {Relative(document.Path)}", [], []);
@@ -475,7 +538,7 @@ public sealed partial class PassengerTools
             document.Save();
             await LandedAsync(cancel);
             return new RefactorAnswer(kind, $"{Relative(document.Path)}: {done}",
-                document.Text.Version == before ? [] : [new RefactorFile(Relative(document.Path), "changed", [], done)], []);
+                document.Text.Version == before ? [] : [new RefactorFile(Relative(document.Path), Words(RefactoredChange.Changed), [], done)], []);
         }
         if (scope is not ("project" or "solution"))
         {
@@ -536,12 +599,17 @@ public sealed partial class PassengerTools
                 left.Add($"{Relative(document.Path)}: the language server does not read it");
                 return;
             }
+            if (document.IsReadOnly)
+            {
+                left.Add(Refusals.ReadOnly(Relative(document.Path)));
+                return;
+            }
             // Its text's version says whether the tidy changed it, never the text made into a string twice.
             int before = document.Text.Version;
             string done = await TidyOne(lsp, document, cleanup);
             if (document.Text.Version != before)
             {
-                tidied.Add(new RefactorFile(Relative(document.Path), "changed", [], done));
+                tidied.Add(new RefactorFile(Relative(document.Path), Words(RefactoredChange.Changed), [], done));
             }
         }
     }
@@ -589,9 +657,12 @@ public sealed partial class PassengerTools
     /// <summary>A refactoring's outcome as the agent reads it: refused with why, or each file it changed and what it left.</summary>
     private RefactorAnswer Applied(string kind, RefactorOutcome made) => made.Problem is { } problem
         ? throw new InvalidOperationException(problem)
-        : new RefactorAnswer(kind, made.Said, [.. made.Files.Select(f => new RefactorFile(Relative(f.Path), f.Change, f.Lines, To: f.To is { } to ? Relative(to) : null))],
+        : new RefactorAnswer(kind, made.Said, [.. made.Files.Select(f => new RefactorFile(Relative(f.Path), Words(f.Change), f.Lines, To: f.To is { } to ? Relative(to) : null))],
             [.. made.Left.Select(name => $"{name}: it was edited meanwhile, so it was left as it is"),
                 .. made.Unchanged.Select(use => $"{Relative(use.Path)}:{use.Line}:{use.Column}: {use.Why}, so it was left as it is")]);
+
+    /// <summary>What a refactoring did to a file, as an agent reads it ("moved").</summary>
+    private static string Words(RefactoredChange change) => JsonNamingPolicy.CamelCase.ConvertName(change.ToString());
 
     private static RefactorAnswer Described(string kind, string said, object dialog) =>
         new(kind, said + "; send options to apply it", [], [], JsonSerializer.SerializeToElement(dialog, DialogJson));

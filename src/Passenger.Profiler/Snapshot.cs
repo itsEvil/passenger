@@ -232,6 +232,13 @@ public sealed class Snapshot
 
     private bool framesAlone;
 
+    /// <summary>Why the run's trace stops short of its end, as its reading found it, or null for a whole trace: one whose
+    /// program ended before its session did (crashed, or killed) holds only what was written before, and lacks the end a
+    /// stopped session writes.</summary>
+    public string? CutShort => Whole.cutShort;
+
+    private string? cutShort;
+
     /// <summary>A Godot game's frames in the stretch, in order, as Godot's own profiler measured them; none for any other program.</summary>
     public IReadOnlyList<GameFrame> GameFrames { get; }
 
@@ -566,16 +573,29 @@ public sealed class Snapshot
     /// <summary>Reads a .nettrace file EventPipe wrote: the samples' stacks, with the methods named from the run's own
     /// method load events, the allocation ticks, the collections and an Avalonia app's frames. Each stack is named once (the
     /// trace numbers its own), kept once however many samples caught it, and a thread's samples in a row at one stack become
-    /// one run.</summary>
+    /// one run. A trace cut short holds what was written before its break (<see cref="CutShort"/>); one TraceEvent cannot
+    /// read at all throws what <see cref="TraceFailures.Of"/> names.</summary>
     public static Snapshot Read(string nettrace)
     {
         if (new FileInfo(nettrace).Length == 0)
         {
             return OfFrames(nettrace);
         }
-        string etlx = TraceLog.CreateFromEventPipeDataFile(nettrace, null, new TraceLogOptions { ContinueOnError = true });
+        ReadThrough through = ReadThroughOnce(nettrace);
+        if (through is { CutShort: { } cut, AnyEvent: false })
+        {
+            return OfNoEvents(nettrace, cut, through.Began);
+        }
+        string? cutShort = through.CutShort;
+        // Each read's index of its own, never beside the trace: a folder it cannot write, or another read of it, is no matter.
+        string etlx = Path.Combine(Path.GetTempPath(), $"passenger-{Guid.NewGuid():N}.etlx");
         try
         {
+            using (FileStream trace = Opened(nettrace))
+            using (EventPipeEventSource source = new(trace))
+            {
+                TraceLog.CreateFromEventTraceLogFile(source, etlx, new TraceLogOptions { ContinueOnError = true });
+            }
             using TraceLog log = new(etlx);
             FrameNames names = new(log);
             List<int[]> stacks = [];
@@ -592,7 +612,9 @@ public sealed class Snapshot
             Profiler.UiFrames.Reader uiFrames = new();
             (int Number, int Generation, string Reason, double At)? collecting = null;
             double? suspended = null;
-            foreach (TraceEvent data in log.Events)
+            // An index of no events is never walked: TraceEvent reads on past its end, making events up as it goes.
+            IEnumerable<TraceEvent> events = log.EventCount == 0 ? [] : log.Events;
+            foreach (TraceEvent data in events)
             {
                 if (data.ProviderName == RuntimeProvider)
                 {
@@ -656,7 +678,7 @@ public sealed class Snapshot
             IEnumerable<double> ends = kept.Select(t => t.Runs.Max(r => r.ToMs)).Concat(drawn.Select(f => f.EndMs)).Concat(played.Select(f => f.EndMs)).Concat(marks);
             double first = starts.DefaultIfEmpty(0).Min();
             double end = ends.DefaultIfEmpty(0).Max();
-            return new Snapshot(kept, stacks, names.Named, names.Codes, threads, ticks, collections, drawn, game, first, end, nettrace, null);
+            return new Snapshot(kept, stacks, names.Named, names.Codes, threads, ticks, collections, drawn, game, first, end, nettrace, null) { cutShort = cutShort };
 
             // The event's stack as a number into the table, each the trace numbers named once and each distinct one kept once.
             int Stack(TraceEvent data)
@@ -693,15 +715,62 @@ public sealed class Snapshot
         }
     }
 
+    /// <summary>What a trace's read through once, with only a mark listening, found: why it stops short of its end, or null
+    /// for a whole one; whether it gave any event; and when it began.</summary>
+    private readonly record struct ReadThrough(string? CutShort, bool AnyEvent, DateTime Began);
+
+    /// <summary>A trace read through once: TraceEvent's index of it holds what came before a break and says nothing of one.
+    /// A trace cut within its header, its Trace block unread (its pointer size unknown), is no snapshot: what TraceEvent
+    /// threw for it goes on to the caller, no index made of it.</summary>
+    private static ReadThrough ReadThroughOnce(string nettrace)
+    {
+        using FileStream trace = Opened(nettrace);
+        using EventPipeEventSource source = new(trace);
+        bool anyEvent = false;
+        source.AllEvents += _ => anyEvent = true;
+        try
+        {
+            source.Process();
+            return new ReadThrough(null, anyEvent, source.SessionStartTime.ToUniversalTime());
+        }
+        catch (Exception broken) when (TraceFailures.Broken(broken) && source.PointerSize != 0)
+        {
+            return new ReadThrough(broken.Message, anyEvent, source.SessionStartTime.ToUniversalTime());
+        }
+    }
+
+    /// <summary>A trace opened for TraceEvent's reading, which closes it however the read ends: shared with every other
+    /// reader and writer and with its deletion, so the person may write over, move or delete it as it is read.</summary>
+    private static FileStream Opened(string nettrace) =>
+        new(nettrace, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+
     /// <summary>A run of a Godot game's frames alone (<see cref="FramesAlone"/>): its trace empty, its frames beside it, timed
     /// from the first one's arrival.</summary>
     private static Snapshot OfFrames(string nettrace)
     {
-        GameProfile? game = GameProfile.ReadBeside(nettrace, null);
+        Snapshot frames = OfFramesBeside(nettrace, null);
+        frames.framesAlone = true;
+        return frames;
+    }
+
+    /// <summary>A run whose trace was cut short before it gave any event, perhaps at its header's last byte, short of which
+    /// an index of it knows no start: nothing an index would hold, so read with none, a game's frames beside it timed from
+    /// the trace's start.</summary>
+    private static Snapshot OfNoEvents(string nettrace, string cutShort, DateTime began)
+    {
+        Snapshot none = OfFramesBeside(nettrace, at => (at - began).TotalMilliseconds);
+        none.cutShort = cutShort;
+        return none;
+    }
+
+    /// <summary>A run of no events: the game's frames beside its trace, if any, and nothing else.</summary>
+    private static Snapshot OfFramesBeside(string nettrace, Func<DateTime, double>? traceMs)
+    {
+        GameProfile? game = GameProfile.ReadBeside(nettrace, traceMs);
         IReadOnlyList<GameFrame> played = game?.Frames ?? [];
         double first = played.Select(f => f.StartMs).DefaultIfEmpty(0).Min();
         double end = played.Select(f => f.EndMs).DefaultIfEmpty(0).Max();
-        return new Snapshot([], [], [], [], new Dictionary<int, string>(), [], [], [], game, first, end, nettrace, null) { framesAlone = true };
+        return new Snapshot([], [], [], [], new Dictionary<int, string>(), [], [], [], game, first, end, nettrace, null);
     }
 
     /// <summary>Stacks compared by their frames, so one caught again is the one kept, and looked up by a walk's frames
@@ -729,10 +798,12 @@ public sealed class Snapshot
     }
 
     /// <summary>The frames a run's stacks are numbered into, each method once by what it is, its full name (its parameters'
-    /// types in full) in its module, and shown by its short name (<see cref="Pretty"/>): overloads that read alike stay two.</summary>
+    /// types in full) in its module, and shown by its short name (<see cref="Pretty"/>): overloads that read alike stay two.
+    /// A trace can name one module in lower case for some of its code and as written for the rest, so a module is told
+    /// apart ignoring case, and named as written where the trace ever does.</summary>
     internal sealed class FrameTable
     {
-        private readonly Dictionary<(string Method, string Module), int> numbers = [];
+        private readonly Dictionary<(string Method, string Module), int> numbers = new(FrameKeys.Instance);
 
         public List<(string Method, string Module)> Named { get; } = [];
 
@@ -748,7 +819,24 @@ public sealed class Snapshot
                 Named.Add((shown, module));
                 Codes.Add(code);
             }
+            else if (Named[number].Module != module && Named[number].Module == Named[number].Module.ToLowerInvariant())
+            {
+                Named[number] = (shown, module);
+                Codes[number] = code ?? Codes[number];
+            }
             return number;
+        }
+
+        /// <summary>A frame's key: its method's full name exactly, its module's name ignoring case.</summary>
+        private sealed class FrameKeys : IEqualityComparer<(string Method, string Module)>
+        {
+            public static readonly FrameKeys Instance = new();
+
+            public bool Equals((string Method, string Module) x, (string Method, string Module) y) =>
+                string.Equals(x.Method, y.Method, StringComparison.Ordinal) && string.Equals(x.Module, y.Module, StringComparison.OrdinalIgnoreCase);
+
+            public int GetHashCode((string Method, string Module) key) =>
+                HashCode.Combine(StringComparer.Ordinal.GetHashCode(key.Method), StringComparer.OrdinalIgnoreCase.GetHashCode(key.Module));
         }
     }
 

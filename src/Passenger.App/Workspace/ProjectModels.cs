@@ -16,10 +16,18 @@ namespace Passenger.App.Workspace;
 public sealed class ProjectModels
 {
     private readonly Dictionary<string, EvaluatedProject> known = new(StringComparer.Ordinal);
-    private readonly ConcurrentQueue<(int Generation, EvaluatedProject Project)> landed = new();
+    private readonly ConcurrentQueue<(int Generation, string? Configured, EvaluatedProject Project)> landed = new();
+
+    /// <summary>The build configuration each evaluation known was made under (<see cref="BuildConfiguration.Key"/>), null for
+    /// the one MSBuild takes given none: one made under another than a round's stands for nothing in it, nor is it kept.</summary>
+    private readonly Dictionary<string, string?> under = new(StringComparer.Ordinal);
     private StateDocument<ProjectModelCache>? kept;
     private string? folder;
     private string? sdk;
+
+    /// <summary>The configuration the last round was asked under (<see cref="BuildConfiguration.Key"/>), null for the one
+    /// MSBuild takes given none: what the folder keeps is what was made under it.</summary>
+    private string? configured;
 
     /// <summary>Bumped as a folder is taken up or let go, so what lands for the one before is dropped.</summary>
     private int generation;
@@ -119,10 +127,12 @@ public sealed class ProjectModels
         {
             return;
         }
+        // Evaluations kept under another configuration are shown until the first round evaluates them all again.
         sdk = value.Sdk;
         foreach ((string path, EvaluatedProject project) in value.Projects)
         {
             known[path] = project;
+            under[path] = value.Configured;
         }
         if (value.Projects.Count > 0)
         {
@@ -132,6 +142,14 @@ public sealed class ProjectModels
         {
             Next();
         }
+    }
+
+    /// <summary>Has every project evaluated again at the next round, as another SDK's MSBuild would: what the SDK resolves
+    /// changed under it (a workload installed).</summary>
+    public void EvaluateAll()
+    {
+        UiThread.Check();
+        sdk = null;
     }
 
     /// <summary>Lets the folder go: what is still being evaluated for it is dropped as it lands.</summary>
@@ -148,7 +166,9 @@ public sealed class ProjectModels
         folder = null;
         kept = null;
         sdk = null;
+        configured = null;
         known.Clear();
+        under.Clear();
         made.Clear();
         Problem = null;
         MissingSdk = null;
@@ -190,7 +210,65 @@ public sealed class ProjectModels
         foreach (string path in known.Where(k => k.Value.Problem is not null && paths.Any(p => PathNames.Within(k.Key, p)) && File.Exists(k.Key)).Select(k => k.Key).ToList())
         {
             known.Remove(path);
+            under.Remove(path);
             made.Remove(path);
+        }
+    }
+
+    /// <summary>Whether a file under the folder that an evaluation known read was written since, <paramref name="within"/>
+    /// ago at most (by an agent's own file tool, or saved, before the folder's watcher may have heard), or an import (a .props
+    /// or .targets) came in a folder an evaluation's wildcards walked, which a project may import once it is there: its
+    /// project is to be evaluated again. Looked at off the window's thread.</summary>
+    public Task<bool> ReadWrittenNowAsync(TimeSpan within)
+    {
+        UiThread.Check();
+        if (folder is not { } under)
+        {
+            return Task.FromResult(false);
+        }
+        List<Stamp> read = [.. known.Values.SelectMany(e => e.Inputs).Where(i => !i.Folder && !i.Presence && PathNames.IsUnder(i.Path, under)).Distinct()];
+        List<Stamp> walked = [.. known.Values.SelectMany(e => e.Folders).Where(f => PathNames.Within(f.Path, under)).Distinct()];
+        DateTime since = DateTime.UtcNow - within;
+        return read.Count == 0 && walked.Count == 0 ? Task.FromResult(false)
+            : BackgroundWork.Run(() => read.Any(i => Written(i, since)) || walked.Any(f => Written(f, since) && ImportCame(f.Path, since)));
+    }
+
+    /// <summary>Whether any of these files, stamped as they were read (a solution), was written since, <paramref name="within"/>
+    /// ago at most, and stands otherwise now. Looked at off the window's thread.</summary>
+    public static Task<bool> WrittenNowAsync(IReadOnlyList<Stamp> read, TimeSpan within)
+    {
+        DateTime since = DateTime.UtcNow - within;
+        return read.Count == 0 ? Task.FromResult(false) : BackgroundWork.Run(() => read.Any(i => Written(i, since)));
+    }
+
+    /// <summary>Whether what was stamped was written since and stands otherwise now, its time looked at first, as it costs
+    /// less than a folder's names.</summary>
+    private static bool Written(Stamp stamp, DateTime since) => WrittenSince(stamp.Path, since) && !Stamps.Holds(stamp);
+
+    private static readonly string[] Imports = [".props", ".targets"];
+
+    /// <summary>Whether a .props or .targets file in a folder was written since.</summary>
+    private static bool ImportCame(string folder, DateTime since)
+    {
+        try
+        {
+            return new DirectoryInfo(folder).EnumerateFiles().Any(f => PathNames.HasExtension(f.Name, Imports) && f.LastWriteTimeUtc >= since);
+        }
+        catch (Exception error) when (error is IOException or UnauthorizedAccessException)
+        {
+            return false;
+        }
+    }
+
+    private static bool WrittenSince(string path, DateTime since)
+    {
+        try
+        {
+            return File.GetLastWriteTimeUtc(path) >= since;
+        }
+        catch (Exception error) when (error is IOException or UnauthorizedAccessException)
+        {
+            return false;
         }
     }
 
@@ -245,16 +323,18 @@ public sealed class ProjectModels
         running = generation;
         Rounds++;
         List<string> projects = [.. Ordered(next.Workspace, next.Active)];
+        configured = next.Workspace.Build?.Chosen.Key;
         Dictionary<string, EvaluatedProject> before = new(StringComparer.Ordinal);
         foreach (string path in projects)
         {
-            if (known.TryGetValue(path, out EvaluatedProject? evaluated))
+            // One made under another configuration is evaluated again, however its inputs stand.
+            if (known.TryGetValue(path, out EvaluatedProject? evaluated) && under.GetValueOrDefault(path) == configured)
             {
                 before[path] = evaluated;
             }
         }
         BackgroundWork.Begin();
-        IdeErrors.Observe(RoundAsync(generation, folder, projects, before, Properties(next.Workspace), ending.Token));
+        IdeErrors.Observe(RoundAsync(generation, configured, folder, projects, before, Properties(next.Workspace), Each(next.Workspace), ending.Token));
     }
 
     /// <summary>The workspace's projects, the active file's first and then those it references as last evaluated, through
@@ -299,10 +379,15 @@ public sealed class ProjectModels
     }
 
     /// <summary>The global properties one project is evaluated with for what a build of it makes (a launch's program, a test
-    /// run's assemblies, a publish): the solution's, and Windows targeting where the host loaded it with that.</summary>
+    /// run's assemblies, a publish): the solution's, the configuration and platform chosen for it
+    /// (<see cref="WorkspaceModel.Build"/>), and Windows targeting where the host loaded it with that.</summary>
     public static Dictionary<string, string> Properties(WorkspaceModel? workspace, ProjectModel project)
     {
         Dictionary<string, string> properties = workspace is null ? new(StringComparer.OrdinalIgnoreCase) : Properties(workspace);
+        foreach ((string name, string value) in workspace?.BuildPropertiesOf(project.Path) ?? new Dictionary<string, string>())
+        {
+            properties[name] = value;
+        }
         if (project.WindowsTargeting)
         {
             properties[MSBuildNames.EnableWindowsTargeting] = "true";
@@ -310,8 +395,28 @@ public sealed class ProjectModels
         return properties;
     }
 
-    private async Task RoundAsync(int mine, string following, List<string> projects, Dictionary<string, EvaluatedProject> before, Dictionary<string, string> properties,
-        CancellationToken cancel)
+    /// <summary>The global properties each project of a workspace takes beyond the solution's for the configuration and
+    /// platform chosen (<see cref="WorkspaceModel.Build"/>), by path; null for the configuration MSBuild takes.</summary>
+    public static IReadOnlyDictionary<string, IReadOnlyDictionary<string, string>>? Each(WorkspaceModel? workspace) =>
+        workspace?.Build is null ? null
+        : workspace.Projects.Select(p => p.Path).Distinct(StringComparer.Ordinal).ToDictionary(p => p, workspace.BuildPropertiesOf, StringComparer.Ordinal);
+
+    /// <summary>The global properties one project is evaluated with for what a build of its solution makes of it
+    /// (<see cref="Properties(WorkspaceModel?, ProjectModel)"/>), with the configuration and platform that build gives it
+    /// where it builds it (<paramref name="built"/>): mapped to x64, it builds into bin/x64/….</summary>
+    public static Dictionary<string, string> Properties(WorkspaceModel? workspace, ProjectModel project, SolutionBuilt? built)
+    {
+        Dictionary<string, string> properties = Properties(workspace, project);
+        if (built is not null)
+        {
+            properties[MSBuildNames.Configuration] = built.Configuration;
+            properties[MSBuildNames.Platform] = built.Platform;
+        }
+        return properties;
+    }
+
+    private async Task RoundAsync(int mine, string? madeUnder, string following, List<string> projects, Dictionary<string, EvaluatedProject> before, Dictionary<string, string> properties,
+        IReadOnlyDictionary<string, IReadOnlyDictionary<string, string>>? each, CancellationToken cancel)
     {
         long began = Stopwatch.GetTimestamp();
         HashSet<string> evaluated = new(StringComparer.Ordinal);
@@ -366,8 +471,10 @@ public sealed class ProjectModels
             }
             if (mine == generation)
             {
+                // What the round evaluated may still wait in a posted landing, which this continuation can come before.
+                Land();
                 Keep(projects);
-                IdeErrors.Write($"Project host (process {host.ProcessId}) evaluated {stale.Count} of the {projects.Count} projects of {following} in {done.Seconds:0.00} s, {Stopwatch.GetElapsedTime(began).TotalSeconds:0.00} s after they were checked");
+                IdeErrors.Write($"Project host (process {host.ProcessId}) evaluated {stale.Count} of the {projects.Count} projects of {following} in {Durations.Said(TimeSpan.FromSeconds(done.Seconds))}, {Durations.Said(Stopwatch.GetElapsedTime(began))} after they were checked");
             }
         }
         catch (OperationCanceledException) when (cancel.IsCancellationRequested)
@@ -409,12 +516,12 @@ public sealed class ProjectModels
                     evaluated.Add(project.Path);
                 }
             }
-            landed.Enqueue((mine, project));
+            landed.Enqueue((mine, madeUnder, project));
             if (Interlocked.Exchange(ref posting, 1) == 0)
             {
                 UiThread.Post(Land);
             }
-        }, cancel);
+        }, cancel, each);
     }
 
     private void SdkIs(MissingSdk? missing)
@@ -431,13 +538,14 @@ public sealed class ProjectModels
     {
         Interlocked.Exchange(ref posting, 0);
         HashSet<string> changed = new(StringComparer.Ordinal);
-        while (landed.TryDequeue(out (int Generation, EvaluatedProject Project) one))
+        while (landed.TryDequeue(out (int Generation, string? Configured, EvaluatedProject Project) one))
         {
             if (one.Generation != generation)
             {
                 continue;
             }
             known[one.Project.Path] = one.Project;
+            under[one.Project.Path] = one.Configured;
             changed.Add(one.Project.Path);
             if (one.Project.Complete)
             {
@@ -460,12 +568,13 @@ public sealed class ProjectModels
         Dictionary<string, EvaluatedProject> complete = new(StringComparer.Ordinal);
         foreach (string path in projects)
         {
-            if (known.TryGetValue(path, out EvaluatedProject? evaluated) && evaluated.Complete)
+            // Only what was made under the configuration asked last: one landing late from a round before it is not.
+            if (known.TryGetValue(path, out EvaluatedProject? evaluated) && evaluated.Complete && under.GetValueOrDefault(path) == configured)
             {
                 complete[path] = evaluated;
             }
         }
-        kept.Set(new ProjectModelCache { Sdk = sdk, Projects = complete });
+        kept.Set(new ProjectModelCache { Sdk = sdk, Configured = configured, Projects = complete });
     }
 
     /// <summary>Whether an evaluation stands: complete, and everything it read as it was then.</summary>

@@ -86,10 +86,12 @@ public sealed class DebugSession : IAsyncDisposable
     public DapConnection Connection { get; }
 
     /// <summary>The adapter with DebuggableConsoleApp started for it to attach to; suspended, the
-    /// program waits at startup until the attach lets it go, in configurationDone.</summary>
-    public static DebugSession ForAttach(ITestOutputHelper output, bool startSuspended, out Process debuggee, string? symbolCache = null)
+    /// program waits at startup until the attach lets it go, in configurationDone. The program has
+    /// <paramref name="programEnvironment"/> over the run's.</summary>
+    public static DebugSession ForAttach(ITestOutputHelper output, bool startSuspended, out Process debuggee, string? symbolCache = null,
+        IReadOnlyDictionary<string, string>? programEnvironment = null)
     {
-        debuggee = StartDebuggee(startSuspended);
+        debuggee = StartDebuggee(startSuspended, programEnvironment);
         return new DebugSession(output, debuggee, terminateDebuggee: false, symbolCache);
     }
 
@@ -102,6 +104,15 @@ public sealed class DebugSession : IAsyncDisposable
     /// <paramref name="symbolCache"/> when given, and the adapter has <paramref name="environment"/> over the run's.</summary>
     public static DebugSession ForLaunch(ITestOutputHelper output, string? symbolCache = null, IReadOnlyDictionary<string, string>? environment = null) =>
         new(output, null, terminateDebuggee: true, symbolCache, environment);
+
+    /// <summary>An adapter's environment giving it the run's evaluation limit scaled for the machine, for a session whose
+    /// first evaluation pays a cold cost (a library loading, or the debugger's own code loaded into the program) that a
+    /// loaded machine may take most of the run's short limit over.</summary>
+    public static IReadOnlyDictionary<string, string> ScaledEvaluations => new Dictionary<string, string>
+    {
+        [AdapterEnvironment.EvaluationTimeoutVariable] = ((int)(AdapterEnvironment.EvaluationTimeout.TotalMilliseconds * TestRun.TimeScale))
+            .ToString(System.Globalization.CultureInfo.InvariantCulture),
+    };
 
     /// <summary>Kills the adapter and the program it launched, as a crash or the IDE's own kill of an adapter that never
     /// answered a disconnect does.</summary>
@@ -251,7 +262,9 @@ public sealed class DebugSession : IAsyncDisposable
         {
             DapStackFrame top = await TopFrameAsync(stop.ThreadId!.Value);
             ScopesResponse scopes = await ScopesAsync(top.Id);
-            return await VariablesAsync(scopes.Scopes.Single().VariablesReference);
+            Assert.True(scopes.Scopes.Count == 1,
+                $"The stopped thread's top frame, {top.Name} at line {top.Line}, has {scopes.Scopes.Count} scopes, so Variables shows it nothing. {Heard()}");
+            return await VariablesAsync(scopes.Scopes[0].VariablesReference);
         }
         catch (DapException failed)
         {
@@ -418,6 +431,39 @@ public sealed class DebugSession : IAsyncDisposable
 
 
 
+
+    /// <summary>The next stop, or null where the session ends first, with what the program wrote to its standard output
+    /// meanwhile: for a step after which the program is to run on to its end.</summary>
+    public async Task<(StoppedEvent? Stop, string Output)> WaitForStopOrEnd()
+    {
+        using CancellationTokenSource limit = CancellationTokenSource.CreateLinkedTokenSource(TestContext.Current.CancellationToken);
+        limit.CancelAfter(EventLimit);
+        StringBuilder output = new();
+        while (true)
+        {
+            (string Name, JsonElement Body) next;
+            try
+            {
+                next = await events.Reader.ReadAsync(limit.Token);
+            }
+            catch (OperationCanceledException) when (!TestContext.Current.CancellationToken.IsCancellationRequested)
+            {
+                throw new TimeoutException($"Neither a stop nor the session's end came in {EventLimit.TotalSeconds:0} s. {Heard()}");
+            }
+            if (next.Name == DapEvents.Terminated)
+            {
+                return (null, output.ToString());
+            }
+            if (next.Name == DapEvents.Stopped)
+            {
+                return (next.Body.Deserialize<StoppedEvent>(DapConnection.Options)!, output.ToString());
+            }
+            if (next.Name == DapEvents.Output && next.Body.Deserialize<OutputEvent>(DapConnection.Options) is { Category: DapOutputCategories.Stdout } written)
+            {
+                output.Append(written.Output);
+            }
+        }
+    }
 
     /// <summary>What the program wrote to its standard output and how it ended (no exit code when none was told), read
     /// from the events to the session's end.</summary>
@@ -614,10 +660,14 @@ public sealed class DebugSession : IAsyncDisposable
     }
 
 
-    private static Process StartDebuggee(bool startSuspended)
+    private static Process StartDebuggee(bool startSuspended, IReadOnlyDictionary<string, string>? environment)
     {
         string path = Debuggees.Apphost("DebuggableConsoleApp");
         ProcessStartInfo start = ChildProcesses.Command(path, []);
+        foreach ((string name, string value) in environment ?? new Dictionary<string, string>())
+        {
+            start.Environment[name] = value;
+        }
         if (startSuspended)
         {
             foreach ((string name, string value) in HeldStart.Variables(changeable: false))
@@ -683,6 +733,13 @@ public static class Debuggees
     public static string Source(params string[] path) => Path.Combine([Repository.Value, "tests", "Debuggees", .. path]);
 
     public static string Program(string name) => Path.Combine(Repository.Value, "artifacts", "bin", name, "debug", $"{name}.dll");
+
+    /// <summary>What runs a debuggee on the newest .NET installed rather than the one it targets: from .NET 11 on, the
+    /// runtime leaves its own exception dispatch among a stop's frames for the debugger to hide.</summary>
+    public static IReadOnlyDictionary<string, string> NewestRuntime { get; } = new Dictionary<string, string> { [Passenger.Core.RuntimeVariables.RollForward] = "LatestMajor" };
+
+    /// <summary>What a debuggee asked to run on the newest .NET evaluates in a frame to show it does: true on .NET 11 or later.</summary>
+    public const string RunsOnNewestRuntime = "System.Environment.Version.Major >= 11";
 
     /// <summary>The line (from one) of a debuggee's Program.cs that holds some code, so a test names
     /// what it stops at rather than a number that moves when a case is added above it.</summary>
@@ -775,4 +832,6 @@ public static class DebugSessionChain
     public static async Task<T> WaitForEvent<T>(this Task<DebugSession> chain, Predicate<T>? condition = null) => await (await chain).WaitForEvent(condition);
 
     public static async Task<(string Output, int? ExitCode)> WaitForEnd(this Task<DebugSession> chain) => await (await chain).WaitForEnd();
+
+    public static async Task<(StoppedEvent? Stop, string Output)> WaitForStopOrEnd(this Task<DebugSession> chain) => await (await chain).WaitForStopOrEnd();
 }

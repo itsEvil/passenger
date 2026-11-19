@@ -159,7 +159,7 @@ public sealed class AspireTests : IClassFixture<AspireApp>, IDisposable
             File.AppendAllText(Path.Combine(Path.GetDirectoryName(project.Host)!, "AppHost.cs"), "\n// Rerun runs a changed AppHost again.\n");
             Ui.Run(window, AppActions.Rerun);
             Ui.WaitFor(() => window.AspireRuntime.Apps is [{ ProcessId: int again }] && again != hostPid
-                && window.Aspire.ResourceSnapshots.Any(resource => resource.DisplayName == "apiservice" && resource.State == "Running"),
+                && window.Aspire.ResourceSnapshots.Any(resource => resource.DisplayName == "apiservice" && resource.State == AspireStates.Running),
                 "Rerun to run the changed AppHost again", TimeSpan.FromMinutes(3));
             Assert.False(Processes.IsRunning(hostPid), "The AppHost that ran before Rerun still runs");
         }
@@ -188,7 +188,7 @@ public sealed class AspireTests : IClassFixture<AspireApp>, IDisposable
             Assert.Equal(0, ServiceChoice(dialog, "webfrontend")!.SelectedIndex);
             Ui.Click(dialog.CopyButton);
             Ui.Click(dialog.NameBox);
-            Ui.Press(dialog, "control A");
+            Ui.Press(dialog, Ui.Command("A"));
             dialog.KeyTextInput("API debug, frontend run");
             Ui.Settle();
             ComboBox api = ServiceChoice(dialog, "apiservice")!;
@@ -439,7 +439,7 @@ public sealed class AspireTests : IClassFixture<AspireApp>, IDisposable
             AspireInteractionDialog form = Prompt(window, "API settings");
             TextBox input = Assert.IsType<TextBox>(form.InputControls["value"]);
             Ui.Click(input);
-            Ui.Press(form, "control A");
+            Ui.Press(form, Ui.Command("A"));
             form.KeyTextInput("typed while connected");
             Ui.Click(form.Primary);
             Ui.WaitFor(() => form.Problem.Text?.Contains("Choose another value", StringComparison.Ordinal) == true,
@@ -447,7 +447,7 @@ public sealed class AspireTests : IClassFixture<AspireApp>, IDisposable
             input = Assert.IsType<TextBox>(form.InputControls["value"]);
             Assert.Equal("typed while connected", input.Text);
             Ui.Click(input);
-            Ui.Press(form, "control A");
+            Ui.Press(form, Ui.Command("A"));
             form.KeyTextInput("latest value");
             Ui.Click(form.Primary);
             Ui.WaitFor(() => File.Exists(project.InteractionAnswer), "the real AppHost's submitted value");
@@ -575,7 +575,7 @@ public sealed class AspireTests : IClassFixture<AspireApp>, IDisposable
 
             Assert.True(window.SelectConfiguration(window.Configurations.Single(configuration => PathNames.Same(configuration.Project, loose)).Name));
             string? beside = Ui.Await(window.RunAsync(), "the pinned CLI's sibling-project refusal");
-            Assert.Contains("13.x (13.6.0 or newer)", beside, StringComparison.Ordinal);
+            Assert.Contains("13.x (13.6.0 or newer) or 17.x", beside, StringComparison.Ordinal);
             Assert.Contains("sibling .csproj", beside, StringComparison.Ordinal);
             Assert.Empty(window.AspireRuntime.Apps);
             Assert.False(window.IsRunning);
@@ -607,7 +607,7 @@ public sealed class AspireTests : IClassFixture<AspireApp>, IDisposable
             Ui.WaitFor(() => AppHostSaid(window).Contains("passenger-profile-port: 5000", StringComparison.Ordinal),
                 () => $"the single-file AppHost given its profile's number value, which it said as:\n{Redacted(AppHostSaid(window))}");
             FindAction(window, "Show Aspire Resources");
-            Ui.WaitFor(() => window.Aspire.ResourceSnapshots.Any(resource => resource.DisplayName == "aspire-dashboard" && resource.State == "Running"), "the single-file AppHost's native resource stream");
+            Ui.WaitFor(() => window.Aspire.ResourceSnapshots.Any(resource => resource.DisplayName == "aspire-dashboard" && resource.State == AspireStates.Running), "the single-file AppHost's native resource stream");
             AspireAppRun app = Assert.Single(window.AspireRuntime.Apps);
             int[] owned = OwnedPids(window);
             Assert.True(app.ProcessId is > 0 && owned.Length > 0);
@@ -820,6 +820,17 @@ public sealed class AspireTests : IClassFixture<AspireApp>, IDisposable
             Assert.Contains("SessionOperationFailed", Ui.Await(failed.Content.ReadAsStringAsync(), "the launch failure"), StringComparison.Ordinal);
             Assert.Equal(services, app.Services.Count);
             Assert.All(app.Services, running => Assert.True(Processes.IsRunning(running.ProcessId!.Value)));
+
+            // A startup hook from a folder another user may write, as one who had the token could ask for, starts nothing.
+            string elsewhere = Path.Join(Path.GetPathRoot(Path.GetFullPath(project.ApiProject)), "passenger-elsewhere", "hook.dll");
+            using HttpResponseMessage hooked = Send(quick, root, HttpMethod.Put, "/run_session?api-version=2024-03-03", endpoint.Token, "passenger-review-abcdefghijkl",
+                JsonSerializer.Serialize(new
+                {
+                    launch_configurations = new[] { new { type = "project", project_path = project.ApiProject, mode = "NoDebug", disable_launch_profile = true } },
+                    env = new[] { new { name = RuntimeVariables.StartupHooks, value = elsewhere } },
+                }));
+            Assert.Equal(HttpStatusCode.InternalServerError, hooked.StatusCode);
+            Assert.Equal(services, app.Services.Count);
             notifications.Abort();
         }
 
@@ -993,7 +1004,7 @@ public sealed class AspireTests : IClassFixture<AspireApp>, IDisposable
     {
         FindAction(window, "Show Aspire Resources");
         Ui.WaitFor(() => new[] { "apiservice", "webfrontend" }.All(name => window.Aspire.ResourceSnapshots.Any(resource =>
-            resource.DisplayName == name && resource.State == "Running"
+            resource.DisplayName == name && resource.State == AspireStates.Running
                 && window.AspireRuntime.FindService(new(project.Host, resource))?.ProcessId is > 0)),
             "the native API and frontend resource stream", TimeSpan.FromMinutes(3));
     }
@@ -1052,7 +1063,7 @@ public sealed class AspireTests : IClassFixture<AspireApp>, IDisposable
     {
         window.ShowToolWindow(ToolWindowIds.Aspire);
         RefreshUntil(window, () => new[] { "apiservice", "webfrontend" }.All(name =>
-            window.Aspire.ResourceSnapshots.Any(resource => resource.DisplayName == name && resource.State == "Running"
+            window.Aspire.ResourceSnapshots.Any(resource => resource.DisplayName == name && resource.State == AspireStates.Running
                 && window.AspireRuntime.FindService(new(project.Host, resource))?.ProcessId is > 0)), "the API and frontend's real DCP-owned processes");
     }
 
@@ -1174,15 +1185,7 @@ public sealed class AspireTests : IClassFixture<AspireApp>, IDisposable
         Dictionary<int, string> left = Leftovers();
         foreach (int id in left.Keys)
         {
-            try
-            {
-                using System.Diagnostics.Process process = System.Diagnostics.Process.GetProcessById(id);
-                process.Kill();
-            }
-            catch (Exception ended) when (ended is ArgumentException or InvalidOperationException or System.ComponentModel.Win32Exception)
-            {
-                // Gone meanwhile.
-            }
+            OwnProcess.Of(id).Kill(alone: true);
         }
         Assert.Fail($"The test's AppHost's programs outlived its window, and were ended:\n{string.Join("\n", left.Values)}");
     }

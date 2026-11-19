@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Globalization;
 using Avalonia;
 using Avalonia.Controls;
@@ -25,9 +26,9 @@ public sealed class MetricsPane : DockPanel
     /// <summary>Where each shipped meter comes among the headings, the program's own after them.</summary>
     private static readonly Dictionary<string, int> ShippedOrder = LiveMetrics.Shipped.Select((meter, at) => (meter, at)).ToDictionary(m => m.meter, m => m.at, StringComparer.Ordinal);
 
-    private readonly StackPanel rows = new() { Margin = new Thickness(8, 4, 8, 8) };
+    private readonly StackPanel rows = new() { Margin = new Thickness(Gaps.Normal, Gaps.Tight, Gaps.Normal, Gaps.Normal) };
     private readonly TextBlock waiting = new() { Classes = { StyleClasses.EmptyText } };
-    private readonly TextBlock status = new() { Classes = { StyleClasses.Muted }, Margin = new Thickness(8, 6, 8, 0), TextTrimming = TextTrimming.CharacterEllipsis, [DockProperty] = Dock.Top };
+    private readonly TextBlock status = new() { Classes = { StyleClasses.Muted }, Margin = new Thickness(Gaps.Normal, Gaps.Small, Gaps.Normal, 0), TextTrimming = TextTrimming.CharacterEllipsis, [DockProperty] = Dock.Top };
     private readonly Dictionary<(string Meter, string Instrument), Chart> charts = [];
     private readonly Dictionary<string, TextBlock> headings = new(StringComparer.Ordinal);
     private readonly HashSet<string> meters = new(StringComparer.Ordinal);
@@ -186,66 +187,87 @@ public sealed class MetricsPane : DockPanel
     /// <summary>Begins reading, in place of the session before (<paramref name="again"/>, with the meters published since).
     /// A start that failed is said at once: asked again, saying so, only while the runtime has yet to open its port (in a
     /// container, a few times, its tools saying no more); left to <see cref="DebuggerChanged"/> once the debugger pauses the
-    /// program; else said and left.</summary>
+    /// program; else said and left. Let go of (<see cref="Stop"/>, a follow after it), it asks nothing more and says nothing.</summary>
     private async Task FollowAsync(int follow, bool again)
     {
         using IDisposable working = BackgroundWork.Scope();
-        if (again && live is { } before)
+        using CancellationTokenSource asked = new();
+        CancellationTokenSource? dropped = asking;
+        asking = asked;
+        dropped?.Cancel();
+        try
         {
-            live = null;
-            await before.DisposeAsync();
-        }
-        DateTime first = DateTime.UtcNow;
-        bool waited = false;
-        for (int attempt = 1; follow == follows; attempt++)
-        {
-            try
+            if (again && live is { } before)
             {
-                LiveMetrics started = place is { } there ? await LiveMetrics.AttachAsync(process, there, Heard(follow))
-                    : await LiveMetrics.AttachAsync(process, [.. meters], Heard(follow), _ =>
-                    {
-                        if (follow == follows)
-                        {
-                            waited = true;
-                            Say(ProgramStarts.Waiting(name, "reading its metrics"));
-                        }
-                    });
-                if (follow != follows)
-                {
-                    await started.DisposeAsync();
-                    return;
-                }
-                live = started;
-                if (waited && charts.Count == 0)
-                {
-                    Say($"Waiting for {name}'s first metrics…");
-                }
-                IdeErrors.Observe(EndedAsync(started, follow));
-                return;
+                live = null;
+                await before.DisposeAsync();
             }
-            catch (ProfilingException error)
+            long first = Stopwatch.GetTimestamp();
+            bool waited = false;
+            for (int attempt = 1; follow == follows; attempt++)
             {
-                if (follow != follows)
+                try
                 {
+                    LiveMetrics started = place is { } there ? await LiveMetrics.AttachAsync(process, there, Heard(follow), asked.Token)
+                        : await LiveMetrics.AttachAsync(process, [.. meters], Heard(follow), _ =>
+                        {
+                            if (follow == follows)
+                            {
+                                waited = true;
+                                Say(ProgramStarts.Waiting(name, "reading its metrics"));
+                            }
+                        }, asked.Token);
+                    if (follow != follows)
+                    {
+                        await started.DisposeAsync();
+                        return;
+                    }
+                    live = started;
+                    if (waited && charts.Count == 0)
+                    {
+                        Say($"Waiting for {name}'s first metrics…");
+                    }
+                    IdeErrors.Observe(EndedAsync(started, follow));
                     return;
                 }
-                if (Paused?.Invoke(process, place) == true)
+                catch (ProfilingException error)
                 {
-                    held = true;
-                    Say(Refusals.MetricsWhilePaused(name));
-                    return;
+                    if (follow != follows)
+                    {
+                        return;
+                    }
+                    if (Paused?.Invoke(process, place) == true)
+                    {
+                        held = true;
+                        Say(Refusals.MetricsWhilePaused(name));
+                        return;
+                    }
+                    bool askAgain = place is null ? SessionStarts.AskAgain(error, Stopwatch.GetElapsedTime(first), HeldStart.PortLimit) : attempt < ContainerAttempts;
+                    if (!askAgain)
+                    {
+                        Say($"{name}: {error.Message}");
+                        return;
+                    }
+                    Say(place is null ? $"Waiting for {name}'s runtime to open its diagnostic port…" : $"{name}: {error.Message}; asking again…");
+                    await Task.Delay(TimeSpan.FromMilliseconds(200), asked.Token);
                 }
-                bool askAgain = place is null ? SessionStarts.AskAgain(error, DateTime.UtcNow - first, HeldStart.PortLimit) : attempt < ContainerAttempts;
-                if (!askAgain)
-                {
-                    Say($"{name}: {error.Message}");
-                    return;
-                }
-                Say(place is null ? $"Waiting for {name}'s runtime to open its diagnostic port…" : $"{name}: {error.Message}; asking again…");
-                await Task.Delay(TimeSpan.FromMilliseconds(200));
+            }
+        }
+        catch (OperationCanceledException) when (asked.IsCancellationRequested)
+        {
+            // Let go of as it asked: the pane follows another program, or none.
+        }
+        finally
+        {
+            if (asking == asked)
+            {
+                asking = null;
             }
         }
     }
+
+    /// <summary>What the follow under way asks with, canceled as the pane lets go of it.</summary>
+    private CancellationTokenSource? asking;
 
     /// <summary>How many times a program in a container is asked for its metrics, whose tools say only that they failed.</summary>
     private const int ContainerAttempts = 15;
@@ -292,6 +314,9 @@ public sealed class MetricsPane : DockPanel
     {
         UiThread.Check();
         follows++;
+        CancellationTokenSource? dropped = asking;
+        asking = null;
+        dropped?.Cancel();
         widen.Stop();
         if (live is { } session)
         {
@@ -404,7 +429,7 @@ public sealed class MetricsPane : DockPanel
         {
             if (!headings.TryGetValue(meter.Key, out TextBlock? heading))
             {
-                headings[meter.Key] = heading = new TextBlock { Text = meter.Key, FontWeight = FontWeight.SemiBold, Margin = new Thickness(0, 8, 0, 2) };
+                headings[meter.Key] = heading = new TextBlock { Text = meter.Key, FontWeight = FontWeight.SemiBold, Margin = new Thickness(0, Gaps.Normal, 0, Gaps.Hair) };
             }
             rows.Children.Add(heading);
             foreach (KeyValuePair<(string Meter, string Instrument), Chart> chart in meter)
@@ -448,14 +473,14 @@ public sealed class MetricsPane : DockPanel
             ToolTip.SetTip(title, first.Unit.Length > 0 ? $"{first.Meter}: {first.Instrument} ({first.Unit})" : $"{first.Meter}: {first.Instrument}");
             Value = MutedText.Of(string.Empty);
             Value.FontSize = 11;
-            StackPanel words = new() { VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(0, 0, 8, 0), Children = { title, Value } };
+            StackPanel words = new() { VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(0, 0, Gaps.Normal, 0), Children = { title, Value } };
             Border frame = new() { Classes = { StyleClasses.Framed }, Child = Line, [Grid.ColumnProperty] = 1 };
             // The words a third of a narrow pane's width (a tool window's), at most 280 of a wide one's, the line the rest.
             Row = new Grid
             {
                 ColumnDefinitions = { new ColumnDefinition(1, GridUnitType.Star) { MaxWidth = 280 }, new ColumnDefinition(2, GridUnitType.Star) },
                 Height = 44,
-                Margin = new Thickness(0, 2),
+                Margin = new Thickness(0, Gaps.Hair),
                 Children = { words, frame },
             };
         }

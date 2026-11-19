@@ -89,31 +89,30 @@ public sealed record GitBranchesState : IStateDocument<GitBranchesState>
 public sealed class BranchesPanel : DockPanel
 {
     private VcsController vcs;
-    private readonly ListBox list;
+    private readonly TreeList list;
     private readonly TextBox search;
     private readonly Dictionary<string, bool> expanded = [];
+    private readonly Button newBranch;
+    private readonly Button update;
+    private readonly Button delete;
     private readonly Button favorite;
+    private readonly Button navigate;
     private List<BranchNode> roots = [];
     private readonly TreeRows<BranchNode> rows = [];
     private int loads;
 
+    /// <summary>Whether the rows are being listed again, the choice let go and taken again in the same moment.</summary>
+    private bool listing;
+
     public BranchesPanel(VcsController git)
     {
         vcs = git;
-        list = new ListBox
+        list = new TreeList
         {
             Classes = { StyleClasses.Tree },
             ItemsSource = rows,
         };
         ReusedRows.Use(list, Row);
-        list.DoubleTapped += (_, e) =>
-        {
-            if (Selected is { } node)
-            {
-                Activate(node);
-                e.Handled = true;
-            }
-        };
         TreeKeys.Attach<BranchNode>(list, Toggle, node =>
         {
             if (node.IsGroup)
@@ -122,35 +121,41 @@ public sealed class BranchesPanel : DockPanel
             }
             Activate(node);
             return true;
-        });
-        list.AddHandler(KeyDownEvent, OnKey, Avalonia.Interactivity.RoutingStrategies.Tunnel);
-        list.SelectionChanged += (_, _) => UpdateTools();
+        }, new ListActs { Keys = Take });
+        // A listing again passes through no choice, which would grey every button for that moment and let go of one pressed.
+        list.SelectionChanged += (_, _) =>
+        {
+            if (!listing)
+            {
+                UpdateTools();
+            }
+        };
         ListMenus.Attach(list, () => Selected is { Branch: { } branch } ? Menu(branch) : []);
-        search = new TextBox { Classes = { StyleClasses.Search }, PlaceholderText = "Branch or tag", Margin = new Thickness(6, 0, 4, 0), VerticalAlignment = VerticalAlignment.Center };
+        search = new TextBox { Classes = { StyleClasses.Search }, PlaceholderText = "Branch or tag", Margin = new Thickness(Gaps.Small, 0, Gaps.Tight, 0), VerticalAlignment = VerticalAlignment.Center };
         search.TextChanged += (_, _) => Show();
+        newBranch = ToolButtons.Of(IconKeys.Add, "New Branch…", () => Request(NewBranchRequested, WhyNotFrom));
+        update = ToolButtons.Of(IconKeys.Update, "Update Selected", () =>
+        {
+            if (Selected?.Branch is { } branch && WhyNotUpdate(branch) is null)
+            {
+                IdeErrors.Observe(vcs.UpdateBranchAsync(branch));
+            }
+        });
+        delete = ToolButtons.Of(IconKeys.Clear, "Delete", () => Request(DeleteRequested, WhyNotDelete));
         favorite = ToolButtons.Of(IconKeys.Star, "Mark/Unmark As Favorite", () =>
         {
-            if (Selected is { Branch: { } branch })
+            if (Selected?.Branch is { } branch && WhyNotFavorite(branch) is null)
             {
                 ToggleFavorite(branch);
             }
         });
-        Border strip = ToolBars.Side(
-            ToolButtons.Of(IconKeys.Add, "New Branch…", () => Request(NewBranchRequested)),
-            ToolButtons.Of(IconKeys.Update, "Update Selected", () =>
-            {
-                if (Selected is { Branch: { Kind: RefKind.Local } branch })
-                {
-                    IdeErrors.Observe(vcs.UpdateBranchAsync(branch));
-                }
-            }),
-            ToolButtons.Of(IconKeys.Clear, "Delete", () => Request(DeleteRequested)),
-            favorite,
-            ToolButtons.Of(IconKeys.Locate, "Navigate Log to Selected Branch Head", () => Request(NavigateRequested)));
+        navigate = ToolButtons.Of(IconKeys.Locate, "Navigate Log to Selected Branch Head", () => Request(NavigateRequested, WhyNotFrom));
+        Border strip = ToolBars.Side(newBranch, update, delete, favorite, navigate);
         Border top = ToolBars.Top(search);
         Children.Add(strip);
         Children.Add(top);
         Children.Add(list);
+        UpdateTools();
     }
 
     /// <summary>The rows shown, top to bottom, as the groups open and the search leaves them.</summary>
@@ -210,6 +215,7 @@ public sealed class BranchesPanel : DockPanel
         if (!isCurrent)
         {
             Add("Checkout", () => IdeErrors.Observe(vcs.CheckoutRefAsync(branch, Branches)));
+            IdeErrors.Observe(GreyWhenRefusedAsync((MenuItem)items[^1], vcs.WhyNotCheckoutRefAsync(branch, Branches)));
         }
         Add($"New Branch from {it}…", () => NewBranchRequested?.Invoke(this, branch));
         if (branch.Kind == RefKind.Local && !isCurrent)
@@ -234,12 +240,16 @@ public sealed class BranchesPanel : DockPanel
         Separate();
         if (branch.Kind == RefKind.Local)
         {
-            Add("Update", () => IdeErrors.Observe(vcs.UpdateBranchAsync(branch)), isCurrent || branch.UpstreamRemote is not null);
-            Add("Push…", () => IdeErrors.Observe(vcs.PushBranchAsync(branch)));
+            string? notUpdated = WhyNotUpdate(branch);
+            Add("Update", () => IdeErrors.Observe(vcs.UpdateBranchAsync(branch)), notUpdated is null);
+            ToolTip.SetTip(items[^1], notUpdated);
+            string? notPushed = vcs.WhyNotRemote;
+            Add("Push…", () => IdeErrors.Observe(vcs.PushBranchAsync(branch)), notPushed is null);
+            ToolTip.SetTip(items[^1], notPushed);
             Separate();
             Add("Rename…", () => RenameRequested?.Invoke(this, branch));
         }
-        if (!isCurrent)
+        if (WhyNotDelete(branch) is null)
         {
             Add("Delete", () => DeleteRequested?.Invoke(this, branch));
         }
@@ -248,6 +258,17 @@ public sealed class BranchesPanel : DockPanel
             items.RemoveAt(items.Count - 1);
         }
         return items;
+    }
+
+    /// <summary>A menu's item greyed once what it does is found refused (a checkout writing out a file git cannot here), its
+    /// tip saying why.</summary>
+    private static async Task GreyWhenRefusedAsync(MenuItem item, Task<string?> refused)
+    {
+        if (await refused is { } why)
+        {
+            item.IsEnabled = false;
+            ToolTip.SetTip(item, why);
+        }
     }
 
     /// <summary>A name quoted for a menu, a long one cut short.</summary>
@@ -407,8 +428,16 @@ public sealed class BranchesPanel : DockPanel
         {
             Flatten(root, shown, text.Length > 0);
         }
-        rows.Show(shown);
-        list.SelectedItem = rows.FirstOrDefault(r => r.Key == chosen);
+        listing = true;
+        try
+        {
+            rows.Show(shown);
+            list.SelectedItem = rows.FirstOrDefault(r => r.Key == chosen);
+        }
+        finally
+        {
+            listing = false;
+        }
         UpdateTools();
     }
 
@@ -497,29 +526,65 @@ public sealed class BranchesPanel : DockPanel
         return [];
     }
 
-    private void Request(EventHandler<BranchInfo>? requested)
+    /// <summary>Asks for what a button does to the chosen branch or tag, where <paramref name="whyNot"/> lets it.</summary>
+    private void Request(EventHandler<BranchInfo>? requested, Func<BranchInfo?, string?> whyNot)
     {
-        if (Selected is { Branch: { } branch })
+        if (Selected?.Branch is { } branch && whyNot(branch) is null)
         {
             requested?.Invoke(this, branch);
         }
     }
 
-    private void UpdateTools() => favorite.IsEnabled = Selected is { Branch.Kind: not RefKind.Tag };
+    /// <summary>Each button greyed where the row chosen gives it nothing to act on, saying why; its menu and keys agree.</summary>
+    private void UpdateTools()
+    {
+        BranchInfo? chosen = Selected?.Branch;
+        ToolButtons.Grey(newBranch, WhyNotFrom(chosen));
+        ToolButtons.Grey(update, WhyNotUpdate(chosen));
+        ToolButtons.Grey(delete, WhyNotDelete(chosen));
+        ToolButtons.Grey(favorite, WhyNotFavorite(chosen));
+        ToolButtons.Grey(navigate, WhyNotFrom(chosen));
+    }
+
+    /// <summary>Why New Branch… and Navigate can't act: HEAD, a group or no row is chosen, which names no commit of its own.</summary>
+    private static string? WhyNotFrom(BranchInfo? branch) => branch is null ? Refusals.NoRefChosen : null;
+
+    /// <summary>Why Update Selected can't act: it brings a local branch up to the remote's branch it tracks, as
+    /// <see cref="VcsController.UpdateBranchAsync"/> does, and nothing else, where a remote can be reached.</summary>
+    private string? WhyNotUpdate(BranchInfo? branch) => branch switch
+    {
+        { Kind: RefKind.Local, Upstream: null } => Refusals.Untracked(branch.Name),
+        { Kind: RefKind.Local } => vcs.WhyNotRemote,
+        { Kind: RefKind.Remote } => Refusals.FetchedNotUpdated(branch.Name),
+        _ => Refusals.NoLocalBranchChosen,
+    };
+
+    /// <summary>Why Delete can't act: git deletes no branch while it is checked out, and a remote's only where the remote
+    /// can be reached.</summary>
+    private string? WhyNotDelete(BranchInfo? branch) => branch switch
+    {
+        null => Refusals.NoRefChosen,
+        { IsCurrent: true } => Refusals.CheckedOut(branch.Name),
+        { Kind: RefKind.Remote } => vcs.WhyNotRemote,
+        _ => null,
+    };
+
+    /// <summary>Why Mark/Unmark As Favorite can't act: a tag is never a favourite (<see cref="GitBranchesState.Holds"/>).</summary>
+    private static string? WhyNotFavorite(BranchInfo? branch) => branch is { Kind: not RefKind.Tag } ? null : Refusals.NoBranchChosen;
 
     /// <summary>Rider's keys here, beside the tree's (<see cref="TreeKeys"/>): Delete (Backspace too on the Mac) deletes, F2 or
     /// Shift+F6 renames a local branch on the Mac (Rename's Ctrl+R, R elsewhere, which the window routes here), and
     /// Ctrl+Alt+N (Cmd+Alt+N) makes one from the chosen.</summary>
-    private void OnKey(object? sender, KeyEventArgs e)
+    private bool Take(KeyEventArgs e)
     {
         bool mac = OperatingSystem.IsMacOS();
         if (Selected is not { } node)
         {
-            return;
+            return false;
         }
         KeyModifiers command = Keystroke.Command;
         if (node.Branch is { } branch && (e.Key == Key.Delete && e.KeyModifiers == KeyModifiers.None
-            || mac && e.Key == Key.Back && e.KeyModifiers is KeyModifiers.None or KeyModifiers.Meta) && !branch.IsCurrent)
+            || mac && e.Key == Key.Back && e.KeyModifiers is KeyModifiers.None or KeyModifiers.Meta) && WhyNotDelete(branch) is null)
         {
             DeleteRequested?.Invoke(this, branch);
         }
@@ -533,22 +598,22 @@ public sealed class BranchesPanel : DockPanel
         }
         else
         {
-            return;
+            return false;
         }
-        e.Handled = true;
+        return true;
     }
 
     /// <summary>A row for whichever group, branch or tag the list hands its container: a group's chevron, a branch's or
     /// tag's mark (a favourite's star, the current branch's in the accent), its name, and where a local branch pushes.</summary>
     private Control Row()
     {
-        RowIcon chevron = new() { Width = 10, Height = 10, Margin = new Thickness(4, 0, 4, 0) };
+        RowIcon chevron = new() { Width = 10, Height = 10, Margin = new Thickness(Gaps.Tight, 0, Gaps.Tight, 0) };
         Border hit = new() { Background = Brushes.Transparent, Child = chevron, VerticalAlignment = VerticalAlignment.Center };
         Border gap = new() { Width = 18 };
-        RowIcon mark = new() { Width = 13, Height = 13, Margin = new Thickness(0, 0, 6, 0) };
+        RowIcon mark = new() { Width = 13, Height = 13, Margin = new Thickness(0, 0, Gaps.Small, 0) };
         TextBlock name = new() { VerticalAlignment = VerticalAlignment.Center };
         // Where it pushes and pulls, muted after its name.
-        TextBlock tracked = new() { FontSize = 12, VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(8, 0, 0, 0) };
+        TextBlock tracked = new() { FontSize = 12, VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(Gaps.Normal, 0, 0, 0) };
         tracked.Classes.Add(StyleClasses.Muted);
         ShrinkingRow row = new() { Height = ListRow.Height, Children = { hit, gap, mark, name, tracked } };
         hit.PointerPressed += (_, e) =>
@@ -561,7 +626,7 @@ public sealed class BranchesPanel : DockPanel
         };
         return row.Showing<BranchNode>(node =>
         {
-            row.Margin = new Thickness(node.Depth * 16, 0, 0, 0);
+            row.Margin = new Thickness(node.Depth * Gaps.Indent, 0, 0, 0);
             hit.IsVisible = node.IsGroup;
             gap.IsVisible = !node.IsGroup;
             chevron.DataKey = node.IsExpanded ? IconKeys.ChevronDown : IconKeys.ChevronRight;

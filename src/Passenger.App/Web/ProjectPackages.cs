@@ -7,21 +7,22 @@ namespace Passenger.App.Web;
 
 /// <summary>A project's own npm packages for a file (its Automatic ESLint and Prettier configuration): installed in the
 /// node_modules of the file's folder or the nearest folder above it that has the package, as Node.js resolves it; or
-/// listed by the nearest package.json above the file that names it, and not installed.</summary>
+/// listed by the nearest package.json above the file that names it, and not installed. Only the person's folders are
+/// looked in (<see cref="FoldersUp"/>).</summary>
 public static class ProjectPackages
 {
     /// <summary>The fields of package.json that list what <c>npm install</c> installs.</summary>
     private static readonly string[] Lists = ["dependencies", "devDependencies", "optionalDependencies", "peerDependencies"];
 
-    /// <summary>The package's folder as Node.js finds it from the file, null when none is installed.</summary>
+    /// <summary>The package's folder as Node.js finds it from the file, in the person's folders (<see cref="FoldersUp"/>);
+    /// null when none is installed there.</summary>
     public static string? Installed(string file, string name)
     {
-        for (string? folder = Path.GetDirectoryName(file); folder is not null; folder = Path.GetDirectoryName(folder))
+        foreach (string folder in Path.GetDirectoryName(file) is { } start ? FoldersUp.From(start) : [])
         {
-            string package = Path.Combine(folder, "node_modules", name);
-            if (File.Exists(Path.Combine(package, "package.json")))
+            if (FoldersUp.Found(folder, Path.Combine("node_modules", name, "package.json")) is { } manifest && File.Exists(manifest))
             {
-                return package;
+                return Path.GetDirectoryName(manifest);
             }
         }
         return null;
@@ -39,18 +40,17 @@ public static class ProjectPackages
         return File.Exists(Path.Combine(full, "package.json")) ? full : null;
     }
 
-    /// <summary>The nearest package.json above the file that lists the package, when the package is not installed for
-    /// it: what <c>npm install</c> there would put in place. Null when it is installed, or nothing lists it.</summary>
+    /// <summary>The nearest package.json above the file that lists the package, in the person's folders, when the package is
+    /// not installed for it: what <c>npm install</c> there would put in place. Null when it is installed, or nothing lists it.</summary>
     public static string? Missing(string file, string name)
     {
         if (Installed(file, name) is not null)
         {
             return null;
         }
-        for (string? folder = Path.GetDirectoryName(file); folder is not null; folder = Path.GetDirectoryName(folder))
+        foreach (string folder in Path.GetDirectoryName(file) is { } start ? FoldersUp.From(start) : [])
         {
-            string manifest = Path.Combine(folder, "package.json");
-            if (File.Exists(manifest) && Names(manifest, name))
+            if (FoldersUp.Found(folder, "package.json") is { } manifest && File.Exists(manifest) && Names(manifest, name))
             {
                 return manifest;
             }
@@ -95,9 +95,9 @@ public static class ProjectPackages
         {
             return false;
         }
-        string relative = PathNames.IsUnder(file, folder) ? Path.GetRelativePath(folder, file) : Path.GetFileName(file);
+        string relative = PathNames.IsUnder(file, folder) && PathNames.Relative(file, folder) is { } below ? below : Path.GetFileName(file);
         return glob.Split(';', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
-            .Any(one => EditorConfig.Matches(one, "/" + relative.Replace('\\', '/')));
+            .Any(one => EditorConfig.Matches(one, "/" + relative));
     }
 }
 
@@ -109,7 +109,7 @@ public static class Npm
     public static string? Cli(string node)
     {
         string folder = Path.GetDirectoryName(PathNames.Canonical(node)) ?? string.Empty;
-        string onPath = Programs.OnPath(OperatingSystem.IsWindows() ? "npm.cmd" : "npm") is { } npm ? Path.GetDirectoryName(npm) ?? string.Empty : string.Empty;
+        string onPath = Programs.Command("npm") is { } npm ? Path.GetDirectoryName(npm) ?? string.Empty : string.Empty;
         string[] candidates =
         [
             // The Windows installer's layout, and nvm-windows'.

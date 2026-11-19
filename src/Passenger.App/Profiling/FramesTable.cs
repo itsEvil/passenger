@@ -26,21 +26,21 @@ internal static class FramesTable
     /// <summary>The chart's colours named, each a swatch of its token's brush; the muted one, what the rest leave, faint.</summary>
     public static StackPanel Legend(IEnumerable<(string Label, string Brush)> parts)
     {
-        StackPanel legend = new() { [DockPanel.DockProperty] = Dock.Left, Orientation = Orientation.Horizontal, Spacing = 14, Margin = new Thickness(12, 2, 12, 0) };
+        StackPanel legend = new() { [DockPanel.DockProperty] = Dock.Left, Orientation = Orientation.Horizontal, Spacing = Gaps.Wide, Margin = new Thickness(Gaps.Wide, Gaps.Hair, Gaps.Wide, 0) };
         foreach ((string label, string brush) in parts)
         {
             Border swatch = new() { Width = 9, Height = 9, VerticalAlignment = VerticalAlignment.Center, Opacity = brush == TokenKeys.TextMuted ? 0.35 : 1 };
             swatch.Bind(Border.BackgroundProperty, swatch.GetResourceObservable(brush));
-            legend.Children.Add(new StackPanel { Orientation = Orientation.Horizontal, Spacing = 5, Children = { swatch, Muted(label) } });
+            legend.Children.Add(new StackPanel { Orientation = Orientation.Horizontal, Spacing = Gaps.Small, Children = { swatch, Muted(label) } });
         }
         return legend;
     }
 
     /// <summary>The tree table of <paramref name="rows"/>, each made once by <paramref name="row"/> and stretched to the
     /// table's width so its numbers stand under their titles.</summary>
-    public static ListBox Table(IEnumerable rows, Func<Control> row)
+    public static TreeList Table(IEnumerable rows, Func<Control> row)
     {
-        ListBox table = new() { Classes = { StyleClasses.Tree }, ItemsSource = rows };
+        TreeList table = new() { Classes = { StyleClasses.Tree }, ItemsSource = rows };
         ReusedRows.Use(table, row);
         table.Styles.Add(new Style(x => x.OfType<ListBoxItem>())
         {

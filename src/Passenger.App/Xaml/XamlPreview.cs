@@ -2,6 +2,7 @@ using Avalonia;
 using Avalonia.Media.Imaging;
 using Passenger.Core;
 using Passenger.Text;
+using Passenger.Xaml;
 using Passenger.Xaml.Dialects;
 using Passenger.Xaml.Projects;
 using Passenger.Xaml.Syntax;
@@ -9,8 +10,8 @@ using Passenger.Xaml.Syntax;
 namespace Passenger.App.Xaml;
 
 /// <summary>One XAML file's design view, drawn from its project's last build by the previewer of its framework: Avalonia's
-/// own (<see cref="AvaloniaPreviewHost"/>) or, on Windows, Passenger's own WPF previewer (<see cref="WpfPreviewHost"/>),
-/// each in a process of its own, sent the file's text as it stands. What the pane shows is here, whichever draws it: the
+/// own (<see cref="AvaloniaPreviewHost"/>), Passenger's own .NET MAUI previewer (<see cref="MauiPreviewHost"/>) or, on
+/// Windows, Passenger's own WPF previewer (<see cref="WpfPreviewHost"/>), each in a process of its own, sent the file's text as it stands. What the pane shows is here, whichever draws it: the
 /// last frame, what the preview is doing, the error that kept the XAML from loading, and the file's elements with their
 /// boxes in the frame (WPF's), kept on their XAML as it is typed. Its previewer rests while the preview is not shown,
 /// the last frame kept, and starts again as it is shown. A UI-thread object.</summary>
@@ -22,6 +23,9 @@ public sealed class XamlPreview : IDisposable
     private readonly XamlDocument document;
     private IPreviewHost? host;
     private IDisposable? waiting;
+
+    /// <summary>Ends the wait of the hold under way (<see cref="Hold"/>) as it is let go.</summary>
+    private CancellationTokenSource? answered;
     private bool disposed;
 
     /// <summary>Counts starts, so one overtaken by another (a build finishing while it copied) lets its previewer go.</summary>
@@ -92,7 +96,7 @@ public sealed class XamlPreview : IDisposable
     internal XamlDocument Document => document;
 
     /// <summary>Starts the previewer of the file's framework on the project's last build, once the project's XAML has been
-    /// read; or says why there is none.</summary>
+    /// read; or says why there is none, the folder not trusted among them.</summary>
     public async Task StartAsync()
     {
         UiThread.Check();
@@ -100,11 +104,18 @@ public sealed class XamlPreview : IDisposable
         lapsed = false;
         if (await document.Loading.Builder is not { } builder || await document.Loaded is null || disposed)
         {
-            Say("Previews are for the XAML of an Avalonia or WPF project");
+            Say("Previews are for the XAML of an Avalonia, WPF or .NET MAUI project");
             return;
         }
         if (start != starts)
         {
+            return;
+        }
+        // A previewer runs the project's built assemblies: none of a folder not trusted, the next edit asking again.
+        if (!WorkspaceTrust.Trusts(document.Document.Path))
+        {
+            lapsed = true;
+            Say(Refusals.Untrusted);
             return;
         }
         switch (builder.Dialect)
@@ -147,6 +158,15 @@ public sealed class XamlPreview : IDisposable
                     return;
                 }
                 Adopt(started);
+                break;
+            case MauiDialect:
+                IPreviewHost? maui = await MauiPreviewHost.StartAsync(this, builder);
+                if (disposed || start != starts)
+                {
+                    maui?.Dispose();
+                    return;
+                }
+                Adopt(maui);
                 break;
             default:
                 Say($"{builder.Dialect.Name} XAML has no preview");
@@ -218,6 +238,79 @@ public sealed class XamlPreview : IDisposable
             }
         }
     }
+
+    /// <summary>The size the root is drawn at in place of its design size (a phone's, a tablet's); null for its design
+    /// size. Only an Avalonia previewer takes one (<see cref="TakesSizes"/>), sent the file again as it changes.</summary>
+    public Passenger.Xaml.Features.PreviewSize? Size
+    {
+        get => size;
+        set
+        {
+            UiThread.Check();
+            if (value == size)
+            {
+                return;
+            }
+            size = value;
+            if (!disposed)
+            {
+                host?.Update();
+            }
+            Changed?.Invoke(this, EventArgs.Empty);
+        }
+    }
+
+    private Passenger.Xaml.Features.PreviewSize? size;
+
+    /// <summary>What a MAUI file's preview is drawn as (its screen, platform and theme), sent the file again as it changes.</summary>
+    public MauiLook Look
+    {
+        get => look;
+        set
+        {
+            UiThread.Check();
+            if (value == look)
+            {
+                return;
+            }
+            look = value;
+            if (!disposed)
+            {
+                host?.Update();
+            }
+            Changed?.Invoke(this, EventArgs.Empty);
+        }
+    }
+
+    private MauiLook look = MauiLook.AsBuilt;
+
+    /// <summary>The platform a MAUI preview is drawn for where <see cref="Look"/> chooses none: that of the build drawn.</summary>
+    public string BuiltPlatform { get; internal set; } = Passenger.MauiPreview.MauiPreviewDevices.Android;
+
+    /// <summary>Whether the file's previewer is MAUI's, which draws it as <see cref="Look"/> says.</summary>
+    public bool TakesLooks => host is MauiPreviewHost;
+
+    /// <summary>Whether the file's previewer draws its root at a size given it: Avalonia's, while the root is a control's
+    /// (<see cref="Passenger.Xaml.Features.PreviewSize.Fits"/>).</summary>
+    public bool TakesSizes
+    {
+        get
+        {
+            if (host is not AvaloniaPreviewHost)
+            {
+                return false;
+            }
+            TextSnapshot text = document.Document.Text.Snapshot;
+            if (fits.Text != text)
+            {
+                fits = (text, Passenger.Xaml.Features.PreviewSize.Fits(text.ToString()));
+            }
+            return fits.Fits;
+        }
+    }
+
+    /// <summary>Whether the root of the text last asked about takes a size, kept until the text changes.</summary>
+    private (TextSnapshot? Text, bool Fits) fits;
 
     /// <summary>The deepest of the file's elements drawn at a point of the frame, in its units; null for none.</summary>
     public PreviewElement? ElementAt(Point point) => Elements.LastOrDefault(e => e.Box.Contains(point));
@@ -360,10 +453,26 @@ public sealed class XamlPreview : IDisposable
         Tell();
     }
 
-    /// <summary>Says the project has no build to draw (<see cref="Unbuilt(ProjectInputs)"/>), which Build for XAML Preview makes.</summary>
-    internal void SayUnbuilt(ProjectInputs inputs)
+    /// <summary>The programs on this machine that run a library's code, by their projects' paths, each by the assembly its
+    /// build makes: what a library's views (a cross-platform app's shared ones) are drawn in. The window gives them; none
+    /// by default.</summary>
+    public Func<string, IReadOnlyList<string>> ProgramsRunning { get; set; } = _ => [];
+
+    /// <summary>A library's build as a program running it carries it: the newest of <paramref name="programs"/>' builds
+    /// that holds the library's assembly beside the program's runtime configuration, and that copy; null where none does.
+    /// Read off the window's thread.</summary>
+    internal static (string Program, string Library)? Hosted(ProjectInputs inputs, IReadOnlyList<string> programs) =>
+        programs.Where(p => File.Exists(p) && File.Exists(Path.ChangeExtension(p, ".runtimeconfig.json")) && File.Exists(Path.ChangeExtension(p, ".deps.json"))
+                && File.Exists(Path.Combine(Path.GetDirectoryName(p)!, inputs.AssemblyName + ".dll")))
+            .OrderByDescending(File.GetLastWriteTimeUtc).Select(p => ((string, string)?)(p, Path.Combine(Path.GetDirectoryName(p)!, inputs.AssemblyName + ".dll"))).FirstOrDefault();
+
+    /// <summary>Says the project has no build to draw (<see cref="Unbuilt(ProjectInputs)"/>), which Build for XAML Preview makes;
+    /// of a library, that the program running it has none (<paramref name="programs"/>, the first of which that builds).</summary>
+    internal void SayUnbuilt(ProjectInputs inputs, IReadOnlyList<string>? programs = null)
     {
-        Say(Unbuilt(inputs));
+        Say(programs is [{ } program, ..]
+            ? $"Build {Path.GetFileNameWithoutExtension(program)}, which runs {Path.GetFileNameWithoutExtension(inputs.ProjectPath)}, to preview its XAML: the previewer draws it in that program's last build"
+            : Unbuilt(inputs));
         WantsBuild = true;
         Tell();
     }
@@ -382,7 +491,8 @@ public sealed class XamlPreview : IDisposable
         }
         IDisposable held = BackgroundWork.Scope();
         waiting = held;
-        IdeErrors.Observe(Task.Delay(Answer).ContinueWith(_ => UiThread.Post(() =>
+        answered = new CancellationTokenSource();
+        IdeErrors.Observe(Task.Delay(Answer, answered.Token).ContinueWith(_ => UiThread.Post(() =>
         {
             if (waiting == held)
             {
@@ -393,16 +503,16 @@ public sealed class XamlPreview : IDisposable
 
     internal void Let()
     {
+        // The hold's clock goes with it: its callback would keep the preview, its document and its window until it fired.
+        answered?.Cancel();
+        answered?.Dispose();
+        answered = null;
         waiting?.Dispose();
         waiting = null;
     }
 
-    /// <summary>The file's path in its project, as the previewers read it (<c>/Views/MainWindow.axaml</c>).</summary>
-    internal string ProjectPath()
-    {
-        string folder = document.Loading.Folder;
-        return "/" + Path.GetRelativePath(folder, document.Document.Path).Replace('\\', '/');
-    }
+    /// <summary>The file's path in its project's assembly, as Avalonia's previewer reads it (<c>/Views/MainWindow.axaml</c>).</summary>
+    internal string ProjectPath() => "/" + XamlProject.PathIn(document.Loading.Folder, document.Document.Path);
 
     /// <summary>The project's newest build output that can run: its assembly with its dependencies beside it, and its runtime
     /// configuration when <paramref name="configured"/> (a class library has none), where MSBuild's evaluation says its
@@ -423,10 +533,9 @@ public sealed class XamlPreview : IDisposable
             found.AddRange(Directory.EnumerateFiles(bin, name, SearchOption.AllDirectories).Where(f => chosen is null || ProjectInputs.InFolderOf(f, chosen, bin)));
         }
         string project = Path.GetFileNameWithoutExtension(inputs.ProjectPath);
-        for (DirectoryInfo? at = new(inputs.Folder); at is not null; at = at.Parent)
+        foreach (string at in FoldersUp.From(inputs.Folder))
         {
-            string artifacts = Path.Combine(at.FullName, "artifacts", "bin", project);
-            if (Directory.Exists(artifacts))
+            if (FoldersUp.Found(at, Path.Combine("artifacts", "bin", project)) is { } artifacts && Directory.Exists(artifacts))
             {
                 found.AddRange(Directory.EnumerateFiles(artifacts, name, SearchOption.AllDirectories).Where(f => chosen is null || ProjectInputs.InFolderOf(f, chosen, artifacts)));
                 break;
@@ -502,7 +611,7 @@ public sealed class XamlPreview : IDisposable
 
     /// <summary>What a previewer's process last said, its last five lines, heard on any thread: once it ends, they go to
     /// passenger.log with its end, and the pane says the last of them.</summary>
-    /// <param name="previewer">Whose previewer it is, as the log names it: Avalonia or WPF.</param>
+    /// <param name="previewer">Whose previewer it is, as the log names it: Avalonia, WPF or MAUI.</param>
     internal sealed class PreviewerLog(XamlPreview preview, string previewer)
     {
         private readonly Queue<string> said = new();
@@ -559,13 +668,22 @@ internal interface IPreviewHost : IDisposable
 /// it references changes.</summary>
 internal sealed record PreviewedBuild(string Assembly, DateTime Written, bool Configured)
 {
+    /// <summary>A library's assembly beside the program it is drawn in (<see cref="Assembly"/>, the program's), where the
+    /// file's project is a library; null for an app's own.</summary>
+    public string? Library { get; init; }
+
     /// <summary>The build at an assembly as it stands; read off the window's thread.</summary>
     public static PreviewedBuild Of(string assembly, bool configured) => new(assembly, Newest(Path.GetDirectoryName(assembly)!), configured);
 
+    /// <summary>How the project's newest build is found, where it is not as <see cref="XamlPreview.Output"/> finds it (a MAUI
+    /// project's of any target); null for that.</summary>
+    public Func<ProjectInputs, string?>? Finder { get; init; }
+
     /// <summary>Whether this is still the project's newest build, unwritten since; read off the window's thread.</summary>
     public bool Stands(ProjectInputs inputs) =>
-        Written != DateTime.MinValue && XamlPreview.Output(inputs, Configured) is { } newest && PathNames.Same(newest, Assembly)
-            && Newest(Path.GetDirectoryName(newest)!) == Written;
+        Written != DateTime.MinValue
+            && (Library is not null ? File.Exists(Library) ? Assembly : null : Finder is { } finder ? finder(inputs) : XamlPreview.Output(inputs, Configured)) is { } newest
+            && PathNames.Same(newest, Assembly) && Newest(Path.GetDirectoryName(newest)!) == Written;
 
     /// <summary>The newest write among a folder's files; the least time where it cannot be read, which no build stands as.</summary>
     private static DateTime Newest(string folder)

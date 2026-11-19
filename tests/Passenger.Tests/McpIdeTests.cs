@@ -6,6 +6,7 @@ using ModelContextProtocol.Protocol;
 using Passenger.App.Mcp;
 using Passenger.App;
 using Passenger.Core;
+using SkiaSharp;
 
 namespace Passenger.Tests;
 
@@ -18,6 +19,29 @@ public sealed class McpIdeTests : McpRig, IClassFixture<RestoredFolders>
     public McpIdeTests(RestoredFolders folders)
         : base(folders)
     {
+    }
+
+    /// <summary>A label put while another Passenger on the same state holds Local History past the call's wait is answered as
+    /// waiting for it, never as put, and is listed once that Passenger lets go (#1791).</summary>
+    [Fact]
+    public async Task A_label_put_while_another_passenger_holds_local_history_is_answered_as_waiting_and_listed_once_let_go()
+    {
+        await TakeFolderAsync();
+        await using McpClient client = await Start(["--mcp", Folder]);
+        await Call(client, McpTools.LocalHistoryLabel, new() { ["name"] = "first" });
+        string root = Path.Combine(Passenger.App.State.ProjectState.FolderOf(OwnState, PathNames.Canonical(Folder)), "localHistory");
+        Assert.True(File.Exists(Path.Combine(root, "changes.log")), $"No Local History log at {root} after a label was put");
+
+        string answer;
+        using (FileStream holding = new(Path.Combine(root, "changes.lock"), FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None))
+        {
+            answer = (await Call(client, McpTools.LocalHistoryLabel, new() { ["name"] = "held" })).GetString()!;
+        }
+        Assert.True(answer.StartsWith("Label held waits for another Passenger", StringComparison.Ordinal),
+            $"A label put while another Passenger held Local History past the call's wait answered \"{answer}\", as if it were kept");
+        JsonElement labelled = (await Call(client, McpTools.LocalHistory)).GetProperty("rows")[0];
+        Assert.True(labelled.GetProperty("title").GetString() == "held" && labelled.GetProperty("label").GetBoolean(),
+            $"Once the other Passenger let go, Local History's newest row is {labelled.GetRawText()}, not the label held");
     }
 
     /// <summary>A grammar takes a moment to read a long file, whose lines inside strings Convert Indentation must know: the action
@@ -34,6 +58,117 @@ public sealed class McpIdeTests : McpRig, IClassFixture<RestoredFolders>
             CallToolResult converted = await Result(client, McpTools.IdeAction, new() { ["action"] = action });
             Assert.True(converted.IsError != true, $"{action} answered: {Text(converted)}");
         }
+    }
+
+    /// <summary>A solution of thousands of warnings and an error answers Problems' lists within their limit, the error first,
+    /// saying how many warnings it left out and how to ask for them: severity error gives the error alone, a folder's path the
+    /// lists within it, and each file's path its own, read on from the line its words name past the limit, which together
+    /// reach every warning.</summary>
+    [Fact]
+    public async Task Problems_of_thousands_of_warnings_answer_within_the_limit_errors_first_and_a_path_or_severity_reaches_the_rest()
+    {
+        await TakeFolderAsync();
+        const int Files = 12;
+        const int Each = 250;
+        Write("Bad.cs", "class Bad\n{\n    public int Count = \"none\";\n}\n");
+        for (int file = 0; file < Files; file++)
+        {
+            Write($"Warnings/W{file}.cs", $"static class W{file}\n{{\n    static void M()\n    {{\n{string.Concat(Enumerable.Range(0, Each).Select(i => $"        int v{i} = {i};\n"))}    }}\n}}\n");
+        }
+        await using McpClient client = await Start(["--mcp", Folder]);
+        await Call(client, McpTools.SettingsSet, new() { ["changes"] = new Dictionary<string, object> { ["solutionWideAnalysis"] = true } });
+
+        JsonElement answer = await Call(client, McpTools.Diagnostics);
+        Assert.True(answer.GetRawText().Length < 64 * 1024, $"Problems' lists of thousands of warnings answered {answer.GetRawText().Length:N0} characters");
+        JsonElement[] solution = [.. answer.GetProperty("solution").EnumerateArray()];
+        int listed = solution.Length + answer.GetProperty("build").GetArrayLength() + answer.GetProperty("toolset").GetArrayLength();
+        Assert.True(listed == AgentAnswers.MostFindings && solution[0].GetProperty("code").GetString() == "CS0029",
+            $"The lists held {listed} findings, the solution's first {solution[0].GetRawText()}, where {AgentAnswers.MostFindings} were to be listed, the error first");
+        string more = answer.GetProperty("more").GetString()!;
+        int warnings = Files * Each;
+        System.Text.RegularExpressions.Match said = System.Text.RegularExpressions.Regex.Match(more, @"^([\d,]+) more findings left out: ([\d,]+) warnings; .*severity.*a folder's path");
+        int left = said.Success ? int.Parse(said.Groups[1].Value, System.Globalization.NumberStyles.AllowThousands, System.Globalization.CultureInfo.InvariantCulture) : 0;
+        Assert.True(said.Success && said.Groups[1].Value == said.Groups[2].Value && left + listed - 1 >= warnings,
+            $"What the lists left out, every warning past the {listed - 1} listed of at least {warnings}, was said as: {more}");
+
+        JsonElement errors = await Call(client, McpTools.Diagnostics, new() { ["severity"] = "error" });
+        Assert.Equal(["CS0029 Bad.cs:3"], errors.GetProperty("solution").EnumerateArray().Select(p => $"{p.GetProperty("code").GetString()} {p.GetProperty("path").GetString()}:{p.GetProperty("line").GetInt32()}"));
+        Assert.False(errors.TryGetProperty("more", out _), "The errors alone were said to leave some out");
+
+        JsonElement folder = await Call(client, McpTools.Diagnostics, new() { ["path"] = "Warnings" });
+        Assert.True(folder.GetProperty("solution").EnumerateArray().All(p => p.GetProperty("path").GetString()!.StartsWith("Warnings", StringComparison.Ordinal)),
+            $"A folder's lists named a file outside it: {folder.GetProperty("solution").GetRawText()[..Math.Min(400, folder.GetProperty("solution").GetRawText().Length)]}");
+
+        // Each file's own, its answer read on from the line its words name where it holds them past the limit.
+        int reached = 0;
+        for (int file = 0; file < Files; file++)
+        {
+            for (int? from = null; ;)
+            {
+                Dictionary<string, object?> asked = new() { ["path"] = $"Warnings/W{file}.cs", ["severity"] = "warning" };
+                if (from is int line)
+                {
+                    asked["from"] = line;
+                }
+                CallToolResult own = await Result(client, McpTools.Diagnostics, asked);
+                using JsonDocument ownJson = JsonDocument.Parse(((TextContentBlock)own.Content[0]).Text);
+                reached += ownJson.RootElement.GetArrayLength();
+                if (own.Content is not [_, TextContentBlock { Text: var words }])
+                {
+                    break;
+                }
+                System.Text.RegularExpressions.Match next = System.Text.RegularExpressions.Regex.Match(words, @"severity warning with from (\d+) lists those from that line on$");
+                Assert.True(next.Success, $"W{file}.cs's warnings past the limit were said as: {words}");
+                from = int.Parse(next.Groups[1].Value, System.Globalization.CultureInfo.InvariantCulture);
+            }
+        }
+        Assert.Equal(warnings, reached);
+    }
+
+    /// <summary>An agent's settings say, setting by setting, what the folder's .editorconfig files set over it for the files
+    /// their sections name, as Settings does under its rows: GDScript's layout the line length scripts take, XAML's
+    /// nothing, set for scripts alone, and the final line break what Markdown files take.</summary>
+    [Fact]
+    public async Task Settings_say_what_the_folders_editorconfig_files_set_over_each_setting()
+    {
+        await TakeFolderAsync();
+        Write(".editorconfig", "root = true\n\n[*.gd]\nmax_line_length = 120\n\n[*.md]\ninsert_final_newline = false\n");
+        await using McpClient client = await Start(["--mcp", Folder]);
+        JsonElement[] settings = [.. (await Call(client, McpTools.Settings)).GetProperty("settings").EnumerateArray()];
+        JsonElement Named(string name) => settings.Single(s => s.GetProperty("name").GetString() == name);
+        string[] said = Named("gdScriptFormat").TryGetProperty("editorConfig", out JsonElement lines) ? [.. lines.EnumerateArray().Select(l => l.GetString()!)] : [];
+        Assert.True(said.SequenceEqual(["./.editorconfig sets max_line_length = 120 for *.gd"]),
+            $"gdScriptFormat said the folder's .editorconfig sets over it: {string.Join("; ", said)}");
+        Assert.False(Named("xamlFormat").TryGetProperty("editorConfig", out JsonElement xaml),
+            $"xamlFormat was said to be set over by a max_line_length set for scripts alone: {xaml}");
+        Assert.Equal("./.editorconfig sets insert_final_newline = false for *.md", Named("ensureFinalLineBreak").GetProperty("editorConfig")[0].GetString());
+    }
+
+    /// <summary>An agent's Passenger whose state PASSENGER_SETTINGS names opens on the settings.json kept there, as a person's
+    /// window would: solution-wide analysis on there is on from its start, listing an error of a file nobody opened, and the
+    /// settings stay its own, kept nowhere, so a change it makes leaves the file as it was.</summary>
+    [Fact]
+    public async Task An_agents_passenger_opens_on_the_settings_kept_in_its_named_state_and_keeps_its_changes_its_own()
+    {
+        await TakeFolderAsync();
+        Write("Bad.cs", "class Bad\n{\n    public int Count = \"none\";\n}\n");
+        string file = Path.Combine(OwnState, global::Passenger.App.State.StateStore.SettingsFile);
+        string kept = new System.Text.Json.Nodes.JsonObject { ["version"] = global::Passenger.App.Settings.AppSettings.Upgrades.Count, ["solutionWideAnalysis"] = true }.ToJsonString();
+        File.WriteAllText(file, kept);
+        McpClient client = await Start(["--mcp", Folder]);
+
+        JsonElement settings = await Call(client, McpTools.Settings);
+        Assert.False(settings.GetProperty("kept").GetBoolean(), "The agent's Passenger said its settings are kept, where they are its own");
+        Assert.True(settings.GetProperty("settings").EnumerateArray().Single(s => s.GetProperty("name").GetString() == "solutionWideAnalysis").GetProperty("value").GetBoolean(),
+            "The agent's Passenger did not open on solution-wide analysis on, as its state's settings.json keeps it");
+        string[] solution = [.. (await Call(client, McpTools.Diagnostics)).GetProperty("solution").EnumerateArray().Select(p => $"{p.GetProperty("code").GetString()} {p.GetProperty("path").GetString()}:{p.GetProperty("line").GetInt32()}")];
+        Assert.True(solution.Contains("CS0029 Bad.cs:3"), $"Solution-wide analysis on from the start listed: {string.Join("; ", solution)}");
+
+        await Call(client, McpTools.SettingsSet, new() { ["changes"] = new Dictionary<string, object> { ["editorFontSize"] = 17 } });
+        await client.DisposeAsync();
+        // Ended, it has written all it would keep.
+        Assert.True(LastPassenger().WaitForExit(TimeSpan.FromMinutes(1).Scaled()), "The agent's Passenger did not end with its session");
+        Assert.Equal(kept, File.ReadAllText(file));
     }
 
     [Fact]
@@ -166,7 +301,7 @@ public sealed class McpIdeTests : McpRig, IClassFixture<RestoredFolders>
 
     /// <summary>An agent on the person's window reads their settings and changes them as Settings does: asked first, a number
     /// brought into its range, kept in settings.json and in force in the window at once; a name or choice Settings lacks
-    /// changes nothing, and Enable MCP Server stays the person's.</summary>
+    /// changes nothing, and Enable MCP Server and the program Godot runs on stay the person's.</summary>
     [AvaloniaFact]
     public void An_agent_reads_and_changes_the_persons_settings_as_settings_does_once_they_allow_it()
     {
@@ -191,7 +326,7 @@ public sealed class McpIdeTests : McpRig, IClassFixture<RestoredFolders>
             {
                 ["changes"] = new Dictionary<string, object> { ["editorFontSize"] = 99, ["showBuildResults"] = "always" },
             }));
-            Press(Question(window, "the question for the agent's settings change"), "Allow");
+            Press(Question(window, "the question for the agent's settings change"), AgentToolDialog.AllowForSession);
             JsonElement[] changed = [.. Await(changing, "the agent's settings change").EnumerateArray()];
             JsonElement size = Assert.Single(changed, c => c.GetProperty("name").GetString() == "editorFontSize");
             Assert.Equal((13.0, 48.0), (size.GetProperty("before").GetDouble(), size.GetProperty("after").GetDouble()));
@@ -209,6 +344,7 @@ public sealed class McpIdeTests : McpRig, IClassFixture<RestoredFolders>
                 (new() { ["editorFontSize"] = "large" }, "editorFontSize takes a number, not \"large\""),
                 (new() { ["mcpServer"] = false }, "Enable MCP Server is the person's to change"),
                 (new() { ["agentFolders"] = new[] { Folder } }, "The folders agents join unasked are the person's to change"),
+                (new() { ["godotExecutable"] = "godot --verbose" }, "godotExecutable names a program Passenger runs, or code it loads: the person sets it in Settings"),
             })
             {
                 CallToolResult refused = Await(Waiting.Apart(() => Result(client, McpTools.SettingsSet, new() { ["changes"] = changes })), "the refused settings change");
@@ -279,6 +415,53 @@ public sealed class McpIdeTests : McpRig, IClassFixture<RestoredFolders>
             $"Settings' dialog was left open: {(await Call(client, McpTools.AppWindows, new() { ["app"] = "ide" })).GetRawText()}");
     }
 
+    /// <summary>An agent's picture of Passenger's own window at 2 pixels a unit shows the code and the active tab's name as
+    /// at 1, where at any scale but 1 the editor's text and the tab's title and icons were left out: drawn after a clip of
+    /// their own, they were scaled twice over, off the picture.</summary>
+    [Fact]
+    public async Task An_agents_picture_of_passengers_window_at_any_scale_shows_the_code_and_the_active_tabs_name()
+    {
+        string folder = TestFolders.Create("mcp-picture-");
+        DeleteAtEnd(folder);
+        File.WriteAllText(Path.Combine(folder, "Shown.cs"),
+            string.Concat(Enumerable.Range(0, 40).Select(i => $"public static class Shown{i} {{ public static int Value => {i} * 1024 + {i}; }}\n")));
+        await using McpClient client = await Start(["--mcp", folder], languageServer: false);
+        await Call(client, McpTools.Open, new() { ["path"] = "Shown.cs" });
+        foreach (string control in (string[])["CodeEditor", "Border.tab.active"])
+        {
+            int once = Edges(await PictureAsync(client, control, 1));
+            int twice = Edges(await PictureAsync(client, control, 2));
+            Assert.True(once > 50 && twice >= once, $"{control} drawn at scale 2 has {twice} edges of glyphs, at scale 1 {once}: what it shows was left out");
+        }
+    }
+
+    private async Task<byte[]> PictureAsync(McpClient client, string control, double scale)
+    {
+        CallToolResult picture = await Result(client, McpTools.AppScreenshot, new() { ["app"] = "ide", ["control"] = control, ["scale"] = scale });
+        return Assert.IsType<ImageContentBlock>(picture.Content[0]).DecodedData.ToArray();
+    }
+
+    /// <summary>The pixels of a picture whose colour differs sharply from the next to their right: the edges glyphs draw,
+    /// which flat fills have only at their ends.</summary>
+    private static int Edges(byte[] png)
+    {
+        using SKBitmap bitmap = SKBitmap.Decode(png);
+        SKColor[] pixels = bitmap.Pixels;
+        int edges = 0;
+        for (int y = 0; y < bitmap.Height; y++)
+        {
+            for (int x = y * bitmap.Width, end = x + bitmap.Width - 1; x < end; x++)
+            {
+                (SKColor a, SKColor b) = (pixels[x], pixels[x + 1]);
+                if (Math.Abs(a.Red - b.Red) + Math.Abs(a.Green - b.Green) + Math.Abs(a.Blue - b.Blue) > 96)
+                {
+                    edges++;
+                }
+            }
+        }
+        return edges;
+    }
+
     /// <summary>Razor for an agent: a component's errors, what a name in its markup is, and a method's usages across its
     /// markup and its code block.</summary>
     [Fact]
@@ -311,8 +494,8 @@ public sealed class McpIdeTests : McpRig, IClassFixture<RestoredFolders>
         [.. found.GetProperty("matches").EnumerateArray().Select(m => $"{m.GetProperty("path").GetString()}:{m.GetProperty("line").GetInt32()}").Order(StringComparer.Ordinal)];
 }
 
-/// <summary>Attach Profiler for an agent, McpIdeTests' where what it tests is held to a time: a profile's samples, so the class
-/// runs alone.</summary>
+/// <summary>Attach Profiler for an agent, and why a memory profile has no heap, McpIdeTests' where what it tests is held to a
+/// time: a profile's samples, so the class runs alone.</summary>
 [Collection(Alone.Name)]
 public sealed class McpIdeProfilingTests : McpRig, IClassFixture<RestoredFolders>
 {
@@ -344,6 +527,29 @@ public sealed class McpIdeProfilingTests : McpRig, IClassFixture<RestoredFolders
         using Process program = Process.GetProcessById(spinning);
         Assert.True(DotnetProcesses.Runs(program), "The program an agent attached the profiler to ended with its snapshot");
         await Call(client, McpTools.Stop);
+    }
+
+    /// <summary>An agent's profile asking for a memory snapshot hears why it has no heap: without seconds, before anything is
+    /// built or run, as the heap is read from the program as it runs; with seconds, of a program that ended before they
+    /// passed, in the answer's heap note.</summary>
+    [Fact]
+    public async Task An_agents_memory_profile_says_why_it_has_no_heap()
+    {
+        await TakeFolderAsync();
+        Write("Program.cs", $"File.WriteAllText(Path.Combine(@\"{Folder}\", \"ran.txt\"), \"ran\");\nConsole.WriteLine(\"done\");\n");
+        string ran = Path.Combine(Folder, "ran.txt");
+        await using McpClient client = await Start(["--mcp", Folder], languageServer: false);
+
+        CallToolResult refused = await Result(client, McpTools.Profile, new() { ["memory"] = true });
+        Assert.True(refused.IsError == true && Text(refused).Contains(PassengerTools.MemoryWithoutSeconds, StringComparison.Ordinal),
+            $"A memory profile without seconds answered: {Text(refused)}");
+        Assert.False(File.Exists(ran), "A memory profile refused for want of seconds ran the program all the same");
+
+        JsonElement ended = await Call(client, McpTools.Profile, new() { ["memory"] = true, ["seconds"] = 60 });
+        Assert.True(File.Exists(ran), $"The memory profile with seconds never ran the program: {ended.GetRawText()}");
+        Assert.True(!ended.TryGetProperty("heap", out JsonElement heap) || heap.ValueKind == JsonValueKind.Null, $"The program that ended at once has a heap: {heap}");
+        Assert.True(ended.TryGetProperty("heapNote", out JsonElement note) && note.GetString()?.StartsWith("The program ended before its memory snapshot", StringComparison.Ordinal) == true,
+            $"The memory profile of a program that ended before its seconds passed says nothing of why it has no heap: {ended.GetRawText()}");
     }
 
     /// <summary>An agent's profile of a program the debugger holds answers at once rather than waiting on it: refused while

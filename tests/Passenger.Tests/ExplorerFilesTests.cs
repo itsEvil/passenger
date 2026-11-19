@@ -6,6 +6,7 @@ using Avalonia.Input;
 using Avalonia.VisualTree;
 using Passenger.App.Debugging;
 using Passenger.App;
+using Passenger.App.CSharp;
 using Passenger.App.Editors;
 using Passenger.App.Explorer;
 using Passenger.App.Vcs;
@@ -191,6 +192,46 @@ public sealed class ExplorerFilesTests : IDisposable
         window.Close();
     }
 
+    /// <summary>A loaded project's folder renamed while a watcher of its build output for the C# language server walks it
+    /// waits for that walk to end, which lists nothing there once let go of: on Windows a folder with a folder under it open
+    /// does not move. The walk is held at its start, as a busy machine holds it.</summary>
+    [AvaloniaFact]
+    public void A_loaded_projects_folders_rename_waits_for_a_walk_of_its_build_output_under_way_for_the_language_server()
+    {
+        string library = Directory.CreateDirectory(Path.Combine(folder, "Lib")).FullName;
+        File.WriteAllText(Path.Combine(library, "Lib.csproj"), TestProjects.Library());
+        File.WriteAllText(Path.Combine(library, "Code.cs"), "class Code\n{\n}\n");
+        Restore.Run(Path.Combine(library, "Lib.csproj"));
+        MainWindow window = Ui.OpenFolder(folder);
+        string lib = PathNames.Canonical(library);
+        Ui.WaitFor(() => window.CSharpService?.Watching?.Watching.Any(w => PathNames.Within(w.Folder, lib)) == true,
+            () => $"Lib's build output to be watched for the C# language server, where {string.Join(", ", (window.CSharpService?.Watching?.Watching ?? []).Select(w => w.Folder))} are",
+            TimeSpan.FromMinutes(2));
+        ServerWatches watches = window.CSharpService!.Watching!;
+        string walked = watches.Watching.First(w => PathNames.Within(w.Folder, lib)).Folder;
+        TaskCompletionSource released = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        Task holding = watches.HoldNextWalk(at => PathNames.Same(at, walked), released.Task);
+        watches.LetGo([walked]).Held.Dispose();
+        window.Confirm = (_, _, _) => Task.FromResult(true);
+        Task<string?> renaming;
+        try
+        {
+            Assert.True(Ui.Pumped(() => holding.IsCompleted, TimeSpan.FromSeconds(30)), $"The watcher of {walked}, started again, never came to its first walk");
+            renaming = window.RenameAsync(lib, "Core");
+            // Pumped, not settled: the walk held holds the IDE's quiet.
+            Ui.PumpUntil(() => renaming.IsCompleted || window.Status?.StartsWith("Waiting for the design-time build of Lib", StringComparison.Ordinal) == true,
+                "the rename to wait for the walk of Lib's build output");
+            Assert.False(renaming.IsCompleted, $"Lib was renamed while the watcher of {walked} let go of was still to walk it, which on Windows refuses the rename: {window.Status}");
+        }
+        finally
+        {
+            released.TrySetResult();
+        }
+        Assert.Null(Ui.Await(renaming, "the rename"));
+        Assert.True(File.Exists(Path.Combine(folder, "Core", "Lib.csproj")), $"Lib's rename did not take it to Core: {window.Status}");
+        window.Close();
+    }
+
     /// <summary>A loaded project's folder moved into another folder is moved back by Undo and into it again by Redo, each once
     /// its build output is watched for the C# language server where it is: what watches inside it lets go first, as for the
     /// move itself, as Windows moves no folder with one inside it watched, and the folder is not made again where it was.</summary>
@@ -282,6 +323,39 @@ public sealed class ExplorerFilesTests : IDisposable
         }
     }
 
+    /// <summary>A loaded project's folder let go of for a move stays unwatched by the watches of a C# language server started
+    /// meanwhile, until the move is done: a move can begin while a server starts (its start waits for the design-time builds
+    /// the move waits out), and on Windows a move with the project's build output watched inside it is refused.</summary>
+    [AvaloniaFact]
+    public void A_folder_let_go_of_stays_unwatched_by_the_watches_of_a_language_server_started_meanwhile_until_done()
+    {
+        string library = Directory.CreateDirectory(Path.Combine(folder, "Lib")).FullName;
+        File.WriteAllText(Path.Combine(library, "Lib.csproj"), TestProjects.Library());
+        File.WriteAllText(Path.Combine(library, "Code.cs"), "class Code\n{\n}\n");
+        Restore.Run(Path.Combine(library, "Lib.csproj"));
+        Restore.Run(Path.Combine(folder, "Shop.csproj"));
+        MainWindow window = Ui.OpenFolder(folder);
+        CSharpService csharp = window.CSharpService ?? throw new InvalidOperationException("The folder opened with no C# service");
+        string lib = PathNames.Canonical(library);
+        string shopOutput = PathNames.Canonical(Path.Combine(folder, "obj"));
+        Ui.WaitFor(() => csharp.Watching?.Watching.Any(w => PathNames.Within(w.Folder, lib)) == true,
+            () => $"Lib's build output to be watched for the C# language server, where {Folders()} are", TimeSpan.FromMinutes(2));
+        ServerWatches first = csharp.Watching!;
+        IDisposable letting = csharp.LetGoOf([lib]).Held;
+        Assert.DoesNotContain(first.Watching, w => PathNames.Within(w.Folder, lib));
+
+        csharp.Restart();
+        Ui.WaitFor(() => csharp.Watching is { } now && now != first && now.Watching.Any(w => PathNames.Same(w.Folder, shopOutput)),
+            () => $"Shop's build output to be watched for the server started again, where {Folders()} are", TimeSpan.FromMinutes(2));
+        Assert.DoesNotContain(csharp.Watching!.Watching, w => PathNames.Within(w.Folder, lib));
+        letting.Dispose();
+        Ui.WaitFor(() => csharp.Watching?.Watching.Any(w => PathNames.Within(w.Folder, lib)) == true,
+            () => $"Lib's build output to be watched again once the move is done, where {Folders()} are", TimeSpan.FromMinutes(2));
+        window.Close();
+
+        string Folders() => string.Join(", ", (csharp.Watching?.Watching ?? []).Select(w => w.Folder));
+    }
+
     /// <summary>Where no folder a process works in can go (Windows), a project's folder deleted while its design-time build
     /// runs beside another project's goes only once that whole round has ended, not as its own build lands: the round's
     /// build session leaves the MSBuild node that built it working in its folder until it ends. Elsewhere it goes as its
@@ -364,6 +438,39 @@ public sealed class ExplorerFilesTests : IDisposable
         window.Close();
     }
 
+    /// <summary>On Windows a folder with a file under it some program holds open will not take a new name or move, and the
+    /// refusal names that program and the file, so the person knows what to close.</summary>
+    [AvaloniaTheory]
+    [InlineData("rename")]
+    [InlineData("move")]
+    public void A_folder_whose_file_a_program_holds_is_refused_on_Windows_naming_the_program_and_the_file(string change)
+    {
+        Assert.SkipUnless(OperatingSystem.IsWindows(), "Only Windows keeps a folder with a file under it held open from moving");
+        string library = PathNames.Canonical(Directory.CreateDirectory(Path.Combine(folder, "Lib")).FullName);
+        string held = Path.Combine(Directory.CreateDirectory(Path.Combine(library, "obj")).FullName, "held.txt");
+        File.WriteAllText(held, "held\n");
+        string shell = Programs.OnPath("powershell.exe") ?? throw new InvalidOperationException("Windows has no powershell.exe on its PATH");
+        MainWindow window = Open();
+        string started = Path.Combine(folder, "started");
+        using System.Diagnostics.Process holding = ChildProcesses.Start(ChildProcesses.Command(shell,
+            ["-NoProfile", "-Command", $"$held = [IO.File]::Open('{held}', 'Open', 'Read', 'ReadWrite, Delete'); Set-Content -Path '{started}' -Value started; Start-Sleep -Seconds 120"], folder));
+        try
+        {
+            Ui.WaitFor(() => File.Exists(started), "powershell to start, holding Lib/obj/held.txt open");
+            string models = PathNames.Canonical(Path.Combine(folder, "Models"));
+            string? refused = change == "rename" ? Ui.Await(window.RenameAsync(library, "Core"), "the rename")
+                : Ui.Await(window.PutAsync([library], models, copy: false), "the move").Count > 0 ? null : window.Status;
+            Assert.True(refused?.Contains($"Held by powershell (process {holding.Id}: {Path.Join("obj", "held.txt")})", StringComparison.Ordinal) == true,
+                $"The {change}'s refusal does not name powershell and the file it holds under Lib, so the person cannot tell what to close: {refused ?? "it went"}");
+            Assert.True(File.Exists(Path.Combine(library, "obj", "held.txt")), $"Lib is not where it was although its {change} was refused");
+        }
+        finally
+        {
+            ChildProcesses.Kill(holding);
+        }
+        window.Close();
+    }
+
     /// <summary>A Directory.Build.targets holding the design-time builds of the projects below it before CoreCompile, each
     /// writing held into its project's folder, until <paramref name="release"/> is there.</summary>
     private static string Holding(string release) => $$"""
@@ -409,6 +516,48 @@ public sealed class ExplorerFilesTests : IDisposable
         Assert.True(Directory.EnumerateFileSystemEntries(trash).Select(Path.GetFileName).SequenceEqual(["Lib"]),
             $"Removing the project beside its solution put [{string.Join(", ", Directory.EnumerateFileSystemEntries(trash).Select(Path.GetFileName))}] in the Trash, where only Lib was");
         Assert.DoesNotContain(window.ExplorerView.Tree.Rows, r => r.Kind == NodeKind.Project);
+        window.Close();
+    }
+
+    /// <summary>A project removed with its folder moved to the Trash, as the second question asks, is one command: one Undo
+    /// puts the project back in the solution and brings its folder back out of the Trash, and Redo takes both away again.</summary>
+    [AvaloniaFact]
+    public void Undo_of_a_project_removed_with_its_folder_brings_back_both_and_redo_takes_both_again()
+    {
+        string library = Directory.CreateDirectory(Path.Combine(folder, "Lib")).FullName;
+        File.Copy(Path.Combine(folder, "Shop.csproj"), Path.Combine(library, "Lib.csproj"));
+        File.WriteAllText(Path.Combine(library, "Shelf.cs"), "class Shelf { }\n");
+        string solution = Path.Combine(folder, "Shop.slnx");
+        string listed = "<Solution>\n  <Project Path=\"Shop.csproj\" />\n  <Project Path=\"Lib/Lib.csproj\" />\n</Solution>\n";
+        File.WriteAllText(solution, listed);
+        MainWindow window = Open();
+        List<string> asked = Questions(window);
+
+        Ui.ClickRow(window, Assert.Single(window.ExplorerView.Tree.Rows, r => r.Kind == NodeKind.Project && r.Name == "Lib"));
+        Ui.Press(window, "BACK_SPACE");
+        Ui.WaitFor(() => Finished(window, "Moved"), "the project's folder to go");
+        Assert.False(Directory.Exists(library), $"Lib's folder stayed: {window.Status}");
+        Assert.DoesNotContain("Lib.csproj", File.ReadAllText(solution), StringComparison.Ordinal);
+        Assert.Equal("Remove Project Lib", window.EditorArea.Commands.ToUndo(null)?.Name);
+
+        asked.Clear();
+        Ui.ClickRow(window, Assert.Single(window.ExplorerView.Tree.Rows, r => r.Kind == NodeKind.Project && r.Name == "Shop"));
+        Ui.Run(window, EditorActions.Undo);
+        Ui.WaitFor(() => window.Status?.StartsWith("Undone", StringComparison.Ordinal) == true || window.Status?.StartsWith("Cannot", StringComparison.Ordinal) == true,
+            () => $"Undo of the removal: {window.Status}");
+        Assert.True(asked.Count == 1 && asked[0].Contains("brings back Lib", StringComparison.Ordinal), $"Undo asked: {string.Join(" | ", asked)}");
+        Assert.True(File.ReadAllText(Path.Combine(library, "Shelf.cs")) == "class Shelf { }\n" && File.Exists(Path.Combine(library, "Lib.csproj")),
+            $"Undo of the removal left Lib's folder in the Trash, holding [{string.Join(", ", Left(trash))}]: {window.Status}");
+        Assert.Equal(listed, File.ReadAllText(solution));
+        Assert.Empty(Directory.EnumerateFileSystemEntries(trash));
+
+        Ui.ClickRow(window, Assert.Single(window.ExplorerView.Tree.Rows, r => r.Kind == NodeKind.Project && r.Name == "Shop"));
+        Ui.Run(window, EditorActions.Redo);
+        Ui.WaitFor(() => window.Status?.StartsWith("Redone", StringComparison.Ordinal) == true || window.Status?.StartsWith("Cannot", StringComparison.Ordinal) == true,
+            () => $"Redo of the removal: {window.Status}");
+        Assert.False(Directory.Exists(library), $"Redo of the removal left Lib's folder: {window.Status}");
+        Assert.True(File.Exists(Path.Combine(trash, "Lib", "Shelf.cs")), "Redo did not move Lib's folder to the Trash again");
+        Assert.DoesNotContain("Lib.csproj", File.ReadAllText(solution), StringComparison.Ordinal);
         window.Close();
     }
 
@@ -759,6 +908,107 @@ public sealed class ExplorerFilesTests : IDisposable
         }
     }
 
+    /// <summary>Delete on a file chosen with others (Ctrl+click, Cmd+click on macOS) asks once, by their count, and moves
+    /// every one to the Trash, closing their tabs and saying so in one line; a file chosen alone is asked of by its name, as
+    /// before.</summary>
+    [AvaloniaFact]
+    public void Delete_on_files_chosen_together_asks_once_and_moves_them_all_to_the_Trash_and_one_chosen_alone_is_asked_of_by_name()
+    {
+        string[] names = ["a.txt", "b.txt", "c.txt", "d.txt", "e.txt"];
+        foreach (string name in names)
+        {
+            File.WriteAllText(Path.Combine(folder, name), name);
+        }
+        MainWindow window = Open();
+        List<string> asked = Questions(window);
+        foreach (string name in (string[])["a.txt", "b.txt", "c.txt", "e.txt"])
+        {
+            window.OpenFile(Path.Combine(folder, name));
+        }
+        Ui.Settle();
+
+        // Each row found first, as finding one chooses it.
+        ExplorerNode[] rows = [.. names.Select(name => Row(window, name))];
+        Ui.ClickRow(window, rows[0]);
+        AlsoChoose(window, rows[1]);
+        AlsoChoose(window, rows[2]);
+        Ui.Press(window, "DELETE");
+        Ui.WaitFor(() => Finished(window, "Moved"), "the three files chosen to go to the Trash");
+        string[] left = [.. names.Where(name => File.Exists(Path.Combine(folder, name)))];
+        Assert.True(left.SequenceEqual(["d.txt", "e.txt"]), $"Delete on three files chosen left [{string.Join(", ", left)}], so the rest of those chosen were not deleted: '{window.Status}'");
+        Assert.True(asked.SequenceEqual(["Move 3 files to the Trash?"]), $"Delete on three files chosen asked [{string.Join(" | ", asked)}], where one question of all three was due");
+        Assert.All(["a.txt", "b.txt", "c.txt"], name => Assert.True(File.Exists(Path.Combine(trash, name)), $"{name} is not in the Trash, so it cannot be put back"));
+        Assert.True(window.EditorArea.Documents.Select(d => d.Name).SequenceEqual(["e.txt"]),
+            $"The tabs left are [{string.Join(", ", window.EditorArea.Documents.Select(d => d.Name))}], so a file deleted still shows as open");
+        Assert.Equal("Moved a.txt, b.txt and c.txt to the Trash", window.Status);
+
+        asked.Clear();
+        Ui.ClickRow(window, rows[3]);
+        Ui.Press(window, "DELETE");
+        Ui.WaitFor(() => !File.Exists(Path.Combine(folder, "d.txt")) || window.Status?.Contains("could not", StringComparison.Ordinal) == true, "d.txt to go to the Trash");
+        Assert.True(asked.SequenceEqual(["Move d.txt to the Trash?"]), $"Delete on a file chosen alone asked [{string.Join(" | ", asked)}], not of it by its name");
+        Assert.Equal("Moved d.txt to the Trash", window.Status);
+        Assert.True(File.Exists(Path.Combine(folder, "e.txt")) && window.EditorArea.Documents.Count == 1, "Delete on a file chosen alone took a file not chosen");
+        window.Close();
+    }
+
+    /// <summary>A folder chosen with a file inside it goes to the Trash once, the file with it: the question is of the
+    /// folder alone, and nothing is said to have failed for the file gone before its turn.</summary>
+    [AvaloniaFact]
+    public void Delete_on_a_folder_chosen_with_a_file_inside_it_moves_the_folder_once_with_the_file()
+    {
+        string order = Path.Combine(folder, "Models", "Order.cs");
+        File.WriteAllText(order, "class Order { }\n");
+        MainWindow window = Open();
+        List<string> asked = Questions(window);
+        ExplorerNode file = Row(window, Path.Combine("Models", "Order.cs"));
+
+        Ui.ClickRow(window, Row(window, "Models"));
+        AlsoChoose(window, file);
+        Ui.Press(window, "DELETE");
+        Ui.WaitFor(() => Finished(window, "Moved"), "the folder chosen to go to the Trash");
+        Assert.True(window.Status == "Moved Models to the Trash", $"Delete on a folder and a file in it said '{window.Status}', where the folder went once with the file");
+        Assert.True(asked.SequenceEqual(["Move the folder Models and everything in it to the Trash?"]),
+            $"Delete on a folder and a file in it asked [{string.Join(" | ", asked)}], where one question of the folder was due");
+        Assert.False(Directory.Exists(Path.Combine(folder, "Models")), "The folder chosen stayed");
+        Assert.True(File.Exists(Path.Combine(trash, "Models", "Order.cs")), "The file chosen inside the folder is not in the Trash with it, so it cannot be put back");
+        Assert.True(Directory.EnumerateFileSystemEntries(trash).Select(Path.GetFileName).SequenceEqual(["Models"]),
+            $"The Trash holds [{string.Join(", ", Directory.EnumerateFileSystemEntries(trash).Select(Path.GetFileName))}], so the file went apart from its folder");
+        window.Close();
+    }
+
+    /// <summary>Delete on rows chosen together greys while one of them would only leave the solution (a project), which
+    /// Remove takes chosen alone with its own questions: the row's menu and the keys say which row and why, and nothing is
+    /// asked or deleted.</summary>
+    [AvaloniaFact]
+    public void Delete_greys_on_a_project_chosen_with_a_file_saying_the_project_is_removed_chosen_alone()
+    {
+        File.WriteAllText(Path.Combine(folder, "Shop.slnx"), "<Solution>\n  <Project Path=\"Shop.csproj\" />\n</Solution>\n");
+        File.WriteAllText(Path.Combine(folder, "Notes.txt"), "groceries\n");
+        MainWindow window = Open();
+        List<string> asked = Questions(window);
+        ExplorerNode project = Assert.Single(window.ExplorerView.Tree.Rows, r => r.Kind == NodeKind.Project);
+        ExplorerNode notes = Row(window, "Notes.txt");
+
+        Ui.ClickRow(window, project);
+        AlsoChoose(window, notes);
+        string why = Refusals.RemovedAlone("Shop", "the solution");
+        Ui.RightClick(Ui.Row(window.ExplorerView, notes));
+        Assert.True(window.ExplorerView.SelectedNodes.Count == 2, "A right-click on a row chosen with another chose it alone, so its menu is not of both");
+        ContextMenu menu = window.ExplorerView.OpenMenu ?? throw new Xunit.Sdk.XunitException("A right-click on Notes.txt opened no menu");
+        MenuItem delete = menu.Items.OfType<MenuItem>().Single(i => (string?)i.Header == "Edit").Items.OfType<MenuItem>()
+            .Single(i => (string?)i.Header is "Delete…" or "Remove…");
+        menu.Close();
+        Ui.Settle();
+        Assert.True(!delete.IsEnabled && (string?)delete.Header == "Delete…" && Equals(ToolTip.GetTip(delete), why),
+            $"The menu's {delete.Header} of a project and a file chosen is {(delete.IsEnabled ? "enabled" : "greyed")}, saying '{ToolTip.GetTip(delete)}', so the person is not told why it takes neither");
+        Ui.Press(window, "DELETE");
+        Assert.Equal(why, window.Status);
+        Assert.True(asked.Count == 0 && File.Exists(Path.Combine(folder, "Notes.txt")) && File.ReadAllText(Path.Combine(folder, "Shop.slnx")).Contains("Shop.csproj", StringComparison.Ordinal),
+            "Delete on a project and a file chosen asked or deleted something");
+        window.Close();
+    }
+
     /// <summary>The Explorer's menu and keys are the window's actions: a row's Rename and Delete run from its menu and
     /// from the keys of the keymap chosen, Visual Studio's Ctrl+R, R (⌘R, R on macOS) and Delete, VS Code's F2 and
     /// Delete, as Rider's RenameElement and $Delete are bound in each; F2 renames nothing in Visual Studio's, where
@@ -843,7 +1093,7 @@ public sealed class ExplorerFilesTests : IDisposable
 
     /// <summary>A folder holding a web project and no solution opens in the File System view, where the project's
     /// Properties and, once MSBuild has evaluated the project as a web one, its wwwroot are listed before its other folders
-    /// and refuse Delete and Rename saying why.</summary>
+    /// and refuse Delete and Rename saying why, Properties' Delete too while it is chosen with another folder.</summary>
     [AvaloniaFact]
     public void A_web_projects_Properties_and_wwwroot_list_first_in_the_file_system_view_once_evaluated_and_refuse_delete_and_rename()
     {
@@ -866,6 +1116,13 @@ public sealed class ExplorerFilesTests : IDisposable
         Ui.ClickRow(window, Row(window, "Properties"));
         Ui.Press(window, "BACK_SPACE");
         Assert.Equal("Properties holds the project's launch and publish profiles", window.Status);
+        // Chosen with another folder, Properties keeps Delete from taking either, the keys on the other.
+        ExplorerNode properties = Row(window, "Properties");
+        Ui.ClickRow(window, Row(window, "Models"));
+        AlsoChoose(window, properties);
+        Ui.Press(window, "BACK_SPACE");
+        Assert.Equal("Properties holds the project's launch and publish profiles", window.Status);
+        Assert.True(Directory.Exists(Path.Combine(folder, "Models")), "Delete on a folder chosen with Properties took the folder, leaving Properties");
         Assert.True(Directory.Exists(webRoot) && Directory.Exists(Path.Combine(folder, "Properties")) && asked.Count == 0, "A folder the SDK reads was renamed or deleted");
         window.Close();
     }
@@ -889,7 +1146,29 @@ public sealed class ExplorerFilesTests : IDisposable
         Assert.True(window.Actions.Context().ToolWindow?.Id == ToolWindowIds.Explorer, $"The Explorer did not take the keys on {row.Name}");
     }
 
+    /// <summary>Clicks a row with the system's command key held, the key for choosing another row (Cmd on macOS, Ctrl
+    /// elsewhere), failing unless it is then chosen with those before.</summary>
+    private static void AlsoChoose(MainWindow window, ExplorerNode row)
+    {
+        int before = window.ExplorerView.SelectedNodes.Count;
+        Ui.Click(Ui.Row(window.ExplorerView, row), modifiers: (RawInputModifiers)Keystroke.Command);
+        Assert.True(window.ExplorerView.SelectedNodes.Count == before + 1 && window.ExplorerView.SelectedNodes.Contains(row),
+            $"A click on {row.Name} with the key for choosing another held left [{string.Join(", ", window.ExplorerView.SelectedNodes.Select(n => n.Name))}] chosen");
+    }
+
     private MainWindow Open() => Ui.OpenFolder(folder, languageServer: false);
+
+    /// <summary>Agrees to every question the window asks, keeping what each asked in order.</summary>
+    private static List<string> Questions(MainWindow window)
+    {
+        List<string> asked = [];
+        window.Confirm = (_, text, _) =>
+        {
+            asked.Add(text);
+            return Task.FromResult(true);
+        };
+        return asked;
+    }
 
     /// <summary>Agrees to every question the window asks, keeping their titles in order.</summary>
     private static List<string> Answer(MainWindow window)
@@ -907,14 +1186,14 @@ public sealed class ExplorerFilesTests : IDisposable
     private static async Task<string?> Moved(Task<IReadOnlyList<string>> moving) => (await moving).Count > 0 ? null : "nothing was moved";
 
     /// <summary>What may hold a folder that would not go or move, for a failure to name: the folders under it watched for the
-    /// C# language server, and on Windows the programs holding it, or a folder under it, open (the IDE's own aside).</summary>
+    /// C# language server, and on Windows the programs holding it, or a file or folder under it, open as the failure is said
+    /// (<see cref="FileHolders.Within"/>); the refusal itself names those holding it as it was refused.</summary>
     private static string Holders(MainWindow window, string folder)
     {
         string[] watched = [.. (window.CSharpService?.Watching?.Watching ?? []).Select(w => w.Folder).Where(w => PathNames.Within(w, folder))];
-        string[] open = !Directory.Exists(folder) ? [] : [.. Directory.EnumerateDirectories(folder, "*", SearchOption.AllDirectories).Prepend(folder)
-            .Select(path => (Path: path, By: FileHolders.Of(path))).Where(held => held.By.Count > 0)
-            .Select(held => $"{held.Path} by {string.Join(", ", held.By.Select(id => DotnetProcesses.Describe(id)?.Program ?? $"process {id}"))}")];
-        return $". Watched for the C# language server under it: [{string.Join(", ", watched)}]; held open: [{string.Join("; ", open)}]";
+        string[] open = [.. FileHolders.Within(folder).Select(held => $"{(held.Process == Environment.ProcessId ? FileHolders.Itself
+            : DotnetProcesses.Describe(held.Process)?.Program ?? "a program")} (process {held.Process}) holding [{string.Join(", ", held.Paths)}]")];
+        return $". Watched for the C# language server under it: [{string.Join(", ", watched)}]; held open now: [{string.Join("; ", open)}]";
     }
 
     /// <summary>What a folder holds, by its paths inside it, for a failure to name.</summary>

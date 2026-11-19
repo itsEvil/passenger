@@ -26,6 +26,20 @@ public sealed class XamlPreviewPane : DockPanel
     private readonly ToolWindows.EmptyState waiting;
     private readonly Panel view;
 
+    /// <summary>The size the root is drawn at: its design's, a phone's or a tablet's, shown while the previewer takes one.</summary>
+    private readonly ComboBox sizes;
+
+    /// <summary>What a MAUI page is drawn as: its screen, platform and theme, shown while its previewer is MAUI's.</summary>
+    private readonly ComboBox screens;
+    private readonly ComboBox platforms;
+    private readonly ComboBox themes;
+
+    /// <summary>The bar of those choosers, under the header.</summary>
+    private readonly Border looks;
+
+    /// <summary>Whether the choosers are being set to what the preview draws, which chooses nothing.</summary>
+    private bool showingLook;
+
     /// <summary>The chosen element's own values, under the frame, while it shows them.</summary>
     private readonly Border properties;
     private readonly TextBlock propertiesTitle;
@@ -50,18 +64,40 @@ public sealed class XamlPreviewPane : DockPanel
     {
         this.preview = preview;
         status = new TextBlock { Classes = { StyleClasses.Muted }, FontSize = 11, VerticalAlignment = VerticalAlignment.Center, TextTrimming = TextTrimming.CharacterEllipsis };
+        sizes = new ComboBox
+        {
+            [DockProperty] = Dock.Right,
+            Classes = { StyleClasses.Compact },
+            VerticalAlignment = VerticalAlignment.Center,
+            Margin = new Thickness(Gaps.Wide, 0, 0, 0),
+            IsVisible = false,
+            ItemsSource = (string[])[DesignSize, .. Passenger.Xaml.Features.PreviewSize.Offered.Select(s => s.Shown)],
+            SelectedIndex = 0,
+        };
+        ToolTip.SetTip(sizes, "The size the preview draws its root at");
+        sizes.SelectionChanged += (_, _) => preview.Size = sizes.SelectedIndex > 0 ? Passenger.Xaml.Features.PreviewSize.Offered[sizes.SelectedIndex - 1] : null;
+        screens = Chooser([.. MauiLook.Screens.Select(s => s.Shown)], "The screen the page is drawn on, and the idiom OnIdiom reads there");
+        platforms = Chooser([.. MauiLook.Platforms.Select(p => p.Shown)], "The platform OnPlatform reads");
+        themes = Chooser([.. Themes], "The theme AppThemeBinding reads");
+        screens.SelectionChanged += (_, _) => Choose(preview.Look with { Screen = screens.SelectedIndex >= 0 ? MauiLook.Screens[screens.SelectedIndex] : null });
+        platforms.SelectionChanged += (_, _) => Choose(preview.Look with { Platform = platforms.SelectedIndex >= 0 ? MauiLook.Platforms[platforms.SelectedIndex].Platform : null });
+        themes.SelectionChanged += (_, _) => Choose(preview.Look with { Theme = themes.SelectedIndex >= 0 ? Themes[themes.SelectedIndex] : null });
         Border header = ToolWindows.ToolBars.OverEditor(new DockPanel
         {
-            Margin = new Thickness(10, 0),
+            Margin = new Thickness(ListRow.TextStart, 0),
             Children =
             {
-                new TextBlock { Text = "Preview", FontWeight = FontWeight.SemiBold, FontSize = 12, VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(0, 0, 10, 0) },
+                new TextBlock { Text = "Preview", FontWeight = FontWeight.SemiBold, FontSize = 12, VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(0, 0, Gaps.Normal, 0) },
+                sizes,
                 status,
             },
         });
+        // A bar of their own under the header, so in a narrow pane they wrap to rows rather than crowd the header out.
+        looks = ToolWindows.ToolBars.OverEditor(new ToolWindows.ToolFlow { Margin = new Thickness(ListRow.TextStart, Gaps.Hair), Spacing = Gaps.Small, Children = { screens, platforms, themes } });
+        looks.IsVisible = false;
         error = new TextBlock { FontSize = 12, TextWrapping = TextWrapping.Wrap };
         error.Classes.Add(StyleClasses.Error);
-        errorBar = new Border { [DockProperty] = Dock.Top, Padding = new Thickness(10, 6), IsVisible = false, Child = error };
+        errorBar = new Border { [DockProperty] = Dock.Top, Padding = new Thickness(Gaps.Wide, Gaps.Small), IsVisible = false, Child = error };
         errorBar.Bind(Border.BackgroundProperty, errorBar.GetResourceObservable(TokenKeys.Banner));
         image = new Image { Stretch = Stretch.Fill };
         // The element at the caret, drawn over the frame in the frame's own units, so it shrinks with it.
@@ -72,7 +108,7 @@ public sealed class XamlPreviewPane : DockPanel
         framed.PointerPressed += OnFramePressed;
         // An edge, so a frame of the editor's own colour still shows where the design ends.
         scaled = new LayoutTransformControl { Child = framed };
-        edge = new Border { Child = scaled, BorderThickness = new Thickness(1), Margin = new Thickness(16), HorizontalAlignment = HorizontalAlignment.Center, VerticalAlignment = VerticalAlignment.Center };
+        edge = new Border { Child = scaled, BorderThickness = Hairlines.Round, Margin = new Thickness(Gaps.Group), HorizontalAlignment = HorizontalAlignment.Center, VerticalAlignment = VerticalAlignment.Center };
         edge.Bind(Border.BorderBrushProperty, edge.GetResourceObservable(TokenKeys.Divider));
         waiting = new ToolWindows.EmptyState { MaxWidth = 320, HorizontalAlignment = HorizontalAlignment.Center };
         waiting.ActionRequested += (_, action) => ActionRequested?.Invoke(this, action);
@@ -95,20 +131,30 @@ public sealed class XamlPreviewPane : DockPanel
         properties = new Border
         {
             [DockProperty] = Dock.Bottom,
-            BorderThickness = new Thickness(0, 1, 0, 0),
-            Padding = new Thickness(10, 6),
+            BorderThickness = Hairlines.Above,
+            Padding = new Thickness(Gaps.Wide, Gaps.Small),
             // One height for every element, so the frame above stays where it is as the caret moves.
             Height = 200,
             IsVisible = false,
-            Child = new ScrollViewer { Content = new StackPanel { Spacing = 4, Children = { propertiesTitle, propertyRows, unknown } } },
+            Child = new ScrollViewer { Content = new StackPanel { Spacing = Gaps.Tight, Children = { propertiesTitle, propertyRows, unknown } } },
         };
         properties.Bind(Border.BorderBrushProperty, properties.GetResourceObservable(TokenKeys.Divider));
         Children.Add(header);
+        Children.Add(looks);
         Children.Add(errorBar);
         Children.Add(properties);
         Children.Add(view);
         this.Bind(BackgroundProperty, this.GetResourceObservable(TokenKeys.Editor_Background));
         preview.Changed += (_, _) => Show();
+        // A MAUI page drawn in the IDE's theme follows it.
+        ActualThemeVariantChanged += (_, _) =>
+        {
+            if (preview.TakesLooks && preview.Look.Theme is null)
+            {
+                preview.Update();
+                ShowLook();
+            }
+        };
         AttachedToVisualTree += (_, _) =>
         {
             shownOn = TopLevel.GetTopLevel(this);
@@ -128,6 +174,9 @@ public sealed class XamlPreviewPane : DockPanel
         Show();
     }
 
+    /// <summary>A MAUI page's screen, platform or theme was chosen; raised on the UI thread with what the preview now draws.</summary>
+    public event EventHandler<MauiLook>? LookChosen;
+
     /// <summary>The action the pane's words offer was asked for (Build for XAML Preview), by its id.</summary>
     public event EventHandler<string>? ActionRequested;
 
@@ -142,6 +191,22 @@ public sealed class XamlPreviewPane : DockPanel
 
     /// <summary>The element's box outlined, in the frame's units; null while none is.</summary>
     public Rect? Outlined => outline.IsVisible ? outlined : null;
+
+    /// <summary>The chooser of the size the root is drawn at.</summary>
+    public ComboBox Sizes => sizes;
+
+    /// <summary>The choosers of a MAUI page's screen, platform and theme.</summary>
+    public ComboBox Screens => screens;
+
+    public ComboBox Platforms => platforms;
+
+    public ComboBox ThemeChooser => themes;
+
+    /// <summary>The themes a MAUI page is drawn in, as the chooser names them and as the previewer is told them.</summary>
+    private static readonly string[] Themes = [Passenger.MauiPreview.MauiPreviewThemes.Light, Passenger.MauiPreview.MauiPreviewThemes.Dark];
+
+    /// <summary>The chooser's first item: the root at the size its XAML designs it at.</summary>
+    public const string DesignSize = "Design size";
 
     /// <summary>Build for XAML Preview's title, which the pane's link shows.</summary>
     public const string BuildForPreviewTitle = "Build for XAML Preview";
@@ -174,7 +239,7 @@ public sealed class XamlPreviewPane : DockPanel
                 Height = ListRow.Height,
                 Children =
                 {
-                    new TextBlock { [DockProperty] = Dock.Right, Text = from, Classes = { StyleClasses.Muted }, FontSize = 11, VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(8, 0, 0, 0) },
+                    new TextBlock { [DockProperty] = Dock.Right, Text = from, Classes = { StyleClasses.Muted }, FontSize = 11, VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(Gaps.Normal, 0, 0, 0) },
                     new TextBlock { [DockProperty] = Dock.Left, Text = property, Width = 130, FontSize = 12, VerticalAlignment = VerticalAlignment.Center, TextTrimming = TextTrimming.CharacterEllipsis },
                     new TextBlock { Text = value, FontSize = 12, VerticalAlignment = VerticalAlignment.Center, TextTrimming = TextTrimming.CharacterEllipsis }.InCodeFont(),
                 },
@@ -202,6 +267,49 @@ public sealed class XamlPreviewPane : DockPanel
         outline.Width = box.Width + (2 * OutlineWidth);
         outline.Height = box.Height + (2 * OutlineWidth);
         outline.IsVisible = true;
+    }
+
+    /// <summary>A chooser of what a MAUI page is drawn as.</summary>
+    private static ComboBox Chooser(string[] items, string tip)
+    {
+        ComboBox chooser = new()
+        {
+            Classes = { StyleClasses.Compact },
+            VerticalAlignment = VerticalAlignment.Center,
+            ItemsSource = items,
+        };
+        ToolTip.SetTip(chooser, tip);
+        return chooser;
+    }
+
+    /// <summary>A chooser's choice, made the preview's unless the chooser is only being shown what it draws.</summary>
+    private void Choose(MauiLook look)
+    {
+        if (showingLook || look == preview.Look)
+        {
+            return;
+        }
+        preview.Look = look;
+        LookChosen?.Invoke(this, look);
+    }
+
+    /// <summary>The choosers shown what a MAUI page is drawn as: its own choice, else its build's platform, that platform's
+    /// kind of screen and the IDE's theme.</summary>
+    private void ShowLook()
+    {
+        looks.IsVisible = preview.TakesLooks;
+        if (!looks.IsVisible)
+        {
+            return;
+        }
+        MauiLook look = preview.Look;
+        string platform = look.Platform ?? preview.BuiltPlatform;
+        string theme = look.Theme ?? (ActualThemeVariant == Avalonia.Styling.ThemeVariant.Dark ? Themes[1] : Themes[0]);
+        showingLook = true;
+        screens.SelectedIndex = MauiLook.Screens.ToList().IndexOf(look.Screen ?? MauiLook.ScreenFor(platform));
+        platforms.SelectedIndex = MauiLook.Platforms.Select(p => p.Platform).ToList().IndexOf(platform);
+        themes.SelectedIndex = Array.IndexOf(Themes, theme);
+        showingLook = false;
     }
 
     private void OnFramePressed(object? sender, PointerPressedEventArgs e)
@@ -251,6 +359,8 @@ public sealed class XamlPreviewPane : DockPanel
     private void Show()
     {
         status.Text = preview.Status;
+        sizes.IsVisible = preview.TakesSizes;
+        ShowLook();
         image.Source = preview.Frame;
         image.Width = preview.FrameSize.Width;
         image.Height = preview.FrameSize.Height;

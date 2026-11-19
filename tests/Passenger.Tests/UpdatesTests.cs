@@ -12,6 +12,7 @@ using Avalonia.Headless;
 using Avalonia.Headless.XUnit;
 using Avalonia.Interactivity;
 using Avalonia.VisualTree;
+using Microsoft.Win32.SafeHandles;
 using ModelContextProtocol.Client;
 using ModelContextProtocol.Protocol;
 using Passenger.App.Mcp;
@@ -37,7 +38,7 @@ public sealed class UpdatesTests : McpRig, IClassFixture<UpdatesTests.DiskImages
     /// <summary>The downloads the release workflow publishes with every release, by fixed names.</summary>
     private static readonly string[] Downloads =
     [
-        "Passenger-macos-arm64.dmg", "Passenger-windows-x64.exe", "Passenger-windows-arm64.exe",
+        "Passenger-macos-arm64.dmg", "Passenger-macos-x64.dmg", "Passenger-windows-x64.exe", "Passenger-windows-arm64.exe",
         "Passenger-linux-x64.tar.gz", "Passenger-linux-arm64.tar.gz",
     ];
 
@@ -78,7 +79,7 @@ public sealed class UpdatesTests : McpRig, IClassFixture<UpdatesTests.DiskImages
         Assert.Contains(Ui.IdeLog().Split('\n'), line => line.Contains($"Updates: Passenger {newer} is out (v{newer}; this is {Product.Version}): {download}", StringComparison.Ordinal));
 
         string[] head = github.Requests[0].Split("\r\n", StringSplitOptions.RemoveEmptyEntries);
-        Assert.Equal($"GET {github.Latest.PathAndQuery} HTTP/1.1", head[0]);
+        Assert.Equal($"GET {github.Listing.PathAndQuery} HTTP/1.1", head[0]);
         Assert.Contains($"User-Agent: Passenger/{Product.Version}", head);
         string[] headers = [.. head.Skip(1).Select(h => h.Split(':')[0]).Order(StringComparer.OrdinalIgnoreCase)];
         Assert.True(headers.SequenceEqual(["Accept", "Host", "User-Agent"], StringComparer.OrdinalIgnoreCase),
@@ -156,7 +157,8 @@ public sealed class UpdatesTests : McpRig, IClassFixture<UpdatesTests.DiskImages
             ("a newer pre-release by its tag", Release($"v{Bumped(1, 0)}-beta.1")),
             ("a newer release GitHub marks a pre-release", Release($"v{Bumped(1, 0)}", prerelease: true)),
             ("a newer draft", Release($"v{Bumped(1, 0)}", draft: true)),
-            ("no release at all", new StandIn.Reply(404, """{"message":"Not Found"}""")),
+            ("no release at all", Listed()),
+            ("no list of releases (404 Not Found)", new StandIn.Reply(404, """{"message":"Not Found"}""")),
         ];
         foreach ((string what, StandIn.Reply answer) in nothingNewer)
         {
@@ -209,7 +211,7 @@ public sealed class UpdatesTests : McpRig, IClassFixture<UpdatesTests.DiskImages
     public void A_failed_or_unanswered_check_says_nothing_and_is_logged_and_Check_for_Updates_says_why()
     {
         using IDisposable theme = TestsTheme();
-        Assert.True(ReleaseFeed.Default.Latest.IsLoopback, $"A test's window would ask {ReleaseFeed.Default.Latest} for the latest release, not a loopback address");
+        Assert.True(ReleaseFeed.Default.Listing.IsLoopback, $"A test's window would ask {ReleaseFeed.Default.Listing} for the latest release, not a loopback address");
 
         github.Answer = new StandIn.Reply(500, """{"message":"Server Error"}""");
         MainWindow window = Started();
@@ -218,7 +220,7 @@ public sealed class UpdatesTests : McpRig, IClassFixture<UpdatesTests.DiskImages
         Ui.Settle();
         Assert.True(github.Requests.Count == 1, "The window did not ask for the latest release as it started");
         Assert.True(Notice(window) is null && window.Status == before, $"A check that failed was shown or said, where it is only logged: {UpdatesSaid(window)}");
-        Assert.Contains(Ui.IdeLog().Split('\n'), line => line.Contains($"Updates: could not ask {github.Latest} for the latest release: it answered 500 Internal Server Error", StringComparison.Ordinal));
+        Assert.Contains(Ui.IdeLog().Split('\n'), line => line.Contains($"Updates: could not ask {github.Listing} for the latest release: {github.Listing} answers 500 Internal Server Error", StringComparison.Ordinal));
         window.Close();
 
         // A server that takes the request and never answers is given up on at the feed's timeout.
@@ -228,7 +230,7 @@ public sealed class UpdatesTests : McpRig, IClassFixture<UpdatesTests.DiskImages
         Ui.Settle();
         Assert.True(github.Requests.Count == 2, "The window did not ask for the latest release as it started");
         Assert.True(Notice(window) is null && window.Status == before, $"A check never answered was shown or said, where it is only logged: {UpdatesSaid(window)}");
-        Assert.Contains(Ui.IdeLog().Split('\n'), line => line.Contains($"Updates: could not ask {github.Latest} for the latest release: no answer in 1 s", StringComparison.Ordinal));
+        Assert.Contains(Ui.IdeLog().Split('\n'), line => line.Contains($"Updates: could not ask {github.Listing} for the latest release: no answer in 1 s", StringComparison.Ordinal));
 
         CheckForUpdates(window);
         Assert.Equal("Could not check for updates: no answer in 1 s", window.Status);
@@ -260,6 +262,200 @@ public sealed class UpdatesTests : McpRig, IClassFixture<UpdatesTests.DiskImages
             $"The notice's button came into view {shown.Count} time(s), with [{string.Join(", ", shown.Select(words => words is null ? "no words" : $"'{words}'"))}], not once with its words");
         Assert.True(github.Requests.Count == 1, $"The window asked for the latest release {github.Requests.Count} times, not once");
         window.Close();
+    }
+
+    /// <summary>After the start a check comes a day after the last answer by the wall clock, which goes on while the
+    /// machine sleeps where a window's timer waits, so a Passenger left open across nights still asks daily; one that
+    /// failed (no network yet, GitHub refusing) is asked again at the next look rather than a day later.</summary>
+    [AvaloniaFact]
+    public void A_failed_check_is_asked_again_at_the_next_look_and_an_answered_one_a_day_later_by_the_wall_clock_however_long_the_machine_slept()
+    {
+        using IDisposable theme = TestsTheme();
+        WallClock clock = new();
+        TimeSpan look = TimeSpan.FromMilliseconds(400);
+        github.Answer = new StandIn.Reply(500, """{"message":"Server Error"}""");
+        MainWindow window = Started(clock: clock, look: look);
+        window.WatchForUpdates();
+        Ui.Settle();
+        Assert.True(github.Requests.Count >= 1, "The window did not ask for the latest release as it started");
+        Assert.True(Notice(window) is null, $"A check that failed was shown, where it is only logged: {UpdatesSaid(window)}");
+
+        // GitHub answers again: the next look asks, where a day's wait would leave the release unsaid until tomorrow.
+        string newer = Bumped(1, 0);
+        github.Answer = Release($"v{newer}");
+        Ui.WaitFor(() => Notice(window) == $"Passenger {newer} available",
+            () => $"v{newer} is out and the check before failed, yet the window's next looks did not ask again: {UpdatesSaid(window)}");
+        int asked = github.Requests.Count;
+
+        string later = Bumped(1, 1);
+        github.Answer = Release($"v{later}");
+        clock.Advance(TimeSpan.FromHours(23));
+        Ui.Hold(look * 4, "several looks less than a day after the last answer");
+        Assert.True(github.Requests.Count == asked,
+            $"The window asked for the latest release {github.Requests.Count - asked} more time(s) within a day of its answer, where it asks once a day");
+
+        // A night asleep: the wall clock passed the day while the window's timer counted nothing of it.
+        clock.Advance(TimeSpan.FromHours(1));
+        Ui.WaitFor(() => Notice(window) == $"Passenger {later} available",
+            () => $"A day passed on the wall clock since the window's last answer, yet its next looks did not ask for v{later}: {UpdatesSaid(window)}");
+        Assert.True(github.Requests.Count == asked + 1, $"The window asked {github.Requests.Count - asked} times a day after its answer, not once");
+        window.Close();
+    }
+
+    /// <summary>A release's notes marked a security release's say what it fixes in their Security section's first line.</summary>
+    private static string SecurityNotes(string version) =>
+        $"{ReleaseNotes.SecurityMarker}\nPassenger {version} closes a hole.\n\n## Security\n\n"
+        + "- **Agents reach only the open folder** ([#1](https://github.com/Zaneris/passenger/issues/1)): a path outside it is refused.\n- Another fix.\n\n## Fixed\n\n- Something else.\n";
+
+    /// <summary>What <see cref="SecurityNotes"/> says the release fixes, in plain words.</summary>
+    private const string SecurityFixes = "Agents reach only the open folder (#1): a path outside it is refused";
+
+    [AvaloniaFact]
+    public void A_release_whose_notes_mark_it_a_security_release_is_named_one_saying_what_it_fixes_and_one_unmarked_is_said_as_before()
+    {
+        using IDisposable theme = TestsTheme();
+        string newer = Bumped(1, 0);
+        github.Answer = Release($"v{newer}", body: SecurityNotes(newer));
+        MainWindow window = Started();
+        window.WatchForUpdates();
+        Ui.Settle();
+        Assert.True(Notice(window) == $"Security update: Passenger {newer} available", $"v{newer}'s notes mark it a security release, but {UpdatesSaid(window)}");
+        string tip = ToolTip.GetTip(window.FindControl<Button>("UpdateButton")!) as string ?? string.Empty;
+        Assert.StartsWith($"Passenger {newer} is a security update: {SecurityFixes}\nInstall it as soon as you can.\n", tip, StringComparison.Ordinal);
+        Assert.Equal($"Passenger {newer} is a security update: {SecurityFixes}. Install it soon", window.Status);
+        Assert.Contains(Ui.IdeLog().Split('\n'), line => line.Contains($"Updates: Passenger {newer} is out (v{newer}; this is {Product.Version}), a security release: ", StringComparison.Ordinal));
+        window.Close();
+
+        string later = Bumped(1, 1);
+        github.Answer = Release($"v{later}", body: $"Passenger {later} fixes things.\n\n## Security\n\n- Not marked a security release.\n");
+        window = Started();
+        string? before = window.Status;
+        window.WatchForUpdates();
+        Ui.Settle();
+        Assert.True(Notice(window) == $"Passenger {later} available", $"v{later}'s notes carry no mark, but {UpdatesSaid(window)}");
+        Assert.DoesNotContain("security", ToolTip.GetTip(window.FindControl<Button>("UpdateButton")!) as string ?? string.Empty, StringComparison.OrdinalIgnoreCase);
+        Assert.Equal(before, window.Status);
+        window.Close();
+    }
+
+    /// <summary>A release after a security release this version lacks is a security update in that release's words, however
+    /// many releases came between, a newer pre-release's or draft's mark passed over; once this version is that security
+    /// release or newer, a release after it says nothing of security.</summary>
+    [AvaloniaFact]
+    public void A_release_after_a_security_release_this_version_lacks_is_a_security_update_in_that_releases_words()
+    {
+        using IDisposable theme = TestsTheme();
+        string marked = Bumped(1, 0);
+        string newer = Bumped(1, 1);
+        string unreleased = "## Security\n\n- A fix not yet released.\n";
+        github.Answer = Listed(
+            Made($"v{Bumped(1, 3)}", draft: true, body: $"{ReleaseNotes.SecurityMarker}\n\n{unreleased}"),
+            Made($"v{Bumped(1, 2)}-rc.1", body: $"{ReleaseNotes.SecurityMarker}\n\n{unreleased}"),
+            Made($"v{newer}", body: $"Passenger {newer} fixes what {marked} left.\n\n## Fixed\n\n- A fix.\n"),
+            Made($"v{marked}", body: SecurityNotes(marked)),
+            Made($"v{Product.Version}", body: $"{ReleaseNotes.SecurityMarker}\n\n## Security\n\n- What this version fixed.\n"));
+        MainWindow window = Started();
+        window.WatchForUpdates();
+        Ui.Settle();
+        Assert.True(Notice(window) == $"Security update: Passenger {newer} available",
+            $"v{newer} follows v{marked}, a security release this version lacks, but {UpdatesSaid(window)}");
+        string tip = ToolTip.GetTip(window.FindControl<Button>("UpdateButton")!) as string ?? string.Empty;
+        Assert.True(tip.StartsWith($"Passenger {newer} is a security update: {SecurityFixes}\nInstall it as soon as you can.\n", StringComparison.Ordinal),
+            $"The notice's tip does not say what v{marked} fixes, the newest security release after this version: {tip}");
+        Assert.Contains(Ui.IdeLog().Split('\n'), line => line.Contains($"Updates: Passenger {newer} is out (v{newer}; this is {Product.Version}), a security update as v{marked} is a security release: ", StringComparison.Ordinal));
+        window.Close();
+
+        // This version is the newest security release: the one after it is an update like any other.
+        string later = Bumped(1, 2);
+        github.Answer = Listed(
+            Made($"v{later}", body: $"Passenger {later} fixes things.\n"),
+            Made($"v{Product.Version}", body: SecurityNotes(Product.Version)),
+            Made("v0.0.1", body: SecurityNotes("0.0.1")));
+        window = Started();
+        string? before = window.Status;
+        window.WatchForUpdates();
+        Ui.Settle();
+        Assert.True(Notice(window) == $"Passenger {later} available", $"Only this version and older ones are security releases, but {UpdatesSaid(window)}");
+        Assert.DoesNotContain("security", ToolTip.GetTip(window.FindControl<Button>("UpdateButton")!) as string ?? string.Empty, StringComparison.OrdinalIgnoreCase);
+        Assert.Equal(before, window.Status);
+        window.Close();
+    }
+
+    /// <summary>GitHub's releases once 0.4.1 follows 0.4.0, a security release: a Passenger 0.3.4 lacks 0.4.0's fixes and is
+    /// told 0.4.1 brings them, in 0.4.0's words, where a Passenger 0.4.0 has them and is told of 0.4.1 alone.</summary>
+    [Fact]
+    public async Task A_0_3_4_is_told_0_4_1_is_a_security_update_in_0_4_0s_words_and_a_0_4_0_that_it_is_out()
+    {
+        github.Answer = Listed(
+            Made("v0.4.1", body: "Passenger 0.4.1 fixes what 0.4.0 left.\n\n## Fixed\n\n- A fix.\n"),
+            Made("v0.4.0", body: SecurityNotes("0.4.0")),
+            Made("v0.3.4", body: "Passenger 0.3.4 fixes things.\n"));
+        ReleaseFeed feed = new(github.Listing, ReleaseFeed.ShortTimeout.Scaled());
+
+        ReleaseAnswer older = await Releases.AskAsync(feed, "0.3.4", TestContext.Current.CancellationToken);
+        Assert.True(older is ReleaseAnswer.Newer { Release: { Version: "0.4.1", Security: SecurityFixes } },
+            $"A Passenger 0.3.4, which lacks 0.4.0's security fixes, was not told 0.4.1 brings them: {older.Said}");
+        Assert.True(github.Requests.Count == 1, $"Passenger asked {github.Requests.Count} times for the releases, not once");
+
+        ReleaseAnswer current = await Releases.AskAsync(feed, "0.4.0", TestContext.Current.CancellationToken);
+        Assert.True(current is ReleaseAnswer.Newer { Release: { Version: "0.4.1", Security: null } },
+            $"A Passenger 0.4.0, which has 0.4.0's security fixes, was told 0.4.1 is other than an update with none: {current.Said}");
+    }
+
+    [AvaloniaFact]
+    public void An_installed_Passenger_offers_to_restart_into_a_security_release_at_once_when_it_is_ready()
+    {
+        using IDisposable theme = TestsTheme();
+        InstalledCopy copy = InstalledCopy.Make(images, TestFolders.Create("installed-"));
+        string newer = Bumped(1, 0);
+        github.Answer = Release($"v{newer}", files: copy.Update(newer), body: SecurityNotes(newer));
+        MainWindow window = Started(copy.Updater());
+        window.WatchForUpdates();
+        Ui.WaitFor(() => Notice(window) == $"Restart to install security update Passenger {newer}", () => $"the status bar to offer the security update once v{newer} had downloaded: {UpdatesSaid(window)}");
+        Assert.Equal($"Passenger {newer} is a security update: {SecurityFixes}, downloaded and checked", window.Status);
+        Assert.Equal("restart into it now", window.StatusPlace?.Name);
+        Assert.StartsWith($"Passenger {newer} is a security update: {SecurityFixes}\nRestart into it now rather than later.\n",
+            ToolTip.GetTip(window.FindControl<Button>("UpdateButton")!) as string ?? string.Empty, StringComparison.Ordinal);
+        window.Close();
+    }
+
+    /// <summary>An attached agent's click on the status bar's Restart to Update in the person's window restarts nothing: it
+    /// is told why, the status bar saying it too, the window stays open and the update still waits for the person.</summary>
+    [AvaloniaFact]
+    public void An_agents_click_on_Restart_to_Update_in_the_persons_window_restarts_nothing_and_is_told_why()
+    {
+        using IDisposable theme = TestsTheme();
+        InstalledCopy copy = InstalledCopy.Make(images, TestFolders.Create("installed-"));
+        string newer = Bumped(1, 0);
+        github.Answer = Release($"v{newer}", files: copy.Update(newer));
+        MainWindow window = Started(copy.Updater());
+        window.WatchForUpdates();
+        Ui.WaitFor(() => Notice(window) == $"Restart to update to Passenger {newer}", $"the status bar to offer Restart to Update to v{newer}");
+        string folder = PathNames.Canonical(Plain("restart-agent-"));
+        window.OpenFolder(folder);
+        window.ApplySettings(window.Settings with { McpServer = true });
+        Ui.Settle();
+        Assert.True(window.AgentSocket is not null, $"The window does not listen for agents: {window.Status}");
+        McpClient client = Await(Waiting.Apart(() => Start(["--mcp-attach", ProcessId, folder])), "the agent attaching");
+        try
+        {
+            Task<CallToolResult> clicking = Waiting.Apart(() => Result(client, McpTools.AppClick, new() { ["app"] = "ide", ["control"] = "#UpdateButton" }));
+            Press(Question(window, "the question for the agent's click in Passenger's windows"), AgentToolDialog.AllowForSession);
+            CallToolResult clicked = Await(clicking, "the agent's click on the status bar's Restart to Update");
+            Assert.True(clicked.IsError == true && Text(clicked).Contains(Refusals.RestartIsThePersons, StringComparison.Ordinal),
+                $"The agent's click on the status bar's Restart to Update was answered: {Text(clicked)}");
+            Ui.Settle();
+            Assert.True(window.IsVisible, "The agent's click on Restart to Update closed the person's window");
+            Assert.Equal(Refusals.RestartIsThePersons, window.Status);
+            Assert.True(Notice(window) == $"Restart to update to Passenger {newer}" && window.UpdateReady?.Version == newer,
+                $"After the agent's click the update no longer waits for the person: {UpdatesSaid(window)}");
+            Assert.True(copy.InstalledVersion is null || copy.InstalledVersion == Product.Version, $"The agent's click installed the update, as {copy.InstalledVersion}");
+        }
+        finally
+        {
+            Gone(client);
+            window.Close();
+        }
     }
 
     [AvaloniaFact]
@@ -310,6 +506,72 @@ public sealed class UpdatesTests : McpRig, IClassFixture<UpdatesTests.DiskImages
         window.Close();
     }
 
+    /// <summary>The window watching for updates may stand behind the person's others: what it finds, its download and
+    /// Restart to Update are said in every window, the one in front and one opened afterwards, from its one check and
+    /// one download; Check for Updates in another window is answered there, downloading nothing again.</summary>
+    [AvaloniaFact]
+    public void A_newer_release_its_download_and_Restart_to_Update_are_said_in_every_window_from_one_check_and_one_download()
+    {
+        using IDisposable theme = TestsTheme();
+        InstalledCopy copy = InstalledCopy.Make(images, TestFolders.Create("installed-"));
+        string newer = Bumped(1, 0);
+        IReadOnlyDictionary<string, byte[]> update = copy.Update(newer);
+        github.Answer = Release($"v{newer}", files: update);
+        github.Hold(copy.Package(newer));
+        string shop = TestFolders.Create("updates-shop-");
+        string bank = TestFolders.Create("updates-bank-");
+        string till = TestFolders.Create("updates-till-");
+        MainWindow window = Started(copy.Updater());
+        MainWindow? frontWindow = null;
+        MainWindow? laterWindow = null;
+        try
+        {
+            window.OpenFolder(shop);
+            window.ApplySettings(window.Settings with { OpenProjectIn = Passenger.App.Settings.OpenProjectIn.NewWindow });
+            // Another solution reopened as Passenger starts, in a window of its own in front of the one that watches.
+            Assert.Null(window.Open(bank));
+            Ui.Settle();
+            MainWindow front = frontWindow = Assert.Single(PassengerApp.Windows, w => w != window);
+            window.WatchForUpdates();
+
+            Ui.PumpUntil(() => Notice(front) is { } shown && shown.StartsWith($"Downloading Passenger {newer}: ", StringComparison.Ordinal),
+                $"the window in front, not the one watching, to say v{newer} is downloading");
+            github.Let();
+            Ui.WaitFor(() => Notice(front) == $"Restart to update to Passenger {newer}",
+                () => $"the window in front to offer Restart to Update once v{newer} had downloaded, where {UpdatesSaid(front)}");
+            Assert.True(Notice(window) == Notice(front), $"The window watching says '{Notice(window)}', the one in front '{Notice(front)}'");
+            Assert.True(front.Actions.WhyNot(AppActions.RestartToUpdate, front.Actions.Context()) is null,
+                "The window in front shows the update ready, but its Restart to Update cannot run");
+            Assert.True(front.UpdateReady?.Version == newer, $"The window in front has {front.UpdateReady?.Version ?? "nothing"} ready, not {newer}");
+
+            Assert.Null(window.Open(till));
+            Ui.Settle();
+            MainWindow later = laterWindow = Assert.Single(PassengerApp.Windows, w => w != window && w != front);
+            Assert.True(Notice(later) == $"Restart to update to Passenger {newer}",
+                $"A window opened after v{newer} was made ready does not offer Restart to Update: {UpdatesSaid(later)}");
+            Assert.True(later.Actions.WhyNot(AppActions.RestartToUpdate, later.Actions.Context()) is null,
+                "A window opened after the update was made ready cannot run Restart to Update");
+            Assert.True(github.Requests.Count == update.Count + 1,
+                $"Three windows made {github.Requests.Count} requests, not one for the release and one for each of the {update.Count} files of this system's update");
+
+            later.Perform(AppActions.CheckForUpdates);
+            Ui.WaitFor(() => later.Status == $"Passenger {newer} is ready: restart to update",
+                () => $"Check for Updates in the window opened later to say there that v{newer} is ready, where {UpdatesSaid(later)}");
+            Assert.True(github.Requests.Count == update.Count + 2,
+                $"Check for Updates in a window that does not watch made {github.Requests.Count - update.Count - 1} requests, not one for the release alone");
+            Assert.True(github.RequestsFor(copy.Package(newer)).Length == 1, $"{copy.Package(newer)} was downloaded again for another window");
+        }
+        finally
+        {
+            laterWindow?.Close();
+            frontWindow?.Close();
+            window.Close();
+            TestFolders.Delete(shop);
+            TestFolders.Delete(bank);
+            TestFolders.Delete(till);
+        }
+    }
+
     [AvaloniaFact]
     public void A_download_that_does_not_match_the_SHA_256_its_release_gives_is_refused_and_the_person_told_why()
     {
@@ -342,6 +604,247 @@ public sealed class UpdatesTests : McpRig, IClassFixture<UpdatesTests.DiskImages
         Ended(window);
         window.InstallUpdate();
         Assert.True(copy.InstalledVersion is null || copy.InstalledVersion == Product.Version, $"The refused update was installed, as {copy.InstalledVersion}");
+    }
+
+    /// <summary>The Mac refusing the disk image just downloaded for a moment is waited out: hdiutil refuses one another
+    /// program (a scanner) holds ("Resource temporarily unavailable"), as an exclusive lock taken on it here does, and
+    /// diskutil image, which opens a held one, one it cannot read. The image, whose SHA-256 is the release's, is opened
+    /// again once let go; one never let go is refused in the tool's words, the log naming what had it open, and one macOS
+    /// refused access to also names the folder it was refused in and where else to get it.</summary>
+    [AvaloniaTheory]
+    [InlineData(DiskImageTool.Hdiutil, "hdiutil: attach failed - Resource temporarily unavailable", "{0}")]
+    [InlineData(DiskImageTool.Diskutil, "diskutil: The operation couldn\u2019t be completed. Permission denied",
+        "macOS refused access to it in {1} ({0}); the release's page has it to install by hand")]
+    [SupportedOSPlatform("macos")]
+    public void A_disk_image_the_Mac_refuses_as_it_lands_opens_once_let_go_and_one_never_let_go_is_refused_in_the_tools_words(DiskImageTool tool, string refused,
+        string why)
+    {
+        Assert.SkipUnless(OperatingSystem.IsMacOS(), "Disk images are macOS's");
+        Assert.SkipWhen(tool == DiskImageTool.Diskutil && !OperatingSystem.IsMacOSVersionAtLeast(26), "diskutil image is macOS 26's");
+        using IDisposable theme = TestsTheme();
+        ConcurrentQueue<int> tries = new();
+        Held held = new(tool);
+        try
+        {
+            AppBundle copy = new(images, TestFolders.Create("installed-")) { Images = tool };
+            string newer = Bumped(1, 0);
+            github.Answer = Release($"v{newer}", files: copy.Update(newer));
+            DiskImageUpdater lettingGo = copy.Updater((image, attempt) =>
+            {
+                tries.Enqueue(attempt);
+                if (attempt == 1)
+                {
+                    held.Hold(image);
+                }
+                else
+                {
+                    held.Let();
+                }
+                return Task.CompletedTask;
+            }, [TimeSpan.FromMilliseconds(200)]);
+            MainWindow window = Started(lettingGo);
+            window.WatchForUpdates();
+            Ui.WaitFor(() => Settled(window, newer), () => $"the update refused as it landed to be made ready or refused, where {UpdatesSaid(window)}");
+            Assert.True(Notice(window) == $"Restart to update to Passenger {newer}",
+                $"A disk image the Mac refused a moment after it landed was not opened once let go: {UpdatesSaid(window)}");
+            Assert.True(tries.SequenceEqual([1, 2]), $"The image was tried {string.Join(", ", tries)}, not once refused and once let go");
+            Assert.True(copy.Holds(newer), $"The status bar offers Restart to Update, but v{newer} is not where it installs from");
+            string[] log = Ui.IdeLog().Split('\n');
+            Assert.Contains(log, line => line.Contains($"Updates: {copy.Package(newer)} did not open as a disk image at try 1 ({refused})", StringComparison.Ordinal));
+            Assert.Contains(log, line => line.Contains($"Updates: {copy.Package(newer)} opened as a disk image at try 2", StringComparison.Ordinal));
+            window.Close();
+
+            AppBundle other = new(images, TestFolders.Create("installed-")) { Images = tool };
+            string later = Bumped(1, 1);
+            github.Answer = Release($"v{later}", files: other.Update(later));
+            tries.Clear();
+            DiskImageUpdater neverLettingGo = other.Updater((image, attempt) =>
+            {
+                tries.Enqueue(attempt);
+                held.Hold(image);
+                return Task.CompletedTask;
+            }, [TimeSpan.FromMilliseconds(100), TimeSpan.FromMilliseconds(100)]);
+            window = Started(neverLettingGo);
+            window.WatchForUpdates();
+            Ui.WaitFor(() => Settled(window, later), () => $"the update refused throughout to be refused, where {UpdatesSaid(window)}");
+            string said = string.Format(System.Globalization.CultureInfo.InvariantCulture, why, refused, Path.Combine(other.Opened, later));
+            string words = $"Passenger {later} was not installed: {other.Package(later)} does not open as a disk image: {said}";
+            Assert.True(window.Status == words, $"An image the Mac never opened was not said in the tool's words: the status bar says '{window.Status}', not '{words}'");
+            Assert.Contains(words, ToolTip.GetTip(window.FindControl<Button>("UpdateButton")!) as string ?? string.Empty);
+            Assert.True(tries.SequenceEqual([1, 2, 3]), $"The image refused throughout was tried {string.Join(", ", tries)}, not three times");
+            Assert.True(other.Downloaded().Count == 0, $"The image refused left {string.Join(", ", other.Downloaded())} behind");
+            string holder = tool == DiskImageTool.Hdiutil ? $"(process {Environment.ProcessId}) on " : "nothing this user runs had it open";
+            string[] refusals = [.. Ui.IdeLog().Split('\n').Where(line => line.Contains($"Updates: {words} (", StringComparison.Ordinal))];
+            Assert.True(refusals.Any(line => line.Contains(holder, StringComparison.Ordinal)),
+                $"The log does not say what held the image refused throughout ('{holder}'): {string.Join("\n", refusals)}");
+            window.Close();
+        }
+        finally
+        {
+            held.Let();
+        }
+
+        static bool Settled(MainWindow window, string version) =>
+            Notice(window) == $"Restart to update to Passenger {version}" || Notice(window) == $"Passenger {version} not installed";
+    }
+
+    /// <summary>A disk image whose disk another program holds open as the update lets it go (a scanner, a backup agent):
+    /// its volume is unmounted, but its disk stays attached while held, which no detach takes, forced or not. The update
+    /// tries again by the disk until hdiutil lists the image no more, saying what held it; held throughout, the app copied
+    /// out is made ready all the same, the log naming what held the disk, and once let go the same release downloaded
+    /// again opens and every attachment of it is let go.</summary>
+    [AvaloniaTheory]
+    [InlineData(DiskImageTool.Hdiutil)]
+    [InlineData(DiskImageTool.Diskutil)]
+    [SupportedOSPlatform("macos")]
+    public void A_disk_image_whose_disk_is_held_as_it_is_let_go_goes_once_let_go_and_one_held_throughout_is_said_and_opens_again(DiskImageTool tool)
+    {
+        Assert.SkipUnless(OperatingSystem.IsMacOS(), "Disk images are macOS's");
+        Assert.SkipWhen(tool == DiskImageTool.Diskutil && !OperatingSystem.IsMacOSVersionAtLeast(26), "diskutil image is macOS 26's");
+        using IDisposable theme = TestsTheme();
+        DiskHold hold = new();
+        ConcurrentQueue<int> tries = new();
+        AppBundle copy = new(images, TestFolders.Create("installed-")) { Images = tool };
+        AppBundle other = new(images, TestFolders.Create("installed-")) { Images = tool };
+        try
+        {
+            string newer = Bumped(1, 0);
+            string folder = Path.Combine(copy.Opened, newer);
+            github.Answer = Release($"v{newer}", files: copy.Update(newer));
+            DiskImageUpdater lettingGo = copy.LettingGoUpdater((attached, attempt) =>
+            {
+                tries.Enqueue(attempt);
+                if (attempt == 1)
+                {
+                    hold.Hold(attached, Path.Combine(folder, "mount"));
+                }
+                else if (attempt == 3)
+                {
+                    hold.Let();
+                }
+                return Task.CompletedTask;
+            }, [TimeSpan.FromMilliseconds(200), TimeSpan.FromMilliseconds(200), TimeSpan.FromMilliseconds(200), TimeSpan.FromMilliseconds(200)]);
+            MainWindow window = Started(lettingGo);
+            window.WatchForUpdates();
+            Ui.WaitFor(() => Settled(window, newer), () => $"the update whose disk was held as it was let go to be made ready or refused, where {UpdatesSaid(window)}");
+            Assert.True(Notice(window) == $"Restart to update to Passenger {newer}", $"An update whose image's disk was held a moment was not made ready: {UpdatesSaid(window)}");
+            Assert.True(tries.Take(3).SequenceEqual([1, 2, 3]),
+                $"The image was let go of at tries {string.Join(", ", tries)}, not refused twice while its disk was held and let go at the third");
+            IReadOnlyList<string> left = AttachedUnder(copy.Opened);
+            Assert.True(left.Count == 0, $"The image whose disk was held a moment is still attached once let go, as {string.Join("; ", left)}");
+            string[] said = [.. Ui.IdeLog().Split('\n').Where(line => line.Contains($"Updates: the disk image in {folder} ", StringComparison.Ordinal))];
+            Assert.True(said.Any(line => line.Contains("was let go of at try ", StringComparison.Ordinal) && line.Contains($"(process {Environment.ProcessId}) on /dev/r", StringComparison.Ordinal)),
+                $"The log does not say the image was let go of once its disk was, naming this process as what held it: {string.Join("\n", said)}");
+            window.Close();
+
+            string later = Bumped(1, 1);
+            folder = Path.Combine(other.Opened, later);
+            github.Answer = Release($"v{later}", files: other.Update(later));
+            tries.Clear();
+            bool holding = true;
+            DiskImageUpdater neverLettingGo = other.LettingGoUpdater((attached, attempt) =>
+            {
+                tries.Enqueue(attempt);
+                if (Volatile.Read(ref holding))
+                {
+                    hold.Hold(attached, Path.Combine(folder, "mount"));
+                }
+                return Task.CompletedTask;
+            }, [TimeSpan.FromMilliseconds(100), TimeSpan.FromMilliseconds(100), TimeSpan.FromMilliseconds(100), TimeSpan.FromMilliseconds(100)]);
+            window = Started(neverLettingGo);
+            window.WatchForUpdates();
+            Ui.WaitFor(() => Settled(window, later), () => $"the update whose disk was held throughout to be made ready or refused, where {UpdatesSaid(window)}");
+            Assert.True(Notice(window) == $"Restart to update to Passenger {later}",
+                $"An update whose app was copied out and checked was not made ready because its image's disk stayed held: {UpdatesSaid(window)}");
+            Assert.True(tries.SequenceEqual([1, 2, 3, 4, 5]), $"The image held throughout was let go of at tries {string.Join(", ", tries)}, not five");
+            Assert.True(AttachedUnder(other.Opened).Count > 0, "The image whose disk was held throughout is not attached, so the test held nothing");
+            said = [.. Ui.IdeLog().Split('\n').Where(line => line.Contains($"Updates: the disk image in {folder} ", StringComparison.Ordinal))];
+            Assert.True(said.Any(line => line.Contains("is still attached after 5 tries to let it go", StringComparison.Ordinal)
+                    && line.Contains($"(process {Environment.ProcessId}) on /dev/r", StringComparison.Ordinal)),
+                $"The log does not say the image held throughout is still attached, naming this process as what held it: {string.Join("\n", said)}");
+
+            // Dropped while still held, then let go: the same release is downloaded to the same file again and opened.
+            window.ApplySettings(window.Settings with { CheckForUpdates = false });
+            Ui.WaitFor(() => !other.Holds(later) && Notice(window) == $"Passenger {later} available", () => $"the update made ready to be dropped as Check for updates went off, where {UpdatesSaid(window)}");
+            Volatile.Write(ref holding, false);
+            hold.Let();
+            window.ApplySettings(window.Settings with { CheckForUpdates = true });
+            Ui.WaitFor(() => Settled(window, later), () => $"the same release downloaded again to be made ready or refused, where {UpdatesSaid(window)}");
+            Assert.True(Notice(window) == $"Restart to update to Passenger {later}", $"Once its disk was let go, the same release's image did not open again: {UpdatesSaid(window)}");
+            left = AttachedUnder(other.Opened);
+            Assert.True(left.Count == 0, $"The same release opened again left its images attached, as {string.Join("; ", left)}");
+            window.Close();
+        }
+        finally
+        {
+            hold.Let();
+            TestVolumes.DetachUnder(copy.Opened);
+            TestVolumes.DetachUnder(other.Opened);
+        }
+
+        static bool Settled(MainWindow window, string version) =>
+            Notice(window) == $"Restart to update to Passenger {version}" || Notice(window) == $"Passenger {version} not installed";
+    }
+
+    /// <summary>A disk held open as another program may hold one (a scanner, a backup agent): its raw device, read.</summary>
+    [SupportedOSPlatform("macos")]
+    private sealed class DiskHold
+    {
+        private SafeFileHandle? held;
+
+        /// <summary>Holds the disk of the attachment whose volume is at <paramref name="mount"/>, the update's own.</summary>
+        public void Hold(IReadOnlyList<AttachedImages.Attachment> attached, string mount)
+        {
+            string at = PathNames.Canonical(mount);
+            if (Volatile.Read(ref held) is null && attached.FirstOrDefault(a => a.Mounts.Any(m => PathNames.Same(m, at))) is { } ours)
+            {
+                Volatile.Write(ref held, File.OpenHandle($"/dev/r{Path.GetFileName(ours.Disk)}", FileMode.Open, FileAccess.Read));
+            }
+        }
+
+        public void Let() => Interlocked.Exchange(ref held, null)?.Dispose();
+    }
+
+    /// <summary>The attachments hdiutil lists of an image under a folder, each as its disk and image.</summary>
+    [SupportedOSPlatform("macos")]
+    private static IReadOnlyList<string> AttachedUnder(string folder)
+    {
+        string under = PathNames.Canonical(folder);
+        (IReadOnlyList<AttachedImages.Attachment>? listed, string why) = Ui.AwaitPumped(Waiting.Apart(() => AttachedImages.ListAsync(CancellationToken.None)),
+            "hdiutil's list of the images attached", TimeSpan.FromMinutes(1).Scaled());
+        Assert.True(listed is not null, why);
+        return [.. listed.Where(a => PathNames.IsUnder(PathNames.Canonical(a.Image), under)).Select(a => $"{a.Disk} of {a.Image}")];
+    }
+
+    /// <summary>A disk image the Mac refuses as hdiutil or diskutil image would find it: held by another program for
+    /// hdiutil, an exclusive lock taken on it; unreadable for diskutil image, which opens a held one.</summary>
+    [SupportedOSPlatform("macos")]
+    private sealed class Held(DiskImageTool tool)
+    {
+        private FileStream? held;
+        private string? unread;
+
+        public void Hold(string image)
+        {
+            if (tool == DiskImageTool.Hdiutil)
+            {
+                held ??= new FileStream(image, FileMode.Open, FileAccess.Read, FileShare.None);
+            }
+            else
+            {
+                File.SetUnixFileMode(image, UnixFileMode.None);
+                unread = image;
+            }
+        }
+
+        public void Let()
+        {
+            Interlocked.Exchange(ref held, null)?.Dispose();
+            if (Interlocked.Exchange(ref unread, null) is { } image && File.Exists(image))
+            {
+                File.SetUnixFileMode(image, UnixFileMode.UserRead | UnixFileMode.UserWrite);
+            }
+        }
     }
 
     [AvaloniaFact]
@@ -406,14 +909,19 @@ public sealed class UpdatesTests : McpRig, IClassFixture<UpdatesTests.DiskImages
         window.Close();
     }
 
-    [AvaloniaFact]
+    /// <summary>The disk image is opened and let go of by diskutil image where macOS has it, hdiutil before; each puts the
+    /// update in place.</summary>
+    [AvaloniaTheory]
+    [InlineData(DiskImageTool.Hdiutil)]
+    [InlineData(DiskImageTool.Diskutil)]
     [SupportedOSPlatform("macos")]
-    public void Restart_to_Update_puts_the_new_version_in_place_of_the_old_and_starts_it_and_closing_installs_it_too()
+    public void Restart_to_Update_puts_the_new_version_in_place_of_the_old_and_starts_it_and_closing_installs_it_too(DiskImageTool tool)
     {
         Assert.SkipUnless(OperatingSystem.IsMacOS(),
             "On Windows Velopack's Update.exe replaces the install once this process has ended; a test cannot end its own process");
+        Assert.SkipWhen(tool == DiskImageTool.Diskutil && !OperatingSystem.IsMacOSVersionAtLeast(26), "diskutil image is macOS 26's");
         using IDisposable theme = TestsTheme();
-        AppBundle copy = new(images, TestFolders.Create("installed-"));
+        AppBundle copy = new(images, TestFolders.Create("installed-")) { Images = tool };
         string newer = Bumped(1, 0);
         github.Answer = Release($"v{newer}", files: copy.Update(newer));
         MainWindow window = Started(copy.Updater());
@@ -540,12 +1048,11 @@ public sealed class UpdatesTests : McpRig, IClassFixture<UpdatesTests.DiskImages
         }
         Assert.True(copy.InstalledVersion == Product.Version, $"{copy.Bundle} is {copy.InstalledVersion} after an update that could not take its place");
         Assert.True(copy.SignatureHolds(), $"{copy.Bundle} is not whole after an update that could not take its place");
-        Assert.Contains(Ui.IdeLog().Split('\n'), line => line.Contains($"Updates: Passenger {newer} was not installed: ", StringComparison.Ordinal)
-            && line.Contains("Permission denied", StringComparison.Ordinal));
+        Assert.Contains(Ui.IdeLog().Split('\n'), line => line.Contains($"Updates: Passenger {newer} was not installed in {copy.Bundle}: Permission denied", StringComparison.Ordinal));
 
         window = Started(copy.Updater());
         window.WatchForUpdates();
-        Assert.Equal($"Passenger {newer} did not install: Help, Show Log says why", window.Status);
+        Assert.Equal($"Passenger {newer} did not install: Permission denied", window.Status);
         Ui.WaitFor(() => Notice(window) == $"Restart to update to Passenger {newer}", "the update that did not install to be offered again");
         Assert.True(github.RequestsFor(copy.Package(newer)).Length == 1, $"{copy.Package(newer)} was downloaded again");
         window.Close();
@@ -553,7 +1060,7 @@ public sealed class UpdatesTests : McpRig, IClassFixture<UpdatesTests.DiskImages
 
     [AvaloniaFact]
     [SupportedOSPlatform("macos")]
-    public void Another_Passenger_open_from_the_same_app_holds_the_update_back_until_it_closes()
+    public void Another_Passenger_open_from_the_same_app_holds_the_update_back_until_it_closes_and_the_next_start_names_it()
     {
         Assert.SkipUnless(OperatingSystem.IsMacOS(),
             "On Windows Velopack's Update.exe replaces the install once this process has ended; a test cannot end its own process");
@@ -592,11 +1099,92 @@ public sealed class UpdatesTests : McpRig, IClassFixture<UpdatesTests.DiskImages
             Assert.True(copy.InstalledVersion == Product.Version, $"The app another Passenger runs from was replaced by {copy.InstalledVersion}");
             Assert.True(copy.Holds(newer), $"v{newer} is no longer ready once Passenger closed without installing it");
             Assert.Contains(Ui.IdeLog().Split('\n'), line => line.Contains($"Updates: Passenger {newer} waits to install: another Passenger runs from {copy.Bundle}", StringComparison.Ordinal));
+
+            window = Started(copy.Updater());
+            window.WatchForUpdates();
+            Assert.True(window.Status?.StartsWith($"Passenger {newer} did not install: another Passenger ran from {copy.Bundle} (process {other.Id}: ", StringComparison.Ordinal) == true
+                && window.Status.Contains("Passenger 120", StringComparison.Ordinal),
+                $"The next start does not say the Passenger running from the same app held the update back: '{window.Status}'");
+            Ui.WaitFor(() => Notice(window) == $"Restart to update to Passenger {newer}", "the update held back to be offered again");
+            window.Close();
         }
         finally
         {
             ChildProcesses.Kill(other);
         }
+    }
+
+    /// <summary>On Windows a Passenger running from the install's current\ holds the update back as Passenger closes, as
+    /// Update.exe would find its files in use: the update stays ready, and the next start names what held it back.</summary>
+    [AvaloniaFact]
+    [SupportedOSPlatform("windows")]
+    public void On_Windows_another_Passenger_running_from_the_install_holds_the_update_back_and_the_next_start_names_it()
+    {
+        Assert.SkipUnless(OperatingSystem.IsWindows(), "Velopack's install is Windows'");
+        using IDisposable theme = TestsTheme();
+        VelopackInstall copy = new(TestFolders.Create("installed-"));
+        string newer = Bumped(1, 0);
+        github.Answer = Release($"v{newer}", files: copy.Update(newer));
+        Updater updater = copy.Updater();
+        MainWindow window = Started(updater);
+        window.WatchForUpdates();
+        Ui.WaitFor(() => Notice(window) == $"Restart to update to Passenger {newer}", $"the status bar to offer Restart to Update to v{newer}");
+
+        // Another Passenger runs from current\: a program at its executable's path there, waiting.
+        string executable = Path.Combine(copy.Current, "Passenger.exe");
+        File.Copy(Path.Combine(Environment.SystemDirectory, "PING.EXE"), executable);
+        using System.Diagnostics.Process other = ChildProcesses.Start(ChildProcesses.Command(executable, ["-n", "600", "127.0.0.1"]));
+        try
+        {
+            Assert.True(updater.Others().Any(running => running.ProcessId == other.Id),
+                $"The program running from {executable} (process {other.Id}) is not found running from the install");
+            window.Close();
+            Ended(window);
+            window.InstallUpdate();
+            Assert.True(copy.Holds(newer), $"v{newer} is no longer ready once Passenger closed without installing it");
+            Assert.Contains(Ui.IdeLog().Split('\n'), line => line.Contains($"Updates: Passenger {newer} waits to install: another Passenger runs from {copy.Current}", StringComparison.Ordinal));
+
+            window = Started(copy.Updater());
+            window.WatchForUpdates();
+            Assert.True(window.Status?.StartsWith($"Passenger {newer} did not install: another Passenger ran from {copy.Current} (process {other.Id}: ", StringComparison.Ordinal) == true
+                && window.Status.Contains("Passenger.exe", StringComparison.OrdinalIgnoreCase),
+                $"The next start does not say the Passenger running from the install held the update back: '{window.Status}'");
+            Ui.WaitFor(() => Notice(window) == $"Restart to update to Passenger {newer}", "the update held back to be offered again");
+            window.Close();
+        }
+        finally
+        {
+            ChildProcesses.Kill(other);
+        }
+    }
+
+    /// <summary>On Windows an Update.exe that does not start as Passenger closes (the test's install has none) leaves the
+    /// install as it was and the update ready, and the next start says why.</summary>
+    [AvaloniaFact]
+    [SupportedOSPlatform("windows")]
+    public void On_Windows_an_Update_exe_that_does_not_start_leaves_the_update_ready_and_the_next_start_says_why()
+    {
+        Assert.SkipUnless(OperatingSystem.IsWindows(), "Velopack's install is Windows'");
+        using IDisposable theme = TestsTheme();
+        VelopackInstall copy = new(TestFolders.Create("installed-"));
+        string newer = Bumped(1, 0);
+        github.Answer = Release($"v{newer}", files: copy.Update(newer));
+        MainWindow window = Started(copy.Updater());
+        window.WatchForUpdates();
+        Ui.WaitFor(() => Notice(window) == $"Restart to update to Passenger {newer}", $"the status bar to offer Restart to Update to v{newer}");
+        window.Close();
+        Ended(window);
+        window.InstallUpdate();
+        Assert.True(copy.Holds(newer), $"v{newer} is no longer ready once Update.exe did not start");
+        string started = $"Updates: Passenger {newer} was not installed: Update.exe did not start: ";
+        Assert.Contains(Ui.IdeLog().Split('\n'), line => line.Contains(started, StringComparison.Ordinal));
+
+        window = Started(copy.Updater());
+        window.WatchForUpdates();
+        Assert.True(window.Status?.StartsWith($"Passenger {newer} did not install: Update.exe did not start: ", StringComparison.Ordinal) == true,
+            $"The next start does not say Update.exe did not start: '{window.Status}'");
+        Ui.WaitFor(() => Notice(window) == $"Restart to update to Passenger {newer}", "the update that did not install to be offered again");
+        window.Close();
     }
 
     [AvaloniaFact]
@@ -608,12 +1196,7 @@ public sealed class UpdatesTests : McpRig, IClassFixture<UpdatesTests.DiskImages
         using IDisposable theme = TestsTheme();
         // A volume of the test's own, as an external drive would be, with Passenger installed on it.
         string folder = TestFolders.Create("installed-");
-        string volume = Directory.CreateDirectory(Path.Combine(folder, "volume")).FullName;
-        string disk = Path.Combine(folder, "volume.dmg");
-        Tool("/usr/bin/hdiutil", "create", "-size", "20m", "-fs", "HFS+", "-volname", "Passenger Tests", "-ov", disk, "-quiet");
-        Tool("/usr/bin/hdiutil", "attach", disk, "-nobrowse", "-noautoopen", "-mountpoint", volume, "-quiet");
-        // Spotlight indexes a volume whatever folder it is mounted in, unless it holds this marker (TestRun.Unindexed's why).
-        File.WriteAllText(Path.Combine(volume, ".metadata_never_index"), string.Empty);
+        (string volume, string disk) = HfsVolume(folder);
         try
         {
             AppBundle copy = new(images, folder, volume);
@@ -635,8 +1218,140 @@ public sealed class UpdatesTests : McpRig, IClassFixture<UpdatesTests.DiskImages
         }
         finally
         {
-            Detach(volume);
+            TestVolumes.Detach(volume, disk);
         }
+    }
+
+    /// <summary>Passenger and its state on a volume of their own, as a home folder moved to an external drive takes them,
+    /// where macOS's disk image tools may refuse to open an image or mount one: the release's disk image is downloaded to
+    /// and opened in a folder of the user's alone on the startup disk, its app copied out into the state, and nothing of
+    /// the image is left once the update is ready.</summary>
+    [AvaloniaFact]
+    [SupportedOSPlatform("macos")]
+    public void An_update_whose_state_is_on_another_volume_opens_its_disk_image_on_the_startup_disk_in_a_folder_of_the_users_alone()
+    {
+        Assert.SkipUnless(OperatingSystem.IsMacOS(), "Disk images are macOS's");
+        using IDisposable theme = TestsTheme();
+        string folder = TestFolders.Create("installed-");
+        (string volume, string disk) = HfsVolume(folder);
+        AppBundle copy = new(images, folder, volume, Path.Combine(volume, "Library", "Application Support", "Passenger")) { ImageFolder = null };
+        string opened = copy.Opened;
+        try
+        {
+            string newer = Bumped(1, 0);
+            github.Answer = Release($"v{newer}", files: copy.Update(newer));
+            string? image = null;
+            UnixFileMode? mode = null;
+            ConcurrentQueue<string> mounts = new();
+            MainWindow window = Started(copy.Updater(opening: (path, _) =>
+            {
+                image = path;
+                mode = File.GetUnixFileMode(opened);
+                return Task.CompletedTask;
+            }, lettingGo: (attached, _) =>
+            {
+                foreach (string mount in attached.SelectMany(a => a.Mounts))
+                {
+                    mounts.Enqueue(mount);
+                }
+                return Task.CompletedTask;
+            }));
+            window.WatchForUpdates();
+            Ui.WaitFor(() => Notice(window) == $"Restart to update to Passenger {newer}" || Notice(window) == $"Passenger {newer} not installed",
+                () => $"the update whose state is on another volume to be made ready or refused, where {UpdatesSaid(window)}");
+            Assert.True(Notice(window) == $"Restart to update to Passenger {newer}", $"An update whose state is on another volume was not made ready: {UpdatesSaid(window)}");
+            string temporary = PathNames.Canonical(UserTemporary.Folder());
+            Assert.True(image is not null && PathNames.IsUnder(PathNames.Canonical(image), temporary),
+                $"The disk image was opened at {image}, not in the user's temporary folder on the startup disk, {temporary}");
+            Assert.True(mounts.Count > 0 && mounts.All(mount => PathNames.IsUnder(PathNames.Canonical(mount), temporary)),
+                $"The disk image was mounted at {string.Join(", ", mounts)}, not in the user's temporary folder on the startup disk, {temporary}");
+            Assert.True(mode == (UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute),
+                $"The folder the disk image was opened in, {opened}, is {mode}, not the user's alone");
+            Assert.True(copy.Holds(newer), $"The status bar offers Restart to Update, but v{newer} is not in the state on the other volume, {copy.Staging}");
+            Assert.False(Directory.Exists(opened), $"The update made ready left the folder its disk image was opened in, {opened}");
+            window.Close();
+            Ended(window);
+            window.InstallUpdate();
+            Assert.True(copy.InstalledVersion == newer, $"Passenger on another volume with its state closed with v{newer} ready, and is {copy.InstalledVersion}");
+            Assert.True(copy.Downloaded().Count == 0, $"The update installed left {string.Join(", ", copy.Downloaded())} behind");
+        }
+        finally
+        {
+            TestVolumes.DetachUnder(opened);
+            TestFolders.Delete(opened);
+            TestVolumes.Detach(volume, disk);
+        }
+    }
+
+    /// <summary>On a volume that cannot swap two folders (HFS+) the new app takes the installed one's place in two renames.
+    /// Another program taking that place between them leaves neither app there: the install throws nothing, keeps both
+    /// whole, and says where each was left, which the next start says too.</summary>
+    [AvaloniaFact]
+    [SupportedOSPlatform("macos")]
+    public void An_app_whose_place_is_taken_between_its_two_renames_says_where_each_app_was_left()
+    {
+        Assert.SkipUnless(OperatingSystem.IsMacOS(), "A volume that cannot swap two folders is a Mac's HFS+ disk image here");
+        using IDisposable theme = TestsTheme();
+        string folder = TestFolders.Create("installed-");
+        (string volume, string disk) = HfsVolume(folder);
+        try
+        {
+            AppBundle copy = new(images, folder, volume);
+            string newer = Bumped(1, 0);
+            github.Answer = Release($"v{newer}", files: copy.Update(newer));
+            // Something comes to the app's name just as the new app is to take it, and stays.
+            MainWindow window = Started(copy.Updater(renaming: (_, to) =>
+            {
+                if (to == copy.Bundle && !File.Exists(copy.Bundle))
+                {
+                    File.WriteAllText(copy.Bundle, "another program's");
+                }
+            }));
+            window.WatchForUpdates();
+            Ui.WaitFor(() => Notice(window) == $"Restart to update to Passenger {newer}", $"the status bar to offer Restart to Update to v{newer}");
+            window.Close();
+            Ended(window);
+            window.InstallUpdate();
+
+            string old = Path.Combine(volume, $".Passenger.app.{newer}.old");
+            string beside = Path.Combine(volume, $".Passenger.app.{newer}");
+            string notInstalled = $"Updates: Passenger {newer} was not installed in {copy.Bundle}: ";
+            string? said = Ui.IdeLog().Split('\n').LastOrDefault(line => line.Contains(notInstalled, StringComparison.Ordinal));
+            Assert.True(said is not null, $"An install whose app's place was taken did not say it was not installed: {UpdatesSaid(window)}");
+            string why = said[(said.IndexOf(notInstalled, StringComparison.Ordinal) + notInstalled.Length)..].TrimEnd();
+            Assert.True(why.Contains("could not be put back", StringComparison.Ordinal) && why.Contains(old, StringComparison.Ordinal)
+                && why.Contains(beside, StringComparison.Ordinal), $"An install that could put neither app in place does not say where each was left: '{why}'");
+            Assert.True(AppBundle.Version(old) == Product.Version, $"The installed app is not whole where the install says it left it, {old}");
+            Assert.True(AppBundle.Version(beside) == newer, $"Passenger {newer} is not whole where the install says it left it, {beside}");
+
+            // The person puts the app back where the words say it is.
+            File.Delete(copy.Bundle);
+            Directory.Move(old, copy.Bundle);
+            Assert.True(copy.SignatureHolds(), $"The app the install left in {old} is not whole once put back");
+            window = Started(copy.Updater());
+            window.WatchForUpdates();
+            Assert.Equal($"Passenger {newer} did not install: {why}", window.Status);
+            Ui.WaitFor(() => Notice(window) == $"Restart to update to Passenger {newer}", "the update that did not install to be offered again");
+            window.Close();
+        }
+        finally
+        {
+            TestVolumes.Detach(volume, disk);
+        }
+    }
+
+    /// <summary>A volume of the test's own in <paramref name="folder"/>, as an external drive would be: HFS+, which cannot
+    /// swap two folders, and unindexed. <see cref="TestVolumes.Detach"/> takes it off.</summary>
+    [SupportedOSPlatform("macos")]
+    private static (string Volume, string Disk) HfsVolume(string folder)
+    {
+        string volume = Directory.CreateDirectory(Path.Combine(folder, "volume")).FullName;
+        string disk = Path.Combine(folder, "volume.dmg");
+        Tool("/usr/bin/hdiutil", "create", "-size", "20m", "-fs", "HFS+", "-volname", "Passenger Tests", "-ov", disk, "-quiet");
+        Tool("/usr/bin/hdiutil", "attach", disk, "-nobrowse", "-noautoopen", "-mountpoint", volume, "-quiet");
+        // Spotlight indexes a volume whatever folder it is mounted in, unless it holds this marker (TestRun.Unindexed's why).
+        File.WriteAllText(Path.Combine(volume, ".metadata_never_index"), string.Empty);
+        return (volume, disk);
     }
 
     [AvaloniaFact]
@@ -877,10 +1592,11 @@ public sealed class UpdatesTests : McpRig, IClassFixture<UpdatesTests.DiskImages
             Ui.WaitFor(() => Notice(window) == $"Passenger {newer} ready to install",
                 () => $"the status bar to say v{newer} is ready to install by hand: {UpdatesSaid(window)}");
 
-            string unpacked = Path.Combine(copy.Staging, newer, "passenger");
-            string command = $"sudo {ShellWords.Quoted(Path.Combine(copy.Install, "install.sh"), ShellKind.Posix)} --system --from {ShellWords.Quoted(unpacked, ShellKind.Posix)} --keep-replaced";
+            string archive = copy.Archive(newer);
+            string command = $"sudo {ShellWords.Quoted(Path.Combine(copy.Install, "install.sh"), ShellKind.Posix)} --system --archive {ShellWords.Quoted(archive, ShellKind.Posix)} "
+                + $"--sha256 {copy.Sum(newer)} --keep-replaced";
             Assert.True(window.UpdateByHand == command, $"The command that installs v{newer} is '{window.UpdateByHand}', not '{command}'");
-            Assert.True(copy.Holds(newer), $"v{newer} is not unpacked at {unpacked}, which the command installs from");
+            Assert.True(copy.Holds(newer), $"v{newer}'s archive is not at {archive}, which the command installs");
             string tip = ToolTip.GetTip(window.FindControl<Button>("UpdateButton")!) as string ?? string.Empty;
             Assert.True(tip.Contains($"this user cannot write {copy.Install}", StringComparison.Ordinal) && tip.Contains(command, StringComparison.Ordinal),
                 $"The notice does not say why Passenger cannot install v{newer} and the command that does: '{tip}'");
@@ -900,6 +1616,59 @@ public sealed class UpdatesTests : McpRig, IClassFixture<UpdatesTests.DiskImages
         {
             File.SetUnixFileMode(opt, was);
         }
+    }
+
+    [AvaloniaFact]
+    [SupportedOSPlatform("linux")]
+    public void A_Linux_install_for_everyone_is_made_ready_where_only_the_person_writes_and_install_sh_takes_only_the_archive_Passenger_checked()
+    {
+        Assert.SkipUnless(OperatingSystem.IsLinux(), LinuxAlone);
+        using IDisposable theme = TestsTheme();
+        LinuxInstall copy = new(TestFolders.Create("installed-"), forEveryone: true);
+        string opt = Path.GetDirectoryName(copy.Install)!;
+        UnixFileMode was = File.GetUnixFileMode(opt);
+        File.SetUnixFileMode(opt, UnixFileMode.UserRead | UnixFileMode.UserExecute);
+        string newer = Bumped(1, 0);
+        try
+        {
+            Assert.SkipWhen(Libc.Access(opt, Libc.MayWrite) == 0, "The test runs as root, who can write any install");
+            github.Answer = Release($"v{newer}", files: copy.Update(newer));
+            MainWindow window = Started(copy.Updater());
+            window.WatchForUpdates();
+            Ui.WaitFor(() => Notice(window) == $"Passenger {newer} ready to install",
+                () => $"the status bar to say v{newer} is ready to install by hand: {UpdatesSaid(window)}");
+            window.Close();
+            Ended(window);
+        }
+        finally
+        {
+            File.SetUnixFileMode(opt, was);
+        }
+        const UnixFileMode OwnersAlone = UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute;
+        foreach (string folder in (string[])[copy.Staging, Path.Combine(copy.Staging, newer)])
+        {
+            Assert.True(File.GetUnixFileMode(folder) == OwnersAlone, $"{folder}, where v{newer} is made ready, is {File.GetUnixFileMode(folder)}: others may change it before it is installed");
+        }
+        Assert.False(Directory.Exists(Path.Combine(copy.Staging, newer, "passenger")), $"v{newer}'s passenger folder stays unpacked beside its archive, where install.sh never reads it");
+
+        // The root step's check, run as the person into the test's home: the same install.sh, without --system.
+        string archive = copy.Archive(newer);
+        byte[] checkedBytes = File.ReadAllBytes(archive);
+        string mine = Path.Combine(copy.Home, ".local", "opt", "passenger");
+        File.AppendAllText(archive, "changed after Passenger checked it");
+        ChildResult refused = copy.InstallArchive(archive, copy.Sum(newer));
+        Assert.True(!refused.Succeeded && refused.Error.Contains($"{archive}'s SHA-256 is", StringComparison.Ordinal)
+            && refused.Error.Contains($"not {copy.Sum(newer)}, the one its release gives", StringComparison.Ordinal),
+            $"install.sh did not refuse an archive changed after Passenger checked it, saying its SHA-256 differs: exit {refused.ExitCode}, {refused.Error}{refused.Output}");
+        Assert.False(Directory.Exists(mine), $"install.sh installed an archive changed after Passenger checked it, in {mine}");
+        string[] left = Directory.Exists(Path.GetDirectoryName(mine)) ? Directory.GetFileSystemEntries(Path.GetDirectoryName(mine)!) : [];
+        Assert.True(left.Length == 0, $"install.sh left what it unpacked beside {mine}: {string.Join(", ", left)}");
+
+        File.Delete(archive);
+        File.WriteAllBytes(archive, checkedBytes);
+        ChildResult installed = copy.InstallArchive(archive, copy.Sum(newer));
+        Assert.True(installed.Succeeded && LinuxInstall.ReleaseOf(mine) == newer,
+            $"install.sh did not install the archive Passenger checked: exit {installed.ExitCode}, {installed.Error}{installed.Output}; {mine} holds {LinuxInstall.ReleaseOf(mine) ?? "nothing"}");
     }
 
     [AvaloniaFact]
@@ -936,17 +1705,17 @@ public sealed class UpdatesTests : McpRig, IClassFixture<UpdatesTests.DiskImages
         Assert.True(copy.InstalledVersion == Product.Version, $"A package manager's copy was changed, to {copy.InstalledVersion}");
     }
 
-    private static void Detach(string volume) => TestVolumes.Detach(volume, (tool, arguments) => Ran(tool, arguments, TimeSpan.FromMinutes(1).Scaled()));
-
     /// <summary>The person's window as the app makes it, its settings kept in the test's state folder, asking the stand-in
     /// within the limit a person's Passenger gives GitHub, scaled to the run, or the test's own (a stand-in held to not
-    /// answering); with the updater of a copy installed in a test folder, or, as every window but the person's own, none.</summary>
-    private MainWindow Started(Updater? updater = null, TimeSpan? feedLimit = null)
+    /// answering); with the updater of a copy installed in a test folder, or, as every window but the person's own, none;
+    /// counting a day between checks on the test's clock, looking whether one is due as often as the test says.</summary>
+    private MainWindow Started(Updater? updater = null, TimeSpan? feedLimit = null, TimeProvider? clock = null, TimeSpan? look = null)
     {
-        ReleaseFeed feed = new(github.Latest, feedLimit ?? ReleaseFeed.ShortTimeout.Scaled());
+        ReleaseFeed feed = new(github.Listing, feedLimit ?? ReleaseFeed.ShortTimeout.Scaled());
         MainWindow window = new()
         {
             Width = 1200, Height = 800, StateFolder = settings, Releases = feed, SelfUpdate = updater,
+            UpdateClock = clock ?? TimeProvider.System, UpdateLook = look ?? TimeSpan.FromHours(1),
         };
         window.Show();
         window.KeepSettings();
@@ -964,9 +1733,9 @@ public sealed class UpdatesTests : McpRig, IClassFixture<UpdatesTests.DiskImages
         if (OperatingSystem.IsMacOS())
         {
             Assert.DoesNotContain("Check for Updates…", helpItems);
-            string[] application = [.. window.ApplicationMenu().Items.Select(i => (i as NativeMenuItem)?.Header ?? "-")];
+            string[] application = [.. MainWindow.ApplicationMenu!.Items.Select(i => (i as NativeMenuItem)?.Header ?? "-")];
             Assert.Equal(["About Passenger", "Check for Updates…", "-", "Settings…"], application);
-            item = window.ApplicationMenu().Items.OfType<NativeMenuItem>().First(i => i.Header == "Check for Updates…");
+            item = MainWindow.ApplicationMenu!.Items.OfType<NativeMenuItem>().First(i => i.Header == "Check for Updates…");
         }
         else
         {
@@ -1029,9 +1798,16 @@ public sealed class UpdatesTests : McpRig, IClassFixture<UpdatesTests.DiskImages
         return $"{parts[0] + major}.{minor}.0";
     }
 
+    /// <summary>GitHub's list of releases holding one release alone, as <see cref="Made"/> makes it.</summary>
+    private StandIn.Reply Release(string tag, bool prerelease = false, bool draft = false, IReadOnlyDictionary<string, byte[]>? files = null, string? body = null) =>
+        Listed(Made(tag, prerelease, draft, files, body));
+
+    /// <summary>GitHub's list of releases, as its API lists them, newest first.</summary>
+    private static StandIn.Reply Listed(params JsonObject[] releases) => new(200, new JsonArray([.. releases]).ToJsonString());
+
     /// <summary>A release as GitHub's API gives it, with every download a release publishes; the files given are the
     /// stand-in's to serve, by their names, and the rest GitHub's, which no test downloads.</summary>
-    private StandIn.Reply Release(string tag, bool prerelease = false, bool draft = false, IReadOnlyDictionary<string, byte[]>? files = null)
+    private JsonObject Made(string tag, bool prerelease = false, bool draft = false, IReadOnlyDictionary<string, byte[]>? files = null, string? body = null)
     {
         JsonArray assets = [];
         foreach (string name in Downloads.Union(files?.Keys ?? []))
@@ -1052,11 +1828,22 @@ public sealed class UpdatesTests : McpRig, IClassFixture<UpdatesTests.DiskImages
             ["draft"] = draft,
             ["prerelease"] = prerelease,
             ["assets"] = assets,
+            ["body"] = body,
         };
-        return new StandIn.Reply(200, release.ToJsonString());
+        return release;
     }
 
     private static IDisposable TestsTheme() => new ThemeBack(Avalonia.Application.Current!.RequestedThemeVariant);
+
+    /// <summary>A wall clock the test moves, as a night's sleep moves the machine's while the window's timers wait.</summary>
+    private sealed class WallClock : TimeProvider
+    {
+        private long ticks = new DateTimeOffset(2026, 11, 13, 4, 15, 0, TimeSpan.Zero).UtcTicks;
+
+        public override DateTimeOffset GetUtcNow() => new(Interlocked.Read(ref ticks), TimeSpan.Zero);
+
+        public void Advance(TimeSpan by) => Interlocked.Add(ref ticks, by.Ticks);
+    }
 
     private sealed class ThemeBack(Avalonia.Styling.ThemeVariant? theme) : IDisposable
     {
@@ -1131,13 +1918,15 @@ public sealed class UpdatesTests : McpRig, IClassFixture<UpdatesTests.DiskImages
         /// <param name="images">The class's disk images, which the updates are.</param>
         /// <param name="folder">The test's folder, which holds Passenger's state and, unless another is given, its Applications.</param>
         /// <param name="applications">Where the app is installed, when not in the folder's Applications.</param>
-        public AppBundle(DiskImages images, string folder, string? applications = null)
+        /// <param name="state">Passenger's state folder, when not the folder's state.</param>
+        public AppBundle(DiskImages images, string folder, string? applications = null, string? state = null)
         {
             this.images = images;
             this.folder = folder;
             Applications = Directory.CreateDirectory(applications ?? Path.Combine(folder, "Applications")).FullName;
             Bundle = Path.Combine(Applications, "Passenger.app");
-            Staging = Path.Combine(folder, "state", "updates");
+            Staging = Path.Combine(state ?? Path.Combine(folder, "state"), "updates");
+            ImageFolder = Path.Combine(folder, "temporary", "updates");
             Make(Bundle, Product.Version);
         }
 
@@ -1149,6 +1938,13 @@ public sealed class UpdatesTests : McpRig, IClassFixture<UpdatesTests.DiskImages
 
         public string Staging { get; }
 
+        /// <summary>Where its updates download and open their disk images: a folder of the test's own, or the updater's own
+        /// in the user's temporary folder where a test makes it null.</summary>
+        public string? ImageFolder { get; init; }
+
+        /// <summary>The folder its updates' disk images are opened in.</summary>
+        public string Opened => ImageFolder ?? new DiskImageUpdater(Bundle, Staging).ImageFolder;
+
         /// <summary>Where each start of the app writes its version: in the folder above the one it is in, the test's own.</summary>
         public string Started => Path.Combine(folder, "started.txt");
 
@@ -1157,7 +1953,30 @@ public sealed class UpdatesTests : McpRig, IClassFixture<UpdatesTests.DiskImages
 
         public override string? InstalledVersion => Version(Bundle);
 
-        public override Updater Updater() => new DiskImageUpdater(Bundle, Staging, StartAsync);
+        /// <summary>What its updates open their disk images with: this Mac's own unless a test names one.</summary>
+        public DiskImageTool Images { get; init; } = DiskImageUpdater.ThisMacs;
+
+        public override Updater Updater() => new DiskImageUpdater(Bundle, Staging, StartAsync) { Images = Images, ImageFolder = Opened };
+
+        /// <summary>The copy's updater, <paramref name="renaming"/> run as each rename of the two that put the new app in
+        /// place on a volume that cannot swap two folders begins.</summary>
+        public DiskImageUpdater Updater(Action<string, string> renaming) =>
+            new(Bundle, Staging, StartAsync) { Renaming = renaming, Images = Images, ImageFolder = Opened };
+
+        /// <summary>The copy's updater, <paramref name="opening"/> run as each try to open the image begins, waiting
+        /// <paramref name="pauses"/> between tries.</summary>
+        public DiskImageUpdater Updater(Func<string, int, Task> opening, IReadOnlyList<TimeSpan> pauses) =>
+            new(Bundle, Staging, StartAsync) { Opening = opening, OpenAgainAfter = pauses, Images = Images, ImageFolder = Opened };
+
+        /// <summary>The copy's updater, <paramref name="lettingGo"/> run as each try to let its image go begins, waiting
+        /// <paramref name="pauses"/> between tries.</summary>
+        public DiskImageUpdater LettingGoUpdater(Func<IReadOnlyList<AttachedImages.Attachment>, int, Task> lettingGo, IReadOnlyList<TimeSpan> pauses) =>
+            new(Bundle, Staging, StartAsync) { LettingGo = lettingGo, LetGoAgainAfter = pauses, Images = Images, ImageFolder = Opened };
+
+        /// <summary>The copy's updater, <paramref name="opening"/> run as each try to open the image begins and
+        /// <paramref name="lettingGo"/> as each try to let it go does.</summary>
+        public DiskImageUpdater Updater(Func<string, int, Task> opening, Func<IReadOnlyList<AttachedImages.Attachment>, int, Task> lettingGo) =>
+            new(Bundle, Staging, StartAsync) { Opening = opening, LettingGo = lettingGo, Images = Images, ImageFolder = Opened };
 
         public override string Package(string version) => ThisSystemsDownload();
 
@@ -1183,16 +2002,18 @@ public sealed class UpdatesTests : McpRig, IClassFixture<UpdatesTests.DiskImages
             }
         }
 
+        /// <summary>What its updates left where they download: in <see cref="Staging"/>, and <see cref="Opened"/> itself.</summary>
         public override IReadOnlyList<string> Downloaded()
         {
+            List<string> left = Directory.Exists(Opened) ? [Opened] : [];
             try
             {
-                return [.. Directory.EnumerateFileSystemEntries(Staging).Select(p => Path.GetFileName(p))];
+                left.AddRange(Directory.EnumerateFileSystemEntries(Staging).Select(p => Path.GetFileName(p)));
             }
             catch (DirectoryNotFoundException)
             {
-                return [];
             }
+            return left;
         }
 
         /// <summary>The installed app made the build's own Passenger, its executable beside the build's assemblies, signed
@@ -1249,7 +2070,8 @@ public sealed class UpdatesTests : McpRig, IClassFixture<UpdatesTests.DiskImages
             Tool("/usr/bin/codesign", "--force", "--options", "runtime", "--sign", "-", bundle);
         }
 
-        private static string? Version(string bundle)
+        /// <summary>The version of the app at <paramref name="bundle"/>, or null where none is there.</summary>
+        public static string? Version(string bundle)
         {
             string plist = Path.Combine(bundle, "Contents", "Info.plist");
             if (!File.Exists(plist))
@@ -1306,6 +2128,9 @@ public sealed class UpdatesTests : McpRig, IClassFixture<UpdatesTests.DiskImages
         }
 
         public override string? InstalledVersion => null;
+
+        /// <summary>The install's current\ folder, which the installed version runs from.</summary>
+        public string Current => current;
 
         public override Updater Updater() =>
             new VelopackUpdater(new TestVelopackLocator("PassengerIDE", Product.Version, packages, current, root, Path.Combine(root, "Update.exe"), channel));
@@ -1449,19 +2274,39 @@ public sealed class UpdatesTests : McpRig, IClassFixture<UpdatesTests.DiskImages
             return new Dictionary<string, byte[]> { [Package(version)] = archive, ["SHA256SUMS"] = Encoding.UTF8.GetBytes(sums) };
         }
 
-        /// <summary>A release of this version unpacked where the updater makes it ready: beside the install, or for an
-        /// install for everyone in the state's folder; not while the updater removes it.</summary>
+        /// <summary>A release of this version made ready where the updater makes it ready: unpacked beside the install, or
+        /// for an install for everyone its archive in the state's folder; not while the updater removes it.</summary>
         public override bool Holds(string version)
         {
-            string unpacked = forEveryone ? Path.Combine(Staging, version) : UpdateFolders.Beside(Install, version);
             try
             {
-                return ReleaseOf(Path.Combine(unpacked, "passenger")) == version;
+                return forEveryone
+                    ? Convert.ToHexStringLower(SHA256.HashData(File.ReadAllBytes(Archive(version)))) == Sum(version)
+                    : ReleaseOf(Path.Combine(UpdateFolders.Beside(Install, version), "passenger")) == version;
             }
             catch (Exception gone) when (gone is DirectoryNotFoundException or FileNotFoundException)
             {
                 return false;
             }
+        }
+
+        /// <summary>Where an install for everyone keeps a release's archive for install.sh.</summary>
+        public string Archive(string version) => Path.Combine(Staging, version, Package(version));
+
+        /// <summary>The SHA-256 the release's SHA256SUMS gives its archive.</summary>
+        public string Sum(string version) => Convert.ToHexStringLower(SHA256.HashData(archives[version]));
+
+        /// <summary>install.sh of the install run as the test's person, into the test's home, on an archive and the SHA-256
+        /// it is to have.</summary>
+        public ChildResult InstallArchive(string archive, string sha256)
+        {
+            ProcessStartInfo install = ChildProcesses.Command("/bin/sh", [Path.Combine(Install, "install.sh"), "--archive", archive, "--sha256", sha256], Home);
+            foreach ((string name, string? value) in Variables())
+            {
+                install.Environment[name] = value;
+            }
+            install.Environment.Remove("SUDO_USER");
+            return Ran(install, TimeSpan.FromMinutes(1));
         }
 
         /// <summary>What is in the folder updates download to, and every release unpacked beside the install.</summary>
@@ -1545,8 +2390,8 @@ public sealed class UpdatesTests : McpRig, IClassFixture<UpdatesTests.DiskImages
             | UnixFileMode.GroupExecute | UnixFileMode.OtherRead | UnixFileMode.OtherExecute;
     }
 
-    /// <summary>GitHub on a loopback port of its own: releases/latest, answered as the test says, once it lets the answers
-    /// go where it held them, or taken and never answered until the client gives up, and a release's downloads, each
+    /// <summary>GitHub on a loopback port of its own: its list of releases, answered as the test says, once it lets the
+    /// answers go where it held them, or taken and never answered until the client gives up, and a release's downloads, each
     /// request's head kept as it came. A file held is sent half way and the rest only once the test lets it go.</summary>
     internal sealed class StandIn : IDisposable
     {
@@ -1562,13 +2407,14 @@ public sealed class UpdatesTests : McpRig, IClassFixture<UpdatesTests.DiskImages
         public StandIn()
         {
             http = new StandInHttp(AnswerAsync);
-            Latest = new Uri($"{http.Root}/repos/Zaneris/passenger/releases/latest");
+            Listing = new Uri($"{http.Root}/repos/Zaneris/passenger/releases");
             Downloads = new Uri(http.Root + DownloadPath);
         }
 
         public sealed record Reply(int Status, string Body);
 
-        public Uri Latest { get; }
+        /// <summary>The list of releases, which the answer answers.</summary>
+        public Uri Listing { get; }
 
         /// <summary>Where a release's files download from, under each release's tag.</summary>
         public Uri Downloads { get; }
@@ -1605,7 +2451,7 @@ public sealed class UpdatesTests : McpRig, IClassFixture<UpdatesTests.DiskImages
         /// <summary>Holds a file half sent until <see cref="Let"/>.</summary>
         public void Hold(string name) => Volatile.Write(ref holding, new Held(name, new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously)));
 
-        /// <summary>Holds each answer to releases/latest, its request taken, until <see cref="Let"/>.</summary>
+        /// <summary>Holds each answer to the list of releases, its request taken, until <see cref="Let"/>.</summary>
         public void HoldAnswers() => Volatile.Write(ref answersHeld, new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously));
 
         /// <summary>Lets go of the file and the answers held.</summary>

@@ -4,11 +4,19 @@ using Passenger.Vcs;
 
 namespace Passenger.App.Mcp;
 
-/// <summary>What an agent's answer holds of what can run long, so it stays within what an agent's client takes: a debugged
-/// value's first few thousand characters, a list's first entries, and the unversioned files of a folder git shows whole
+/// <summary>What an agent's answer holds of what can run long, so it stays within what an agent's client takes
+/// (<see cref="MostCharacters"/>): a debugged value's first few thousand characters, a list's first entries, a place's line
+/// around its column, places by file with every file counted, and the unversioned files of a folder git shows whole
 /// gathered into that folder's one entry. Each cut says what it left out and how to read it. Pure.</summary>
 public static class AgentAnswers
 {
+    /// <summary>How many characters an answer that can run long holds, its JSON or its text: about 10,000 tokens, within what
+    /// an agent's client takes from one result, with room for the words saying what it left out.</summary>
+    public const int MostCharacters = 40_000;
+
+    /// <summary>How many characters of a place's line an answer shows: a minified file's one line is no answer's.</summary>
+    public const int LineLength = 200;
+
     /// <summary>How many characters of a value a debug answer shows.</summary>
     public const int ValueLength = 4000;
 
@@ -17,6 +25,9 @@ public static class AgentAnswers
 
     /// <summary>How many files a sentence names.</summary>
     public const int MostNamed = 100;
+
+    /// <summary>How many errors and warnings the Problems window's lists hold in all.</summary>
+    public const int MostFindings = 200;
 
     /// <summary>A value as a debug answer shows it: whole when short, else its first characters and "…", with words saying
     /// its length and the debug_evaluate that reads on, of <paramref name="expression"/> or, where none is given, of the
@@ -46,7 +57,7 @@ public static class AgentAnswers
     /// <summary>An expression as written before a member it is given: as it is where it names a variable or a member of one,
     /// else in parentheses; "of its " where there is none.</summary>
     private static string Read(string? expression) => expression is not { Length: > 0 } named ? "of its "
-        : named.All(c => char.IsLetterOrDigit(c) || c is '_' or '.' or '@' or '$' or '[' or ']') && !char.IsDigit(named[0]) ? named
+        : named.All(c => Microsoft.CodeAnalysis.CSharp.SyntaxFacts.IsIdentifierPartCharacter(c) || c is '.' or '@' or '$' or '[' or ']') && !char.IsDigit(named[0]) ? named
         : $"({named})";
 
     /// <summary>A C# string literal's length as the string it writes, and how much of it is shown within
@@ -100,10 +111,150 @@ public static class AgentAnswers
         }
     }
 
+    /// <summary>How many of a list's first entries fit within <paramref name="room"/> characters, each taking its
+    /// <paramref name="size"/> and a separator's.</summary>
+    public static int Fitting<T>(IReadOnlyList<T> items, Func<T, int> size, int room)
+    {
+        int kept = 0;
+        foreach (T item in items)
+        {
+            room -= size(item) + 1;
+            if (room < 0)
+            {
+                break;
+            }
+            kept++;
+        }
+        return kept;
+    }
+
+    /// <summary>How <paramref name="room"/> characters are shared among lists needing more together (<paramref name="needs"/>,
+    /// each one's characters): a list needing no more than an equal share of what those needing less leave takes all it
+    /// needs, and those needing more split the rest equally.</summary>
+    public static int[] Shares(IReadOnlyList<int> needs, int room)
+    {
+        int[] shares = new int[needs.Count];
+        int left = Math.Max(0, room);
+        int sharing = needs.Count;
+        foreach (int list in Enumerable.Range(0, needs.Count).OrderBy(i => needs[i]))
+        {
+            shares[list] = Math.Min(needs[list], left / sharing);
+            left -= shares[list];
+            sharing--;
+        }
+        return shares;
+    }
+
+    /// <summary>A list's first entries within <paramref name="room"/> characters, by each one's <paramref name="size"/>, and
+    /// words saying how many more it left out and how to read them (<paramref name="how"/>), null when it left none.</summary>
+    public static (IReadOnlyList<T> Kept, string? More) Within<T>(IReadOnlyList<T> items, Func<T, int> size, int room, string noun, string how)
+    {
+        int kept = Fitting(items, size, room);
+        return kept == items.Count ? (items, null) : ([.. items.Take(kept)], More(items.Count - kept, noun, how));
+    }
+
+    /// <summary>How groups are held within <paramref name="room"/> characters: every group whole where they all fit; else as
+    /// many as fit named with their count alone (<paramref name="named"/>'s size), the first of those whole
+    /// (<paramref name="whole"/>'s) while the room left takes them, the rest left out. Gives how many come whole and how
+    /// many named after them.</summary>
+    public static (int Whole, int Named) Grouped<T>(IReadOnlyList<T> groups, Func<T, int> whole, Func<T, int> named, int room)
+    {
+        if (Fitting(groups, whole, room) == groups.Count)
+        {
+            return (groups.Count, 0);
+        }
+        int count = Fitting(groups, named, room);
+        int left = room - groups.Take(count).Sum(g => named(g) + 1);
+        int wholes = 0;
+        while (wholes < count && whole(groups[wholes]) - named(groups[wholes]) is int more && more <= left)
+        {
+            left -= more;
+            wholes++;
+        }
+        return (wholes, count - wholes);
+    }
+
+    /// <summary>A text's first characters within <paramref name="length"/>, never between a pair's surrogates, and "…".</summary>
+    public static string Cut(string text, int length)
+    {
+        int end = Math.Min(length, text.Length);
+        if (end > 0 && end < text.Length && char.IsLowSurrogate(text[end]))
+        {
+            end--;
+        }
+        return $"{text[..end]}…";
+    }
+
+    /// <summary>How many of a text's first lines fit within <paramref name="room"/> characters, each with its line break.</summary>
+    public static int LinesWithin(IReadOnlyList<string> lines, int room) => Fitting(lines, l => l.Length, room);
+
+    /// <summary>A place's line as an answer shows it: trimmed, and where longer than <see cref="LineLength"/> the part around
+    /// <paramref name="column"/> (from 1, in the line as given), "…" where it was cut.</summary>
+    public static string Line(string line, int column)
+    {
+        string trimmed = line.Trim();
+        if (trimmed.Length <= LineLength)
+        {
+            return trimmed;
+        }
+        int lead = line.Length - line.TrimStart().Length;
+        int at = Math.Clamp(column - 1 - lead, 0, trimmed.Length);
+        int start = Math.Clamp(at - LineLength / 4, 0, trimmed.Length - LineLength);
+        int end = start + LineLength;
+        if (start > 0 && char.IsLowSurrogate(trimmed[start]))
+        {
+            start++;
+        }
+        if (end < trimmed.Length && char.IsLowSurrogate(trimmed[end]))
+        {
+            end--;
+        }
+        return $"{(start > 0 ? "…" : string.Empty)}{trimmed[start..end].Trim()}{(end < trimmed.Length ? "…" : string.Empty)}";
+    }
+
     /// <summary>A list's first <paramref name="most"/> entries, and words saying how many more it left out and how to read
     /// them (<paramref name="how"/>), null when it left none.</summary>
     public static (IReadOnlyList<T> Kept, string? More) Listed<T>(IReadOnlyList<T> items, int most, string noun, string how) =>
         items.Count <= most ? (items, null) : ([.. items.Take(most)], More(items.Count - most, noun, how));
+
+    /// <summary>Lists of findings held to <paramref name="most"/> in all and, given each one's <paramref name="size"/>, to
+    /// <paramref name="characters"/>, the severest first: every list's of the first rank (an error's, 0) before any list's of
+    /// the next, the lists' own order kept within a rank and each list's within itself, all after the first that did not fit
+    /// left out. Gives each list's kept, and how many of each rank were left out.</summary>
+    public static (IReadOnlyList<T>[] Kept, int[] Left) Severest<T>(IReadOnlyList<IReadOnlyList<T>> lists, Func<T, int> rank, int ranks, int most,
+        Func<T, int>? size = null, int characters = int.MaxValue)
+    {
+        List<T>[] kept = [.. lists.Select(_ => new List<T>())];
+        int[] left = new int[ranks];
+        int room = most;
+        bool full = false;
+        for (int r = 0; r < ranks; r++)
+        {
+            for (int at = 0; at < lists.Count; at++)
+            {
+                foreach (T item in lists[at])
+                {
+                    if (rank(item) != r)
+                    {
+                        continue;
+                    }
+                    int taking = size is null ? 0 : size(item) + 1;
+                    full = full || room == 0 || taking > characters;
+                    if (!full)
+                    {
+                        kept[at].Add(item);
+                        room--;
+                        characters -= taking;
+                    }
+                    else
+                    {
+                        left[r]++;
+                    }
+                }
+            }
+        }
+        return ([.. kept], left);
+    }
 
     /// <summary>Names in a sentence, at most <see cref="MostNamed"/>, then how many more were left out and how to read them.</summary>
     public static string Named(IReadOnlyList<string> names, string noun, string how)

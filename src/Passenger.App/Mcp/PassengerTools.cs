@@ -20,7 +20,7 @@ namespace Passenger.App.Mcp;
 /// the language server's knowledge of the code, builds and runs, the debugger, and the IDE itself
 /// (screenshots, actions, typing), each run on the UI thread as the window's own commands are. Lines and
 /// columns count from one, as an editor shows them; a relative path is the open folder's. A tool not ReadOnly says
-/// whether it is Destructive: a person's window asks before an agent first uses one that is not declared harmless.
+/// whether it is Destructive: a person's window asks before an agent's call of one that is not declared harmless.
 /// What a folder has and runs a tool asks of the window's session (<see cref="ProjectSession"/>) as the call finds it, and
 /// what it starts it starts through the session's controllers; the window itself only for what is the window's: opening
 /// a folder in it, its editors, its terminal, its actions and what it draws. No tool reads the status bar.
@@ -28,7 +28,14 @@ namespace Passenger.App.Mcp;
 /// none is an agent's own IDE's.</summary>
 public sealed partial class PassengerTools(MainWindow window, AgentConnection? connection = null)
 {
-    private static readonly TimeSpan ServerLimit = TimeSpan.FromSeconds(120);
+    /// <summary>The variable that gives <see cref="ServerLimit"/> in milliseconds.</summary>
+    [IdentifierHome]
+    public const string ServerLimitVariable = "PASSENGER_MCP_SERVER_WAIT_MS";
+
+    /// <summary>How long a code tool waits for the C# language server to be ready for its question before it refuses: 2
+    /// minutes, or what <see cref="ServerLimitVariable"/> gives; a value there that is no whole number of milliseconds above
+    /// 0 is fatal.</summary>
+    public static TimeSpan ServerLimit => EnvironmentValues.Milliseconds(ServerLimitVariable, TimeSpan.FromSeconds(120));
 
     /// <summary>How long a file's markers are waited for: its checks are quick once its project is read.</summary>
     private static readonly TimeSpan MarkersLimit = TimeSpan.FromSeconds(30);
@@ -52,7 +59,7 @@ public sealed partial class PassengerTools(MainWindow window, AgentConnection? c
         "before that column's character. Returns the workspace.")]
     public Task<Workspace> Open(string path, int? line = null, int? column = null, CancellationToken cancel = default) => OnUi(cancel, async () =>
     {
-        string full = Resolve(path);
+        string full = Named(path);
         // Opened once what another folder ran has ended.
         if (Directory.Exists(full) || (File.Exists(full) && WorkspaceModel.Opens(full) && line is null))
         {
@@ -86,7 +93,7 @@ public sealed partial class PassengerTools(MainWindow window, AgentConnection? c
             {
                 await window.OpenFolder(Path.GetDirectoryName(full)!, connection).WaitAsync(cancel);
             }
-            // Its disk's text taken first, as every tool naming a file does, then shown.
+            // Its disk's text taken first, as every tool naming a file does (refused where the agent may not read it), then shown.
             OpenDocument document = await DocumentAsync(full, cancel);
             // On a person's window, the file they have shown keeps their caret, and another comes behind it.
             bool theirs = Beside && Editors.Active == document;
@@ -107,36 +114,117 @@ public sealed partial class PassengerTools(MainWindow window, AgentConnection? c
         // Projects come once the walk for them lands, and what MSBuild evaluates once each evaluation does.
         await Session.WorkspaceRead.WaitAsync(cancel);
         await Session.AspireFilesRead.WaitAsync(cancel);
+        await Session.NodeFilesRead.WaitAsync(cancel);
         await Task.Yield();
         await Session.Models.Idle.WaitAsync(cancel);
-        return await RunsWorkspace(Snapshot(), cancel);
+        return HeldWorkspace(await RunsWorkspace(Snapshot(), cancel));
     });
 
+    [McpServerTool(Name = McpTools.RequestFullAccess, Title = "Ask for every tool", Destructive = false), Description(
+        "On a person's window, asks them once to let every tool go on without a question at each call until the agent disconnects " +
+        "or the window opens another folder, and answers whether they did; denied, a later request is refused unasked, each tool still asking.")]
+    public Task<string> RequestFullAccess(CancellationToken cancel = default) => OnUi(cancel, async () =>
+    {
+        (string said, bool refused) = connection is null ? (AgentConnection.NothingAsks, false) : await connection.AllowEveryToolAsync(window, AgentCall.Current, cancel);
+        cancel.ThrowIfCancellationRequested();
+        return refused ? throw new InvalidOperationException(said) : said;
+    }, projects: false);
+
     [McpServerTool(Name = McpTools.Workspace, Title = "The workspace", ReadOnly = true), Description(
-        "The open folder and solution (or solution filter), its projects (output type, frameworks and the one chosen, unloaded marked), run " +
-        "configurations (the chosen one marked), the language server's state, the open files (unsaved marked) and the active " +
+        "The open folder and solution (or solution filter), its projects (output type, frameworks and the one chosen, unloaded marked; a shared one with sharedBy), run " +
+        "configurations (the chosen one marked), the build configuration every build takes and the others, whether the folder is trusted, the language server's state, the open files (unsaved marked) and the active " +
         "one with its caret, and the Aspire AppHosts and container run under way, each resource with its state, hold, debug " +
         "session and target. routes adds the web projects' routes, read from their code.")]
-    public Task<Workspace> GetWorkspace(bool routes = false, CancellationToken cancel = default) => OnUi(cancel, async () =>
+    public Task<Workspace> GetWorkspace(bool routes = false, string? within = null, CancellationToken cancel = default) => OnUi(cancel, async () =>
     {
-        Workspace answered = await RunsWorkspace(Snapshot(), cancel);
+        string? inside = Within(within);
+        Workspace answered = await RunsWorkspace(Snapshot(inside), cancel);
         if (!routes)
         {
-            return answered;
+            return HeldWorkspace(answered);
         }
         if (Session.CSharp is null)
         {
-            throw new InvalidOperationException($"{Refusals.NoCSharp}, and routes are read from code through it");
+            throw new InvalidOperationException($"{Session.WhyNoCSharp}, and routes are read from code through it");
         }
         await When(() => Session.CSharp is not { } csharp || csharp.IsReady || csharp.IsStopped, ServerLimit, cancel, ServerState());
         IReadOnlyList<Roslyn.Extension.WebRoute> found = await window.RoutesAsync(cancel);
-        return answered with
+        return HeldWorkspace(answered with
         {
-            Routes = [.. found.Select(r => new RouteInfo(Path.GetFileNameWithoutExtension(r.Project), r.Kind, Endpoints.RouteRequests.Title(r), r.Handler,
+            Routes = [.. found.Where(r => inside is null || PathNames.Within(r.Path, inside)).Select(r => new RouteInfo(Path.GetFileNameWithoutExtension(r.Project), r.Kind,
+                Endpoints.RouteRequests.Title(r), r.Handler,
                 [.. r.Parameters.Select(p => $"{p.Name}{(p.Constraints is { } c ? ":" + c : p.Type is { } t ? ": " + t : string.Empty)}{(p.Optional ? "?" : string.Empty)} ({p.Source})")],
                 Relative(r.Path), ServerPlaces.PositionOf(Editors, r.Path, new LspPosition(r.At.Line, r.At.Character)).Line + 1, r.BodyType))],
-        };
+        });
     });
+
+    /// <summary>workspace's answer held within <see cref="AgentAnswers.MostCharacters"/>: its projects, run configurations,
+    /// open files and routes whole where they fit; else each list in turn given its share of the room left beside those
+    /// after it (<see cref="AgentAnswers.Shares"/>), the first projects whole and those after named alone where room is
+    /// short (<see cref="AgentAnswers.Grouped"/>), the first of each other list whole and the rest left out, its more saying
+    /// how many and that within lists those of a folder or file.</summary>
+    private static Workspace HeldWorkspace(Workspace answered)
+    {
+        IReadOnlyList<ProjectInfo> projects = answered.Projects;
+        IReadOnlyList<RouteInfo> routes = answered.Routes ?? [];
+        int room = Room(answered with { Projects = [], RunConfigurations = [], OpenFiles = [], Routes = answered.Routes is null ? null : [] });
+        int[] needs = [Need(projects), Need(answered.RunConfigurations), Need(answered.OpenFiles), Need(routes)];
+        if (needs.Sum() <= room)
+        {
+            return answered;
+        }
+        (int whole, int named) = AgentAnswers.Grouped(projects, Size, p => Size(Named(p)), Share(0));
+        ProjectInfo[] kept = [.. projects.Take(whole), .. projects.Skip(whole).Take(named).Select(Named)];
+        room -= Need(kept);
+        int configurations = Kept(answered.RunConfigurations, 1);
+        int files = Kept(answered.OpenFiles, 2);
+        int routesKept = Kept(routes, 3);
+        int projectsLeft = projects.Count - kept.Length;
+        int configurationsLeft = answered.RunConfigurations.Count - configurations;
+        int filesLeft = answered.OpenFiles.Count - files;
+        int routesLeft = routes.Count - routesKept;
+        string?[] said =
+        [
+            named == 0 ? null : string.Create(System.Globalization.CultureInfo.InvariantCulture, $"{named:N0} {Plural.Noun(named, "project")} named alone"),
+            projectsLeft == 0 ? null : Left(projectsLeft, "project"),
+            configurationsLeft == 0 ? null : Left(configurationsLeft, "run configuration"),
+            filesLeft == 0 ? null : Left(filesLeft, "open file"),
+            routesLeft == 0 ? null : Left(routesLeft, "route"),
+        ];
+        string?[] cut =
+        [
+            named + projectsLeft == 0 ? null : "projects",
+            configurationsLeft == 0 ? null : "run configurations",
+            filesLeft == 0 ? null : "open files",
+            routesLeft == 0 ? null : "routes",
+        ];
+        return answered with
+        {
+            Projects = kept,
+            RunConfigurations = [.. answered.RunConfigurations.Take(configurations)],
+            OpenFiles = [.. answered.OpenFiles.Take(files)],
+            Routes = answered.Routes is null ? null : [.. routes.Take(routesKept)],
+            More = $"{Plural.Listed([.. said.OfType<string>()])}: within, a folder or file, lists the {Plural.Listed([.. cut.OfType<string>()])} there whole",
+        };
+
+        // A list's share of the room left, beside the lists after it.
+        int Share(int list) => AgentAnswers.Shares(needs[list..], room)[0];
+
+        // How many of a list's first entries its share takes, the room they fill no longer left.
+        int Kept<T>(IReadOnlyList<T> list, int at)
+        {
+            int count = AgentAnswers.Fitting(list, Size, Share(at));
+            room -= Need(list.Take(count));
+            return count;
+        }
+
+        static int Need<T>(IEnumerable<T> list) => list.Sum(entry => Size(entry) + 1);
+
+        // A project named alone, its kind and frameworks left to within.
+        static ProjectInfo Named(ProjectInfo project) => new(project.Name, project.Path, null, null);
+
+        static string Left(int left, string noun) => string.Create(System.Globalization.CultureInfo.InvariantCulture, $"{left:N0} more {Plural.Noun(left, noun)} left out");
+    }
 
     /// <summary>Waits for an image's or a font's decode, which lands off the window's thread: one whose first decode
     /// failed has closed its tab, and the agent hears why rather than that the file is open.</summary>
@@ -161,8 +249,29 @@ public sealed partial class PassengerTools(MainWindow window, AgentConnection? c
             throw new ArgumentException($"to {end} is before from {first + 1}");
         }
         int last = Math.Min((to ?? text.LineCount) - 1, text.LineCount - 1);
-        return string.Join('\n', Enumerable.Range(first, last - first + 1).Select(i => $"{i + 1,6}\t{text.GetLineText(i)}"));
+        return Numbered(text, first, last);
     });
+
+    /// <summary>A text's lines from <paramref name="first"/> to <paramref name="last"/> (from 0) numbered as editor_text
+    /// numbers them, held within <see cref="AgentAnswers.MostCharacters"/>: those that fit, at least the first (cut where it
+    /// alone runs past), then how many more lines were left out and the from that reads on.</summary>
+    private static string Numbered(TextSnapshot text, int first, int last)
+    {
+        System.Text.StringBuilder shown = new();
+        int room = AgentAnswers.MostCharacters - WordsRoom;
+        int at = first;
+        for (; at <= last; at++)
+        {
+            string line = $"{at + 1,6}\t{text.GetLineText(at)}";
+            if (line.Length + 1 > room && at > first)
+            {
+                break;
+            }
+            shown.Append(at > first ? "\n" : string.Empty).Append(line.Length > room ? AgentAnswers.Cut(line, room) : line);
+            room -= line.Length + 1;
+        }
+        return at > last ? shown.ToString() : $"{shown}\n{AgentAnswers.More(last - at + 1, "line", $"from {at + 1} reads on")}";
+    }
 
     // Not ide_action's app.saveAll: never asked on a person's window (#278), and its answer names what was left unsaved.
     [McpServerTool(Name = McpTools.SaveAll, Title = "Save every file", Destructive = false), Description("Saves every open file with unsaved changes.")]
@@ -181,12 +290,14 @@ public sealed partial class PassengerTools(MainWindow window, AgentConnection? c
         return unsaved == 0 ? "Nothing to save" : $"Saved {Plural.Of(unsaved, "file")}";
     });
 
-    /// <summary>Saves every changed file and comes back once each save has landed (<see cref="Passenger.App.Editors.EditorArea.LandedAsync"/>), so
-    /// the agent, its shell and what it starts read what was saved; a save that never lands fails the call, saying why.</summary>
+    /// <summary>Saves every changed file and comes back once each save has landed (<see cref="Passenger.App.Editors.EditorArea.LandedAsync"/>)
+    /// and each file moved is moved in Git's index too (<see cref="Vcs.VcsController.MovesIndexed"/>), so the agent, its shell and
+    /// what it starts read what was saved and git status shows a rename; a save that never lands fails the call, saying why.</summary>
     private async Task SaveLandedAsync(CancellationToken cancel)
     {
         Editors.SaveAll();
         await LandedAsync(cancel);
+        await Session.Vcs.MovesIndexed.WaitAsync(cancel);
     }
 
     /// <summary>Comes back once each save still landing has (<see cref="Passenger.App.Editors.EditorArea.LandedAsync"/>); one that never lands
@@ -205,11 +316,62 @@ public sealed partial class PassengerTools(MainWindow window, AgentConnection? c
     [McpServerTool(Name = McpTools.Diagnostics, Title = "Errors and warnings", ReadOnly = true), Description(
         "A file's errors, warnings and notes as the editor marks them, fresh: C#'s from the language server (its messages too), any " +
         "other's once its checks have run (XAML's, an MSBuild file's evaluation and NuGet advisories, a web language's server " +
-        "and ESLint). With no path, what the Problems window lists beyond a file's: toolset (each project's load warnings and " +
-        "errors), build (the last build's, whoever started it) and solution (every file's, while settings' solutionWideAnalysis " +
-        "is on).")]
-    public async Task<object> Diagnostics(string? path = null, CancellationToken cancel = default) =>
-        path is null ? await Problems(cancel) : await FileDiagnostics(path, cancel);
+        "and ESLint). With no path, or a folder's, what the Problems window lists beyond a file's (within it): toolset (each " +
+        "project's load warnings and errors), build (the last build's, whoever started it) and solution (every file's, while " +
+        "settings' solutionWideAnalysis is on), errors first, by file, at most 200 in all; project (a name) narrows these. " +
+        "severity (error, warning, info, hint) narrows either.")]
+    public async Task<object> Diagnostics(string? path = null, string? severity = null, string? project = null, int? from = null, CancellationToken cancel = default)
+    {
+        if (severity is not null && Rank(severity) is null)
+        {
+            throw new ArgumentException($"severity takes error, warning, info or hint, not '{severity}'");
+        }
+        string? full = path is null ? null : await OnUi(cancel, () => Task.FromResult(Resolve(path)));
+        if (path is not null && !Directory.Exists(full))
+        {
+            if (project is not null)
+            {
+                throw new ArgumentException("project narrows the Problems window's lists, which diagnostics answers with no path or a folder's; a file's are its own");
+            }
+            IReadOnlyList<Finding> found = await FileDiagnostics(path, cancel);
+            return HeldFindings([.. found.Where(f => (severity is null || f.Severity == severity) && (from is null || f.Line >= from))]);
+        }
+        return from is null ? await Problems(full, severity, project, cancel)
+            : throw new ArgumentException("from reads on a file's findings: the Problems window's lists, with no path or a folder's, take severity, project or a path within", nameof(from));
+    }
+
+    /// <summary>A file's findings as an answer holds them (<see cref="AgentAnswers.Severest"/>): all of them in their order
+    /// where they fit within <see cref="AgentAnswers.MostCharacters"/>, else the severest first, each severity's by place,
+    /// followed by how many of each severity were left out and the severity and from that read on.</summary>
+    private static object HeldFindings(IReadOnlyList<Finding> found)
+    {
+        (IReadOnlyList<Finding>[] kept, int[] left) = AgentAnswers.Severest<Finding>([[.. found.OrderBy(f => f.Line).ThenBy(f => f.Column)]], f => Rank(f.Severity) ?? 2, 4,
+            int.MaxValue, Size, AgentAnswers.MostCharacters - WordsRoom);
+        if (left.Sum() == 0)
+        {
+            return found;
+        }
+        Finding next = found.Except(kept[0]).OrderBy(f => Rank(f.Severity) ?? 2).ThenBy(f => f.Line).ThenBy(f => f.Column).First();
+        return Listed(kept[0], AgentAnswers.More(left.Sum(), "finding", $"{LeftOut(left)}; severity {next.Severity} with from {next.Line} lists those from that line on"));
+    }
+
+    /// <summary>How many findings of each severity an answer left out, the severest first: "1,800 warnings and 3 hints".</summary>
+    private static string LeftOut(int[] left)
+    {
+        string[] nouns = ["error", "warning", "message", "hint"];
+        return Plural.Listed([.. left.Select((count, rank) => count == 0 ? null
+            : string.Create(System.Globalization.CultureInfo.InvariantCulture, $"{count:N0} {Plural.Noun(count, nouns[rank])}")).OfType<string>()]);
+    }
+
+    /// <summary>A finding's severity as diagnostics orders them, the severest first; null for no severity it names.</summary>
+    private static int? Rank(string severity) => severity switch
+    {
+        "error" => 0,
+        "warning" => 1,
+        "info" => 2,
+        "hint" => 3,
+        _ => null,
+    };
 
     private Task<IReadOnlyList<Finding>> FileDiagnostics(string path, CancellationToken cancel) => OnUi(cancel, async () =>
     {
@@ -222,13 +384,18 @@ public sealed partial class PassengerTools(MainWindow window, AgentConnection? c
                     + "Razor, a C# project's XAML, MSBuild files, JSON, YAML, HTML, CSS, SCSS, Less, JavaScript, TypeScript, Dockerfiles and compose files, "
                     + "Godot's scenes, shaders and scripts, and .editorconfig, .slnx and .http files");
             }
+            string? unmatched = Bdd.FeatureChecks.IsFeature(marked.Path) ? await FeatureMatchedAsync(marked, cancel) : null;
             TimeSpan waited = await Checked(marked, cancel);
             List<Finding> missing = [];
+            if (unmatched is not null)
+            {
+                missing.Add(new Finding("info", null, unmatched, Relative(marked.Path), 1, 1));
+            }
             if (marked.Unanswered is { Count: > 0 } unanswered)
             {
                 // Each check that has not answered for the text as it stands, within the wait or its own.
                 string who = Plural.Agreeing(unanswered.Count, "it", "they");
-                string within = marked.IsChecking ? $", still checking after a wait of {(int)Math.Round(waited.TotalSeconds)} s" : string.Empty;
+                string within = marked.IsChecking ? $", still checking after a wait of {Durations.Said(waited)}" : string.Empty;
                 missing.Add(new Finding("info", null, $"Not yet checked as it stands by {string.Join(", ", unanswered)}{within}: what {who} found before is listed",
                     Relative(marked.Path), 1, 1));
             }
@@ -272,6 +439,29 @@ public sealed partial class PassengerTools(MainWindow window, AgentConnection? c
         })];
     });
 
+    /// <summary>Waits until a feature's marks are of its steps matched against the step definitions as the code stands: the
+    /// C# language server settled on the folder, as every C# question waits for it (refused saying so while it still loads),
+    /// the bindings read and the file read against them. Null once they are; else why its steps are matched against none,
+    /// its project's failed load among them, the server then holding none of the project's definitions.</summary>
+    private async Task<string?> FeatureMatchedAsync(OpenDocument feature, CancellationToken cancel)
+    {
+        if (Session.CSharp is null)
+        {
+            return Refusals.StepsUnmatched(serverRuns: false);
+        }
+        await ServerSettledAsync(feature.Path, _ => true, cancel);
+        await window.StepsAsync(cancel);
+        if (!Session.Steps.HasRead)
+        {
+            return Refusals.StepsUnmatched(serverRuns: Session.CSharp is { IsReady: true });
+        }
+        Bdd.FeatureAnalysis? read = await Session.Features.CurrentAsync(feature);
+        // A file read with no step (one its reader finds no feature in) has none to match.
+        return read is { Reading.Steps.Count: > 0 } && Session.ProjectOf(feature.Path)?.Path is { } project && Session.CSharp?.FailedLoadOf(project) is { } failed
+            ? Refusals.StepsUnmatched(Relative(project), failed.Message)
+            : null;
+    }
+
     /// <summary>Waits, within <see cref="MarkersLimit"/>, for a file's own checks of its text as it stands (<see
     /// cref="OpenDocument.IsChecking"/>), which its markers and the fixes for them answer from, until the turn it comes back in
     /// finds none under way: a check begun as the last one ended is waited for too, and its caller reads them in that turn.
@@ -299,6 +489,7 @@ public sealed partial class PassengerTools(MainWindow window, AgentConnection? c
         CodePlace at = await AskedAt(path, line, column, symbol, cancel);
         Served served = await Serve(at.Path, cancel);
         int offset = Offset(served.Document, at.Line, at.Column);
+        await ExpressionSettledAsync(served, offset, cancel);
         string said = await CardAsync(served.Document, offset, cancel);
         // A C# place on no symbol tells of the one its line declares.
         if (said.Length == 0 && served is ServerServed { Web: null } code)
@@ -318,13 +509,14 @@ public sealed partial class PassengerTools(MainWindow window, AgentConnection? c
         "no source, and says so). Beyond the language servers': from XAML, the C# or XAML declaring a type, property, event, " +
         "resource or element, a library's type decompiled, a theme's XAML by Source Link; package.json's dependencies and npm " +
         "run scripts; a compose file's build (Dockerfile, project), names, variables (.env) and env_files; Aspire's AddProject " +
-        "and the resource names a service reads; an MSBuild file's properties (where set, the one in force first), item types, " +
+        "and AddDotnetProject and the resource names a service reads; an MSBuild file's properties (where set, the one in force first), item types, " +
         "targets, imports and SDKs.")]
     public Task<IReadOnlyList<Place>> Definition(string? path = null, int? line = null, int? column = null, string? symbol = null, CancellationToken cancel = default) => OnUi(cancel, async () =>
     {
         CodePlace at = await AskedAt(path, line, column, symbol, cancel);
         Served served = await Serve(at.Path, cancel);
         int offset = Offset(served.Document, at.Line, at.Column);
+        await ExpressionSettledAsync(served, offset, cancel);
         Declared? declared = await window.Assist.Languages.DeclaredAsync(served.Document, offset);
         // A C# place on no symbol goes from the one its line declares.
         if (declared is { Places.Count: 0, Page: null } && served is ServerServed { Web: null } code && await SymbolOffset(code, at.Line, at.Column, offset) is int named && named != offset)
@@ -345,10 +537,17 @@ public sealed partial class PassengerTools(MainWindow window, AgentConnection? c
     [McpServerTool(Name = McpTools.Usages, Title = "Find usages", ReadOnly = true), Description(
         "Every place the symbol at a position is used, its declaration included, as Find Usages finds them (a C# symbol's in " +
         "XAML too), by file, each as line:column and its line's text, after the C# symbol the place took; in XAML, an " +
-        "element's name in its file and code-behind, a resource's key across the project, or a C# type or member as from its " +
-        "declaration. JSON and MSBuild files have none.")]
-    public Task<UsagesFound> Usages(string? path = null, int? line = null, int? column = null, string? symbol = null, CancellationToken cancel = default) => OnUi(cancel, async () =>
+        "element's name in its file, code-behind and C# expressions, a resource's key across the project, or a C# type or " +
+        "member as from its declaration; a Reqnroll step's or step definition's, every step it binds in .feature files. JSON " +
+        "and MSBuild files have none.")]
+    public Task<UsagesFound> Usages(string? path = null, int? line = null, int? column = null, string? symbol = null, string? within = null,
+        int? from = null, CancellationToken cancel = default) => OnUi(cancel, async () =>
     {
+        string? inside = Within(within);
+        if (from is not null && (inside is null || !File.Exists(inside)))
+        {
+            throw new ArgumentException("from reads on a file's places: within names that file", nameof(from));
+        }
         CodePlace at = await AskedAt(path, line, column, symbol, cancel);
         // A GDScript's member or local is found by Passenger's reading of the project's scripts, before Godot's server serves it.
         if (Godot.GodotScriptTypes.IsScript(at.Path))
@@ -356,7 +555,7 @@ public sealed partial class PassengerTools(MainWindow window, AgentConnection? c
             OpenDocument script = await DocumentAsync(at.Path, cancel);
             if (await window.Assist.GDScriptUsesAsync(script, Offset(script, at.Line, at.Column)) is ({ } scriptUses, { } unsure))
             {
-                return ByFile(null, await Places(scriptUses, cancel)) with
+                return ByFile(inside, from, null, await Places(scriptUses, cancel)) with
                 {
                     Note = unsure.Count > 0 ? $"May use it where Passenger can't see whose member is read: {Passenger.Workspace.GDScript.GDScriptRefactorings.Places(unsure)}" : null,
                 };
@@ -368,7 +567,7 @@ public sealed partial class PassengerTools(MainWindow window, AgentConnection? c
         switch (served)
         {
             case XamlServed xaml:
-                return ByFile(null, await XamlUsages(xaml, offset, cancel) is { Count: > 0 } uses ? uses
+                return ByFile(inside, from, null, await XamlUsages(xaml, offset, cancel) is { Count: > 0 } uses ? uses
                     : throw new InvalidOperationException($"No name, resource key or C# symbol at {place}: {XamlAssist.XamlUsesWhat}"));
             case MSBuildServed:
                 throw Lacks(served, "Find Usages", MSBuildHas);
@@ -380,8 +579,12 @@ public sealed partial class PassengerTools(MainWindow window, AgentConnection? c
                     + $"{Path.GetFileName(script.Document.Path)} yet to be asked: one is starting for it");
             case ShaderServed shader:
                 return await window.Assist.Languages.Shaders.UsesAsync(shader.Document, offset) is (_, { } shaderUses)
-                    ? ByFile(null, await Places(shaderUses, cancel))
+                    ? ByFile(inside, from, null, await Places(shaderUses, cancel))
                     : throw new InvalidOperationException($"No uniform, varying, function, struct or constant the shader declares is at {place}");
+            case FeatureServed feature:
+                return await window.Assist.Languages.Gherkin.AgentUsesAsync(feature.Document, offset) is ({ } stepsOf, { } stepPlaces)
+                    ? ByFile(inside, from, stepsOf, await Places(stepPlaces, cancel))
+                    : throw new InvalidOperationException($"No step a step definition binds is at {place}");
             case ServerServed unfound when !unfound.Provides("referencesProvider"):
                 throw new InvalidOperationException($"{unfound.Language} has no usages: its language server finds none, so Find Usages finds nothing in {Path.GetFileName(unfound.Document.Path)}");
         }
@@ -405,18 +608,106 @@ public sealed partial class PassengerTools(MainWindow window, AgentConnection? c
         Roslyn.Extension.NamedSymbol? named = component?.Symbol
             ?? (served.Document.Language == Languages.Language.CSharp ? await server.Lsp.SymbolAtAsync(offset, cancel) : null);
         string? taken = named is null ? null : $"{named.Shown} ({named.Kind})";
-        found = [.. found, .. await window.Assist.Languages.Xaml.CodeUsesAsync(named), .. DocumentUris.Besides(godot, found)];
+        // A step definition's steps, which no language server knows, beside its C# uses.
+        IReadOnlyList<LspLocation> steps = served.Document.Language == Languages.Language.CSharp
+            && await window.Assist.Languages.Gherkin.AgentUsesAsync(served.Document, offset) is (_, { } bound) ? bound : [];
+        found = [.. found, .. await window.Assist.Languages.Xaml.CodeUsesAsync(named, served.Document.Path), .. DocumentUris.Besides(godot, found), .. steps];
         // Answered now, saying which files that could use it the server has yet to take in.
         IReadOnlyList<(string Path, string Project)> untaken = server.Web is null && Session.CSharp is { } csharp ? await csharp.UntakenAsync(served.Document, offset, cancel) : [];
         // A project whose scripts no scene reaches lists none of its scenes, and says why.
         string[] notes = [.. new[] { untaken.Count > 0 ? Refusals.Untaken([.. untaken.Select(u => Relative(u.Path))]) : null, Session.ProjectOf(served.Document.Path)?.GodotLayoutProblem }.OfType<string>()];
-        return ByFile(taken, await Places(found, cancel)) with { Note = notes.Length > 0 ? string.Join(". ", notes) : null };
+        (IReadOnlyList<Place> places, IReadOnlySet<string> generated) = await SetApart(found, cancel);
+        return ByFile(inside, from, taken, places, generated, notes.Length > 0 ? string.Join(". ", notes) : null);
     });
 
-    /// <summary>usages' answer: its places in order (<see cref="Sorted"/>), each file named once.</summary>
-    private static UsagesFound ByFile(string? symbol, IReadOnlyList<Place> places) =>
-        new(symbol, places.Count, [.. Sorted(places).GroupBy(p => p.Path, StringComparer.Ordinal)
-            .Select(file => new FilePlaces(file.Key, [.. file.Select(p => p.Text.Length == 0 ? $"{p.Line}:{p.Column}" : $"{p.Line}:{p.Column} {p.Text}")]))]);
+    /// <summary>usages' answer: its places within <paramref name="within"/> (a full path, else every one), from the line
+    /// <paramref name="from"/> on where given, in order (<see cref="Sorted"/>), each file named once, those of
+    /// <paramref name="generated"/> said to be generated code; held within <see cref="AgentAnswers.MostCharacters"/> (<see
+    /// cref="AgentAnswers.Grouped"/>): every file it can counted, the first files' places listed, and one file alone its
+    /// first places, saying what it left out.</summary>
+    private UsagesFound ByFile(string? within, int? from, string? symbol, IReadOnlyList<Place> places, IReadOnlySet<string>? generated = null, string? note = null)
+    {
+        IReadOnlyList<Place> asked = Sorted([.. places.Where(p => (within is null || Inside(p.Path, within)) && (from is null || p.Line >= from))], generated);
+        List<FilePlaces> files = [.. asked.GroupBy(p => p.Path, StringComparer.Ordinal)
+            .Select(file => new FilePlaces(file.Key, [.. file.Select(Shown)])
+            {
+                Generated = generated?.Contains(file.Key) == true ? true : null,
+            })];
+        UsagesFound found = new(symbol, asked.Count, files, note);
+        (int whole, int named) = AgentAnswers.Grouped(files, Size, f => Size(Counted(f)), Room(found with { Files = [] }));
+        if (whole == files.Count)
+        {
+            return found;
+        }
+        if (files is [{ } only])
+        {
+            return OneFile(found, only, asked);
+        }
+        string[] said = [.. new[] { Said(files.Skip(whole).Take(named), "counted, not listed"), Said(files.Skip(whole + named), "left out") }.OfType<string>()];
+        return found with
+        {
+            Files = [.. files.Take(whole), .. files.Skip(whole).Take(named).Select(Counted)],
+            More = $"{Plural.Listed(said)}: within, a folder or file, lists their places",
+        };
+
+        static string? Said(IEnumerable<FilePlaces> those, string what) => those.Sum(f => f.Places!.Count) is int places && places == 0 ? null
+            : string.Create(System.Globalization.CultureInfo.InvariantCulture, $"{places:N0} {Plural.Noun(places, "place")} in {those.Count():N0} {Plural.Noun(those.Count(), "file")} {what}");
+
+        static FilePlaces Counted(FilePlaces file) => file with { Places = null, Count = file.Places!.Count };
+    }
+
+    /// <summary>A usage as its file's places list it: "line:column text".</summary>
+    private static string Shown(Place place) => place.Text.Length == 0 ? $"{place.Line}:{place.Column}" : $"{place.Line}:{place.Column} {place.Text}";
+
+    /// <summary>usages' answer of one file's places past the limit: its first places that fit, ending before a line whose
+    /// places it could not list whole (unless that is its first), and the from that reads on from the next.</summary>
+    private UsagesFound OneFile(UsagesFound found, FilePlaces file, IReadOnlyList<Place> places)
+    {
+        int kept = AgentAnswers.Fitting(file.Places!, Size, Room(found with { Files = [file with { Places = [] }] }));
+        if (kept == places.Count)
+        {
+            return found;
+        }
+        int next = places[kept].Line;
+        while (kept > 0 && places[kept - 1].Line == next && places[0].Line != next)
+        {
+            kept--;
+        }
+        return found with
+        {
+            Files = [file with { Places = [.. file.Places!.Take(kept)] }],
+            More = AgentAnswers.More(places.Count - kept, "place", $"from {next} with within {file.Path} lists those from that line on"),
+        };
+    }
+
+    /// <summary>The folder or file a tool's within names, in full, refused where there is none; null where none is named.</summary>
+    private string? Within(string? within)
+    {
+        if (within is null)
+        {
+            return null;
+        }
+        string full = Resolve(within);
+        return Directory.Exists(full) || File.Exists(full) ? full : throw new ArgumentException($"within names {within}, which is no folder or file here");
+    }
+
+    /// <summary>Whether a path an answer shows (<see cref="Relative(string)"/>) lies within a folder or file in full, read
+    /// from its text alone.</summary>
+    private bool Inside(string shown, string within) =>
+        PathNames.Within(Path.IsPathRooted(shown) || Session.Folder is not { } folder ? shown : Path.Join(folder, shown), within);
+
+    /// <summary>The places the language server names as <see cref="Places"/> reads them, with the paths among them that are
+    /// generated code as Roslyn tells it (<see cref="GeneratedCode.SetApartAsync"/>).</summary>
+    private async Task<(IReadOnlyList<Place> Places, IReadOnlySet<string> Generated)> SetApart(IReadOnlyList<LspLocation> locations, CancellationToken cancel)
+    {
+        if (Session.CSharp is not { } csharp)
+        {
+            return (await Places(locations, cancel), new HashSet<string>());
+        }
+        (IReadOnlyList<LspLocation> copied, IReadOnlySet<string> generated) = await csharp.Generated.SetApartAsync(locations, cancel);
+        IReadOnlyList<Place> places = await Lines([.. copied.Select(l => (l.Uri, l.Range.Start, true))], cancel);
+        return (places, new HashSet<string>(places.Where((_, i) => generated.Contains(copied[i].Uri)).Select(p => p.Path), StringComparer.Ordinal));
+    }
 
     /// <summary>A Godot node renamed for an agent (<see cref="CSharpAssist.RenameNodesAsync"/>), its files saved; refused where no
     /// node's name is at the place.</summary>
@@ -438,15 +729,23 @@ public sealed partial class PassengerTools(MainWindow window, AgentConnection? c
             throw new InvalidOperationException(refused);
         }
         await SaveLandedAsync(cancel);
-        return $"{made.Said}: {string.Join(", ", made.Files.Select(f => Relative(f.Path)))}";
+        return $"{made.Said}: {AgentAnswers.Named([.. made.Files.Select(f => Relative(f.Path))], "file", FilesOfTheChange)}";
     }
 
     [McpServerTool(Name = McpTools.Hierarchy, Title = "Call or type hierarchy", ReadOnly = true), Description(
         "One level of the hierarchy of the symbol at a position, as the Hierarchy window: direction callers (each at its " +
         "call), callees, supertypes, subtypes (a member's: what it overrides or implements, or what overrides or implements " +
         "it, every level), or implementations (Go to Implementation's).")]
-    public Task<IReadOnlyList<HierarchyEntry>> Hierarchy(string? path = null, int? line = null, int? column = null, string direction = "callers", string? symbol = null,
-        CancellationToken cancel = default) => OnUi<IReadOnlyList<HierarchyEntry>>(cancel, async () =>
+    public Task<CallToolResult> Hierarchy(string? path = null, int? line = null, int? column = null, string direction = "callers", string? symbol = null,
+        string? within = null, CancellationToken cancel = default) => OnUi(cancel, async () =>
+    {
+        string? inside = Within(within);
+        IReadOnlyList<HierarchyEntry> found = await HierarchyOfAsync(path, line, column, direction, symbol, cancel);
+        return Held(inside is null ? found : [.. found.Where(e => Inside(e.Path, inside))], direction[..^1], "within, a folder or file, lists those there");
+    });
+
+    /// <summary>One level of the hierarchy hierarchy answers, every entry of it.</summary>
+    private async Task<IReadOnlyList<HierarchyEntry>> HierarchyOfAsync(string? path, int? line, int? column, string direction, string? symbol, CancellationToken cancel)
     {
         CodePlace at = await AskedAt(path, line, column, symbol, cancel);
         (OpenDocument document, LspDocument lsp) = await CodeOrCopy(at.Path, cancel);
@@ -462,9 +761,9 @@ public sealed partial class PassengerTools(MainWindow window, AgentConnection? c
         {
             throw new ArgumentException($"No direction '{direction}'; there are callers, callees, supertypes, subtypes and implementations", nameof(direction));
         }
-        HierarchyItem item = (calls ? await lsp.PrepareCallHierarchyAsync(offset) : await lsp.PrepareTypeHierarchyAsync(offset))
-            ?? throw new InvalidOperationException(await NoHierarchyAsync(lsp, offset, calls));
         string name = CSharp.AssistContext.NameAt(document.Text.Snapshot, offset);
+        HierarchyItem item = (calls ? await lsp.PrepareCallHierarchyAsync(offset) : await lsp.PrepareTypeHierarchyAsync(offset))
+            ?? throw new InvalidOperationException(await NoHierarchyAsync(lsp, offset, name, calls));
         if (!calls && !CSharp.RelatedSymbols.IsType(item, name))
         {
             // A member's own, as Base and Derived Symbols go: the server's type hierarchy at a member is its type's.
@@ -483,13 +782,14 @@ public sealed partial class PassengerTools(MainWindow window, AgentConnection? c
         };
         IReadOnlyList<Place> places = await Places(await csharp.WrittenAsync([.. found.Select(f => new LspLocation(f.Item.Uri, f.At))], cancel), cancel);
         return [.. found.Select((f, i) => new HierarchyEntry(f.Item.Name, f.Item.Detail, places[i].Path, places[i].Line, places[i].Column, places[i].Text))];
-    });
+    }
 
-    /// <summary>Why the symbol at an offset has no hierarchy of the kind asked, naming the directions that follow it where
-    /// it has the other kind: a type no callers, a member in no type no supertypes.</summary>
-    private static async Task<string> NoHierarchyAsync(LspDocument lsp, int offset, bool calls)
+    /// <summary>Why the symbol at an offset, of the name there, has no hierarchy of the kind asked, naming the directions
+    /// that follow it where it has the other kind: a type no callers, a member in no type no supertypes. The server's type
+    /// hierarchy at a member is the type the member is in, so only a type of the name there is one.</summary>
+    private static async Task<string> NoHierarchyAsync(LspDocument lsp, int offset, string name, bool calls)
     {
-        if (calls && await lsp.PrepareTypeHierarchyAsync(offset) is { } type)
+        if (calls && await lsp.PrepareTypeHierarchyAsync(offset) is { } type && CSharp.RelatedSymbols.IsType(type, name))
         {
             return $"{type.Name} is a type, which has no callers or callees: direction supertypes, subtypes or implementations follows it";
         }
@@ -508,7 +808,8 @@ public sealed partial class PassengerTools(MainWindow window, AgentConnection? c
         "Razor component (Foo.razor, Foo.razor.css); an Aspire resource's name where its AppHost " +
         "declares it and its services read it; a Godot node's name (in a scene, or a GetNode path) in its scenes and the code's paths; " +
         "a Godot input action, group, animation, autoload, shader parameter or translation key a string names, where defined and in each such string; " +
-        "a XAML element's name with its code-behind's uses; a JSON property (in " +
+        "a XAML element's name with its code-behind's uses; a Reqnroll step (from a step, or its definition's expression: newName " +
+        "the new expression, its parameters as they were), in its attribute and every step; a JSON property (in " +
         "package.json's scripts, every npm run of one); a compose file's names, its override's too. MSBuild files have none. " +
         "force renames a GDScript member where uses Passenger can't see remain, leaving them.")]
     public Task<string> Rename(string newName, string? path = null, int? line = null, int? column = null, string? symbol = null,
@@ -516,10 +817,12 @@ public sealed partial class PassengerTools(MainWindow window, AgentConnection? c
         CancellationToken cancel = default) => OnUi(cancel, () => Patience.RunAsync(Editors.Commands, () => Session.CSharp?.Session, async patience =>
     {
         CodePlace at = await AskedAt(path, line, column, symbol, cancel);
+        using AgentsChange naming = window.NameAgentsChange($"Rename to {newName}");
         // A GDScript's member or local is renamed by Passenger's reading of the project's scripts, before Godot's server serves it.
         if (Godot.GodotScriptTypes.IsScript(at.Path))
         {
             OpenDocument script = await DocumentAsync(at.Path, cancel);
+            naming.Names(Renaming(script, Offset(script, at.Line, at.Column), newName));
             if (await window.Assist.GDScriptRenameAsync(script, Offset(script, at.Line, at.Column), newName, force, patience) is { } scriptRenamed)
             {
                 if (scriptRenamed.Problem is { } refused)
@@ -527,11 +830,28 @@ public sealed partial class PassengerTools(MainWindow window, AgentConnection? c
                     throw new InvalidOperationException(scriptRenamed.Anyway is null ? refused : $"{refused}; force: true renames it anyway, leaving them");
                 }
                 await SaveLandedAsync(cancel);
-                return $"{scriptRenamed.Said}: {string.Join(", ", scriptRenamed.Files.Select(f => Relative(f.Path)))}";
+                return $"{scriptRenamed.Said}: {AgentAnswers.Named([.. scriptRenamed.Files.Select(f => Relative(f.Path))], "file", FilesOfTheChange)}";
             }
         }
         Served served = await Serve(at.Path, cancel);
+        if (served.Document.IsReadOnly)
+        {
+            throw new InvalidOperationException($"Rename was not applied: {Refusals.ReadOnly(served.Document.Name)}");
+        }
         int offset = Offset(served.Document, at.Line, at.Column);
+        naming.Names(Renaming(served.Document, offset, newName));
+        // A Reqnroll step, from a step or its definition's expression (its method's name is C#'s to rename).
+        if ((served is FeatureServed || served.Document.Language == Languages.Language.CSharp)
+            && await window.Assist.Languages.Gherkin.StepAtAsync(served.Document, offset) is { } stepped)
+        {
+            RefactorOutcome step = await window.Assist.Languages.Gherkin.RenameStepAsync(stepped, newName);
+            if (step.Problem is { } refused)
+            {
+                throw new InvalidOperationException(refused);
+            }
+            await SaveLandedAsync(cancel);
+            return $"{step.Said}: {AgentAnswers.Named([.. step.Files.Select(f => Relative(f.Path))], "file", FilesOfTheChange)}";
+        }
         if (served is ServerServed { Web.Kind: WebServerKind.Yaml } yaml && global::Passenger.App.Containers.ComposeFiles.IsCompose(yaml.Document.Path)
             && await ComposeAssist.ComposeRenamingAsync(yaml.Lsp, yaml.Document, offset) is { } composed)
         {
@@ -545,7 +865,7 @@ public sealed partial class PassengerTools(MainWindow window, AgentConnection? c
                 throw new InvalidOperationException(refused);
             }
             await SaveLandedAsync(cancel);
-            return $"{compose.Said}: {string.Join(", ", compose.Files.Select(f => Relative(f.Path)))}";
+            return $"{compose.Said}: {AgentAnswers.Named([.. compose.Files.Select(f => Relative(f.Path))], "file", FilesOfTheChange)}";
         }
         // A Godot name a string gives (an input action, a group, an autoload…) is renamed where the project defines it, as from the window.
         if (served is ServerServed { Web: null } named && named.Document.Language == Languages.Language.CSharp
@@ -561,7 +881,7 @@ public sealed partial class PassengerTools(MainWindow window, AgentConnection? c
                 throw new InvalidOperationException(refused);
             }
             await SaveLandedAsync(cancel);
-            return $"{kindRenamed.Said}: {string.Join(", ", kindRenamed.Files.Select(f => Relative(f.Path)))}";
+            return $"{kindRenamed.Said}: {AgentAnswers.Named([.. kindRenamed.Files.Select(f => Relative(f.Path))], "file", FilesOfTheChange)}";
         }
         // A Godot node a GetNode path names is renamed in its scenes, as from its scene.
         if (served is ServerServed { Web: null } code && code.Document.Language == Languages.Language.CSharp
@@ -581,6 +901,8 @@ public sealed partial class PassengerTools(MainWindow window, AgentConnection? c
                 throw Lacks(served, "Rename", MSBuildHas);
             case ShaderServed:
                 throw Lacks(served, "Rename", ShaderHas);
+            case FeatureServed feature:
+                throw new InvalidOperationException($"No step one step definition binds is at {Relative(feature.Document.Path)}:{at.Line}:{at.Column}");
             case ScriptServed script:
                 script.Web.AskServer?.Invoke();
                 throw new InvalidOperationException($"No member or local of a script is at {Relative(script.Document.Path)}:{at.Line}:{at.Column} as Passenger reads the "
@@ -614,7 +936,7 @@ public sealed partial class PassengerTools(MainWindow window, AgentConnection? c
                 throw new InvalidOperationException(problem);
             }
             await SaveLandedAsync(cancel);
-            return $"{made.Said}: {string.Join(", ", made.Files.Select(f => Relative(f.Path)).Distinct())}";
+            return $"{made.Said}: {AgentAnswers.Named([.. made.Files.Select(f => Relative(f.Path)).Distinct()], "file", FilesOfTheChange)}";
         }
         RefactorOutcome renaming = await window.Assist.Actions.RenameSymbolAsync(served.Document, offset, newName, renameFiles, patience);
         // A C# string naming a GDScript member renames it as from its script, uses Passenger can't see held back the same.
@@ -625,7 +947,12 @@ public sealed partial class PassengerTools(MainWindow window, AgentConnection? c
         return await SymbolRenamed(renaming, cancel);
     }, AgentCall.Say, cancel));
 
-    /// <summary>A symbol's rename's answer, its files saved: the files it changed and moved, and those left as edited meanwhile.</summary>
+    /// <summary>What Local History names an agent's rename of the name at an offset of a file.</summary>
+    private string Renaming(OpenDocument document, int offset, string newName) =>
+        NameAt(document, offset) is { } old ? $"Rename {old} to {newName}" : $"Rename to {newName}";
+
+    /// <summary>A symbol's rename's answer, its files saved: the files it changed and moved, those left as edited meanwhile,
+    /// and a file that could not follow its type.</summary>
     private async Task<string> SymbolRenamed(RefactorOutcome renaming, CancellationToken cancel)
     {
         if (renaming.Problem is { } notRenamed)
@@ -637,11 +964,11 @@ public sealed partial class PassengerTools(MainWindow window, AgentConnection? c
             return renaming.Said;
         }
         await SaveLandedAsync(cancel);
-        List<string> changed = [.. renaming.Files.Where(f => f.Change == "changed").Select(f => Relative(f.Path))];
-        List<string> moved = [.. renaming.Files.Where(f => f.Change == "moved").Select(f => $"{Relative(f.Path)} to {Relative(f.To!)}")];
+        List<string> changed = [.. renaming.Files.Where(f => f.Change == RefactoredChange.Changed).Select(f => Relative(f.Path))];
+        List<string> moved = [.. renaming.Files.Where(f => f.Change == RefactoredChange.Moved).Select(f => $"{Relative(f.Path)} to {Relative(f.To!)}")];
         string renamed = moved.Count > 0 ? $"; renamed {string.Join(", ", moved)}" : string.Empty;
         string unrenamed = renaming.Left.Count > 0 ? $"; not in {string.Join(", ", renaming.Left)}, edited meanwhile" : string.Empty;
-        return $"Renamed in {Plural.Of(changed.Count, "file")}: {string.Join(", ", changed)}{renamed}{unrenamed}";
+        return $"Renamed in {Plural.Of(changed.Count, "file")}: {string.Join(", ", changed)}{renamed}{unrenamed}{(renaming.Unmoved is { } unmoved ? $"; but {unmoved}" : string.Empty)}";
     }
 
     [McpServerTool(Name = McpTools.CodeActions, Title = "Fixes and refactorings", ReadOnly = true), Description(
@@ -682,6 +1009,9 @@ public sealed partial class PassengerTools(MainWindow window, AgentConnection? c
                 throw new InvalidOperationException(SceneFixesHere);
             case ShaderServed:
                 throw Lacks(served, "fixes or refactorings", ShaderHas);
+            case FeatureServed feature:
+                listed = [.. (await window.Assist.OwnFixesAsync(feature.Document, Offset(feature.Document, line, column))).Select(f => (f.Title, $"{f.Title} [quickfix]"))];
+                break;
             default:
                 int offset = Offset(served.Document, line, column);
                 await AspireMarked(served, cancel);
@@ -708,6 +1038,13 @@ public sealed partial class PassengerTools(MainWindow window, AgentConnection? c
         string? name = null,
         CancellationToken cancel = default) => OnUi(cancel, () => Patience.RunAsync(Editors.Commands, () => Session.CSharp?.Session, async patience =>
     {
+        using AgentsChange naming = window.NameAgentsChange(choice is null ? title : $"{title} ({choice})");
+        string what = choice is null ? $"'{title}'" : $"'{title}' ({choice})";
+        // A C# file is opened only once its project has it; any other is refused before its language is asked.
+        if (Languages.Language.ForPath(path).Service != Languages.LanguageService.CSharp)
+        {
+            RefuseReadOnly(await DocumentAsync(path, cancel), what);
+        }
         if (Godot.GodotScriptTypes.IsScript(Resolve(path)))
         {
             OpenDocument script = await DocumentAsync(path, cancel);
@@ -717,6 +1054,7 @@ public sealed partial class PassengerTools(MainWindow window, AgentConnection? c
                 patience, name);
         }
         Served served = await Serve(path, cancel);
+        RefuseReadOnly(served.Document, what);
         switch (served)
         {
             case XamlServed xaml:
@@ -731,6 +1069,11 @@ public sealed partial class PassengerTools(MainWindow window, AgentConnection? c
                 throw new InvalidOperationException(SceneFixesHere);
             case ShaderServed:
                 throw Lacks(served, "fixes or refactorings", ShaderHas);
+            case FeatureServed feature:
+                IReadOnlyList<EditorFix> stepFixes = await window.Assist.OwnFixesAsync(feature.Document, Offset(feature.Document, line, column));
+                return await ApplyOwnFix(feature.Document, stepFixes.FirstOrDefault(f => f.Title == title)
+                    ?? throw new InvalidOperationException(stepFixes.Count == 0 ? $"No fixes here in {Relative(feature.Document.Path)}" : $"No action '{title}' here; there are: {string.Join("; ", stepFixes.Select(f => f.Title))}"),
+                    patience, name);
         }
         ServerServed server = (ServerServed)served;
         int offset = Offset(served.Document, line, column);
@@ -763,7 +1106,6 @@ public sealed partial class PassengerTools(MainWindow window, AgentConnection? c
         {
             throw new InvalidOperationException($"'{title}' offers no choices");
         }
-        string what = choice is null ? $"'{title}'" : $"'{title}' ({choice})";
         CodeAction resolved = await lsp.ResolveChosenAsync(chosen, scope);
         // Resolved again once the files come under the projects its edit reaches are in them, as the window's are.
         if (resolved.Edit is { } reaching && Session.CSharp is { IsReady: true } csharp)
@@ -792,23 +1134,38 @@ public sealed partial class PassengerTools(MainWindow window, AgentConnection? c
         {
             throw new InvalidOperationException($"{what} was not applied: {stale}");
         }
-        List<string> dropped = [];
-        int files;
-        using (Passenger.App.Editors.CommandHistory.Recording recording = Editors.Commands.Record(title))
+        // Made as the window makes it, under the action's title in Undo, a type it renames taking its files along.
+        RefactorOutcome made = await window.Assist.Actions.ApplyEditAsync(edit, asked, title, what);
+        if (made.Problem is { } problem)
         {
-            try
-            {
-                files = WorkspaceEdits.ApplyAsCommand(Editors, edit, recording, asked, dropped);
-                await WorkspaceEdits.LandedAsync(recording, null);
-            }
-            catch (WorkspaceEditFailed failed)
-            {
-                throw new InvalidOperationException($"{what} was not applied: {failed.Message}");
-            }
+            throw new InvalidOperationException(problem);
         }
         await SaveLandedAsync(cancel);
-        return $"Applied {what} to {Plural.Of(files, "file")}{unrun}{(dropped.Count > 0 ? $", but not to {string.Join(", ", dropped)}, edited meanwhile" : string.Empty)}";
+        return ActionApplied(what, made, unrun);
     }, AgentCall.Say, cancel));
+
+    /// <summary>Refuses a code action on a file the editor shows read-only, before its fixes or any server's actions are
+    /// asked for.</summary>
+    private static void RefuseReadOnly(OpenDocument document, string what)
+    {
+        if (document.IsReadOnly)
+        {
+            throw new InvalidOperationException($"{what} was not applied: {Refusals.ReadOnly(document.Name)}");
+        }
+    }
+
+    /// <summary>What an agent hears of a code action's edit made: the files it changed, made or deleted, counted, those it
+    /// renamed, a command it carries that Passenger cannot run, those left as edited meanwhile, and a file that could not
+    /// follow its type.</summary>
+    private string ActionApplied(string what, RefactorOutcome made, string unrun)
+    {
+        int changed = made.Files.Count(f => f.Change != RefactoredChange.Moved) - made.Left.Count;
+        List<string> moved = [.. made.Files.Where(f => f.Change == RefactoredChange.Moved).Select(f => $"{Relative(f.Path)} to {Relative(f.To!)}")];
+        string to = changed > 0 || moved.Count == 0 ? $" to {Plural.Of(changed, "file")}" : string.Empty;
+        string renaming = moved.Count > 0 ? $", renaming {string.Join(", ", moved)}" : string.Empty;
+        string left = made.Left.Count > 0 ? $", but not to {string.Join(", ", made.Left)}, edited meanwhile" : string.Empty;
+        return $"Applied {what}{to}{renaming}{unrun}{left}{(made.Unmoved is { } unmoved ? $"; but {unmoved}" : string.Empty)}";
+    }
 
     /// <summary>A code action whose change its server makes by its own command, made as the window makes it
     /// (<see cref="ServerCommands"/>), the files saved: which files it changed and made, and where it put a name to rename.</summary>
@@ -828,8 +1185,8 @@ public sealed partial class PassengerTools(MainWindow window, AgentConnection? c
         string named = made.RenameAt is { } place && Editors.Find(DocumentUris.ToPath(place.Uri)) is { } open
             ? $", naming what it made {open.Text.Snapshot.GetText(TextNavigation.WordAt(open.Text.Snapshot, ServerLines.Of(open.Text.Snapshot).OffsetOf(place.Range.Start)))} at {Relative(open.Path)}:{place.Range.Start.Line + 1}:{place.Range.Start.Character + 1}"
             : string.Empty;
-        string changed = string.Join(", ", made.Files.Where(f => f.Change != "created").Select(f => Relative(f.Path)));
-        string created = string.Join(", ", made.Files.Where(f => f.Change == "created").Select(f => Relative(f.Path)));
+        string changed = AgentAnswers.Named([.. made.Files.Where(f => f.Change != RefactoredChange.Created).Select(f => Relative(f.Path))], "file", FilesOfTheChange);
+        string created = AgentAnswers.Named([.. made.Files.Where(f => f.Change == RefactoredChange.Created).Select(f => Relative(f.Path))], "file", FilesOfTheChange);
         string where = (changed.Length > 0 ? $" to {changed}" : string.Empty) + (created.Length > 0 ? $"{(changed.Length > 0 ? "," : string.Empty)} making {created}" : string.Empty);
         return $"Applied {what}{where}{named}{(made.Left.Count > 0 ? $", but not to {string.Join(", ", made.Left)}, edited meanwhile" : string.Empty)}";
     }
@@ -847,13 +1204,18 @@ public sealed partial class PassengerTools(MainWindow window, AgentConnection? c
     }
 
     [McpServerTool(Name = McpTools.Format, Title = "Reformat a file", Destructive = true), Description(
-        "Reformats a file as Reformat Code does, and saves it: XAML by its .editorconfig, GDScript by Godot's style guide, a web " +
+        "Reformats a file as Reformat Code does, and saves it: XAML by its .editorconfig, GDScript by Godot's style guide, a " +
+        ".feature file by its gherkin_* editorconfig keys, a web " +
         "language by the project's Prettier where it formats it, else the language server. MSBuild files have none.")]
     public Task<string> Format(string path, CancellationToken cancel = default) => OnUi(cancel, async () =>
     {
+        if (Resolve(path) is { } full && !Reaches(full, changes: true))
+        {
+            throw new InvalidOperationException(CSharp.CodeActions.Reformatted.Refused("Reformat Code", Refusals.ReadOnly(Path.GetFileName(full))).Said);
+        }
         OpenDocument document;
         LspDocument? lsp = null;
-        if (Passenger.App.Xaml.XamlService.IsXaml(Resolve(path)) || Godot.GodotScriptTypes.IsScript(Resolve(path)))
+        if (Passenger.App.Xaml.XamlService.IsXaml(Resolve(path)) || Godot.GodotScriptTypes.IsScript(Resolve(path)) || Bdd.FeatureChecks.IsFeature(Resolve(path)))
         {
             document = await DocumentAsync(path, cancel);
         }
@@ -895,8 +1257,9 @@ public sealed partial class PassengerTools(MainWindow window, AgentConnection? c
     [McpServerTool(Name = McpTools.FindSymbol, Title = "Go to symbol", ReadOnly = true), Description(
         "The solution's own C# and Razor symbols (not packages') whose names match query by substring, initials or camel " +
         "humps (\"GH\" finds GetHashCode), as Go to Symbol finds them, the name itself first, then names starting with it, " +
-        "types before members; an indexer by this[] or Item. Other files' names are in their outline.")]
-    public Task<IReadOnlyList<SymbolFound>> FindSymbol(
+        "types before members, then what only its source generators declare, in a read-only copy of their code; an indexer " +
+        "by this[] or Item. Other files' names are in their outline.")]
+    public Task<CallToolResult> FindSymbol(
         string query,
         [Description("class, interface, struct, enum, method, property, field, event, constructor...")] string? kind = null,
         int limit = 50,
@@ -913,28 +1276,49 @@ public sealed partial class PassengerTools(MainWindow window, AgentConnection? c
         {
             throw new ArgumentException($"No kind '{kind}'; Go to Symbol's kinds are {string.Join(", ", SymbolKinds.All)}", nameof(kind));
         }
+        // Found once the C# files come under the folder's projects are in them: a file just made may declare the name.
+        await Server(cancel);
+        await TakenInAsync(null, cancel);
         RoslynSession session = await Server(cancel);
         if (exact || indexer)
         {
-            return (IReadOnlyList<SymbolFound>)[.. (await NamedAsync(session, query, kind, limit, cancel)).Symbols.Select(Found)];
+            SymbolsNamed named = await NamedAsync(session, query, kind, limit, cancel);
+            return Held([.. named.Symbols.Select(Found)], "symbol", NarrowedSymbols, named.More, LargerLimit);
         }
         IReadOnlyList<SymbolFound> indexers = query == "Item" && kind is null or "property"
             ? [.. (await NamedAsync(session, "this[]", "property", limit, cancel, noneRefused: false)).Symbols.Select(Found)]
             : [];
         IReadOnlyList<SymbolInformation> found = await session.SymbolsAsync(query);
         // Each target framework finds a symbol again; the server's order is not by match, so the name itself first, which no limit cuts.
-        List<SymbolInformation> kept = [.. found
-            .Where(s => DocumentUris.GeneratedName(s.Location.Uri) is null && (kind is null || SymbolKinds.Name(s.Kind).Equals(kind, StringComparison.OrdinalIgnoreCase)))
+        List<SymbolInformation> matching = [.. WorkspaceSymbols.Kept(found)
+            .Where(s => kind is null || SymbolKinds.Name(s.Kind).Equals(kind, StringComparison.OrdinalIgnoreCase))
             .DistinctBy(s => (s.Name, s.Kind, s.Location.Uri, s.Location.Range.Start.Line, s.Location.Range.Start.Character))
-            .OrderBy(s => NameMatch(s.Name, query))
-            .ThenBy(s => SymbolKinds.Name(s.Kind) is "class" or "interface" or "struct" or "enum" ? 0 : 1)
-            .Take(Math.Max(0, limit - indexers.Count))];
-        IReadOnlyList<Place> places = await Places([.. kept.Select(s => s.Location)], cancel);
-        return (IReadOnlyList<SymbolFound>)[.. indexers,
-            .. kept.Select((s, i) => new SymbolFound(s.Name, SymbolKinds.Name(s.Kind), s.Owner, places[i].Path, places[i].Line, places[i].Column))];
+            .OrderBy(WorkspaceSymbols.Generated)
+            .ThenBy(s => NameMatch(s.Name, query))
+            .ThenBy(s => SymbolKinds.Name(s.Kind) is "class" or "interface" or "struct" or "enum" ? 0 : 1)];
+        List<SymbolInformation> kept = [.. matching.Take(Math.Max(0, limit - indexers.Count))];
+        if (indexers.Count == 0 && kept.Count == 0 && FailedLoads() is { Count: > 0 } failed)
+        {
+            throw new InvalidOperationException(Refusals.NoneWhileUnloaded($"No {kind ?? "symbol"} of the solution's own code matches {query}", failed));
+        }
+        // A Razor file's C# at its place in the Razor file, another generator's in a copy of its code.
+        IReadOnlyList<Place> places = await Places(await session.WrittenAsync([.. kept.Select(s => s.Location)], cancel), cancel);
+        // Each one's container as the exact find names it, a type's namespace too.
+        IReadOnlyList<string?> containers = await session.ContainersAsync([.. kept.Select(s => s.Location)], cancel) ?? [.. kept.Select(s => s.Owner)];
+        return Held([.. indexers, .. kept.Select((s, i) => new SymbolFound(s.Name, SymbolKinds.Name(s.Kind), containers[i], places[i].Path, places[i].Line, places[i].Column))],
+            "symbol", NarrowedSymbols, matching.Count - kept.Count, LargerLimit);
 
         static SymbolFound Found(NamedPlace n) => new(n.Name, n.Kind, n.Container, n.Path, n.Line, n.Column) { Id = n.Id };
     });
+
+    /// <summary>How the files of a change that an answer named none of are read.</summary>
+    private const string FilesOfTheChange = "local_history of a folder within names those there";
+
+    /// <summary>How find_symbol's symbols left out are read.</summary>
+    private const string NarrowedSymbols = "kind or a longer query narrows them";
+
+    /// <summary>How the entries an agent's limit left out are read.</summary>
+    private const string LargerLimit = "a larger limit lists them";
 
     /// <summary>How well a symbol's name matches a query: the name itself, then in another letter case, then one that starts
     /// with it, then one that has it, then Go to Symbol's other matches (initials, humps).</summary>
@@ -990,9 +1374,12 @@ public sealed partial class PassengerTools(MainWindow window, AgentConnection? c
         }
         if (kept.Count == 0 && noneRefused)
         {
-            throw new InvalidOperationException($"No {kind ?? "symbol"} of the solution's own code is named {name}: find_symbol finds names like it");
+            string none = $"No {kind ?? "symbol"} of the solution's own code is named {name}";
+            throw new InvalidOperationException(FailedLoads() is { Count: > 0 } failed ? Refusals.NoneWhileUnloaded(none, failed) : $"{none}: find_symbol finds names like it");
         }
-        IReadOnlyList<Place> places = await Lines([.. kept.Select(s => (DocumentUris.FromPath(s.Path!), new LspPosition(s.At!.Line, s.At.Character), true))], cancel);
+        // A symbol only a source generator declares is at its place in a copy of the generator's code.
+        IReadOnlyList<Place> places = await Places([.. kept.Select(s => new LspLocation(s.Path is { } path ? DocumentUris.FromPath(path) : s.Generated!,
+            new LspRange(new LspPosition(s.At!.Line, s.At.Character), new LspPosition(s.At.Line, s.At.Character))))], cancel);
         List<NamedPlace> named = [.. kept.Select((s, i) => new NamedPlace(s.Name, s.Shown, s.Kind, s.Id, s.Container, places[i].Path, places[i].Line, places[i].Column))];
         return new SymbolsNamed([.. named.Take(limit)], Math.Max(0, named.Count - limit) + (kind is null ? found.More : 0));
     }
@@ -1005,7 +1392,8 @@ public sealed partial class PassengerTools(MainWindow window, AgentConnection? c
         List<string> each = [];
         foreach (NamedPlace place in named.Symbols)
         {
-            (OpenDocument document, _) = await Code(place.Path, cancel);
+            // A symbol only a source generator declares is read in a copy of its code.
+            (OpenDocument document, _) = await CodeOrCopy(place.Path, cancel);
             each.Add($"{place}\n{await CardAsync(document, Offset(document, place.Line, place.Column), cancel)}".TrimEnd());
         }
         return string.Join("\n\n", each) + (named.More > 0 ? $"\n\nAnd {named.More} more: name one by its container, its parameters' types or its documentation id" : string.Empty);
@@ -1064,11 +1452,11 @@ public sealed partial class PassengerTools(MainWindow window, AgentConnection? c
         return text.ToString().TrimEnd();
     }
 
-    /// <summary>Usages in the order an agent reads them: by file, then line and column, a source generator's files (their
-    /// copies, <see cref="GeneratedCode"/>) last.</summary>
-    private static IReadOnlyList<Place> Sorted(IReadOnlyList<Place> places) =>
-        [.. places.OrderBy(p => (p.Text.Length == 0 && p.Path.EndsWith(" (generated)", StringComparison.Ordinal)) || GeneratedCode.IsCopy(p.Path)).ThenBy(p => p.Path, StringComparer.Ordinal)
-            .ThenBy(p => p.Line).ThenBy(p => p.Column)];
+    /// <summary>Usages in the order an agent reads them: by file, then line and column, generated code's files last: a
+    /// source generator's (their copies, <see cref="GeneratedCode"/>) and those of <paramref name="generated"/>.</summary>
+    private static IReadOnlyList<Place> Sorted(IReadOnlyList<Place> places, IReadOnlySet<string>? generated) =>
+        [.. places.OrderBy(p => (p.Text.Length == 0 && p.Path.EndsWith(" (generated)", StringComparison.Ordinal)) || GeneratedCode.IsCopy(p.Path) || generated?.Contains(p.Path) == true)
+            .ThenBy(p => p.Path, StringComparer.Ordinal).ThenBy(p => p.Line).ThenBy(p => p.Column)];
 
     /// <summary>The offset a C# code tool asks about: the place given when a symbol is there (its hover says what one), else
     /// the one its line declares (<see cref="DeclaredOn"/>).</summary>
@@ -1109,7 +1497,23 @@ public sealed partial class PassengerTools(MainWindow window, AgentConnection? c
         "elements with what names them (x:Class, x:Name, x:Key, a style's selector), an MSBuild file's properties with their " +
         "values, items, targets and imports, a Godot scene's nodes with their scripts, instances and signals' connections, a " +
         "Markdown file's headings.")]
-    public Task<string> Outline(string path, CancellationToken cancel = default) => OnUi(cancel, async () =>
+    public Task<string> Outline(string path, int? from = null, CancellationToken cancel = default) => OnUi(cancel, async () =>
+    {
+        List<string> parts = [.. (await OutlineTextAsync(path, cancel)).Split('\n')];
+        if (from is int first)
+        {
+            int at = parts.FindIndex(p => OutlineLine(p) >= first);
+            parts = at < 0 ? [$"Nothing is declared from line {first} on"] : parts[at..];
+        }
+        return HeldLines(parts, "part", next => OutlineLine(parts[next]) is int line ? $"from {line} lists those from that line on" : "from, a later line, lists those from it on");
+    });
+
+    /// <summary>The line of the file an outline's part says it is at, null where it says none of the file's own.</summary>
+    private static int? OutlineLine(string part) =>
+        System.Text.RegularExpressions.Regex.Match(part, @"line (\d+)\)$") is { Success: true } found && int.TryParse(found.Groups[1].ValueSpan, out int line) ? line : null;
+
+    /// <summary>A file's structure as outline answers it, whole.</summary>
+    private async Task<string> OutlineTextAsync(string path, CancellationToken cancel)
     {
         if (Languages.Language.ForPath(Resolve(path)) == Languages.Language.Markdown)
         {
@@ -1144,6 +1548,11 @@ public sealed partial class PassengerTools(MainWindow window, AgentConnection? c
             case ShaderServed shader:
                 return CSharp.GodotShaderAssist.Outline(shader.Document.Text.Snapshot.ToString()) is { Count: > 0 } declared
                     ? string.Join('\n', declared.Select(d => $"{d.Written} ({d.Kind}, line {d.Line})")) : "Nothing is declared in this file";
+            case FeatureServed feature:
+                Outline<Navigation.SymbolRow> parts = await new Editors.FeatureOutline(feature.Document.Text, () => Session.FeatureProjectFolder(feature.Document.Path))
+                    .ReadAsync(feature.Document.Path, null, cancel);
+                return parts.Rows.Count == 0 ? "The file has no feature"
+                    : string.Join('\n', parts.Rows.Select(row => $"{new string(' ', row.Depth * 2)}{row.Detail ?? row.Name}: {row.Name} (line {row.Position.Line + 1})"));
         }
         LspDocument lsp = ((ServerServed)served).Lsp;
         System.Text.StringBuilder text = new();
@@ -1165,7 +1574,7 @@ public sealed partial class PassengerTools(MainWindow window, AgentConnection? c
                 Write(symbol.Children ?? [], depth + 1);
             }
         }
-    });
+    }
 
     /// <summary>A scene's outline as Structure shows it: each node by its name and class at its line, its script's and
     /// instance's files, and its signals' connections with the method each calls.</summary>
@@ -1200,7 +1609,7 @@ public sealed partial class PassengerTools(MainWindow window, AgentConnection? c
         "(DefaultContainer: its container image, into the engine; an AppHost through its publishers, to its last folder or aspire-output); " +
         "with preset, exports the Godot project's game through that export_presets.cfg preset (with debug, a debug export; to exportPath, from " +
         "the project's folder, in place of its export_path), Godot's output in run's. " +
-        "Returns whether it succeeded, how it ended, every error and warning, the folder or image published to, and MSBuild's last " +
+        "Returns whether it succeeded, how it ended, its errors and warnings, the folder or image published to, and MSBuild's last " +
         "lines when it failed (output of build has them all).")]
     public Task<BuildResult> Build(string? publish = null, string? profile = null, string? preset = null, bool debug = false, string? exportPath = null,
         CancellationToken cancel = default) => OnUi(cancel, async () =>
@@ -1218,23 +1627,31 @@ public sealed partial class PassengerTools(MainWindow window, AgentConnection? c
             throw new ArgumentException($"{preset} is a Godot export preset: omit publish, a .NET project's");
         }
         string? game = preset is null ? null : window.GodotExportFolder() ?? throw new InvalidOperationException(Refusals.NoGodotProject);
+        // An export the agent places is written where it may change files.
+        string? exported = game is null || exportPath is null ? null : Resolve(global::Passenger.Workspace.GodotResPaths.Globalized(game, exportPath), changes: true);
         ProjectModel? published = publish is null ? null : Project(publish);
         AgentCall.Follow(window.Actions.Work, published is null && game is null ? AppActions.Build : AppActions.Publish);
         // The build, publish or export goes on without an agent that gives up on it, shown in the Build or Run window.
-        BuildOutcome built = await (game is not null ? Builds.ExportGodotAsync(new GodotExportRequest(game, preset!, debug, exportPath))
+        BuildOutcome built = await (game is not null ? Builds.ExportGodotAsync(new GodotExportRequest(game, preset!, debug, exported))
             : published is null ? Builds.BuildAsync(BuildCause.Explicit, CancellationToken.None)
             : Builds.PublishAsync(new PublishRequest(published.Path, profile ?? Session.Publishing.ProfileOf(published.Path)))).WaitAsync(cancel);
         // So the code tools the agent calls next know what it built.
         await (Session.CSharp?.ReferencesHeld ?? Task.CompletedTask).WaitAsync(cancel);
         IReadOnlyList<Finding> problems = [.. built.Problems.Select(p => new Finding(
             p.Severity == ProblemSeverity.Error ? "error" : "warning", p.Code, p.Message, p.Path is { } at ? Relative(at) : p.Project, p.Position.Line + 1, p.Position.Column + 1))];
-        return new BuildResult(built.Succeeded, built.Message, problems.Count(p => p.Severity == "error"), problems.Count(p => p.Severity == "warning"), problems,
-            built.Succeeded || built.Output.Count == 0 ? null : string.Join('\n', built.Output)) { Folder = built.Published, Image = built.Image };
+        BuildResult result = new(built.Succeeded, built.Message, problems.Count(p => p.Severity == "error"), problems.Count(p => p.Severity == "warning"), [],
+            built.Succeeded || built.Output.Count == 0 ? null : Masked(string.Join('\n', built.Output))) { Folder = built.Published, Image = built.Image };
+        (IReadOnlyList<Finding>[] kept, int[] left) = AgentAnswers.Severest<Finding>([problems], p => Rank(p.Severity) ?? 2, 4, AgentAnswers.MostFindings, Size, Room(result));
+        return result with
+        {
+            Problems = left.Sum() == 0 ? problems : kept[0],
+            More = left.Sum() == 0 ? null : AgentAnswers.More(left.Sum(), "problem", $"{LeftOut(left)}; diagnostics with no path, a folder's, project or severity lists the build's"),
+        };
     });
 
     [McpServerTool(Name = McpTools.Run, Title = "Run a configuration", Destructive = true), Description(
         "Runs a configuration as Run does, built first when it says so, and waits for it to end, an Avalonia or WPF app's " +
-        "UI or an AppHost's resources to be up, or its host's start (where it listens). Returns its output so far and its exit code once it has one; a run refused (one " +
+        "UI or an AppHost's resources to be up, its host's start (where it listens), or its app's start on a device. Returns its output so far and its exit code once it has one; a run refused (one " +
         "running, a failed build with its errors) is an error. A terminal configuration runs in a Terminal tab (terminal_run " +
         "types into it); a container configuration answers once its services are up, with each one's state. With resource, " +
         "that one alone, its configuration started if no run has it.")]
@@ -1245,6 +1662,7 @@ public sealed partial class PassengerTools(MainWindow window, AgentConnection? c
         [Description("Under dotnet watch (Settings' choice by default), where hot_reload or a save applies edits")] bool? hotReload = null,
         string? resource = null,
         [Description("Collect its logs and traces from now on (false stops), as Edit Configurations' box does; telemetry reads them")] bool? telemetry = null,
+        bool? terminal = null,
         CancellationToken cancel = default) => OnUi(cancel, async () =>
     {
         if (resource is not null)
@@ -1257,6 +1675,7 @@ public sealed partial class PassengerTools(MainWindow window, AgentConnection? c
             {
                 throw new ArgumentException("An AppHost's resource sends its logs and traces to the AppHost's own dashboard; omit telemetry");
             }
+            NoTerminalFor(terminal);
             if (await ComposeTargetAsync(resource, configuration, starts: true, cancel) is { } service)
             {
                 return arguments is null ? await RunComposeServiceAsync(service, waitSeconds, cancel)
@@ -1271,8 +1690,14 @@ public sealed partial class PassengerTools(MainWindow window, AgentConnection? c
             }
             return await AspireResourceUpAsync(target, waitSeconds, cancel);
         }
-        Choose(configuration);
+        using Choosing choice = Choose(configuration);
         string name = Session.Configurations.Chosen?.Name ?? string.Empty;
+        if (Session.Configurations.Chosen is { IsMultiple: true })
+        {
+            return arguments is null && telemetry is null && terminal is null ? await RunProjectsAsync(name, hotReload, waitSeconds, choice, cancel)
+                : throw new ArgumentException($"{name} starts each of its projects as its own configuration does: omit arguments, telemetry and terminal, or run that configuration");
+        }
+        UseTerminal(name, terminal);
         if (telemetry is { } collect)
         {
             if (Session.Configurations.Chosen is { } collecting && Session.Aspire.IsAspire(collecting))
@@ -1290,6 +1715,7 @@ public sealed partial class PassengerTools(MainWindow window, AgentConnection? c
                 throw new InvalidOperationException(WithBuildErrors(refused, built.Ended));
             }
         }
+        choice.Began = true;
         if (builds.Containers is { } running)
         {
             // Its services are up once Run answers: what an agent wants is how each stands and what they said.
@@ -1300,6 +1726,9 @@ public sealed partial class PassengerTools(MainWindow window, AgentConnection? c
         // A Godot game Run started, Passenger its remote debugger.
         Godot.GodotGame? game = Session.RunPlan is { Godot: not null, GodotEditor: false } ? Session.Game : null;
         HeardServing serving = HeardServing.Ran(Session);
+        // An app Run installed and started on a device or emulator, up once its shell there found its process.
+        Run.Devices.DeviceLaunch? device = Session.RunPlan?.Device is { App: not null } launched ? launched : null;
+        string? onDevice = null;
         if (Session.Configurations.Chosen is { } host && Session.Aspire.IsAspire(host) && Session.Aspire.FindApp(host.Project) is { } aspireApp)
         {
             AgentCall.Say($"Running {name}: waiting up to {Math.Max(0, waitSeconds)} s for it to end or its resources to be up");
@@ -1307,19 +1736,20 @@ public sealed partial class PassengerTools(MainWindow window, AgentConnection? c
         }
         else
         {
-            AgentCall.Say($"Running {name}: waiting up to {Math.Max(0, waitSeconds)} s for it to end, its UI to be up or its host to start");
-            // A window, a serving host or a game's frames never end by themselves; looked at every 50 ms, its words reaching the console unannounced.
+            AgentCall.Say(device is not null ? $"Running {name}: waiting up to {Math.Max(0, waitSeconds)} s for it to end or start on {device.Target.Name}"
+                : $"Running {name}: waiting up to {Math.Max(0, waitSeconds)} s for it to end, its UI to be up or its host to start");
+            // A window, a serving host, a game's frames or an app on a device never end by themselves; looked at every 50 ms, its words reaching the console unannounced.
             await Until(() => ended.IsCompleted || app is { State: not LiveTree.LiveAppState.Waiting } || game is { Monitors: not null } or { State: LiveTree.LiveAppState.Ended }
-                || serving.Serves(), TimeSpan.FromSeconds(Math.Max(0, waitSeconds)), cancel);
+                || serving.Serves() || (onDevice = device?.App!.StartedIn(Session.Runner.Shown())) is not null, TimeSpan.FromSeconds(Math.Max(0, waitSeconds)), cancel);
         }
-        if (app is { State: LiveTree.LiveAppState.Refused })
+        if (app is { State: LiveTree.LiveAppState.Refused or LiveTree.LiveAppState.Ended })
         {
-            // An app ended for the person's screen says so as it exits, and an answer is not to call it running.
-            await Until(() => ended.IsCompleted, Waits.Of(TimeSpan.FromSeconds(3)), cancel);
+            // An app ended for the person's screen says so as it exits, its inspector's end heard before the run's or after: an answer is not to call it running.
+            await When(() => ended.IsCompleted, Waits.Of(TimeSpan.FromSeconds(3)), cancel, Ends(ended));
         }
         int? code = ended.IsCompletedSuccessfully ? ended.Result : null;
         string output = AppHostOutput(200) ?? RunOutput(200);
-        // A game or a XAML app Run attached to quietly takes hot_reload; one asked for with it and not attached says why not.
+        // A game, a XAML app or an app on a device Run attached to quietly takes hot_reload; one asked for with it and not attached says why not.
         string reloads = Session.Debug.Running.Any(r => r.Name == name) ? $" with Hot Reload: {McpTools.HotReload} applies the editors' edits"
             : hotReload == true && window.Status is { } told && told.StartsWith($"Running {name} without Hot Reload: ", StringComparison.Ordinal) ? told[$"Running {name}".Length..]
             : string.Empty;
@@ -1329,14 +1759,76 @@ public sealed partial class PassengerTools(MainWindow window, AgentConnection? c
             : app is { State: LiveTree.LiveAppState.Connected } ? $"Running {name}{reloads}, {UiUp(app)}"
             : game is { State: LiveTree.LiveAppState.Connected, Monitors: not null } ? $"Running {name}{reloads}, {GameUp}"
             : serving.Said is { } said ? $"Running {name}, {said}"
+            : device is not null && onDevice is not null ? $"Running {name}{reloads}, {device.App!.Package} started on {device.Target.Name} as process {onDevice}"
             : $"Running {name}";
         // What an Aspire run said of itself as it started (its HTTPS over HTTP).
         if (Session.Configurations.Chosen is { } chosen && Session.Aspire.IsAspire(chosen) && Session.Aspire.FindApp(chosen.Project) is { } aspire)
         {
             status += string.Concat(aspire.Notes.Select(n => $"\nNote: {n}"));
         }
+        // A program that said it needs a terminal, as the Run window offers one.
+        if (builds.RunNeed is { } need)
+        {
+            status += $". {need.Said}: {McpTools.Run} with terminal true runs it in a Terminal tab";
+        }
         return new RunResult(code is null, code, status, output);
     });
+
+    /// <summary>terminal, as run and debug_start take it: the chosen configuration's program started in a Terminal tab from now
+    /// on, or in the Run and Debug windows' consoles, as Edit Configurations keeps its Use external console.</summary>
+    private void UseTerminal(string name, bool? terminal)
+    {
+        if (terminal is not { } inTerminal)
+        {
+            return;
+        }
+        if (Session.Configurations.Chosen is { } elsewhere && (elsewhere.IsContainer || elsewhere.IsScript || Session.Aspire.IsAspire(elsewhere)))
+        {
+            throw new ArgumentException($"{name} runs {(elsewhere.IsContainer ? "containers" : elsewhere.IsScript ? "a package.json script" : "an AppHost")}, whose console is its own; omit terminal");
+        }
+        Session.Configurations.UseConsole(name, inTerminal ? ConsoleKind.Terminal : ConsoleKind.Internal);
+    }
+
+    /// <summary>terminal refused with resource: an AppHost's resource or a compose service writes to its run's own console.</summary>
+    private static void NoTerminalFor(bool? terminal)
+    {
+        if (terminal is not null)
+        {
+            throw new ArgumentException("A resource writes to its AppHost's or its compose run's console; omit terminal");
+        }
+    }
+
+    /// <summary>run of a multi-project configuration: its projects started, then each waited for until it ends or its host
+    /// starts, within the wait; how each stands, and each one's last lines under its name.</summary>
+    private async Task<RunResult> RunProjectsAsync(string name, bool? hotReload, int waitSeconds, Choosing choice, CancellationToken cancel)
+    {
+        BuildRunController builds = Builds;
+        AgentCall.Follow(window.Actions.Work, AppActions.RunProgram, AppActions.Build);
+        using (LaunchBuild built = new(builds))
+        {
+            if (await Started(builds.RunAsync(null, hotReload), AppActions.RunProgram, cancel) is { } refused)
+            {
+                throw new InvalidOperationException(WithBuildErrors(refused, built.Ended));
+            }
+        }
+        choice.Began = true;
+        (IReadOnlyList<string> debugged, IReadOnlyList<TerminalRun> ran, IReadOnlyList<string> notes) = builds.ProjectsOf(name);
+        List<(TerminalRun Run, HeardServing Serving)> each = [.. ran.Select(r => (r, new HeardServing(() => r, () => r.Session, () => TextSnapshot.Empty)))];
+        AgentCall.Say($"Running {name}: waiting up to {Math.Max(0, waitSeconds)} s for each of its programs to end or its host to start");
+        // A terminal's screen raises nothing an agent's wait can hear: looked at every 50 ms.
+        await Until(() => each.All(e => e.Run.Ended.IsCompleted || e.Serving.Serves()), TimeSpan.FromSeconds(Math.Max(0, waitSeconds)), cancel);
+        IEnumerable<string> stands = each.Select(e => Stands(e.Run, e.Serving));
+        string output = string.Join("\n", each.Select(e => $"{e.Run.Name}:\n{Tail(e.Run.Session, 40)}"));
+        return new RunResult(each.Any(e => !e.Run.Ended.IsCompleted), null,
+            $"{BuildRunController.ProjectsStarted(name, debugged, [.. ran.Select(r => r.Name)])}. {string.Join("; ", stands)}{string.Concat(notes.Select(n => $"\nNote: {n}"))}", output);
+
+        static string Stands(TerminalRun run, HeardServing serving)
+        {
+            Task<int> ended = run.Ended;
+            return ended.IsCompletedSuccessfully ? BuildRunController.RunEnded(run.Name, ended.Result)
+                : serving.Said is { } said ? $"{run.Name}, {said}" : $"{run.Name}, running";
+        }
+    }
 
     [McpServerTool(Name = McpTools.Output, Title = "A console's last lines", ReadOnly = true), Description(
         "The last lines of a console. of run (the default): what Run's program wrote (under Hot Reload, dotnet watch's words " +
@@ -1468,6 +1960,8 @@ public sealed partial class PassengerTools(MainWindow window, AgentConnection? c
         {
             ToolWindows.DebugTab tab = TabFor(session)!;
             await Session.Debug.StopAsync(tab);
+            // A session's app on a device ends there after the session.
+            await Session.EndedOnDevicesAsync(tab.Name);
             return $"Stopped {tab.Name}";
         }
         string? idle = Builds.WhyNotStop();
@@ -1481,7 +1975,8 @@ public sealed partial class PassengerTools(MainWindow window, AgentConnection? c
         "Builds and runs the unit tests, or those whose full name contains filter, as the Unit Tests window does, each project " +
         "by the runner its build asks for (Microsoft Testing Platform for xUnit v3, MSTest's and NUnit's runners and TUnit; a Godot game's GUT " +
         "and GoDotTest in Godot; VSTest for the rest). With debug, under the debugger: a stop in a test comes back, and debug_continue goes on. Returns the tally and " +
-        "every failure with its message and stack trace.")]
+        "every failure with its message and stack trace; a failed Reqnroll or SpecFlow scenario's steps each with how it went, one that did not pass with the " +
+        "definition its text binds, its arguments, what was said and the stack's frames in the folder.")]
     public Task<TestRunInfo> TestsRun(
         string? filter = null,
         bool debug = false, CancellationToken cancel = default) => OnUi(cancel, async () =>
@@ -1495,7 +1990,8 @@ public sealed partial class PassengerTools(MainWindow window, AgentConnection? c
         await Until(() => !tests.IsLooking, TestsLookLimit, cancel);
         // Matched once built: a test written a moment ago, or one only a runner finds, is among them.
         Task<string?> run = filter is null ? tests.RunAsync(folder, null, debug)
-            : tests.RunMatchingAsync(folder, m => m.FullName is { } name && name.Contains(filter, StringComparison.Ordinal), $"No test's name contains '{filter}'", debug);
+            : tests.RunMatchingAsync(folder, m => m.FullName is { } name && name.Contains(filter, StringComparison.Ordinal),
+                unfound => $"No test's name contains '{filter}'" + (unfound is null ? string.Empty : $": {unfound}"), debug);
         if (debug)
         {
             // A debugged test's stop comes back to the agent; looked at every 50 ms: no pause of the test host is told.
@@ -1512,13 +2008,13 @@ public sealed partial class PassengerTools(MainWindow window, AgentConnection? c
         {
             throw new InvalidOperationException(WithBuildErrors(problem, built.Ended));
         }
-        return TestInfo(tests);
+        return TestInfo(tests, await StepsOfAsync([.. tests.RunOutcomes.Where(o => o.State == Testing.TestState.Failed)], cancel));
     });
 
     [McpServerTool(Name = McpTools.TestsList, Title = "The unit tests", ReadOnly = true), Description(
         "The tests the Unit Tests window shows (from code, and their runner once built), each with its full name, state from " +
         "the last run (earlier: when, if an earlier session's) and file:line: those whose full name contains filter and whose state is state, at most limit.")]
-    public Task<IReadOnlyList<TestInfoRow>> TestsList(
+    public Task<CallToolResult> TestsList(
         [Description("Part of a test's full name (Namespace.Class.Method)")] string? filter = null,
         [Description("passed, failed, skipped or notRun")] string? state = null,
         int limit = 200,
@@ -1530,13 +2026,12 @@ public sealed partial class PassengerTools(MainWindow window, AgentConnection? c
             : throw new ArgumentException($"No state '{state}'; there are passed, failed, skipped and notRun");
         // Found from code as the folder opens; looked at every 50 ms, as the finder raises nothing as it is done.
         await Until(() => !Session.Tests.IsLooking, TestsLookLimit, cancel);
-        return (IReadOnlyList<TestInfoRow>)[.. Session.Tests.Tree.Methods
-            .Where(m => (filter is null || (m.FullName ?? m.Name).Contains(filter, StringComparison.Ordinal)) && (only is null || m.State == only))
-            .Take(Math.Max(1, limit))
-            .Select(m => new TestInfoRow(TestName(m), StateName(m.State), m.Path is { } at ? $"{Relative(at)}:{m.Line}" : null)
+        List<Testing.TestNode> asked = [.. Session.Tests.Tree.Methods
+            .Where(m => (filter is null || (m.FullName ?? m.Name).Contains(filter, StringComparison.Ordinal)) && (only is null || m.State == only))];
+        return Held([.. asked.Take(Math.Max(1, limit)).Select(m => new TestInfoRow(TestName(m), StateName(m.State), m.Path is { } at ? $"{Relative(at)}:{m.Line}" : null)
             {
                 Earlier = m.Standing,
-            })];
+            })], "test", "filter or state narrows them", Math.Max(0, asked.Count - Math.Max(1, limit)), LargerLimit);
     });
 
     /// <summary>The states tests_list says and takes, in its description's words.</summary>
@@ -1552,9 +2047,11 @@ public sealed partial class PassengerTools(MainWindow window, AgentConnection? c
     /// <summary>The last run's tally and its failures, of the tests it ran alone as it told them (a test renamed as it ran
     /// still told), a method's results together (its failed rows, the rest counted), each message and stack whole and its
     /// output's last lines.</summary>
-    private TestRunInfo TestInfo(Testing.TestController tests)
+    private TestRunInfo TestInfo(Testing.TestController tests, IReadOnlyDictionary<Testing.TestOutcome, IReadOnlyList<StepInfo>>? steps = null)
     {
         List<TestFailure> failures = [];
+        int stepsGiven = 0;
+        int stepsLeft = 0;
         foreach (IGrouping<(string, string, string?), Testing.TestOutcome> method in tests.RunOutcomes
             .GroupBy(o => (o.Test.Project, o.Test.Method, o.Test.Framework)).Where(m => m.Any(o => o.State == Testing.TestState.Failed)))
         {
@@ -1562,14 +2059,121 @@ public sealed partial class PassengerTools(MainWindow window, AgentConnection? c
             Testing.TestNode? shown = tests.Tree.Node(test) is { } node ? node.Kind == Testing.TestNodeKind.Row ? node.Parent : node : null;
             bool several = shown?.Framework is not null || tests.RunOutcomes.Any(o => o.Test.Project == test.Project && o.Test.Method == test.Method && o.Test.Framework != test.Framework);
             string? place = shown?.Path is { } at ? $"{Relative(at)}:{shown.Line}" : test.Path is { } found ? $"{Relative(found)}:{test.Line}" : null;
+            List<StepInfo> its = steps is null ? [] : [.. method.SelectMany(o => steps.GetValueOrDefault(o) ?? [])];
+            if (its.Count > 0 && stepsGiven + its.Count > AgentAnswers.MostFindings)
+            {
+                stepsLeft++;
+                its = [];
+            }
+            stepsGiven += its.Count;
             failures.Add(new TestFailure(shown is null ? $"{test.Method}{(several ? $" ({test.Framework})" : string.Empty)}" : TestName(shown), place,
-                Testing.TestNode.FailuresOf([.. method], FailureOutputLines)));
+                Masked(Testing.TestNode.FailuresOf([.. method], FailureOutputLines)))
+            {
+                Steps = its.Count > 0 ? its : null,
+            });
         }
-        return new TestRunInfo(tests.Summary, failures);
+        TestRunInfo run = new(tests.Summary, [])
+        {
+            StepsLeftOut = stepsLeft == 0 ? null : $"The steps of {Plural.Of(stepsLeft, "more failed scenario")} are left out; tests_run with a filter naming one answers its steps",
+        };
+        int kept = AgentAnswers.Fitting(failures, Size, Room(run));
+        return run with
+        {
+            Failures = kept == failures.Count ? failures : [.. failures.Take(kept)],
+            More = kept == failures.Count ? null : AgentAnswers.More(failures.Count - kept, "failed test", "tests_list with state failed names them, and tests_run with a filter answers theirs"),
+        };
     }
 
     /// <summary>How many of a failure's last lines of output an answer gives: an agent's answer holds no test's every line.</summary>
     private const int FailureOutputLines = 50;
+
+    /// <summary>Each failed Reqnroll or SpecFlow scenario's steps as its run went, by its outcome (<see cref="MainWindow.FeatureRunsAsync"/>):
+    /// each step's text, place and outcome; one that did not pass with the definition its text binds as the editor matches it,
+    /// the arguments it ran with as converted where the run says them, else as its text gives them, what the run said, the
+    /// failure's frames in the folder, and for one undefined or ambiguous what came close, in the editor's words.</summary>
+    private async Task<Dictionary<Testing.TestOutcome, IReadOnlyList<StepInfo>>> StepsOfAsync(IReadOnlyList<Testing.TestOutcome> failed, CancellationToken cancel)
+    {
+        Dictionary<Testing.TestOutcome, IReadOnlyList<StepInfo>> steps = new(ReferenceEqualityComparer.Instance);
+        foreach (Bdd.FeatureRun feature in await window.FeatureRunsAsync(Session, failed))
+        {
+            try
+            {
+                // The bindings the definitions are named from, read from the code as the server has it now.
+                await ServerSettledAsync(feature.Path, _ => true, cancel);
+                await window.StepsAsync(cancel);
+            }
+            catch (Exception unread) when (unread is TimeoutException or InvalidOperationException)
+            {
+                AgentCall.Say($"The steps' definitions are not named: {unread.Message}");
+            }
+            Bdd.FeatureAnalysis analysis = await Session.Features.ReadAsync(feature.Path, feature.Text);
+            foreach (IGrouping<Testing.TestOutcome, (Passenger.Workspace.Gherkin.StepResult Result, Testing.TestOutcome Test)> test in feature.Steps.GroupBy(s => s.Test, ReferenceEqualityComparer.Instance as IEqualityComparer<Testing.TestOutcome>))
+            {
+                steps[test.Key] = [.. test.Select(s => StepOf(feature, analysis, s.Result, s.Test))];
+            }
+        }
+        return steps;
+    }
+
+    private StepInfo StepOf(Bdd.FeatureRun feature, Bdd.FeatureAnalysis analysis, Passenger.Workspace.Gherkin.StepResult result, Testing.TestOutcome test)
+    {
+        StepInfo step = new(result.Said, $"{Relative(feature.Path)}:{result.Line + 1}", result.Outcome.ToString().ToLowerInvariant())
+        {
+            Row = test.Row,
+        };
+        if (result.Outcome == Passenger.Workspace.Gherkin.StepOutcome.Passed)
+        {
+            return step;
+        }
+        Passenger.Workspace.Gherkin.FeatureStep? written = analysis.Reading.Steps.FirstOrDefault(s => s.Line == result.Line);
+        Passenger.Workspace.Gherkin.StepMatch? match = null;
+        if (written is not null && analysis.Matcher is { } matcher && result.Said.StartsWith(written.Keyword.TrimEnd(), StringComparison.Ordinal))
+        {
+            string text = result.Said[written.Keyword.TrimEnd().Length..].TrimStart();
+            Passenger.Workspace.Gherkin.FeatureScenario scenario = written.Scenario;
+            match = matcher.Match(written.Kind, text, written.DocString is not null, written.Table is not null,
+                new Passenger.Workspace.Gherkin.StepContext(analysis.Reading.Feature?.Title, scenario.Title, scenario.AllTags));
+            if (match.Bindings.FirstOrDefault() is { } bound)
+            {
+                step = step with
+                {
+                    Definition = bound.Binding.MethodPlace is { } place ? $"{Relative(place.Path)}:{place.Line + 1} {bound.Binding.Type}.{bound.Binding.Method}" : $"{bound.Binding.Type}.{bound.Binding.Method}",
+                    Arguments = result.Arguments ?? string.Join(", ", bound.Arguments.Select((a, i) =>
+                        $"{(i < bound.Binding.Parameters.Count ? $"{bound.Binding.Parameters[i].Name} ({bound.Binding.Parameters[i].Type}): " : string.Empty)}{text.Substring(a.Start, a.Length)}")),
+                };
+            }
+        }
+        string? said = result.Outcome is Passenger.Workspace.Gherkin.StepOutcome.Undefined or Passenger.Workspace.Gherkin.StepOutcome.Ambiguous
+            ? string.Join("\n", analysis.Marks.Where(m => analysis.Text.GetLineFromOffset(m.Range.Start) == result.Line).Select(m => m.Message)) is { Length: > 0 } marked ? marked : result.Message
+            : result.Message ?? (result.Outcome == Passenger.Workspace.Gherkin.StepOutcome.Failed ? test.Message : null);
+        return step with
+        {
+            Message = said is null ? null : Masked(said),
+            Frames = result.Outcome == Passenger.Workspace.Gherkin.StepOutcome.Failed && OwnFrames(test.StackTrace) is { Count: > 0 } frames ? frames : null,
+        };
+    }
+
+    /// <summary>The frames of a stack in the open folder's files, each "at Type.Method(…) in path:line" with the path the folder's own.</summary>
+    private List<string> OwnFrames(string? stack)
+    {
+        List<string> frames = [];
+        foreach (string line in (stack ?? string.Empty).Split('\n'))
+        {
+            string frame = line.Trim();
+            int @in = frame.LastIndexOf(" in ", StringComparison.Ordinal);
+            int at = frame.LastIndexOf(":line ", StringComparison.Ordinal);
+            if (!frame.StartsWith("at ", StringComparison.Ordinal) || @in < 0 || at < @in || Session.Folder is not { } folder)
+            {
+                continue;
+            }
+            string path = frame[(@in + 4)..at];
+            if (Path.IsPathFullyQualified(path) && PathNames.IsUnder(PathNames.Canonical(path), folder))
+            {
+                frames.Add($"{frame[..@in]} in {Relative(PathNames.Canonical(path))}:{frame[(at + 6)..]}");
+            }
+        }
+        return frames;
+    }
 
     /// <summary>A test's full name, Namespace.Class.Method, and the target framework it ran under when its project has several.</summary>
     private static string TestName(Testing.TestNode method)
@@ -1589,7 +2193,7 @@ public sealed partial class PassengerTools(MainWindow window, AgentConnection? c
         "and Xaml); GDScript Errors (scriptErrors: a debugged Godot game stops at a script error, on by default); or Break When " +
         "Value Changes on control's property (as app_details names it) in the app debugged, for the " +
         "session, condition reading newValue, oldValue and control. condition is a C# bool (GDScript in .gd); hitCondition \"==3\", \">=2\" or " +
-        "\"%2\"; logMessage (\"count is {count}\") is written each hit; suspend false makes a tracepoint. Bound at once while " +
+        "\"%2\"; logMessage (\"count is {count}\", \\{ for a brace) is written each hit; suspend false makes a tracepoint. Bound at once while " +
         "debugging.")]
     public Task<IReadOnlyList<BreakpointInfo>> SetBreakpoint(
         string? path = null,
@@ -1641,13 +2245,18 @@ public sealed partial class PassengerTools(MainWindow window, AgentConnection? c
             return ExceptionBreakpoints();
         }
         (string full, int at) = LinePlace(path, line);
-        TextSnapshot text = (Editors.Find(full) is { HoldsText: true } open ? open.Text.Snapshot : await BackgroundWork.Run(() => Passenger.App.Editors.EditorArea.Read(full)))
-            ?? throw new ArgumentException(File.Exists(full) ? $"{Relative(full)} has no text to set a breakpoint in" : $"No file {Relative(full)} is here to set a breakpoint in");
-        LineIn(text, full, at + 1);
+        // A file the agent may not read is told nothing of, there or not: its breakpoint is set as named, for the debugger to place.
+        bool readable = Reaches(full, changes: false);
+        if (readable)
+        {
+            TextSnapshot text = (Editors.Find(full) is { HoldsText: true } open ? open.Text.Snapshot : await BackgroundWork.Run(() => Passenger.App.Editors.EditorArea.Read(full)))
+                ?? throw new ArgumentException(File.Exists(full) ? $"{Relative(full)} has no text to set a breakpoint in" : $"No file {Relative(full)} is here to set a breakpoint in");
+            LineIn(text, full, at + 1);
+        }
         LineBreakpoint set = column is int inside ? (await LambdaBreakpointAsync(full, at, inside, set: true))! : store.Set(full, at, attribute is { Length: > 0 } ? attribute : null);
         store.Update(set, enabled: true, suspend, condition, hitCondition, logMessage);
         await InTheProgram(cancel);
-        Passenger.Languages.CSharp.ParsedText? parsed = Session.Debug.IsDebugging ? null : await LambdaBreakpoints.ParsedAsync(Editors, full);
+        Passenger.Languages.CSharp.ParsedText? parsed = Session.Debug.IsDebugging || !readable ? null : await LambdaBreakpoints.ParsedAsync(Editors, full);
         // An open file's parse only as its text stands: its lines may have moved since.
         if (parsed is not null && Editors.Find(full) is { HoldsText: true } shown && !ReferenceEquals(parsed.Text, shown.Text.Snapshot))
         {
@@ -1715,9 +2324,13 @@ public sealed partial class PassengerTools(MainWindow window, AgentConnection? c
 
     /// <summary>The breakpoint inside the C# lambda holding a column (from one) of a line (from zero), set if
     /// <paramref name="set"/> says to, else null with none there; refused where no lambda written after the line's code
-    /// begins holds that column.</summary>
+    /// begins holds that column, and in a file the agent may not read.</summary>
     private async Task<LineBreakpoint?> LambdaBreakpointAsync(string path, int line, int column, bool set)
     {
+        if (!Reaches(path, changes: false))
+        {
+            throw new InvalidOperationException(Refusals.OutOfReach(path, Session.Folder, changes: false));
+        }
         Passenger.Languages.CSharp.ParsedText parsed = await LambdaBreakpoints.ParsedAsync(Editors, path)
             ?? throw new ArgumentException($"A column names a lambda's breakpoint in a C# file, which {Relative(path)} is not");
         if (line >= parsed.Text.LineCount)
@@ -1798,14 +2411,16 @@ public sealed partial class PassengerTools(MainWindow window, AgentConnection? c
 
     [McpServerTool(Name = McpTools.DebugStart, Title = "Debug a configuration", Destructive = true), Description(
         "Builds and launches a configuration under the debugger, as Debug does, and waits for a stop, its end, an Avalonia " +
-        "or WPF app's UI or its host's start (where it listens). Returns where it is. With resource, that one alone, restarted.")]
+        "or WPF app's UI, its host's start (where it listens) or its app's start on a device. Returns where it is. With " +
+        "resource, that one alone, restarted.")]
     public Task<DebugSnapshot> DebugStart(
         string? configuration = null,
         string? arguments = null,
-        int waitSeconds = 60, string? resource = null, CancellationToken cancel = default) => OnUi(cancel, async () =>
+        int waitSeconds = 60, string? resource = null, bool? terminal = null, CancellationToken cancel = default) => OnUi(cancel, async () =>
     {
         if (resource is not null)
         {
+            NoTerminalFor(terminal);
             if (await ComposeTargetAsync(resource, configuration, starts: true, cancel) is { } service)
             {
                 return arguments is null ? await DebugComposeServiceAsync(service, attach: false, waitSeconds, cancel)
@@ -1813,16 +2428,31 @@ public sealed partial class PassengerTools(MainWindow window, AgentConnection? c
             }
             return await DebugAspireTarget(resource, configuration, arguments, attach: false, waitSeconds, cancel);
         }
-        Choose(configuration);
+        using Choosing choice = Choose(configuration);
         AgentCall.Follow(window.Actions.Work, AppActions.Debug, AppActions.Build);
+        bool several = Session.Configurations.Chosen is { IsMultiple: true };
+        if (several && (arguments is not null || terminal is not null))
+        {
+            throw new ArgumentException($"{Session.Configurations.Chosen!.Name} starts each of its projects as its own configuration does: omit arguments and terminal, or debug that configuration");
+        }
+        UseTerminal(Session.Configurations.Chosen?.Name ?? string.Empty, terminal);
+        string? started = null;
         using (LaunchBuild built = new(Builds))
         {
             if (await Started(Builds.DebugAsync(arguments), AppActions.Debug, cancel) is { } problem)
             {
                 throw new InvalidOperationException(WithBuildErrors(problem, built.Ended));
             }
+            choice.Began = true;
+            // What a multi-project start started, the answer's own being the program the debugger shows.
+            if (several && Session.Configurations.Chosen is { } chosen)
+            {
+                (IReadOnlyList<string> debugged, IReadOnlyList<TerminalRun> ran, _) = Builds.ProjectsOf(chosen.Name);
+                started = BuildRunController.ProjectsStarted(chosen.Name, debugged, [.. ran.Select(r => r.Name)]);
+            }
         }
-        return await AfterLaunch(TimeSpan.FromSeconds(waitSeconds), cancel);
+        DebugSnapshot snapshot = await AfterLaunch(TimeSpan.FromSeconds(waitSeconds), cancel);
+        return started is null ? snapshot : snapshot with { Status = $"{started}. The debugger shows {Session.Debug.Chosen?.Name ?? "none of them"}: {snapshot.Status}" };
     });
 
     /// <summary>A start an agent waits on (Run's, Debug's), ended as Stop ends one when the agent gives up on the call before
@@ -1861,7 +2491,10 @@ public sealed partial class PassengerTools(MainWindow window, AgentConnection? c
         List<Problem> errors = built is { Status: BuildStatus.Failed } ? [.. built.Problems.Where(p => p.Severity == ProblemSeverity.Error)] : [];
         if (errors.Count == 0)
         {
-            return refused;
+            // Where the person chooses beside the configuration, an agent chooses with one call.
+            return refused.EndsWith(Refusals.ChooseRunTarget, StringComparison.Ordinal) && Session.Configurations.Chosen is { } chosen
+                ? $"{refused} ({McpTools.IdeAction} {AppActions.ChooseRunTarget} with input \"{chosen.Name}:\" lists them, \"{chosen.Name}:name\" chooses one)"
+                : refused;
         }
         IEnumerable<string> lines = errors.Take(10).Select(p =>
             $"{(p.Path is { } at ? $"{Relative(at)}:{p.Position.Line + 1}:{p.Position.Column + 1}" : p.Project)}: {p.Code} {p.Message}");
@@ -1884,13 +2517,16 @@ public sealed partial class PassengerTools(MainWindow window, AgentConnection? c
 
     /// <summary>Where a program just launched under the debugger is once it stops or ends, or, for an app with a window,
     /// which runs until it is closed, once its UI is up, for a Godot game once it has connected (a breakpoint set in its
-    /// files waited for as a stop), and for a host that serves until it is stopped, once it has started, saying so and where
-    /// it listens: an agent waits for no more than it needs.</summary>
+    /// files waited for as a stop), for a host that serves until it is stopped, once it has started, saying so and where it
+    /// listens, and for an app on a device, once it has started there: an agent waits for no more than it needs.</summary>
     private async Task<DebugSnapshot> AfterLaunch(TimeSpan limit, CancellationToken cancel)
     {
         LiveTree.LiveApp? app = Session.LiveApp;
         Godot.GodotGame? game = Session.Game is { Debugged: not null } debugged ? debugged : null;
-        DateTime until = DateTime.UtcNow + limit;
+        // An app debugged on a device or emulator, up once its shell there found its process, which its tab's console says.
+        ToolWindows.DebugTab? device = Session.Debug.Chosen is { Plan.Device.App: not null } onDevice ? onDevice : null;
+        string? process = null;
+        Deadline until = Deadline.In(limit);
         // Running, its GDScript or C# beside it running too: a game stopped in either language is stopped.
         Func<bool> going = () => Session.Debug.Session is { State: DebugState.Running or DebugState.Starting } chosen && !Companions(chosen).Any(b => b.State == DebugState.Paused);
         HeardServing serving = HeardServing.Debugged(Session.Debug);
@@ -1902,14 +2538,15 @@ public sealed partial class PassengerTools(MainWindow window, AgentConnection? c
         bool Done()
         {
             bool done = !going() || app is { State: not LiveTree.LiveAppState.Waiting } || (!breaks && game is { Monitors: not null })
-                || game is { State: LiveTree.LiveAppState.Ended } || serving.Serves();
+                || game is { State: LiveTree.LiveAppState.Ended } || serving.Serves()
+                || (device is not null && Session.Debug.Session is { State: DebugState.Running } && (process = StartedOnDevice(device)) is not null);
             // What the call waits for now, told as its progress over whatever the launch's own work says meanwhile.
             int now = Session.Debug.Session is not { State: not DebugState.Starting } ? 0 : game is { State: LiveTree.LiveAppState.Connected } ? 1
-                : app is { State: LiveTree.LiveAppState.Waiting } ? 2 : 3;
+                : app is { State: LiveTree.LiveAppState.Waiting } ? 2 : device is not null ? 4 : 3;
             if (!done && now != phase)
             {
                 phase = now;
-                call?.Waits(Awaited(now, game?.Name, stops, limit));
+                call?.Waits(Awaited(now, game?.Name, stops, limit, device?.Plan?.Device?.Target.Name));
             }
             return done;
         }
@@ -1921,7 +2558,7 @@ public sealed partial class PassengerTools(MainWindow window, AgentConnection? c
             if (going() && app is { State: LiveTree.LiveAppState.Connected })
             {
                 // A stop in the first layout, just after the inspector's hello, is waited for too; looked at every 50 ms.
-                await Until(() => !going(), Min(LaunchSettle, until - DateTime.UtcNow), cancel);
+                await Until(() => !going(), Min(LaunchSettle, until.Left), cancel);
             }
             DebugSnapshot started = await AfterResume(TimeSpan.Zero, cancel);
             DebugSnapshot shown = app is { State: LiveTree.LiveAppState.Refused or LiveTree.LiveAppState.Ended, Problem: { } refused } ? started with { Status = $"{started.Status}. {refused}" }
@@ -1929,10 +2566,12 @@ public sealed partial class PassengerTools(MainWindow window, AgentConnection? c
                 : app is { State: LiveTree.LiveAppState.Connected } ? started with { Status = $"{started.Status}, {UiUp(app)}" }
                 : game is { State: LiveTree.LiveAppState.Connected, Monitors: not null } ? started with { Status = $"{started.Status}, {GameUp}" }
                 : serving.Said is { } said ? started with { Status = $"{started.Status}, {said}" }
+                : process is not null && device?.Plan?.Device is { App: { } onIt } launch
+                    ? started with { Status = $"{started.Status}, {onIt.Package} started on {launch.Target.Name} as process {process}" }
                 : started;
             // The whole wait out with the program running: what it was waited for never stopped it.
             return waitedOut && shown.Debugged == DebugState.Running && stops is not null
-                ? shown with { Status = $"{shown.Status}; in the {limit.TotalSeconds:0} s waited it never stopped at {stops}" } : shown;
+                ? shown with { Status = $"{shown.Status}; in the {Durations.Said(limit)} waited it never stopped at {stops}" } : shown;
         }
         finally
         {
@@ -1941,19 +2580,27 @@ public sealed partial class PassengerTools(MainWindow window, AgentConnection? c
     }
 
     /// <summary>What a launch under the debugger is waited for at a phase of its start, within <paramref name="limit"/> in
-    /// all: the program to start, a game that runs to stop or end, an app's UI, else a stop, the end or a host's start;
-    /// <paramref name="stops"/> names the breakpoints it may stop at.</summary>
-    private static string Awaited(int phase, string? game, string? stops, TimeSpan limit)
+    /// all: the program to start, a game that runs to stop or end, an app's UI, its start on <paramref name="device"/>, else
+    /// a stop, the end or a host's start; <paramref name="stops"/> names the breakpoints it may stop at.</summary>
+    private static string Awaited(int phase, string? game, string? stops, TimeSpan limit, string? device = null)
     {
         string stop = stops is null ? "a stop" : $"a stop at {stops}";
-        string within = $"up to {limit.TotalSeconds:0} s in all";
+        string within = $"up to {Durations.Said(limit)} in all";
         return phase switch
         {
             0 => $"Debugging: waiting for the program to start, then for {stop}, its end, its UI or its host's start ({within})",
             1 => $"Debugging: {game} runs; waiting for {stop} or its end ({within})",
             2 => $"Debugging: the program runs; waiting for its UI, {stop} or its end ({within})",
+            4 => $"Debugging: the program runs; waiting for its start on {device}, {stop} or its end ({within})",
             _ => $"Debugging: the program runs; waiting for {stop}, its end or its host's start ({within})",
         };
+    }
+
+    /// <summary>The app's process on its device as its shell said it started there, in its Debug tab's console; null until it has.</summary>
+    private static string? StartedOnDevice(ToolWindows.DebugTab tab)
+    {
+        tab.Console.Flush();
+        return tab.Plan?.Device?.App?.StartedIn(tab.Console.Document.Snapshot);
     }
 
     /// <summary>The breakpoints that may stop a program launched under the debugger (a game's, those in its folder), as an
@@ -2123,7 +2770,7 @@ public sealed partial class PassengerTools(MainWindow window, AgentConnection? c
         (path, line) switch
         {
             (null, null) => Resume(s => s.ContinueAsync(), waitSeconds, session, cancel),
-            ({ } file, int to) => Resume(debugged => debugged.RunToCursorAsync(Resolve(file), to - 1), waitSeconds, session, cancel),
+            ({ } file, int to) => Resume(debugged => debugged.RunToCursorAsync(Named(file), to - 1), waitSeconds, session, cancel),
             _ => throw new ModelContextProtocol.McpException("Run to a line takes both path and line"),
         };
 
@@ -2154,7 +2801,7 @@ public sealed partial class PassengerTools(MainWindow window, AgentConnection? c
         DebugSession paused = await Paused(session, choose: true);
         // The move's own stop, whichever comes first, it or the answer: an earlier move's stop has the same reason.
         int before = paused.Stops;
-        if (await Session.Debug.SetNextStatementAsync(paused, Resolve(path), line - 1) is { } problem)
+        if (await Session.Debug.SetNextStatementAsync(paused, Named(path), line - 1) is { } problem)
         {
             throw new InvalidOperationException(problem);
         }
@@ -2236,8 +2883,10 @@ public sealed partial class PassengerTools(MainWindow window, AgentConnection? c
     [McpServerTool(Name = McpTools.IdeAction, Title = "Run an IDE action", Destructive = true), Description(
         "Runs an IDE action by its id (app.build, app.debug.stepOver...; ide_actions lists them) as its shortcut would, waits " +
         "for the work it begins and says what it came to, or says why it cannot. input: app.migrations.add's name, updateTo's " +
-        "target; app.saveAsLaunchProfile's configuration (else the chosen one); app.targetFramework's framework, as " +
-        "Project:net9.0 where several projects target several.")]
+        "target, environment's name; app.saveAsLaunchProfile's configuration (else the chosen one); app.targetFramework's framework, as " +
+        "Project:net9.0 where several projects target several; app.chooseRunTarget's device, emulator or simulator by name " +
+        "(Configuration:name for another configuration's), app.chooseBuildConfiguration's configuration (Release, or " +
+        "Release|x64; none lists them for either).")]
     public Task<string> IdeAction(string action, string? input = null, CancellationToken cancel = default) => OnUi(cancel, async () =>
     {
         if (action.StartsWith("app.migrations.", StringComparison.Ordinal) && window.Actions[action] is not null)
@@ -2251,6 +2900,14 @@ public sealed partial class PassengerTools(MainWindow window, AgentConnection? c
         if (action == AppActions.TargetFramework && input is not null)
         {
             return window.ChooseFrameworkForAgent(input);
+        }
+        if (action == AppActions.ChooseRunTarget)
+        {
+            return await window.ChooseRunTargetForAgentAsync(input);
+        }
+        if (action == AppActions.ChooseBuildConfiguration)
+        {
+            return await window.ChooseBuildConfigurationForAgentAsync(input);
         }
         if (input is not null)
         {
@@ -2335,7 +2992,7 @@ public sealed partial class PassengerTools(MainWindow window, AgentConnection? c
     [McpServerTool(Name = McpTools.IdeActions, Title = "The IDE's actions", ReadOnly = true), Description(
         "Every action ide_action runs (those with no shortcut too), as id: name [group] (shortcut on this platform), " +
         "and why one cannot run here now.")]
-    public Task<IReadOnlyList<string>> IdeActions(
+    public Task<CallToolResult> IdeActions(
         [Description("Only those whose id, name or group holds it (\"rebase\", \"Git\")")] string? query = null,
         CancellationToken cancel = default) => OnUi(cancel, () =>
     {
@@ -2344,8 +3001,9 @@ public sealed partial class PassengerTools(MainWindow window, AgentConnection? c
         IEnumerable<IdeAction> asked = query is not { Length: > 0 } words ? actions.All
             : actions.All.Where(a => a.Id.Contains(words, StringComparison.OrdinalIgnoreCase) || a.Title.Contains(words, StringComparison.OrdinalIgnoreCase)
                 || a.Group.Contains(words, StringComparison.OrdinalIgnoreCase));
-        return Task.FromResult((IReadOnlyList<string>)[.. asked.Select(a =>
-            $"{a.Id}: {a.Title} [{a.Group}]{(actions.Shortcut(a.Id) is { } keys ? $" ({keys})" : string.Empty)}{(a.WhyNot(context) is { } why ? $" - cannot run: {why}" : string.Empty)}")]);
+        return Task.FromResult(Held([.. asked.Select(a =>
+            $"{a.Id}: {a.Title} [{a.Group}]{(actions.Shortcut(a.Id) is { } keys ? $" ({keys})" : string.Empty)}{(a.WhyNot(context) is { } why ? $" - cannot run: {why}" : string.Empty)}")],
+            "action", "query, a group's name or a word of the action's, narrows them"));
     });
 
     // The work behind them
@@ -2353,9 +3011,24 @@ public sealed partial class PassengerTools(MainWindow window, AgentConnection? c
     /// <summary>Whether the agent is attached to a person's window, beside the person, rather than in an IDE of its own.</summary>
     private bool Beside => connection is { Attached: true };
 
-    /// <summary>A tool's work on the UI thread, its waits ended by <paramref name="cancel"/> (the agent gave up on the
-    /// call, or went), once the folder's projects are read and evaluated, which is what every tool that runs, builds or
-    /// tests a project asks about (unless <paramref name="projects"/> is false, for one that asks nothing of them). What it
+    /// <summary>How long a call waits for the look its coming asked for (<see cref="LookedAgainAsync"/>): one queued behind a
+    /// walk of a whole folder lets the call go on, what it finds coming as heard.</summary>
+    private static TimeSpan LookLimit => Waits.Of(TimeSpan.FromSeconds(5));
+
+    /// <summary>An agent's call coming to the window: the window looks again for what the system dropped, as it does coming
+    /// in front, when the agent's calls had stopped a while (<see cref="MainWindow.AgentCalling"/>), and the call waits until
+    /// what it found reached the window's thread, so the call's own work, queued after, reads it.</summary>
+    internal async Task LookedAgainAsync(CancellationToken cancel)
+    {
+        Task look = await UiThread.InvokeAsync(() => window.AgentCalling());
+        // A wait with no fault to leave behind: a look ends however it went.
+        await Task.WhenAny(look, Task.Delay(LookLimit, cancel));
+        cancel.ThrowIfCancellationRequested();
+    }
+
+    /// <summary>A tool's work on the UI thread, its waits ended by <paramref name="cancel"/> (the agent gave up on the call,
+    /// or went), once the folder's projects are read and evaluated as written (<see cref="ProjectSession.ProjectsAsWrittenAsync"/>),
+    /// which every tool that runs, builds or tests a project asks about (unless <paramref name="projects"/> is false). What it
     /// refuses (nothing to debug, no such file) reaches the agent in its own words: the SDK passes only an McpException's
     /// message on, and hides every other's.</summary>
     private async Task<T> OnUi<T>(CancellationToken cancel, Func<Task<T>> work, bool projects = true)
@@ -2385,6 +3058,11 @@ public sealed partial class PassengerTools(MainWindow window, AgentConnection? c
                         await Session.WorkspaceRead.WaitAsync(cancel);
                         await Session.Models.Idle.WaitAsync(cancel);
                         AgentCall.Say(null);
+                    }
+                    if (projects)
+                    {
+                        // A project file the agent edited a moment ago, through edit or its own shell, the folder's watcher may not have heard of yet.
+                        await Session.ProjectsAsWrittenAsync(AgentCall.Say, cancel);
                     }
                     return await work();
                 }
@@ -2445,7 +3123,7 @@ public sealed partial class PassengerTools(MainWindow window, AgentConnection? c
     {
         if (limit > TimeSpan.Zero)
         {
-            AgentCall.Say($"The program runs: waiting up to {limit.TotalSeconds:0} s for it to stop or end");
+            AgentCall.Say($"The program runs: waiting up to {Durations.Said(limit)} for it to stop or end");
         }
         DebugSession? going = session ?? Session.Debug.Session;
         // A Godot game's other language stops for it too: its GDScript beside its C#, or the C# its GDScript is beside.
@@ -2551,6 +3229,11 @@ public sealed partial class PassengerTools(MainWindow window, AgentConnection? c
     {
         DebugController debugger = Session.Debug;
         string? summary = session is null ? debugger.Summary : debugger.SummaryOf(session);
+        // A program that said it needs a terminal, as the Debug window offers one.
+        if ((session is null ? debugger.Chosen : debugger.TabOf(session)) is { } tab && Builds.DebugNeedOf(tab) is { } need)
+        {
+            summary += $". {need.Said}: {McpTools.DebugStart} with terminal true debugs it in a Terminal tab";
+        }
         if (session is null || session.State == DebugState.Ended)
         {
             return new DebugSnapshot(null, null, null, [], [], session?.ExitCode, summary);
@@ -2579,7 +3262,7 @@ public sealed partial class PassengerTools(MainWindow window, AgentConnection? c
             try
             {
                 ExceptionInfoResponse info = await session.ExceptionInfoAsync(session.StoppedThread.Value);
-                exception = Describe(info.Details) ?? $"{info.ExceptionId}: {info.Description}";
+                exception = Masked(Describe(info.Details) ?? $"{info.ExceptionId}: {info.Description}");
             }
             catch (DapException error)
             {
@@ -2730,12 +3413,32 @@ public sealed partial class PassengerTools(MainWindow window, AgentConnection? c
         ? paused
         : throw new InvalidOperationException("The program is running; debug_pause stops it where it is");
 
-    private void Choose(string? configuration)
+    /// <summary>A launching call's configuration chosen as a person's Run chooses it, the choice put back as it stood once
+    /// the call ends unless its launch began (<see cref="Choosing.Began"/>) or another choice was made meanwhile: a call
+    /// refused leaves the window's choice as it was.</summary>
+    private Choosing Choose(string? configuration)
     {
         RunConfigurations configurations = Session.Configurations;
+        RunChoice held = configurations.Held;
         if (configuration is not null && !configurations.Select(configuration))
         {
             throw new InvalidOperationException($"No run configuration '{configuration}'; there are: {string.Join(", ", configurations.All.Select(c => c.Name))}");
+        }
+        return new Choosing(this, configurations, held, configurations.Held);
+    }
+
+    /// <summary>A launching call's choice of its configuration (<see cref="Choose"/>), put back as it was when disposed
+    /// before the launch began.</summary>
+    private sealed class Choosing(PassengerTools tools, RunConfigurations configurations, RunChoice held, RunChoice made) : IDisposable
+    {
+        public bool Began { get; set; }
+
+        public void Dispose()
+        {
+            if (!Began && tools.Session.Configurations == configurations && configurations.Held == made)
+            {
+                configurations.PutBack(held);
+            }
         }
     }
 
@@ -2772,7 +3475,7 @@ public sealed partial class PassengerTools(MainWindow window, AgentConnection? c
 
     /// <summary>A line breakpoint's file and line from zero, as an agent names them.</summary>
     private (string Path, int Line) LinePlace(string? path, int? line) => path is { Length: > 0 } && line is int at
-        ? (Resolve(path), at - 1)
+        ? (Named(path), at - 1)
         : throw new InvalidOperationException("Name a path and a line for a line breakpoint, or an exception type for an exception breakpoint");
 
     /// <summary>A C# file no tab shows, whose marks the server's refresh or its opening left unpulled, pulled now, so the
@@ -2805,49 +3508,91 @@ public sealed partial class PassengerTools(MainWindow window, AgentConnection? c
         return [.. actions.Where(a => a.Disabled is null)];
     }
 
-    /// <summary>The language server, once it has loaded the workspace.</summary>
+    /// <summary>The language server, once it has loaded the workspace; refused, saying why, while the folder's projects
+    /// have no SDK to load with (<see cref="Unloadable"/>) or are still loading after the wait.</summary>
     private async Task<RoslynSession> Server(CancellationToken cancel)
     {
+        if (Unloadable() is { } unloadable)
+        {
+            throw new InvalidOperationException(unloadable);
+        }
         if (Session.CSharp is null)
         {
-            throw new InvalidOperationException(Refusals.NoCSharp);
+            throw new InvalidOperationException(Session.WhyNoCSharp);
         }
         // The session's server, which starts again when its projects change: each look is at the one there is then.
         if (Session.CSharp is { IsReady: false })
         {
             AgentCall.Say("Waiting for the C# language server to load the solution");
-            await When(() => Session.CSharp is not { IsReady: false, IsStopped: false }, ServerLimit, cancel, ServerState());
+            await When(() => Session.CSharp is not { IsReady: false, IsStopped: false } || Unloadable() is not null, ServerLimit, cancel, ServerState(), SdkState());
             AgentCall.Say(null);
         }
-        return Session.CSharp is { IsReady: true, Session: { } server }
-            ? server
-            : Session.CSharp is { IsStopped: true }
-            ? throw new InvalidOperationException(Refusals.CSharpStopped)
-            : throw new TimeoutException($"The language server has not loaded the workspace ({Session.CSharp?.State ?? "none"})");
+        return Unloadable() is { } found ? throw new InvalidOperationException(found)
+            : Session.CSharp is { IsReady: true, Session: { } server } ? server
+            : Session.CSharp is { IsStopped: true } ? throw new InvalidOperationException(Refusals.CSharpStopped)
+            : throw new TimeoutException(Refusals.StillLoading(ServerLimit, Session.CSharp?.State ?? "none"));
     }
 
-    /// <summary>Waits, once the language server has loaded the workspace, until it holds in its project the C# file asked
-    /// about, if it came under one of the folder's projects since (an agent's written a moment before looked for first),
-    /// else every such file, for up to <see cref="Patience.Limit"/>: of a file in none it answers from its Miscellaneous
-    /// Files, and a name declared there it does not find. Refused, naming the first, when the time is up; whether it was
-    /// waited for (false while the server still loads the workspace).</summary>
+    /// <summary>The folder's projects found to have no .NET SDK, or one again: what a wait for the server's load wakes on too.</summary>
+    private Wake SdkState()
+    {
+        ProjectModels models = Session.Models;
+        return On(h => models.SdkChanged += h, h => models.SdkChanged -= h);
+    }
+
+    /// <summary>The projects the C# language server met an error loading, each with the first it met, by name: what it may
+    /// hold none of the code of.</summary>
+    private IReadOnlyList<(string Project, string Error)> FailedLoads() =>
+        [.. (Session.CSharp?.ProjectProblems ?? []).Where(p => p.Severity == ProblemSeverity.Error).GroupBy(p => p.Project, PathNames.Comparer)
+            .Select(g => (Path.GetFileNameWithoutExtension(g.Key), g.First().Message))];
+
+    /// <summary>Why the server holds a C# file of one of the folder's projects in none: the project met an error loading,
+    /// said with it; null where it holds the file, or the project met none.</summary>
+    private async Task<string?> NotLoadedAsync(string path, CancellationToken cancel)
+    {
+        if (!path.EndsWith(".cs", StringComparison.OrdinalIgnoreCase) || Session.CSharp is not { Session: { } server } csharp || Session.ProjectOf(path) is not { } project
+            || csharp.ProjectProblems.FirstOrDefault(p => p.Severity == ProblemSeverity.Error && PathNames.Same(p.Project, project.Path)) is not { } error)
+        {
+            return null;
+        }
+        try
+        {
+            return (await server.HeldTextsAsync([path], cancel)).Any(h => h.Hash is not null) ? null : Refusals.ProjectNotLoaded(project.Name, error.Message);
+        }
+        catch (LanguageServerFailed)
+        {
+            return null;
+        }
+    }
+
+    /// <summary>Waits, once the language server has loaded the workspace, until it holds in their projects the C# files come
+    /// under the folder's projects since (an agent's just written first) that the file asked about sees (<see
+    /// cref="CSharpService.SeenFrom"/>), else every one, up to <see cref="Patience.Limit"/>, as it answers without a file in none:
+    /// refused, naming the first, when the time is up, and at once while the projects have no SDK (<see cref="Unloadable"/>);
+    /// whether it was waited for (false while the server still loads the workspace).</summary>
     private async Task<bool> TakenInAsync(string? path, CancellationToken cancel)
     {
+        if ((path is null || Session.ProjectOf(Resolve(path)) is not null) && Unloadable() is { } unloadable)
+        {
+            throw new InvalidOperationException(unloadable);
+        }
         if (Session.CSharp is not { IsReady: true } csharp)
         {
             return false;
         }
-        IReadOnlyList<(string Path, string Project)> left = path is null
-            ? await csharp.UnplacedAsync(Patience.Limit, looking: true, null, SayTakingIn, cancel)
-            : await csharp.PlacedAsync(Resolve(path), Patience.Limit, looking: true, SayTakingIn, cancel);
+        IReadOnlyList<(string Path, string Project)> left = await csharp.UnplacedAsync(Patience.Limit, looking: true, path is null ? null : csharp.SeenFrom(Resolve(path)),
+            SayTakingIn, cancel);
         return left.Count == 0 ? true : throw new TimeoutException(NotTakenIn(left));
     }
 
     /// <summary>The agent's progress while a C# file is waited for (null once it is not).</summary>
-    private void SayTakingIn(string? file) => AgentCall.Say(file is null ? null : $"Waiting for the C# language server to load {Relative(file)} into its project");
+    private void SayTakingIn(string? file) => AgentCall.Say(file is null ? null
+        : global::Passenger.Workspace.WorkspaceModel.IsProjectFile(file) ? $"Waiting for the C# language server to load {Relative(file)} again"
+        : $"Waiting for the C# language server to load {Relative(file)} into its project");
 
-    private string NotTakenIn(IReadOnlyList<(string Path, string Project)> left) =>
-        Refusals.NotTakenIn(Relative(left[0].Path), Path.GetFileNameWithoutExtension(left[0].Project));
+    private string NotTakenIn(IReadOnlyList<(string Path, string Project)> left) => CSharpService.IsReload(left[0])
+        ? Refusals.NotLoadedAgain(Path.GetFileNameWithoutExtension(left[0].Project))
+        : Refusals.NotTakenIn(Relative(left[0].Path), Path.GetFileNameWithoutExtension(left[0].Project));
 
     /// <summary>A file opened as the editor would, with the language server's document for it once the server has loaded
     /// the workspace and holds the file in its project (<see cref="TakenInAsync"/>, waited for before the file is opened,
@@ -2855,33 +3600,79 @@ public sealed partial class PassengerTools(MainWindow window, AgentConnection? c
     private async Task<(OpenDocument Document, LspDocument Lsp)> Code(string path, CancellationToken cancel, bool takenIn = false)
     {
         NotGenerated(path);
+        bool ofProject = Session.ProjectOf(Resolve(path)) is not null;
+        if (ofProject && Unloadable() is { } unloadable)
+        {
+            throw new InvalidOperationException(unloadable);
+        }
         takenIn = takenIn || await TakenInAsync(path, cancel);
         OpenDocument document = await DocumentAsync(path, cancel);
         if (Session.CSharp is null)
         {
-            throw new InvalidOperationException(Refusals.NoCSharp);
+            throw new InvalidOperationException(Session.WhyNoCSharp);
         }
         // The server is never given another language's file, so waiting for it to load one would wait out the limit.
         if (document.Language.Service != Languages.LanguageService.CSharp)
         {
             throw new InvalidOperationException($"This is the C# language server's, which answers for C# and Razor files, not {LanguageOf(document)} ones such as {Path.GetFileName(document.Path)}");
         }
-        // Answers before the solution has loaded are wrong; looked at every 50 ms: a server document raises nothing.
         if (document.Syntax is { } syntax && (await syntax.CurrentAsync()).DeepAt is not null)
         {
             throw new InvalidOperationException(Refusals.TooDeep(Path.GetFileName(document.Path)));
         }
-        await Until(() => Session.CSharp is not { } csharp || csharp.IsStopped || csharp.IsReady && csharp.For(document)?.Lsp is not null, ServerLimit, cancel);
-        if (Session.CSharp is { IsStopped: true })
-        {
-            throw new InvalidOperationException(Refusals.CSharpStopped);
-        }
+        await ServerSettledAsync(document.Path, csharp => csharp.For(document)?.Lsp is not null, cancel);
         if (!takenIn)
         {
             await TakenInAsync(path, cancel);
         }
+        // Found meanwhile to have no SDK, the folder's projects are in no project the server holds either.
+        if ((ofProject && Unloadable() is { } found ? found : await NotLoadedAsync(document.Path, cancel)) is { } notLoaded)
+        {
+            throw new InvalidOperationException(notLoaded);
+        }
         return (document, Session.CSharp?.For(document)?.Lsp
-            ?? throw new TimeoutException($"The language server has not loaded {Path.GetFileName(document.Path)} ({Session.CSharp?.State ?? "none"})"));
+            ?? throw new TimeoutException(Session.CSharp is { IsReady: false } loading ? Refusals.StillLoading(ServerLimit, loading.State)
+                : $"The language server has not loaded {Path.GetFileName(document.Path)} ({Session.CSharp?.State ?? "none"})"));
+    }
+
+    /// <summary>Waits until the C# language server answers for a file of the folder's as its projects stand, and <paramref name="held"/>
+    /// holds: answers before the solution has loaded, or before what a restore as it loaded brought (the projects' load
+    /// after it, their generators' run), are of the code before, so the agent is told what it waits for. Refused once the
+    /// server has stopped, and when the time is up with the load or what the restore brought still to come.</summary>
+    private async Task ServerSettledAsync(string path, Func<CSharpService, bool> held, CancellationToken cancel)
+    {
+        string? reloading = null;
+        bool settled = false;
+        // Looked at every 50 ms.
+        await Until(() =>
+        {
+            if (Session.CSharp is not { } csharp || csharp.IsStopped)
+            {
+                return settled = true;
+            }
+            if (csharp.IsReady && csharp.ReloadingWhat(path) is var what && what != reloading)
+            {
+                reloading = what;
+                AgentCall.Say(what is null ? null : $"Waiting for {what}");
+            }
+            return settled = csharp.IsReady && reloading is null && !csharp.AwaitsRestore(path) && held(csharp);
+        }, ServerLimit, cancel);
+        if (reloading is not null)
+        {
+            AgentCall.Say(null);
+        }
+        if (Session.CSharp is { IsStopped: true })
+        {
+            throw new InvalidOperationException(Refusals.CSharpStopped);
+        }
+        if (!settled && Session.CSharp is { IsReady: false } unready)
+        {
+            throw new TimeoutException(Refusals.StillLoading(ServerLimit, unready.State));
+        }
+        if (!settled && (reloading ?? (Session.CSharp?.AwaitsRestore(path) == true ? $"the C# language server to restore {Session.ProjectOf(path)?.Name}" : null)) is { } coming)
+        {
+            throw new TimeoutException(Refusals.StillComing(ServerLimit, coming));
+        }
     }
 
     /// <summary><see cref="Code"/>, or a source generator's code copied, as the document the server has now and only asked
@@ -2894,7 +3685,7 @@ public sealed partial class PassengerTools(MainWindow window, AgentConnection? c
         }
         OpenDocument copy = await DocumentAsync(path, cancel);
         await When(() => Session.CSharp is not { } csharp || csharp.IsReady || csharp.IsStopped, ServerLimit, cancel, ServerState());
-        (LspDocument? lsp, string? why) = Session.CSharp is { } service ? await service.Generated.AskableAsync(copy, cancel) : (null, Refusals.NoCSharp);
+        (LspDocument? lsp, string? why) = Session.CSharp is { } service ? await service.Generated.AskableAsync(copy, cancel) : (null, Session.WhyNoCSharp);
         return lsp is null ? throw new InvalidOperationException(why) : (copy, lsp);
     }
 
@@ -2998,7 +3789,7 @@ public sealed partial class PassengerTools(MainWindow window, AgentConnection? c
     /// worked out as it opened (the C# server's diagnostics, a linter's findings, a compose file's names).</summary>
     public const int FilesKept = 4;
 
-    private readonly KeptFiles kept = KeptFiles.For(connection);
+    private readonly KeptFiles kept = KeptFiles.For(window, connection);
 
     /// <summary>The files an agent's session asked about last, held open after their calls: at most <see cref="FilesKept"/>,
     /// the least recently asked let go first, every one once its calls pause for <see cref="Idle"/> or the agent goes. Its
@@ -3015,32 +3806,40 @@ public sealed partial class PassengerTools(MainWindow window, AgentConnection? c
         {
             later?.Cancel();
             CancellationTokenSource waiting = later = new();
-            // Unheld: what settles on an agent's call waits for what the call did, never for files kept for its next one.
-            IdeErrors.Observe(BackgroundWork.Unheld(async () =>
+            Task idle;
+            // Started apart from the call that kept the files, whose flow would carry its files, editors and window along.
+            using (ExecutionContext.SuppressFlow())
             {
-                try
+                // Unheld: what settles on an agent's call waits for what the call did, never for files kept for its next one.
+                idle = BackgroundWork.Unheld(async () =>
                 {
-                    await Task.Delay(Idle, waiting.Token);
-                }
-                catch (OperationCanceledException)
-                {
-                    return;
-                }
-                UiThread.Post(() =>
-                {
-                    if (later == waiting)
+                    try
                     {
-                        LetGo();
+                        await Task.Delay(Idle, waiting.Token);
                     }
+                    catch (OperationCanceledException)
+                    {
+                        return;
+                    }
+                    UiThread.Post(() =>
+                    {
+                        if (later == waiting)
+                        {
+                            LetGo();
+                        }
+                    });
                 });
-            }));
+            }
+            IdeErrors.Observe(idle);
         }
 
-        /// <summary>The kept files of an agent's session, let go when its agent goes.</summary>
-        public static KeptFiles For(AgentConnection? connection)
+        /// <summary>The kept files of an agent's session in a window, let go when its agent goes or its window closes.</summary>
+        public static KeptFiles For(MainWindow window, AgentConnection? connection)
         {
             KeptFiles files = new();
             connection?.WhenLeft(files.LetGo);
+            // Its files and its idle wait are the window's: a closed window's would be kept until the wait ended.
+            window.Closed += (_, _) => files.LetGo();
             return files;
         }
 
@@ -3146,16 +3945,75 @@ public sealed partial class PassengerTools(MainWindow window, AgentConnection? c
                 }
                 // Gone or refused since the language server read it: its places are still places, without their text.
                 TextPosition at = place.Server ? ServerPlaces.PositionOf(text, place.At) : new TextPosition(place.At.Line, place.At.Character);
-                string line = text is not null && at.Line < text.LineCount ? text.GetLineText(at.Line).Trim() : string.Empty;
+                string line = text is not null && at.Line < text.LineCount ? AgentAnswers.Line(text.GetLineText(at.Line), at.Column + 1) : string.Empty;
                 return new Place(Relative(folder, path), at.Line + 1, at.Column + 1, line);
             })];
         }, cancel);
     }
 
+    /// <summary>What an answer's entry takes of <see cref="AgentAnswers.MostCharacters"/>: its JSON as the answer writes it.</summary>
+    private static int Size<T>(T entry) => System.Text.Json.JsonSerializer.Serialize(entry, McpHost.AnswerJson).Length;
+
+    /// <summary>What of <see cref="AgentAnswers.MostCharacters"/> an answer's list may take: the rest is kept for what the
+    /// answer says beside it (<paramref name="beside"/>'s JSON) and the words saying what it left out.</summary>
+    private static int Room<T>(T beside) => AgentAnswers.MostCharacters - Size(beside) - WordsRoom;
+
+    /// <summary>The room kept for an answer's words of what it left out and how to read it.</summary>
+    private const int WordsRoom = 1_000;
+
+    /// <summary>A list's answer held within <see cref="AgentAnswers.MostCharacters"/>: its first entries as JSON and, where it
+    /// left some out, after them the words saying how many (<paramref name="noun"/>) and how to read them
+    /// (<paramref name="how"/>); <paramref name="beyond"/> more found past the entries (an agent's limit) are said as left
+    /// out too, read as <paramref name="beyondHow"/> says where the limit alone cut them. Where the size cut them, words of
+    /// the last entry kept (<paramref name="readOn"/>) come before <paramref name="how"/>.</summary>
+    private static CallToolResult Held<T>(IReadOnlyList<T> entries, string noun, string how, int beyond = 0, string? beyondHow = null, Func<T, string>? readOn = null)
+    {
+        int kept = AgentAnswers.Fitting(entries, Size, AgentAnswers.MostCharacters - WordsRoom);
+        int left = entries.Count - kept + beyond;
+        string said = kept == entries.Count && beyondHow is not null ? beyondHow
+            : kept < entries.Count && kept > 0 && readOn is not null ? $"{readOn(entries[kept - 1])}; {how}"
+            : how;
+        return Listed(kept == entries.Count ? entries : [.. entries.Take(kept)], left == 0 ? null : AgentAnswers.More(left, noun, said));
+    }
+
+    /// <summary>A text cut, where its JSON runs past <paramref name="room"/> characters, to a part whose JSON does not.</summary>
+    private static string JsonWithin(string text, int room)
+    {
+        string cut = text;
+        for (int length = room; Size(cut) > room; length /= 2)
+        {
+            cut = AgentAnswers.Cut(text, length);
+        }
+        return cut;
+    }
+
+    /// <summary>A list's answer: its entries as JSON and, after them, <paramref name="more"/>'s words where it has some.</summary>
+    private static CallToolResult Listed<T>(IReadOnlyList<T> kept, string? more)
+    {
+        TextContentBlock json = new() { Text = System.Text.Json.JsonSerializer.Serialize(kept, McpHost.AnswerJson) };
+        return new CallToolResult { Content = more is null ? [json] : [json, new TextContentBlock { Text = more }] };
+    }
+
+    /// <summary>A text answer's lines held within <see cref="AgentAnswers.MostCharacters"/>: its first lines, and after them
+    /// how many more it left out and how to read them (<paramref name="how"/>, given the first line left out, from 0); at
+    /// least the first line, cut where it alone runs past.</summary>
+    private static string HeldLines(IReadOnlyList<string> lines, string noun, Func<int, string> how)
+    {
+        int kept = AgentAnswers.LinesWithin(lines, AgentAnswers.MostCharacters - WordsRoom);
+        if (kept == lines.Count)
+        {
+            return string.Join('\n', lines);
+        }
+        string shown = kept > 0 ? string.Join('\n', lines.Take(kept)) : AgentAnswers.Cut(lines[0], AgentAnswers.MostCharacters - WordsRoom);
+        return $"{shown}\n{AgentAnswers.More(lines.Count - Math.Max(kept, 1), noun, how(Math.Max(kept, 1)))}";
+    }
+
     /// <summary>A diff's tab as the workspace names it: a diff of its file, never the file's own tab.</summary>
     private string DiffNamed(OpenDocument tab) => $"diff of {Relative(tab.Path)} ({tab.Diff!.Shown.Title})";
 
-    private Workspace Snapshot()
+    /// <summary>The workspace as it stands; with <paramref name="inside"/>, a folder or file, only the projects, run
+    /// configurations (by their projects' and files' places) and open files there.</summary>
+    private Workspace Snapshot(string? inside = null)
     {
         ProjectSession session = Session;
         OpenDocument? active = Editors.Active;
@@ -3164,27 +4022,70 @@ public sealed partial class PassengerTools(MainWindow window, AgentConnection? c
         return new Workspace(
             session.Folder,
             session.Workspace?.Filter?.Path ?? session.Solution?.Path,
-            [.. (session.Workspace?.Projects ?? []).Select(p => new ProjectInfo(p.Name, Relative(p.Path), p.OutputType, p.TargetFrameworks)
+            [.. (session.Workspace?.Projects ?? []).Where(p => Here(p.Path)).Select(p => new ProjectInfo(p.Name, Relative(p.Path), p.IsAndroidApp ? "Exe" : p.OutputType, p.TargetFrameworks)
             {
                 Unloaded = session.Unloaded.Contains(p.Path) ? true : null,
                 ChosenFramework = session.Frameworks.Of(p),
+            }), .. (session.Workspace?.SharedProjects ?? []).Where(Here).Select(p => new ProjectInfo(Path.GetFileNameWithoutExtension(p), Relative(p), null, [])
+            {
+                SharedBy = [.. ImportersOf(session, p)],
             })],
-            [.. session.Configurations.All.Select(c => c.Name)],
+            [.. session.Configurations.All.Where(c => inside is null || PlacesOf(c).Any(Here)).Select(c => c.Name)],
             session.Configurations.Chosen?.Name,
             session.CSharp is not { } csharp ? "none" : csharp.IsReady ? "ready" : csharp.State,
-            [.. Editors.Documents.Where(d => d.IsModified || Editors.HasTab(d) || !kept.Keeps(d)).Select(d => Relative(d.Path) + (d.IsModified ? " (unsaved)" : "")),
-                .. Editors.Diffs.Select(DiffNamed)],
+            [.. Editors.Documents.Where(d => (d.IsModified || Editors.HasTab(d) || !kept.Keeps(d)) && Here(d.Path)).Select(d => Relative(d.Path) + (d.IsModified ? " (unsaved)" : "")),
+                .. Editors.Diffs.Where(d => Here(d.Path)).Select(DiffNamed)],
             active is null ? null : $"{(active.Diff is null ? Relative(active.Path) : DiffNamed(active))}:{caret!.Value.Line + 1}:{caret.Value.Column + 1}",
             Session.Debug.Session?.State.ToString().ToLowerInvariant() ?? "not debugging")
         {
-            SdkMissing = window.DotnetWant is { Install: not null } wanted && Refusals.Dotnet(wanted, session.Folder) is { } lacking
-                ? window.AgentsOwn
-                    ? $"{lacking}. This Passenger, an agent's own, installs nothing: the person installs it with Install .NET SDK in the banner over their Passenger's window"
-                    : $"{lacking}. Install .NET SDK installs it: the person's, from the banner over Passenger's window, or an agent's ide_action {AppActions.InstallDotnetSdk}, which asks them first"
-                : session.Models.MissingSdk is { } missing ? Refusals.NoSdk(missing, session.Folder) : null,
+            SdkMissing = SdkMissingSaid(session),
+            Trust = session.Folder is null ? null : session.Trusted ? "trusted" : Refusals.Untrusted,
+            MobileNeeds = window.MobileWant.Said,
             UnreadSolution = session.Workspace?.Unread is { } unread ? UnreadSolutionSaid(unread) : null,
+            BuildConfiguration = session.BuildChoices.Chosen is not { } built ? null
+                : session.BuildChoices.Offered.Where(o => !o.Is(built)).Select(o => o.Key).ToList() is { Count: > 0 } others
+                    ? $"{built.Key} (ide_action {AppActions.ChooseBuildConfiguration} with input {Plural.Either(others)} switches it)"
+                    : built.Key,
+            MultiProject = session.Configurations.Profiles.Count > 0 || session.Configurations.ProfileProblems.Count > 0
+                ? [.. session.Configurations.Profiles.Select(p => $"{p.Name}: {string.Join(", ", p.Starts.Select(s => $"{Path.GetFileNameWithoutExtension(s.Project)} {s.Action?.ToString() ?? "(unknown action)"}"
+                    + (s.LaunchProfile.Length > 0 ? $" in {s.LaunchProfile}" : string.Empty)))}"),
+                    .. session.Configurations.ProfileProblems]
+                : null,
         };
+
+        bool Here(string path) => inside is null || PathNames.Within(path, inside);
     }
+
+    /// <summary>The files a run configuration starts from: its project's (a script's package.json), its Dockerfile, its
+    /// Compose files and the projects a multi-project one starts, each canonical as the window holds them.</summary>
+    private static IEnumerable<string> PlacesOf(RunConfiguration configuration) =>
+        new[] { configuration.Project, configuration.Dockerfile }.Concat(configuration.ComposeFiles).Concat(configuration.Starts.Select(s => s.Project))
+            .Where(place => place.Length > 0);
+
+    /// <summary>The projects importing a shared project's items, by name, as last evaluated.</summary>
+    private static IEnumerable<string> ImportersOf(ProjectSession session, string shared)
+    {
+        string items = SharedProjects.ItemsFileOf(shared);
+        return session.Projects.Where(p => p.Evaluated?.Inputs.Any(i => PathNames.Same(i.Path, items)) == true).Select(p => p.Name);
+    }
+
+    /// <summary>What .NET the machine or the folder lacks and how it is mended, as workspace says it; null lacking nothing.</summary>
+    private string? SdkMissingSaid(ProjectSession session) =>
+        window.DotnetWant is { Installs: not null } wanted && Refusals.Dotnet(wanted, session.Folder) is { } lacking
+            ? window.AgentsOwn
+                ? $"{lacking}. This Passenger, an agent's own, installs nothing: the person installs it with Install .NET SDK in the banner over their Passenger's window"
+                : $"{lacking}. Install .NET SDK installs it: the person's, from the banner over Passenger's window, or an agent's ide_action {AppActions.InstallDotnetSdk}, which asks them first"
+            : window.DotnetWant is { Lack: DotnetLack.OtherProcessor } or { Translated: true, Install: not null } && Refusals.Dotnet(window.DotnetWant, session.Folder) is { } loadsNone
+                ? $"{loadsNone}{(window.DotnetWant.Install is null ? string.Empty : $". {Refusals.InstallsOnlyNative}")}. "
+                    + $"The person downloads the Passenger built for this computer from {Updates.Releases.ThisSystemsDownload}"
+            : session.Models.MissingSdk is { } missing ? Refusals.NoSdk(missing, session.Folder) : null;
+
+    /// <summary>Why the folder's projects cannot load for the C# code tools to search: they have no .NET SDK to load with,
+    /// said as workspace says it; null while they have one, or the folder has no project.</summary>
+    private string? Unloadable() =>
+        Session is { Projects.Count: > 0 } session && (window.DotnetWant.NoSdkAtAll || session.Models.MissingSdk is not null) && SdkMissingSaid(session) is { } lacking
+            ? Refusals.ProjectsUnloadable(lacking)
+            : null;
 
     /// <summary>A solution that does not read as an agent is told it: its path, where its reader stopped as the editor
     /// counts the file's lines, and why.</summary>
@@ -3193,9 +4094,33 @@ public sealed partial class PassengerTools(MainWindow window, AgentConnection? c
             ? $"{Relative(unread.Path)}:{at.Line + 1}:{at.Column + 1}: {unread.Why}"
             : $"{Relative(unread.Path)}: {unread.Why}";
 
-    /// <summary>A path an agent gave, from the open folder unless rooted, as the IDE names it (in any letter case).</summary>
-    private string Resolve(string path) =>
-        PathNames.Canonical(Path.IsPathRooted(path) || Session.Folder is not { } folder ? path : Path.Combine(folder, path));
+    /// <summary>A path an agent gave (<see cref="Named"/>), refused in the one sentence where the agent may not read it, or
+    /// with <paramref name="changes"/> change it (<see cref="AgentReach"/>): every path a tool takes but those
+    /// <see cref="Named"/> lists. One it reads but never changes is read-only by where it lies (a package's, the SDK's, a
+    /// copy made to be read), whatever its path says.</summary>
+    private string Resolve(string path, bool changes = false)
+    {
+        string full = Named(path);
+        return Reaches(full, changes) ? full
+            : throw new InvalidOperationException(changes && Reaches(full, changes: false) ? $"{Refusals.ReadOnly(Relative(full))}, so nothing changed"
+                : Refusals.OutOfReach(full, Session.Folder, changes));
+    }
+
+    /// <summary>Whether the agent may read a file or folder (a canonical path), or with <paramref name="changes"/> change it,
+    /// as the window's folder and the folders its trusted solution reaches stand (<see cref="AgentReach"/>).</summary>
+    private bool Reaches(string full, bool changes) =>
+        changes ? AgentReach.Changes(full, Session.Folder, Session.Reached) : AgentReach.Reads(full, Session.Folder, Session.Reached);
+
+    /// <summary>A path an agent gave, from the open folder unless rooted, as the IDE names it (in any letter case), wherever
+    /// it is: taken so only by open for a folder or solution, the workspace the agent chooses, and as a place in a debugged
+    /// program's code, which may be built anywhere and none of whose text the debugger's tools answer. One whose asking would
+    /// reach another machine or open a device is refused unasked (<see cref="FoundPaths"/>).</summary>
+    private string Named(string path)
+    {
+        string given = Path.IsPathRooted(path) || Session.Folder is not { } folder ? path : Path.Combine(folder, path);
+        return FoundPaths.Askable(given, Session.Folder is { } open ? [open] : []) ? PathNames.Canonical(given)
+            : throw new InvalidOperationException(Refusals.NeverAsked(given));
+    }
 
     private string Relative(string path) => Relative(Session.Folder, path);
 
@@ -3203,8 +4128,12 @@ public sealed partial class PassengerTools(MainWindow window, AgentConnection? c
         ? Path.GetRelativePath(folder, path)
         : path;
 
-    /// <summary>The last lines of a terminal's scrollback and screen, as a program in it left them.</summary>
-    private static string Tail(global::Passenger.Terminal.TerminalSession terminal, int lines)
+    /// <summary>What a program, a terminal, a build or a container said, as an agent's answer carries it: its secrets masked by
+    /// the one rule (<see cref="global::Passenger.App.Containers.ContainerSecrets.InSaid"/>), the open folder's .env among those it knows.</summary>
+    private string Masked(string said) => global::Passenger.App.Containers.ContainerSecrets.InSaid(said, Session.Folder);
+
+    /// <summary>The last lines of a terminal's scrollback and screen, as a program in it left them, masked.</summary>
+    private string Tail(global::Passenger.Terminal.TerminalSession terminal, int lines)
     {
         global::Passenger.Terminal.TerminalScreen screen = terminal.Screen;
         List<string> all = [.. screen.Scrollback.Select(l => l.Text()).Concat(screen.Lines.Select(l => l.Text()))];
@@ -3212,17 +4141,17 @@ public sealed partial class PassengerTools(MainWindow window, AgentConnection? c
         {
             all.RemoveAt(all.Count - 1);
         }
-        return string.Join('\n', all.Skip(Math.Max(0, all.Count - lines)));
+        return Masked(string.Join('\n', all.Skip(Math.Max(0, all.Count - lines))));
     }
 
     /// <summary>The last lines of what Run's program wrote, where it runs: its tab of the terminal, else the Run console.</summary>
     private string RunOutput(int lines) => Session.RunProgram is TerminalRun terminal ? Tail(terminal.Session, lines) : Tail(Session.Runner.Shown(), lines);
 
-    /// <summary>A console's last lines.</summary>
-    private static string Tail(TextSnapshot text, int lines)
+    /// <summary>A console's last lines, masked.</summary>
+    private string Tail(TextSnapshot text, int lines)
     {
         int first = Math.Max(0, text.LineCount - lines);
-        return text.GetText(text.GetLineStart(first), text.Length - text.GetLineStart(first));
+        return Masked(text.GetText(text.GetLineStart(first), text.Length - text.GetLineStart(first)));
     }
 
     /// <summary>Waits on the UI thread, letting it run, until something holds, the time is up, or the agent no longer
@@ -3230,8 +4159,8 @@ public sealed partial class PassengerTools(MainWindow window, AgentConnection? c
     /// place saying why; everywhere else <see cref="When"/>.</summary>
     private static async Task Until(Func<bool> condition, TimeSpan limit, CancellationToken cancel)
     {
-        DateTime until = DateTime.UtcNow + limit;
-        while (!condition() && DateTime.UtcNow < until)
+        Deadline until = Deadline.In(limit);
+        while (!condition() && !until.Passed)
         {
             await Task.Delay(50, cancel);
         }
@@ -3317,8 +4246,25 @@ public sealed record Workspace(
     /// project's framework) and how the person mends it; null lacking nothing.</summary>
     public string? SdkMissing { get; init; }
 
+    /// <summary>Whether the folder is trusted, so Passenger runs its code ("trusted"), or why none of it runs; null with no
+    /// folder open.</summary>
+    public string? Trust { get; init; }
+
+    /// <summary>What the folder's mobile projects need that the machine lacks, and where they build if not on it, as the
+    /// banner over Passenger's window says it; null with nothing to say.</summary>
+    public string? MobileNeeds { get; init; }
+
     /// <summary>The container run under way, beside the AppHosts, its services as their resources are; null with none.</summary>
     public ContainerRunInfo? ContainerRun { get; init; }
+
+    /// <summary>The run configurations that start several projects, the solution's launch profiles, each with what it does
+    /// with each project (Start debugs it when debugged) and its launch profile, then why a file of them did not read; null
+    /// with none.</summary>
+    public IReadOnlyList<string>? MultiProject { get; init; }
+
+    /// <summary>The build configuration every build, run and test takes (Release|Any CPU), then the others the solution or
+    /// projects declare; null before they are read.</summary>
+    public string? BuildConfiguration { get; init; }
 
     /// <summary>The web projects' routes, when asked for.</summary>
     public IReadOnlyList<RouteInfo>? Routes { get; init; }
@@ -3326,13 +4272,19 @@ public sealed record Workspace(
     /// <summary>The solution the folder opens by that does not read ("path:line:column: why"), in whose place the projects
     /// under the folder are open; null with none.</summary>
     public string? UnreadSolution { get; init; }
+
+    /// <summary>How many projects the answer named alone or left out, and run configurations, open files and routes it left
+    /// out, and how to read them; null where it holds them all.</summary>
+    public string? More { get; init; }
 }
 
 /// <summary>A route as an agent reads it: its project, what declares it, its methods and template ("GET /todos/{id:int}"),
 /// its handler, its parameters ("id:int (route)"), where it is declared, and its body's type.</summary>
 public sealed record RouteInfo(string Project, string Kind, string Route, string Handler, IReadOnlyList<string> Parameters, string Path, int Line, string? Body);
 
-public sealed record ProjectInfo(string Name, string Path, string? OutputType, IReadOnlyList<string> TargetFrameworks)
+/// <summary>A project as workspace lists it: its output type as evaluated, but Exe for an Android app (a .NET MAUI app's
+/// Android build), which .NET for Android evaluates as Library though it runs.</summary>
+public sealed record ProjectInfo(string Name, string Path, string? OutputType, IReadOnlyList<string>? TargetFrameworks)
 {
     /// <summary>True for a project not loaded: one the solution filter opened leaves out, or one the person unloaded; null
     /// for one loaded, which the answer leaves unsaid.</summary>
@@ -3341,6 +4293,10 @@ public sealed record ProjectInfo(string Name, string Path, string? OutputType, I
     /// <summary>A multi-targeted project's framework chosen, which its XAML preview, its XAML and the language server's
     /// answers for its C# follow; null for a project of one.</summary>
     public string? ChosenFramework { get; init; }
+
+    /// <summary>For a shared project (.shproj), which builds nothing of its own, the projects importing its items and so
+    /// compiling its files; null for every other project.</summary>
+    public IReadOnlyList<string>? SharedBy { get; init; }
 }
 
 public sealed record Finding(string Severity, string? Code, string Message, string? Path, int Line, int Column);
@@ -3350,9 +4306,23 @@ public sealed record Place(string Path, int Line, int Column, string Text);
 /// <summary>usages' answer: the C# symbol the place took, as its card names it, how many places, each file's places as
 /// "line:column text", and what it went without (files the C# language server has yet to take in, a Godot project's scenes
 /// its build doesn't reach), when it did.</summary>
-public sealed record UsagesFound(string? Symbol, int Count, IReadOnlyList<FilePlaces> Files, string? Note = null);
+public sealed record UsagesFound(string? Symbol, int Count, IReadOnlyList<FilePlaces> Files, string? Note = null)
+{
+    /// <summary>How many places the answer only counted or left out, and how to read them.</summary>
+    public string? More { get; init; }
+}
 
-public sealed record FilePlaces(string Path, IReadOnlyList<string> Places);
+/// <summary>A file's places, as "line:column text"; null where the answer only counts them (<see cref="Count"/>).</summary>
+public sealed record FilePlaces(string Path, IReadOnlyList<string>? Places)
+{
+    /// <summary>How many places the file has, where the answer counts them rather than listing them.</summary>
+    public int? Count { get; init; }
+
+    /// <summary>True for a file of generated code, as Roslyn tells it (a source generator's, or one a tool wrote: a .g.cs,
+    /// a .designer.cs, one marked &lt;auto-generated&gt;), listed after the rest; null for one a person wrote, which the
+    /// answer leaves unsaid.</summary>
+    public bool? Generated { get; init; }
+}
 
 public sealed record HierarchyEntry(string? Name, string? Detail, string Path, int Line, int Column, string Text);
 
@@ -3360,6 +4330,9 @@ public sealed record HierarchyEntry(string? Name, string? Detail, string Path, i
 /// an agent acts on (output of build has them).</summary>
 public sealed record BuildResult(bool Succeeded, string Outcome, int Errors, int Warnings, IReadOnlyList<Finding> Problems, string? OutputTail)
 {
+    /// <summary>How many of its errors and warnings were left out, and how to read them.</summary>
+    public string? More { get; init; }
+
     /// <summary>The folder a publish landed in, once it did.</summary>
     public string? Folder { get; init; }
 
@@ -3424,9 +4397,36 @@ public sealed record DebugSnapshot(
     public IReadOnlyList<string>? Sessions { get; init; }
 }
 
-public sealed record TestRunInfo(string Summary, IReadOnlyList<TestFailure> Failures, DebugSnapshot? Debugger = null);
+public sealed record TestRunInfo(string Summary, IReadOnlyList<TestFailure> Failures, DebugSnapshot? Debugger = null)
+{
+    /// <summary>How many more failed tests were left out, and how to read them.</summary>
+    public string? More { get; init; }
 
-public sealed record TestFailure(string Test, string? Location, string Details);
+    /// <summary>What of the failed scenarios' steps an answer of many left out.</summary>
+    public string? StepsLeftOut { get; init; }
+}
+
+public sealed record TestFailure(string Test, string? Location, string Details)
+{
+    /// <summary>A failed Reqnroll or SpecFlow scenario's steps, as its run went.</summary>
+    public IReadOnlyList<StepInfo>? Steps { get; init; }
+}
+
+/// <summary>A scenario's step as its run went: its text with an example's values, place and outcome, the example row it ran for;
+/// for one that did not pass, the definition its text binds (path:line Type.Method), its arguments, what was said, and a
+/// failure's frames in the folder.</summary>
+public sealed record StepInfo(string Step, string Location, string Outcome)
+{
+    public string? Row { get; init; }
+
+    public string? Definition { get; init; }
+
+    public string? Arguments { get; init; }
+
+    public string? Message { get; init; }
+
+    public IReadOnlyList<string>? Frames { get; init; }
+}
 
 public sealed record TestInfoRow(string Test, string State, string? Location)
 {

@@ -49,7 +49,8 @@ public partial class MainWindow
                 // Done once dotnet watch has said what it made of the save; the status bar follows its later words.
                 IdeErrors.Observe(WorkingAsync(AppActions.ApplyHotReloadChanges, "Applying Hot Reload changes…", () => SaveForWatchAsync(TimeSpan.Zero)));
             }
-        }, _ => session.Debug.Running.Count > 0 || UnsavedGameScripts().Count > 0 ? null
+        }, _ => Untrusted() is { } untrusted ? untrusted
+            : session.Debug.Running.Count > 0 || UnsavedGameScripts().Count > 0 ? null
             : session.Debug.HotReload is not null || session.Debug.IsDebugging ? session.Debug.WhyNotApply()
             : buildRun.WatchesHotReload ? null
             : RunXamlEdited ? null
@@ -521,8 +522,8 @@ public partial class MainWindow
                 return false;
             }
         }
-        status.Text = "Restarting application to apply changes ...";
-        tab.Console.Append("Hot Reload: Restarting application to apply changes ...\n");
+        status.Text = "Restarting application to apply changes…";
+        tab.Console.Append("Hot Reload: Restarting application to apply changes…\n");
         if (tab.RestartFor is { } restart)
         {
             bool restarted = await restart(outcome);
@@ -542,7 +543,7 @@ public partial class MainWindow
         }
         // The restart's build took Problems to its own tab; the edits that needed the restart are what to see.
         Bottom.Problems.Shown = ProblemsTab.HotReload;
-        string said = $"Restarted in {took.Elapsed.TotalSeconds:0.0} s to apply changes: {outcome.Said}";
+        string said = $"Restarted in {Durations.Said(took.Elapsed)} to apply changes: {outcome.Said}";
         IdeLog.Write(IdeLog.Debugger, said);
         tab.Console.Append($"Hot Reload: {said}\n");
         // Each edit that needed it, in a compiler message's shape, at the compiler's line, which the console links to its line.

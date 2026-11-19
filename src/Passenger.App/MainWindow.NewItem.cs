@@ -1,4 +1,5 @@
 using Passenger.App.Editors;
+using Passenger.App.Explorer;
 using Passenger.App.Templates;
 using Passenger.Core;
 using Passenger.Text;
@@ -18,8 +19,8 @@ public partial class MainWindow
     {
         actions!.Add(new IdeAction(AppActions.NewItem, "New Item…", ExplorerGroup, c => IdeErrors.Observe(ShowNewItemAsync(NewItemPlace(c)!)))
         {
-            WhyNot = c => RowOf(c) is { } row ? NewGoesIn(row) is null ? $"Nothing new goes in {row.Name}" : null
-                : NewItemPlace(c) is null ? Refusals.NoFolder : null,
+            WhyNot = c => NewItemPlace(c) is { } place ? ExplorerNode.KeptOut(place)
+                : RowOf(c) is { } row ? $"Nothing new goes in {row.Name}" : Refusals.NoFolder,
             // Shown in the Explorer's menus, where it takes the keys.
             KeysOf = () => AppActions.KeysIn(AppActions.NewItem) is var keys && keys != AppActions.NewItem ? keys : null,
         });
@@ -66,8 +67,8 @@ public partial class MainWindow
     }
 
     /// <summary>What New Item made, one command Undo takes back whole: Passenger's own file written, or what dotnet new
-    /// wrote taken in (its files made, its folders made whole), then followed and opened, the first in front. Null once
-    /// added, else why not.</summary>
+    /// wrote taken in (its files made, its folders made whole, those in a shared project's folder written into its items
+    /// file), then followed and opened, the first in front. Null once added, else why not.</summary>
     private async Task<string?> AddItemAsync(MadeItem made)
     {
         List<string> files = [.. made.Files];
@@ -99,6 +100,10 @@ public partial class MainWindow
             if (made.Own is null)
             {
                 CameOrWent([.. made.Files, .. made.Folders]);
+            }
+            if (IntoShared(files, recording) is { } unshared)
+            {
+                status.Text = unshared;
             }
         }
         // Opened last first, so the first is in front.

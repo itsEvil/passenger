@@ -3,6 +3,7 @@ using Passenger.Core;
 using Passenger.Editor;
 using Passenger.Host;
 using Passenger.Packages;
+using Passenger.Text;
 using Passenger.Workspace;
 
 namespace Passenger.App.MSBuild;
@@ -27,6 +28,17 @@ public sealed class MSBuildService(Func<string?> folder, Func<WorkspaceModel?> w
 
     /// <summary>What the folder's audit feeds know of vulnerable packages, its session's packages'.</summary>
     public Func<Task<VulnerabilityData>>? Vulnerabilities { get; set; }
+
+    /// <summary>What a project (by path) gets only through the packages and projects it references, in the frameworks no
+    /// reference of its own stands for, as its restore resolved them, by package; its session's packages'.</summary>
+    public Func<string, Task<IReadOnlyDictionary<string, IReadOnlyList<TransitiveUse>>>>? Brought { get; set; }
+
+    /// <summary>Reads whether package versions are deprecated, its session's packages': ended once each is known, or its
+    /// feeds did not answer.</summary>
+    public Func<IReadOnlyCollection<(string Id, string Version)>, Task>? ReadDeprecations { get; set; }
+
+    /// <summary>A package version's deprecation as read, its session's packages'; null where none is known.</summary>
+    public Func<string, string, Deprecation?>? Deprecated { get; set; }
 
     /// <summary>Something to say in the status bar: why a project could not be evaluated, or a feed did not answer.</summary>
     public event EventHandler<string>? Message;
@@ -79,6 +91,17 @@ public sealed class MSBuildService(Func<string?> folder, Func<WorkspaceModel?> w
         }
     }
 
+    /// <summary>Restores written (each project's project.assets.json, canonical): an open project file whose restore one is is
+    /// evaluated again, so its marks of the vulnerable versions it gets through others follow what the restore resolved.</summary>
+    public void Restored(IReadOnlySet<string> assets)
+    {
+        UiThread.Check();
+        foreach (MSBuildDocument document in documents.Values.Where(d => d.Restores(assets)).ToList())
+        {
+            document.Again();
+        }
+    }
+
     /// <summary>The workspace's projects were evaluated: an open file that had no project to be evaluated through may now.</summary>
     public void ProjectsEvaluated()
     {
@@ -91,7 +114,7 @@ public sealed class MSBuildService(Func<string?> folder, Func<WorkspaceModel?> w
 
     /// <summary>A project's evaluation landed for one of its files: the project's other open files take it up too, without
     /// asking for it again.</summary>
-    internal void Inspected(MSBuildDocument from, MSBuildInsight insight, IReadOnlyDictionary<string, string> texts)
+    internal void Inspected(MSBuildDocument from, MSBuildInsight insight, IReadOnlyDictionary<string, TextSnapshot> texts)
     {
         foreach (MSBuildDocument other in documents.Values.Where(d => d != from && d.Project is { } own && PathNames.Same(own, insight.Project)).ToList())
         {
@@ -101,9 +124,14 @@ public sealed class MSBuildService(Func<string?> folder, Func<WorkspaceModel?> w
 
     /// <summary>The project a file is evaluated through: a project itself; else the workspace's project whose evaluation
     /// imported it, the nearest; a Directory.*.props or .targets the nearest project under its folder; else the project Go
-    /// to Declaration came from into it; null for none.</summary>
+    /// to Declaration came from into it; null for none, and for a Docker Compose project (.dcproj), whose SDK is Visual
+    /// Studio's alone, so an evaluation could only fail on it.</summary>
     public string? ProjectFor(string path)
     {
+        if (WorkspaceModel.IsComposeProject(path))
+        {
+            return null;
+        }
         if (WorkspaceModel.IsProjectFile(path))
         {
             return path;
@@ -134,13 +162,28 @@ public sealed class MSBuildService(Func<string?> folder, Func<WorkspaceModel?> w
         }
     }
 
-    /// <summary>The open MSBuild files whose text differs from the disk's, which an evaluation reads in its place.</summary>
-    internal Dictionary<string, string> Texts()
+    /// <summary>The open MSBuild files whose text differs from the disk's, which an evaluation reads in its place: their
+    /// snapshots, made into text on the evaluation's worker (<see cref="TextsOf"/>), never on the window's thread.</summary>
+    internal Dictionary<string, TextSnapshot> Texts()
     {
-        Dictionary<string, string> texts = new(StringComparer.Ordinal);
-        foreach (OpenDocument document in documents.Keys.Where(d => d.IsModified))
+        Dictionary<string, TextSnapshot> texts = new(StringComparer.Ordinal);
+        foreach (OpenDocument document in documents.Keys)
         {
-            texts[document.Path] = document.Text.Snapshot.ToString();
+            if (document.IsModified)
+            {
+                texts[document.Path] = document.Text.Snapshot;
+            }
+        }
+        return texts;
+    }
+
+    /// <summary>The text of each snapshot <see cref="Texts"/> took, as the project host reads it; off the window's thread.</summary>
+    internal static Dictionary<string, string> TextsOf(IReadOnlyDictionary<string, TextSnapshot> snapshots)
+    {
+        Dictionary<string, string> texts = new(snapshots.Count, StringComparer.Ordinal);
+        foreach ((string path, TextSnapshot snapshot) in snapshots)
+        {
+            texts[path] = snapshot.ToString();
         }
         return texts;
     }
@@ -148,8 +191,8 @@ public sealed class MSBuildService(Func<string?> folder, Func<WorkspaceModel?> w
     /// <summary>The global properties a build of the solution gives its projects.</summary>
     internal Dictionary<string, string> Properties() => workspace() is { } open ? ProjectModels.Properties(open) : [];
 
-    /// <summary>The project host for the folder's SDK; null with no folder.</summary>
-    internal async Task<ProjectHost?> HostAsync() => folder() is { } open ? await BackgroundWork.Run(() => ProjectHosts.ForAsync(open)) : null;
+    /// <summary>The project host for the folder's SDK; null with no folder, or one not trusted.</summary>
+    internal async Task<ProjectHost?> HostAsync() => folder() is { } open && WorkspaceTrust.Trusts(open) ? await BackgroundWork.Run(() => ProjectHosts.ForAsync(open)) : null;
 
     /// <summary>The SDKs the host's .NET SDK carries (its Sdks folder's), read once.</summary>
     internal Task<IReadOnlyList<string>> SdksAsync() => sdks ??= ReadSdksAsync();
@@ -186,6 +229,24 @@ public sealed class MSBuildService(Func<string?> folder, Func<WorkspaceModel?> w
         catch (Exception failed) when (FeedSet.IsFeedFailure(failed))
         {
             return VulnerabilityData.None;
+        }
+    }
+
+    /// <summary>Reads whether the package versions are deprecated, those not read yet: done at once when all are, and
+    /// without a word when nothing can say.</summary>
+    internal async Task DeprecationsAsync(IReadOnlyCollection<(string Id, string Version)> wanted)
+    {
+        if (ReadDeprecations is not { } read || wanted.Count == 0)
+        {
+            return;
+        }
+        try
+        {
+            await read(wanted);
+        }
+        catch (Exception failed) when (FeedSet.IsFeedFailure(failed))
+        {
+            // The sources did not read: no version is marked deprecated until they do.
         }
     }
 

@@ -55,7 +55,7 @@ public sealed class AspireRunResources : IExtensionWorkspaceMessageHandler<Aspir
 public sealed class ConnectionReads : IExtensionWorkspaceMessageHandler<ConnectionReadsRequest, ConnectionReadsFound>
 {
     public Task<ConnectionReadsFound> ExecuteAsync(ConnectionReadsRequest message, ExtensionWorkspaceMessageContext context, CancellationToken cancellationToken) =>
-        AspireSource.ConnectionReadsAsync(context.Solution, message.Projects, cancellationToken, message.Keys);
+        AspireSource.ConnectionReadsAsync(context.Solution, message.Projects, cancellationToken, message.Keys, message.File);
 }
 
 internal static class AspireSource
@@ -92,35 +92,12 @@ internal static class AspireSource
             string hash = TextHash.Of(text.ToString());
             foreach (InvocationExpressionSyntax added in root.DescendantNodes().OfType<InvocationExpressionSyntax>())
             {
-                if (model.GetSymbolInfo(added, cancel).Symbol is not IMethodSymbol method || method.Name != "AddProject"
-                    || method.ContainingType.ToDisplayString() != "Aspire.Hosting.ProjectResourceBuilderExtensions"
-                    || method.ContainingAssembly.Name != "Aspire.Hosting")
+                if (AspireServices.CalledAs(added) is null || model.GetSymbolInfo(added, cancel).Symbol is not IMethodSymbol method
+                    || await ServiceAsync(added, method, model, project.FilePath, cancel).ConfigureAwait(false) is not ({ } name, { } projectPath))
                 {
                     continue;
                 }
-                string? name = null;
-                string? projectPath = null;
-                foreach (ArgumentSyntax argument in added.ArgumentList.Arguments)
-                {
-                    string? parameter = AspireProjectDeclaration.Parameter(method, added, argument)?.Name;
-                    if (Constant(argument.Expression, model, cancel) is not { } value)
-                    {
-                        continue;
-                    }
-                    if (parameter == "name")
-                    {
-                        name = value;
-                    }
-                    else if (parameter == "projectPath")
-                    {
-                        projectPath = ResolvePath(value, AppHostDirectory(model.Compilation) ?? Path.GetDirectoryName(project.FilePath));
-                    }
-                }
-                if (method.TypeArguments is [INamedTypeSymbol projectType])
-                {
-                    projectPath = await AspireProjectDeclaration.MetadataPathAsync(projectType, model.Compilation, cancel).ConfigureAwait(false);
-                }
-                if (!string.IsNullOrWhiteSpace(name) && projectPath is not null)
+                if (!string.IsNullOrWhiteSpace(name))
                 {
                     resources.Add(new(name, projectPath, document.FilePath, PlaceAt(text, added.SpanStart), hash));
                 }
@@ -361,20 +338,9 @@ internal static class AspireSource
                 return null;
             }
             string? projectPath = null;
-            if (method.ContainingType.ToDisplayString() == "Aspire.Hosting.ProjectResourceBuilderExtensions" && method.Name == "AddProject")
+            if (AspireServices.Of(method) is not null)
             {
-                if (method.TypeArguments is [INamedTypeSymbol metadata])
-                {
-                    projectPath = await AspireProjectDeclaration.MetadataPathAsync(metadata, model.Compilation, cancel).ConfigureAwait(false);
-                }
-                else
-                {
-                    ArgumentSyntax? pathArgument = add.ArgumentList.Arguments.FirstOrDefault(a => AspireProjectDeclaration.Parameter(method, add, a)?.Name == "projectPath");
-                    if (pathArgument is not null && Constant(pathArgument.Expression, model, cancel) is { } path)
-                    {
-                        projectPath = ResolvePath(path, AppHostDirectory(model.Compilation));
-                    }
-                }
+                projectPath = (await ServiceAsync(add, method, model, document.Project.FilePath, cancel).ConfigureAwait(false))?.Project;
                 if (projectPath is null)
                 {
                     return null;
@@ -525,13 +491,15 @@ internal static class AspireSource
     }
 
     /// <summary>The connection strings a document's code reads, each where its name is written: the constant argument of
-    /// GetConnectionString or of a client integration's connectionName, and a <c>ConnectionStrings:</c> key in a string.</summary>
+    /// GetConnectionString or of a client integration's connectionName, and a <c>ConnectionStrings:</c> key in a string. Only
+    /// a call by one of their names the compilation can call (<see cref="NamesConnections"/>) is bound.</summary>
     private static IEnumerable<Use> ConnectionUses(SyntaxNode root, SemanticModel model, CancellationToken cancel)
     {
         HashSet<ExpressionSyntax> named = [];
+        (bool extensions, bool integrations) = Connecting(model.Compilation);
         foreach (InvocationExpressionSyntax call in root.DescendantNodes().OfType<InvocationExpressionSyntax>())
         {
-            if (model.GetSymbolInfo(call, cancel).Symbol is not IMethodSymbol method)
+            if (!NamesConnections(CalledBy(call), extensions, integrations) || model.GetSymbolInfo(call, cancel).Symbol is not IMethodSymbol method)
             {
                 continue;
             }
@@ -559,64 +527,71 @@ internal static class AspireSource
     private static bool MayReadConnections(SyntaxNode root) =>
         root.DescendantNodes().Any(node => node switch
         {
-            InvocationExpressionSyntax call => (call.Expression switch
-            {
-                MemberAccessExpressionSyntax member => member.Name.Identifier.ValueText,
-                SimpleNameSyntax simple => simple.Identifier.ValueText,
-                _ => string.Empty,
-            }) is "GetConnectionString" or ['A', 'd', 'd', ..],
+            InvocationExpressionSyntax call => NamesConnections(NameOf(call.Expression), true, true),
             LiteralExpressionSyntax literal => literal.IsKind(SyntaxKind.StringLiteralExpression)
                 && literal.Token.ValueText.StartsWith("ConnectionStrings:", StringComparison.OrdinalIgnoreCase),
             _ => false,
         });
 
-    /// <summary>What each project's code read, by its version: a project's documents are read again only once one of them,
-    /// or a project it references, has changed. The connection strings and the configuration keys come of one walk.</summary>
-    private static readonly System.Collections.Concurrent.ConcurrentDictionary<ProjectId, (VersionStamp Version, IReadOnlyList<ConnectionRead> Reads, IReadOnlyList<ConfigurationKey> Keys)> ConnectionsRead = new();
+    /// <summary>Whether a call by this name can name a connection string (<see cref="NamesConnection"/>): GetConnectionString,
+    /// where its class is there to call, or an Add method of a longer name (every client integration's that takes a
+    /// connectionName: AddRedisClient, never a collection's Add) where a client integration's assembly is.</summary>
+    private static bool NamesConnections(string? name, bool extensions, bool integrations) =>
+        name == "GetConnectionString" ? extensions : integrations && name is ['A', 'd', 'd', _, ..];
+
+    /// <summary>What a compilation can call that names a connection string: GetConnectionString's class, and a client
+    /// integration's assembly, referenced or its own.</summary>
+    private static (bool Extensions, bool Integrations) Connecting(Compilation compilation) =>
+        (!compilation.GetTypesByMetadataName("Microsoft.Extensions.Configuration.ConfigurationExtensions").IsEmpty,
+            compilation.ReferencedAssemblyNames.Append(compilation.Assembly.Identity).Any(assembly => ClientIntegration(assembly.Name)));
+
+    /// <summary>Whether an assembly is an Aspire client integration's, not the AppHost's.</summary>
+    private static bool ClientIntegration(string assembly) =>
+        assembly.StartsWith("Aspire.", StringComparison.Ordinal) && !assembly.StartsWith("Aspire.Hosting", StringComparison.Ordinal);
+
+    /// <summary>What each project's code read, by its version: a project's documents are looked at again only once one of
+    /// them, or a project it references, has changed. The connection strings and the configuration keys come of one walk.</summary>
+    private static readonly SolutionKept<ProjectId, (VersionStamp Version, IReadOnlyList<ConnectionRead> Reads, IReadOnlyList<ConfigurationKey> Keys)> ConnectionsRead =
+        SolutionKept.ByProject<(VersionStamp, IReadOnlyList<ConnectionRead>, IReadOnlyList<ConfigurationKey>)>();
+
+    /// <summary>What each document's code read, so an edit reads again only what it can change.</summary>
+    private static readonly DocumentReadsKept<(IReadOnlyList<ConnectionRead> Reads, IReadOnlyList<ConfigurationKey> Keys)> DocumentsRead = new();
 
     /// <summary>The connection strings the projects' code reads (<see cref="ConnectionUses"/>), each where its name is
     /// written, and with <see cref="ConnectionReadsRequest.Keys"/> the configuration keys it reads or binds
-    /// (<see cref="ConfigurationSource"/>): every target framework's build of a project, each read once.</summary>
-    public static async Task<ConnectionReadsFound> ConnectionReadsAsync(Solution solution, IReadOnlyList<string> projects, CancellationToken cancel, bool keys = false)
+    /// (<see cref="ConfigurationSource"/>): every target framework's build of a project, each read once. With
+    /// <paramref name="file"/>, only that file's code.</summary>
+    public static async Task<ConnectionReadsFound> ConnectionReadsAsync(Solution solution, IReadOnlyList<string> projects, CancellationToken cancel, bool keys = false,
+        string? file = null)
     {
         List<ConnectionRead> reads = [];
         List<ConfigurationKey> configured = [];
+        ConnectionsRead.LetGoOfGone(solution);
+        System.Collections.Concurrent.ConcurrentDictionary<ProjectId, (VersionStamp Version, IReadOnlyList<ConnectionRead> Reads, IReadOnlyList<ConfigurationKey> Keys)> read =
+            ConnectionsRead.Of(solution);
         foreach (string path in projects)
         {
             HashSet<(string Name, string File, int Line, int Character)> seen = [];
             HashSet<(string Key, string Kind, string? File, int Line, int Character)> keyed = [];
             foreach (Project project in solution.Projects.Where(p => SamePath(p.FilePath, path)))
             {
-                VersionStamp version = await project.GetDependentVersionAsync(cancel).ConfigureAwait(false);
-                if (!ConnectionsRead.TryGetValue(project.Id, out (VersionStamp Version, IReadOnlyList<ConnectionRead> Reads, IReadOnlyList<ConfigurationKey> Keys) known) || known.Version != version)
+                (IReadOnlyList<ConnectionRead> Reads, IReadOnlyList<ConfigurationKey> Keys) known;
+                if (file is not null)
                 {
-                    List<ConnectionRead> found = [];
-                    List<ConfigurationKey> named = [];
-                    foreach (Document document in project.Documents.Where(d => d.FilePath is not null))
+                    known = await ReadAsync(path, project, DocumentIdsOf(solution, file).Where(id => id.ProjectId == project.Id).Select(project.GetDocument)
+                        .OfType<Document>(), cancel).ConfigureAwait(false);
+                }
+                else
+                {
+                    VersionStamp version = await project.GetDependentVersionAsync(cancel).ConfigureAwait(false);
+                    if (!read.TryGetValue(project.Id, out (VersionStamp Version, IReadOnlyList<ConnectionRead> Reads, IReadOnlyList<ConfigurationKey> Keys) kept) || kept.Version != version)
                     {
-                        if (await document.GetSyntaxRootAsync(cancel).ConfigureAwait(false) is not { } root)
-                        {
-                            continue;
-                        }
-                        bool connections = MayReadConnections(root);
-                        bool configuration = ConfigurationSource.MayRead(root);
-                        if (!connections && !configuration || await document.GetSemanticModelAsync(cancel).ConfigureAwait(false) is not { } model)
-                        {
-                            continue;
-                        }
-                        SourceText text = await document.GetTextAsync(cancel).ConfigureAwait(false);
-                        if (connections)
-                        {
-                            found.AddRange(ConnectionUses(root, model, cancel).Select(use =>
-                                new ConnectionRead(path, use.Name, document.FilePath!, PlaceAt(text, use.Expression.SpanStart), PlaceAt(text, use.Expression.Span.End))));
-                        }
-                        if (configuration)
-                        {
-                            named.AddRange(ConfigurationSource.Read(path, document.FilePath!, root, model, text, cancel));
-                        }
+                        (IReadOnlyList<ConnectionRead> found, IReadOnlyList<ConfigurationKey> named) =
+                            await ReadAsync(path, project, project.Documents.Where(d => d.FilePath is not null), cancel).ConfigureAwait(false);
+                        kept = (version, found, named);
+                        read[project.Id] = kept;
                     }
-                    known = (version, found, named);
-                    ConnectionsRead[project.Id] = known;
+                    known = (kept.Reads, kept.Keys);
                 }
                 reads.AddRange(known.Reads.Where(r => seen.Add((r.Name, r.Path, r.At.Line, r.At.Character))).Select(r => r with { Project = path }));
                 if (keys)
@@ -628,13 +603,50 @@ internal static class AspireSource
         return new ConnectionReadsFound(reads, keys ? configured : null);
     }
 
+    /// <summary>The connection strings and configuration keys the documents of <paramref name="project"/> (the one at
+    /// <paramref name="path"/>) read, each document's kept while what it was read from stands (<see cref="DocumentReadsKept{T}"/>).</summary>
+    private static async Task<(IReadOnlyList<ConnectionRead> Reads, IReadOnlyList<ConfigurationKey> Keys)> ReadAsync(string path, Project project,
+        IEnumerable<Document> documents, CancellationToken cancel)
+    {
+        IReadOnlyList<(IReadOnlyList<ConnectionRead> Reads, IReadOnlyList<ConfigurationKey> Keys)> each =
+            await DocumentsRead.OfAsync(project, documents, (document, stop) => ReadAsync(path, document, stop), cancel).ConfigureAwait(false);
+        return ([.. each.SelectMany(e => e.Reads)], [.. each.SelectMany(e => e.Keys)]);
+    }
+
+    /// <summary>The connection strings and configuration keys a document's code reads, of the project at
+    /// <paramref name="path"/>: a document whose syntax can read neither is never bound.</summary>
+    private static async Task<DocumentReadsKept<(IReadOnlyList<ConnectionRead> Reads, IReadOnlyList<ConfigurationKey> Keys)>.Read> ReadAsync(string path,
+        Document document, CancellationToken cancel)
+    {
+        if (await document.GetSyntaxRootAsync(cancel).ConfigureAwait(false) is not { } root)
+        {
+            return new(([], []), false);
+        }
+        bool connections = MayReadConnections(root);
+        bool configuration = ConfigurationSource.MayRead(root);
+        if (!connections && !configuration)
+        {
+            return new(([], []), false);
+        }
+        if (await document.GetSemanticModelAsync(cancel).ConfigureAwait(false) is not { } model)
+        {
+            return new(([], []), true);
+        }
+        SourceText text = await document.GetTextAsync(cancel).ConfigureAwait(false);
+        IReadOnlyList<ConnectionRead> found = connections
+            ? [.. ConnectionUses(root, model, cancel).Select(use =>
+                new ConnectionRead(path, use.Name, document.FilePath!, PlaceAt(text, use.Expression.SpanStart), PlaceAt(text, use.Expression.Span.End)))]
+            : [];
+        IReadOnlyList<ConfigurationKey> named = configuration ? [.. ConfigurationSource.Read(path, document.FilePath!, root, model, text, cancel)] : [];
+        return new((found, named), true);
+    }
+
     /// <summary>Whether an argument is the name of a connection string a service reads: GetConnectionString's, or an Aspire
     /// client integration's connectionName (AddNpgsqlDataSource, AddRedisClient, AddSqlServerDbContext and the rest).</summary>
     private static bool NamesConnection(IMethodSymbol method, InvocationExpressionSyntax call, ArgumentSyntax argument) =>
         AspireProjectDeclaration.Parameter(method, call, argument)?.Name is { } parameter
         && (IsConnectionString(method) && parameter == "name"
-            || parameter == "connectionName" && method.ContainingAssembly.Name.StartsWith("Aspire.", StringComparison.Ordinal)
-                && !method.ContainingAssembly.Name.StartsWith("Aspire.Hosting", StringComparison.Ordinal));
+            || parameter == "connectionName" && ClientIntegration(method.ContainingAssembly.Name));
 
     private static bool IsConnectionString(IMethodSymbol method) => method.Name == "GetConnectionString"
         && method.ContainingType.ToDisplayString() == "Microsoft.Extensions.Configuration.ConfigurationExtensions"
@@ -665,29 +677,32 @@ internal static class AspireSource
         }
     }
 
-    private static string? ResolvePath(string path, string? directory)
+    /// <summary>The resource a call of Aspire's that adds a service names (<see cref="AspireServices"/>) and the project it adds,
+    /// by its Projects type or its path from the AppHost's folder (<paramref name="appHost"/>'s, its project's file), each as
+    /// the compilation knows it; null for another call.</summary>
+    internal static async Task<(string? Name, string? Project)?> ServiceAsync(InvocationExpressionSyntax call, IMethodSymbol method, SemanticModel model,
+        string? appHost, CancellationToken cancel)
     {
-        try
-        {
-            return Path.IsPathFullyQualified(path) ? Path.GetFullPath(path) : directory is null ? null : Path.GetFullPath(path, directory);
-        }
-        catch (ArgumentException)
+        if (AspireServices.Of(method) is not { } adding)
         {
             return null;
         }
-        catch (NotSupportedException)
-        {
-            return null;
-        }
+        AspireServices.Service service = AspireServices.Read(call, adding, argument => AspireProjectDeclaration.Parameter(method, call, argument)?.Name);
+        string? project = method.TypeArguments is [INamedTypeSymbol metadata]
+            ? await AspireProjectDeclaration.MetadataPathAsync(metadata, model.Compilation, cancel).ConfigureAwait(false)
+            : Constant(service.Path, model, cancel) is { } path ? AspireServices.ProjectOf(path, AppHostDirectory(model.Compilation, appHost)) : null;
+        return (Constant(service.Name, model, cancel), project);
     }
 
-    private static string? AppHostDirectory(Compilation compilation)
+    /// <summary>The AppHost's folder, its relative paths' start: as its build records it (Aspire's <c>apphostprojectpath</c>,
+    /// read in any letter case), else the folder of its project's file, <paramref name="project"/>.</summary>
+    internal static string? AppHostDirectory(Compilation compilation, string? project)
     {
         string[] directories = [.. compilation.Assembly.GetAttributes()
             .Where(a => a.AttributeClass?.ToDisplayString() == "System.Reflection.AssemblyMetadataAttribute")
-            .Where(a => a.ConstructorArguments is [{ Value: "AppHostProjectPath" }, { Value: string }])
+            .Where(a => a.ConstructorArguments is [{ Value: string key }, { Value: string }] && key.Equals("AppHostProjectPath", StringComparison.OrdinalIgnoreCase))
             .Select(a => (string)a.ConstructorArguments[1].Value!)];
-        return directories.Length == 1 ? directories[0] : null;
+        return directories.Length == 1 ? directories[0] : Path.GetDirectoryName(project);
     }
 
     /// <summary>A resource's name as a service writes it in a string: the name of a connection string it reads (an argument
@@ -909,11 +924,4 @@ internal static class AspireSource
         : name.Any(c => !char.IsAsciiLetterOrDigit(c) && c != '-') ? "A resource's name has only letters, digits and dashes"
         : name.EndsWith('-') || name.Contains("--", StringComparison.Ordinal) ? "A resource's name has no dash at its end and no two together"
         : null;
-
-    internal static async Task<string?> ProjectPathAsync(Document document, InvocationExpressionSyntax call, SemanticModel model, CancellationToken cancel)
-    {
-        SyntaxNode? root = await document.GetSyntaxRootAsync(cancel).ConfigureAwait(false);
-        Graph? graph = root is null ? null : await ReadGraphAsync(document, root, model, cancel).ConfigureAwait(false);
-        return graph?.Resources.SingleOrDefault(r => r.Declaration.Span.Contains(call.Span))?.ProjectPath;
-    }
 }

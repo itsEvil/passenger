@@ -11,6 +11,7 @@ using Passenger.App.ToolWindows;
 using Passenger.Core;
 using Passenger.Editor;
 using Passenger.Text;
+using Passenger.Workspace;
 
 namespace Passenger.Tests;
 
@@ -19,7 +20,8 @@ namespace Passenger.Tests;
 /// GetNode string offers the scene's nodes, and in a res:// string the project's files, which Go to Declaration opens;
 /// an exported property's card says what the scene sets it to; Rename on a node's name in a GetNode path renames it in the
 /// scene and in every path of the code, one step of Undo. Its project (Godot.NET.Sdk) is restored from the packages the
-/// Godot found carries, so without a Godot 4 .NET build each test skips saying why; no Godot runs.</summary>
+/// Godot found carries, so without a Godot 4 .NET build each test skips saying why; Godot runs only headless, to save a
+/// scene as bytes.</summary>
 public sealed class GodotSceneTests : IClassFixture<GodotSceneTests.Game>
 {
     private readonly Game game;
@@ -352,6 +354,64 @@ public sealed class GodotSceneTests : IClassFixture<GodotSceneTests.Game>
         }
     }
 
+    /// <summary>A line written above a node's path while Rename's box is open on it (by the file's other window, by an agent)
+    /// moves the name down: the rename finds the node where its name now is and renames it, rather than looking where the box
+    /// opened and refusing the file as changed.</summary>
+    [AvaloniaFact]
+    public void A_line_written_above_a_nodes_path_while_its_rename_box_is_open_still_renames_the_node()
+    {
+        MainWindow window = game.Open(ScriptPath);
+        try
+        {
+            Ui.WaitFor(() => Marked(window).Count > 0, "the scene's checks to be read");
+            CodeEditor editor = window.EditorArea.CodeEditor;
+            Ui.PlaceAfter(editor, "GetNode<Label>(\"Hud/Sc");
+            Ui.Run(window, AppActions.Rename);
+            Ui.WaitFor(() => window.Assist.Renaming == "Score", () => $"Rename's box on the node Score ({window.Assist.Renaming}; {window.Status})");
+            editor.ApplyEdits([new TextEdit(0, 0, "// Written while Rename's box was open.\n")]);
+            window.KeyTextInput("Points");
+            Ui.Press(window, "ENTER");
+            Ui.WaitFor(() => window.Status?.StartsWith("Renamed", StringComparison.Ordinal) == true || window.Status?.Contains("not renamed", StringComparison.Ordinal) == true,
+                () => $"the node's rename to be made or refused ({window.Status})");
+            Assert.StartsWith("Renamed Score to Points", window.Status, StringComparison.Ordinal);
+            Assert.Contains("[node name=\"Points\" type=\"Label\" parent=\"Hud\"]", File.ReadAllText(ScenePath), StringComparison.Ordinal);
+            Assert.Contains("GetNode<Label>(\"Hud/Points\")", editor.Document.Snapshot.ToString(), StringComparison.Ordinal);
+        }
+        finally
+        {
+            window.Close();
+        }
+    }
+
+    /// <summary>A line written above a node's name in its scene while Rename's box is open on it moves the name down: the rename
+    /// finds the node where its name now is and renames it, rather than looking where the box opened and refusing the scene as
+    /// changed.</summary>
+    [AvaloniaFact]
+    public void A_line_written_above_a_nodes_name_in_its_scene_while_its_rename_box_is_open_still_renames_the_node()
+    {
+        MainWindow window = game.Open(ScenePath);
+        try
+        {
+            CodeEditor editor = window.EditorArea.CodeEditor;
+            Ui.PlaceAfter(editor, "[node name=\"Sco");
+            Ui.Run(window, AppActions.Rename);
+            Ui.WaitFor(() => window.Assist.Renaming == "Score", () => $"Rename's box on the node Score ({window.Assist.Renaming}; {window.Status})");
+            int above = editor.Document.Snapshot.ToString().IndexOf("[ext_resource", StringComparison.Ordinal);
+            editor.ApplyEdits([new TextEdit(above, 0, "; Written while Rename's box was open.\n")]);
+            window.KeyTextInput("Points");
+            Ui.Press(window, "ENTER");
+            Ui.WaitFor(() => window.Status?.StartsWith("Renamed", StringComparison.Ordinal) == true || window.Status?.Contains("not renamed", StringComparison.Ordinal) == true,
+                () => $"the node's rename to be made or refused ({window.Status})");
+            Assert.StartsWith("Renamed Score to Points", window.Status, StringComparison.Ordinal);
+            Assert.Contains("[node name=\"Points\" type=\"Label\" parent=\"Hud\"]", editor.Document.Snapshot.ToString(), StringComparison.Ordinal);
+            Assert.Contains("GetNode<Label>(\"Hud/Points\")", File.ReadAllText(ScriptPath), StringComparison.Ordinal);
+        }
+        finally
+        {
+            window.Close();
+        }
+    }
+
     /// <summary>The scene's connection to a method Main lacks is an error on Main's name, and one whose signal gives an argument
     /// the handler does not take is one on the handler's, each naming the scene and its line; Find Usages of the handler lists
     /// the connection calling it, and Go to Declaration from that connection's method in the scene goes back to the handler, as
@@ -583,6 +643,72 @@ public sealed class GodotSceneTests : IClassFixture<GodotSceneTests.Game>
         }
     }
 
+    /// <summary>A Godot script that saves, compressed as Godot's editor saves a scene, a scene whose root keeps Main.cs, then quits.</summary>
+    private const string BinaryMaker = "extends SceneTree\n\n\nfunc _init() -> void:\n\tvar level := Node2D.new()\n\tlevel.name = \"Level\"\n"
+        + "\tlevel.set_meta(\"code\", load(\"res://Main.cs\"))\n\tvar scene := PackedScene.new()\n\tscene.pack(level)\n"
+        + "\tprint(\"saved level \", ResourceSaver.save(scene, \"res://level.scn\", ResourceSaver.FLAG_COMPRESS))\n\tlevel.free()\n\tquit()\n";
+
+    /// <summary>Rename of the script's class with its file moves the file, and what loads it follows within the rename's one
+    /// command, as a move in the Explorer has it follow: the text scene's path, the .uid beside it, and a scene Godot saved as
+    /// bytes, its path written anew with every other byte kept; one Undo puts every file back as it was.</summary>
+    [AvaloniaFact]
+    public void Renaming_a_scripts_class_moves_its_file_with_its_scenes_text_and_binary_and_its_uid_following()
+    {
+        string maker = TestFolders.Create("godot-binary-");
+        try
+        {
+            TestFolders.Write(maker, "project.godot", "; Engine configuration file.\nconfig_version=5\n\n[application]\n\nconfig/name=\"Maker\"\n");
+            TestFolders.Write(maker, "Main.cs", Script);
+            TestFolders.Write(maker, "Main.cs.uid", "uid://cmain1\n");
+            string script = TestFolders.Write(maker + "-home", "make.gd", BinaryMaker);
+            string made = GodotExplorerCopyTests.Run(game.Godot!, maker, maker + "-home", ["--script", script]) ?? string.Empty;
+            Assert.True(made.Contains("saved level 0", StringComparison.Ordinal), $"Godot saved no binary scene naming Main.cs:\n{made}");
+            File.Copy(Path.Combine(maker, "level.scn"), game.PathOf("level.scn"));
+        }
+        finally
+        {
+            TestFolders.Delete(maker);
+            TestFolders.Delete(maker + "-home");
+        }
+        string level = game.PathOf("level.scn");
+        byte[] saved = File.ReadAllBytes(level);
+        GodotBinaryResource original = GodotBinaryResource.Read(saved, out string? unread) ?? throw new Xunit.Sdk.XunitException($"Passenger can't read Godot's binary scene: {unread}");
+        Assert.True(saved.AsSpan().StartsWith("RSCC"u8) && original.Externals.Any(e => e.Path == "res://Main.cs"),
+            $"Godot's binary scene is not compressed or names no res://Main.cs: {string.Join(", ", original.Externals)}");
+        string hero = game.PathOf("Hero.cs");
+
+        MainWindow window = game.Open(ScriptPath);
+        try
+        {
+            Ui.WaitFor(() => Marked(window).Count > 0, "the scene's checks to be read");
+            CodeEditor editor = window.EditorArea.CodeEditor;
+            Ui.PlaceAfter(editor, "partial class Mai");
+            Ui.Run(window, AppActions.Rename);
+            Ui.WaitFor(() => window.Assist.Renaming == "Main", () => $"Rename's box on the script's class ({window.Assist.Renaming}; {window.Status})");
+            window.KeyTextInput("Hero");
+            Ui.Press(window, "ENTER");
+            IReadOnlyList<GodotBinaryExternal> named = [.. original.Externals.Select(e => e.Path == "res://Main.cs" ? e with { Path = "res://Hero.cs" } : e)];
+            Ui.WaitFor(() => File.Exists(hero) && GodotBinaryResource.Read(File.ReadAllBytes(level), out _)?.Externals.SequenceEqual(named) == true,
+                () => $"the binary scene to name the script where its rename moved it ({window.Status}): {string.Join(", ", GodotBinaryResource.Read(File.ReadAllBytes(level), out _)?.Externals ?? [])}",
+                TimeSpan.FromMinutes(1));
+            Assert.True(original.With(null, named).AsSpan().SequenceEqual(File.ReadAllBytes(level)), "The binary scene changed more than the script's path");
+            Assert.Equal(Scene.Replace("path=\"res://Main.cs\"", "path=\"res://Hero.cs\"", StringComparison.Ordinal), File.ReadAllText(ScenePath));
+            Assert.True(File.Exists(hero + ".uid") && !File.Exists(ScriptPath + ".uid") && !File.Exists(ScriptPath), "The script's .uid did not go with it to Hero.cs");
+            Assert.Equal("uid://cmain1", File.ReadAllText(hero + ".uid").Trim());
+
+            window.Confirm = (_, _, _) => Task.FromResult(true);
+            editor.Focus();
+            Ui.Run(window, EditorActions.Undo);
+            Ui.WaitFor(() => File.Exists(ScriptPath) && File.ReadAllBytes(level).AsSpan().SequenceEqual(saved) && File.ReadAllText(ScenePath) == Scene,
+                () => $"Undo to put the script, its scenes and its .uid back ({window.Status}): {File.ReadAllText(ScenePath)}");
+            Assert.True(File.Exists(ScriptPath + ".uid") && !File.Exists(hero) && !File.Exists(hero + ".uid"), "Undo left the script or its .uid where the rename moved them");
+        }
+        finally
+        {
+            window.Close();
+        }
+    }
+
     /// <summary>Context Help on Node2D's Position, which Main sets, browses the property's place on Node2D's page of Godot's
     /// class reference for the version of the Godot found; on Main's override of _Ready, Node's virtual _ready's place on
     /// Node's; on a signal Button's base class gives, its place there; on the project's own handler it says there is none.</summary>
@@ -748,6 +874,58 @@ public sealed class GodotSceneTests : IClassFixture<GodotSceneTests.Game>
         Ui.WaitFor(() => window.ExplorerView.Tree.Rows.Any(r => r.Path is { } row && PathNames.Same(row, shown)),
             () => $"the Explorer to show {Path.GetFileName(path)}: {string.Join(", ", window.ExplorerView.Tree.Rows.Select(r => r.Path))}");
         Ui.ClickRow(window, window.ExplorerView.Tree.Rows.First(r => r.Path is { } row && PathNames.Same(row, shown)));
+    }
+
+    /// <summary>A res:// string's list is made off the UI thread: the project's files made into items and the server's matched
+    /// against them there, so with 2,000 files more in the project the list costs the UI thread, from Complete to the list
+    /// open, what it did before them, counted rather than timed.</summary>
+    [AvaloniaFact]
+    public void A_res_paths_list_of_the_projects_files_is_made_off_the_UI_thread()
+    {
+        string crates = game.PathOf("crates");
+        MainWindow window = game.Open(ScriptPath);
+        try
+        {
+            long few = Listed();
+            Directory.CreateDirectory(crates);
+            for (int i = 0; i < 2_000; i++)
+            {
+                File.WriteAllText(Path.Combine(crates, $"crate{i:0000}.txt"), "crate\n");
+            }
+            string under = "crates" + Path.DirectorySeparatorChar;
+            Ui.WaitFor(() => window.FileIndex.Files.Count(f => f.StartsWith(under, StringComparison.Ordinal)) == 2_000,
+                () => $"the 2,000 files come to the folder's index, which lists {window.FileIndex.Files.Count(f => f.StartsWith(under, StringComparison.Ordinal))}");
+            long many = Listed();
+            TestContext.Current.TestOutputHelper?.WriteLine($"A res:// string's list opened with {few / 1024} KB on the UI thread; with 2,000 files more in the project, {many / 1024} KB");
+            // Less than the least object for each file more: whatever is made of a file is made off it.
+            Assert.True(many - few < 2_000 * 24L,
+                $"With 2,000 files more in the project a res:// string's list opened with {many / 1024} KB allocated on the UI thread, against {few / 1024} KB before them: "
+                + $"{(many - few) / 2_000} bytes for each file more, so its files were made into items or matched there");
+        }
+        finally
+        {
+            window.Close();
+            Directory.Delete(crates, recursive: true);
+        }
+
+        // The least the UI thread allocates from Complete in a res:// string to its list open.
+        long Listed()
+        {
+            CodeEditor editor = window.EditorArea.CodeEditor;
+            long least = long.MaxValue;
+            for (int round = 0; round < 3; round++)
+            {
+                Ui.PlaceAfter(editor, "GD.Load<PackedScene>(\"res://");
+                long before = GC.GetAllocatedBytesForCurrentThread();
+                Ui.Run(window, AppActions.Complete, settle: false);
+                Ui.Pumped(() => window.Assist.CompletionNarrowedBy == "res://" && window.Assist.CompletionLabels.Contains("res://player.tscn"), TimeSpan.FromSeconds(60));
+                least = Math.Min(least, GC.GetAllocatedBytesForCurrentThread() - before);
+                Assert.True(window.Assist.CompletionNarrowedBy == "res://" && window.Assist.CompletionLabels.Contains("res://player.tscn"),
+                    $"Complete in a res:// string offers {string.Join(", ", window.Assist.CompletionLabels.Take(5))}, not the project's files");
+                Ui.Press(window, "ESCAPE");
+            }
+            return least;
+        }
     }
 
     /// <summary>A res:// string in a scene completes from the project's files as its "res://" is typed, the scene itself and

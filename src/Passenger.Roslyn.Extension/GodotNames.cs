@@ -192,6 +192,7 @@ internal static class GodotGenerated
         List<GodotKindUse> uses = [];
         HashSet<(string, int)> seen = [];
         HashSet<string> names = [asked.Name];
+        GodotKinds.LetGoOfGone(solution);
         foreach (Project project in GodotKinds.ProjectsOf(solution, asked.Folder, asked.Projects))
         {
             foreach (Document document in project.Documents)
@@ -244,7 +245,7 @@ internal static class GodotGenerated
                 }
                 SourceText? text = null;
                 foreach (SyntaxToken token in root.DescendantTokens().Where(t => t.IsKind(SyntaxKind.StringLiteralToken) && Exact(t)
-                    && t.ValueText.StartsWith("res://", StringComparison.Ordinal) && asked.Paths.Any(p => Names(p, t.ValueText))))
+                    && t.ValueText.StartsWith(GodotResPaths.Scheme, StringComparison.Ordinal) && asked.Paths.Any(p => Names(p, t.ValueText))))
                 {
                     if (seen.Add((path, token.SpanStart)))
                     {

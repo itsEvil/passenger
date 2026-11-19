@@ -15,44 +15,59 @@ namespace Passenger.App.Debugging;
 /// opens in a tab); F2 types a new value in its row; Delete takes a watch away; a value that did not end with the other
 /// threads held runs again with every thread let go from its link; and its menu is the Variables and Watches menu. What a
 /// row asks for it raises, for the debugger to do.</summary>
-public sealed class VariablesList : ListBox
+public sealed class VariablesList : TreeList
 {
-    // Styled as the ListBox it is, so the theme's ListBox.tree reaches it.
-    protected override Type StyleKeyOverride => typeof(ListBox);
-
     public VariablesList(VariablesTree tree)
     {
         Tree = tree;
         Classes.Add(StyleClasses.Tree);
         ItemsSource = tree.Rows;
         ReusedRows.Use(this, Row);
-        DoubleTapped += (_, _) =>
-        {
-            // A double-click opens what has members, and sets what has none; a query's SQL opens its text.
-            if (SelectedItem is VariableNode node && node.HasChildren)
-            {
-                IdeErrors.Observe(Toggle(node));
-            }
-            else if (SelectedItem is VariableNode { IsQueryText: true } text)
-            {
-                TextOpened?.Invoke(this, text);
-            }
-            else
-            {
-                EditSelectedValue();
-            }
-        };
         TreeKeys.Attach<VariableNode>(this, node => IdeErrors.Observe(Toggle(node)), node =>
         {
-            if (!node.IsQueryText || Tree.Rows.Any(r => r.IsEditing))
+            if (!node.IsQueryText || Editing)
             {
                 return false;
             }
             TextOpened?.Invoke(this, node);
             return true;
+        }, new ListActs
+        {
+            // A double click and Enter open what has members and set what has none; a query's SQL opens its text.
+            Open = () =>
+            {
+                if (Editing)
+                {
+                    return;
+                }
+                if (SelectedItem is VariableNode node && node.HasChildren)
+                {
+                    IdeErrors.Observe(Toggle(node));
+                }
+                else if (SelectedItem is VariableNode { IsQueryText: true } text)
+                {
+                    TextOpened?.Invoke(this, text);
+                }
+                else
+                {
+                    EditSelectedValue();
+                }
+            },
+            Edit = () =>
+            {
+                if (!Editing)
+                {
+                    EditSelectedValue();
+                }
+            },
+            Remove = () =>
+            {
+                if (!Editing && SelectedItem is VariableNode { Role: VariableRole.Watch } watch)
+                {
+                    WatchRemoved?.Invoke(this, watch.Name);
+                }
+            },
         });
-        // Ahead of the list's own keys, as the tree's are.
-        AddHandler(KeyDownEvent, OnKey, Avalonia.Interactivity.RoutingStrategies.Tunnel);
         // The menu is made again as the choice moves: each one made says as it closes.
         PropertyChanged += (_, e) =>
         {
@@ -159,25 +174,8 @@ public sealed class VariablesList : ListBox
         }
     }
 
-    private void OnKey(object? sender, KeyEventArgs e)
-    {
-        // A value being typed in its row takes its own keys.
-        if (SelectedItem is not VariableNode node || e.Source is TextBox || Tree.Rows.Any(r => r.IsEditing))
-        {
-            return;
-        }
-        switch (e.Key)
-        {
-            case Key.Delete or Key.Back when node.Role == VariableRole.Watch:
-                WatchRemoved?.Invoke(this, node.Name);
-                e.Handled = true;
-                break;
-            case Key.F2 when node.Settable is not null:
-                node.IsEditing = true;
-                e.Handled = true;
-                break;
-        }
-    }
+    /// <summary>Whether a value is being typed in its row, which takes its own keys.</summary>
+    private bool Editing => Tree.Rows.Any(r => r.IsEditing);
 
     /// <summary>The Variables and Watches menu: Set Value, Copy Value and Copy Name, Add to Watches, Inspect (the value
     /// evaluated on its own, to open), Remove Watch for a watch, and last Set Data Breakpoint (Remove Data Breakpoint on a
@@ -250,16 +248,16 @@ public sealed class VariablesList : ListBox
     {
         RowIcon chevron = RowIcon.Chevron();
         Border toggle = new() { Width = 18, Height = ListRow.Height, Background = Brushes.Transparent, Child = chevron };
-        RowIcon icon = new() { Margin = new Thickness(0, 0, 6, 0) };
+        RowIcon icon = new() { Margin = new Thickness(0, 0, Gaps.Small, 0) };
         // In the icon's place, a colour's own.
-        Border swatch = new() { Classes = { StyleClasses.Swatch }, Width = 12, Height = 12, Margin = new Thickness(2, 0, 8, 0), VerticalAlignment = VerticalAlignment.Center };
+        Border swatch = new() { Classes = { StyleClasses.Swatch }, Width = 12, Height = 12, Margin = new Thickness(Gaps.Hair, 0, Gaps.Normal, 0), VerticalAlignment = VerticalAlignment.Center };
         TextBlock name = new() { VerticalAlignment = VerticalAlignment.Center };
         TextBlock type = new() { VerticalAlignment = VerticalAlignment.Center };
         type.Classes.Add(StyleClasses.Muted);
         TextBlock value = new() { VerticalAlignment = VerticalAlignment.Center, TextTrimming = TextTrimming.CharacterEllipsis, MaxWidth = 900 };
-        TextBox editor = new() { Classes = { StyleClasses.Search }, MinHeight = 22, Height = 22, MinWidth = 240, Padding = new Thickness(6, 0), IsVisible = false, VerticalAlignment = VerticalAlignment.Center };
+        ValueField editor = new() { Classes = { StyleClasses.Search }, MinHeight = 22, Height = 22, Padding = new Thickness(Gaps.Small, 0), IsVisible = false, VerticalAlignment = VerticalAlignment.Center };
         // Before the words saying why, which a narrow row cuts first.
-        Button again = new() { Classes = { StyleClasses.Link }, Content = RunWithThreads, Margin = new Thickness(0, 0, 8, 0), VerticalAlignment = VerticalAlignment.Center, IsVisible = false };
+        Button again = new() { Classes = { StyleClasses.Link }, Content = RunWithThreads, Margin = new Thickness(0, 0, Gaps.Normal, 0), VerticalAlignment = VerticalAlignment.Center, IsVisible = false };
         ToolTip.SetTip(again, "Evaluates it again with every other thread of the program running meanwhile, which changes what they hold");
         // Narrower than its row, the value gives way first, ending in an ellipsis, then its type.
         ShrinkingRow row = new()
@@ -367,5 +365,24 @@ public sealed class VariablesList : ListBox
             value.IsVisible = type.IsVisible = true;
             again.IsVisible = node is { NeedsThreads: true, Expression: not null };
         }
+    }
+}
+
+/// <summary>The field a row's value is typed over in (Set Value): as wide as what it holds and at least
+/// <see cref="Wanted"/> where its row has the room; in a narrower row it gives way first, down to a few letters, before
+/// the row's name does, its text scrolling within it.</summary>
+internal sealed class ValueField : TextBox
+{
+    /// <summary>The least it is wide where its row has the room.</summary>
+    private const double Wanted = 240;
+
+    public ValueField() => SetValue(ShrinkingRow.LeastProperty, 80);
+
+    protected override Type StyleKeyOverride => typeof(TextBox);
+
+    protected override Size MeasureOverride(Size availableSize)
+    {
+        Size size = base.MeasureOverride(availableSize);
+        return size.WithWidth(Math.Max(size.Width, Math.Min(Wanted, availableSize.Width)));
     }
 }

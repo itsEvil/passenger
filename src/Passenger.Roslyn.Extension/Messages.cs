@@ -20,6 +20,8 @@ public static class Handlers
     public const string DocumentTexts = "Passenger.Roslyn.Extension.DocumentTexts";
     public const string DocumentsWritten = "Passenger.Roslyn.Extension.DocumentsWritten";
     public const string ReferencesRead = "Passenger.Roslyn.Extension.ReferencesRead";
+    public const string ReferencedFiles = "Passenger.Roslyn.Extension.ReferencedFiles";
+    public const string GeneratorsRun = "Passenger.Roslyn.Extension.GeneratorsRun";
     public const string AspireProjectDeclaration = "Passenger.Roslyn.Extension.AspireProjectDeclaration";
     public const string AspireCodeHelp = "Passenger.Roslyn.Extension.AspireCodeHelp";
     public const string AspireReferenceFix = "Passenger.Roslyn.Extension.AspireReferenceFix";
@@ -32,12 +34,14 @@ public static class Handlers
     public const string LocalizedReads = "Passenger.Roslyn.Extension.LocalizedReads";
     public const string SymbolsNamed = "Passenger.Roslyn.Extension.SymbolsNamed";
     public const string SymbolAt = "Passenger.Roslyn.Extension.SymbolAt";
+    public const string SymbolContainers = "Passenger.Roslyn.Extension.SymbolContainers";
     public const string WrittenPlaces = "Passenger.Roslyn.Extension.WrittenPlaces";
     public const string ComponentClass = "Passenger.Roslyn.Extension.ComponentClass";
     public const string GeneratedTexts = "Passenger.Roslyn.Extension.GeneratedTexts";
     public const string GeneratedNamed = "Passenger.Roslyn.Extension.GeneratedNamed";
     public const string PartialHalf = "Passenger.Roslyn.Extension.PartialHalf";
     public const string GeneratedParts = "Passenger.Roslyn.Extension.GeneratedParts";
+    public const string GeneratedDocuments = "Passenger.Roslyn.Extension.GeneratedDocuments";
     public const string JsInteropCalls = "Passenger.Roslyn.Extension.JsInteropCalls";
     public const string GodotCode = "Passenger.Roslyn.Extension.GodotCode";
     public const string GodotNames = "Passenger.Roslyn.Extension.GodotNames";
@@ -46,13 +50,23 @@ public static class Handlers
     public const string GodotNameStrings = "Passenger.Roslyn.Extension.GodotNameStrings";
     public const string GodotFix = "Passenger.Roslyn.Extension.GodotFix";
     public const string ToolkitRenames = "Passenger.Roslyn.Extension.ToolkitRenames";
+    public const string GeneratedMembers = "Passenger.Roslyn.Extension.GeneratedMembers";
+    public const string MauiExpressionCompletion = "Passenger.Roslyn.Extension.MauiExpressionCompletion";
+    public const string MauiExpressionSymbol = "Passenger.Roslyn.Extension.MauiExpressionSymbol";
+    public const string MauiXamlChecks = "Passenger.Roslyn.Extension.MauiXamlChecks";
+    public const string MauiExpressionUses = "Passenger.Roslyn.Extension.MauiExpressionUses";
+    public const string MauiExpressionHover = "Passenger.Roslyn.Extension.MauiExpressionHover";
+    public const string CompletionCall = "Passenger.Roslyn.Extension.CompletionCall";
+    public const string StepBindings = "Passenger.Roslyn.Extension.StepBindings";
 
     public static readonly IReadOnlyList<string> All =
     [
         DescribeSignature, ChangeSignature, DescribeInterface, ExtractInterface, DescribeType, MoveTypeToFile, MoveTypeToNamespace,
-        DescribeHierarchy, PullMembersUp, PushMembersDown, DocumentTexts, DocumentsWritten, ReferencesRead, AspireProjectDeclaration, AspireCodeHelp, AspireReferenceFix, AspireRunResources,
-        AspireRename, AspireParameters, ConnectionReads, WebRoutes, RouteBody, LocalizedReads, SymbolsNamed, SymbolAt, WrittenPlaces,
-        ComponentClass, GeneratedTexts, GeneratedNamed, PartialHalf, GeneratedParts, JsInteropCalls, GodotCode, GodotNames, GodotPaths, GodotKindStrings, GodotNameStrings, GodotFix, ToolkitRenames,
+        DescribeHierarchy, PullMembersUp, PushMembersDown, DocumentTexts, DocumentsWritten, ReferencesRead, ReferencedFiles, GeneratorsRun, AspireProjectDeclaration, AspireCodeHelp, AspireReferenceFix, AspireRunResources,
+        AspireRename, AspireParameters, ConnectionReads, WebRoutes, RouteBody, LocalizedReads, SymbolsNamed, SymbolAt, SymbolContainers, WrittenPlaces,
+        ComponentClass, GeneratedTexts, GeneratedNamed, PartialHalf, GeneratedParts, GeneratedDocuments, JsInteropCalls, GodotCode, GodotNames, GodotPaths, GodotKindStrings, GodotNameStrings, GodotFix, ToolkitRenames, GeneratedMembers,
+        MauiExpressionCompletion, MauiExpressionSymbol, MauiXamlChecks, MauiExpressionUses, MauiExpressionHover,
+        CompletionCall, StepBindings,
     ];
 }
 
@@ -62,7 +76,38 @@ public static class ExtensionMethods
     /// <summary>A request about a file in no project, its <c>textDocument</c> and, for part of it, its <c>range</c>: its
     /// colours, as the server's semantic tokens encode them; null for a file a project holds.</summary>
     public const string LooseColours = "passenger/looseSemanticTokens";
+
+    /// <summary>workspace/diagnostic with a <c>frameworks</c> map from a multi-targeted project's file to the framework
+    /// solution-wide analysis takes it in, its reports and previous results each naming their project (<c>_vs_projectContext</c>).</summary>
+    public const string WorkspaceDiagnostic = "passenger/workspaceDiagnostic";
+
+    /// <summary>textDocument/completion, its list saying beside its items how well each fits where it is asked for
+    /// (<see cref="CompletionPriorities"/>); asked in parts (<see cref="CompletionParts"/>), what is in scope first.</summary>
+    public const string Completion = "passenger/completion";
+
+    /// <summary>The later part of a completion list asked in parts, by the id its first part gave (<see cref="LaterAsked"/>):
+    /// a list of the types and extension members of namespaces not imported, or null where none comes.</summary>
+    public const string LaterCompletion = "passenger/laterCompletion";
+
+    /// <summary>textDocument/prepareCallHierarchy, its item made where the symbol is declared, so a use of it in another
+    /// document has one, and at a record's positional parameter the property it declares.</summary>
+    public const string CallHierarchy = "passenger/prepareCallHierarchy";
 }
+
+/// <summary>A C# completion list asked in two parts: what is in scope first, then the types and extension members of
+/// namespaces not imported, which the server lists after every other item and is slowest to find, worked out at once but
+/// answered when they come. The parts are one list in one order, the later's sort texts after any of the first's.</summary>
+public static class CompletionParts
+{
+    /// <summary>The request's member asking for the list in parts.</summary>
+    public const string Asked = "passengerParts";
+
+    /// <summary>The first part's member giving the id its later part is asked by; missing where none comes.</summary>
+    public const string Later = "later";
+}
+
+/// <summary>The later part of a completion list asked for, by the id its first part gave.</summary>
+public sealed record LaterAsked([property: JsonPropertyName(CompletionParts.Later)] long Later);
 
 /// <summary>Files the solution has, by their paths, whose texts as the server holds them are asked for: an edit to a file
 /// not open is placed by the server's lines and columns, so it lands where meant only on the text the server read.</summary>
@@ -101,6 +146,19 @@ public sealed record ReferencesAsked;
 /// <summary>How many assemblies were read again.</summary>
 public sealed record ReferencesTaken([property: JsonPropertyName("read")] int Read);
 
+/// <summary>Files changed on disk, by their paths, of which those the solution's projects reference are asked for.</summary>
+public sealed record ReferencedAsked([property: JsonPropertyName("paths")] IReadOnlyList<string> Paths);
+
+/// <summary>The paths asked of that a project references, as an assembly or an analyzer.</summary>
+public sealed record ReferencedFound([property: JsonPropertyName("paths")] IReadOnlyList<string> Paths);
+
+/// <summary>A load of projects ended: the source generators' runs it queued are waited for.</summary>
+public sealed record GeneratorsAsked;
+
+/// <summary>The source generators' runs queued when asked have run; the files a project's builds write that the server
+/// holds otherwise than the disk, which they read as the server holds them.</summary>
+public sealed record GeneratorsRan([property: JsonPropertyName("unread")] IReadOnlyList<string> Unread);
+
 /// <summary>A text's fingerprint as both sides make it: SHA-256 of its characters with every line break as '\n', since a
 /// server's line and column are the same whichever break a line ends in (and Passenger holds a CR file's as '\n').</summary>
 public static class TextHash
@@ -128,7 +186,26 @@ public sealed record NamedSymbol(
     [property: JsonPropertyName("id")] string? Id,
     [property: JsonPropertyName("container")] string? Container,
     [property: JsonPropertyName("path")] string? Path,
-    [property: JsonPropertyName("at")] Place? At);
+    [property: JsonPropertyName("at")] Place? At)
+{
+    /// <summary>The server's URI of the source generator's document that declares it, where none of its declarations is in the
+    /// solution's own files (<see cref="At"/> its place there); null otherwise.</summary>
+    [JsonPropertyName("generated")]
+    public string? Generated { get; init; }
+
+    /// <summary>The field or method the MVVM Toolkit makes it of, where it is a property the toolkit's generators make (an
+    /// <c>[ObservableProperty]</c> field's, a <c>[RelayCommand]</c> method's command); null otherwise.</summary>
+    [JsonPropertyName("madeOf")]
+    public NamedSymbol? MadeOf { get; init; }
+}
+
+/// <summary>Declarations whose symbols' containers are asked for, each by its name's span as the server names it (a
+/// workspace symbol's place).</summary>
+public sealed record ContainersAsked([property: JsonPropertyName("declarations")] IReadOnlyList<UriSpan> Declarations);
+
+/// <summary>Each declaration's container, in order, as <see cref="NamedSymbol.Container"/> names it: a member's or a nested
+/// type's type, a type's namespace; null for a type in the global namespace, or a place that declares nothing now.</summary>
+public sealed record ContainersFound([property: JsonPropertyName("containers")] IReadOnlyList<string?> Containers);
 
 /// <summary>A place in a document as the server counts it: a line and a UTF-16 column, from zero.</summary>
 public sealed record Place([property: JsonPropertyName("line")] int Line, [property: JsonPropertyName("character")] int Character);
@@ -182,6 +259,83 @@ public sealed record GeneratedText(
     [property: JsonPropertyName("projectName")] string ProjectName,
     [property: JsonPropertyName("generator")] string Generator);
 
+/// <summary>Documents by the URIs the server names them by (a source generator's its own), asked whether each is generated
+/// code.</summary>
+public sealed record GeneratedDocumentsAsked([property: JsonPropertyName("uris")] IReadOnlyList<string> Uris);
+
+/// <summary>Whether each document asked about is generated code, in order: false for a URI of no C# document.</summary>
+public sealed record GeneratedDocumentsFound([property: JsonPropertyName("generated")] IReadOnlyList<bool> Generated);
+
+/// <summary>A C# expression of a MAUI XAML file: its attribute's value as the file writes it, the class the file makes,
+/// the <c>x:DataType</c> in scope, for an event's handler the element's type and the event, types by their full metadata
+/// names; and each type its code names by a XAML prefix, by its C# name.</summary>
+public sealed record MauiExpression(
+    [property: JsonPropertyName("value")] string Value,
+    [property: JsonPropertyName("root")] string? Root,
+    [property: JsonPropertyName("dataType")] string? DataType,
+    [property: JsonPropertyName("eventOwner")] string? EventOwner,
+    [property: JsonPropertyName("event")] string? Event,
+    [property: JsonPropertyName("types")] IReadOnlyDictionary<string, string>? Types = null);
+
+/// <summary>A place in an expression of a MAUI XAML file, by its place in the attribute's value as written.</summary>
+public sealed record MauiExpressionAsked(
+    [property: JsonPropertyName("path")] string Path,
+    [property: JsonPropertyName("expression")] MauiExpression Expression,
+    [property: JsonPropertyName("at")] int At);
+
+/// <summary>What completion offers at a place in an expression, and where in the value the text it replaces starts.</summary>
+public sealed record MauiCompletions(
+    [property: JsonPropertyName("start")] int Start,
+    [property: JsonPropertyName("items")] IReadOnlyList<MauiCompletion> Items);
+
+/// <summary>One thing completion offers: what it shows, what goes in, its kind as Roslyn tags it, what it says beside, and
+/// what it sorts by.</summary>
+public sealed record MauiCompletion(
+    [property: JsonPropertyName("label")] string Label,
+    [property: JsonPropertyName("insert")] string Insert,
+    [property: JsonPropertyName("kind")] string Kind,
+    [property: JsonPropertyName("detail")] string? Detail,
+    [property: JsonPropertyName("sort")] string Sort);
+
+/// <summary>The hover card of a place in an expression, in Markdown, as C#'s hover gives it; null where there is none.</summary>
+public sealed record MauiHover([property: JsonPropertyName("markdown")] string? Markdown);
+
+/// <summary>A MAUI XAML file as the editor has it, and its expressions, to be checked as MAUI's source generator and C#'s
+/// compiler would.</summary>
+public sealed record MauiChecksAsked(
+    [property: JsonPropertyName("path")] string Path,
+    [property: JsonPropertyName("text")] string Text,
+    [property: JsonPropertyName("expressions")] IReadOnlyList<MauiExpression> Expressions);
+
+/// <summary>A MAUI XAML file's expressions, in which the uses of a C# symbol, by its documentation id, are asked for.</summary>
+public sealed record MauiUsesAsked(
+    [property: JsonPropertyName("path")] string Path,
+    [property: JsonPropertyName("expressions")] IReadOnlyList<MauiExpression> Expressions,
+    [property: JsonPropertyName("id")] string Id);
+
+/// <summary>Where the expressions asked of name the symbol: each use's expression, by its place in those asked of, and its
+/// span in that expression's value.</summary>
+public sealed record MauiUsesFound([property: JsonPropertyName("uses")] IReadOnlyList<MauiUse> Uses);
+
+public sealed record MauiUse(
+    [property: JsonPropertyName("expression")] int Expression,
+    [property: JsonPropertyName("start")] int Start,
+    [property: JsonPropertyName("end")] int End);
+
+/// <summary>What the checks found.</summary>
+public sealed record MauiChecksFound([property: JsonPropertyName("checks")] IReadOnlyList<MauiCheck> Checks);
+
+/// <summary>A problem found: the generator's at a place of the file (<paramref name="At"/>, <paramref name="Expression"/>
+/// -1), or C#'s in an expression asked of, from <paramref name="Start"/> to <paramref name="End"/> of its value.</summary>
+public sealed record MauiCheck(
+    [property: JsonPropertyName("expression")] int Expression,
+    [property: JsonPropertyName("at")] Place? At,
+    [property: JsonPropertyName("start")] int Start,
+    [property: JsonPropertyName("end")] int End,
+    [property: JsonPropertyName("error")] bool Error,
+    [property: JsonPropertyName("code")] string Code,
+    [property: JsonPropertyName("message")] string Message);
+
 /// <summary>A Razor component's file, whose class is asked for.</summary>
 public sealed record ComponentAsked([property: JsonPropertyName("path")] string Path);
 
@@ -232,10 +386,12 @@ public sealed record AspireParameter(string Name, bool Secret, Place Start, Plac
 public sealed record AspireParametersFound(IReadOnlyList<AspireParameter> Parameters);
 
 /// <summary>The projects whose code's connection-string reads are asked for, by their project files' paths, and with
-/// <paramref name="Keys"/> every configuration key their code reads or binds too (<see cref="ConfigurationKey"/>).</summary>
+/// <paramref name="Keys"/> every configuration key their code reads or binds too (<see cref="ConfigurationKey"/>); with
+/// <paramref name="File"/>, only what that file's code in them reads.</summary>
 public sealed record ConnectionReadsRequest(
     [property: JsonPropertyName("projects")] IReadOnlyList<string> Projects,
-    [property: JsonPropertyName("keys")] bool Keys = false);
+    [property: JsonPropertyName("keys")] bool Keys = false,
+    [property: JsonPropertyName("file")] string? File = null);
 
 /// <summary>A configuration key a project's code reads or binds, as .NET's configuration names it (sections joined by ':',
 /// <c>*</c> for any item of a collection or key of a dictionary): what reads it (<see cref="ConfigurationKinds"/>), the type
@@ -744,6 +900,51 @@ public sealed record ToolkitFound(
     public static readonly ToolkitFound None = new([], null);
 }
 
+/// <summary>The members source generators add to the types the solution's own files declare: every such type of the
+/// projects named by their files (<paramref name="Projects"/>), and each a C# file named declares (<paramref name="Files"/>).</summary>
+public sealed record GeneratedMembersAsked(
+    [property: JsonPropertyName("projects")] IReadOnlyList<string> Projects,
+    [property: JsonPropertyName("files")] IReadOnlyList<string> Files);
+
+/// <summary>Each type asked of that generators add members to.</summary>
+public sealed record GeneratedMembersFound([property: JsonPropertyName("types")] IReadOnlyList<GeneratedType> Types);
+
+/// <summary>A type of the solution's own files by its metadata name (a nested one's after its declaring type's and a '+'),
+/// the files of its own that declare it, and the members only generators declare.</summary>
+public sealed record GeneratedType(
+    [property: JsonPropertyName("name")] string Name,
+    [property: JsonPropertyName("files")] IReadOnlyList<string> Files,
+    [property: JsonPropertyName("members")] IReadOnlyList<GeneratedMember> Members);
+
+/// <summary>A member a generator declares, its kind as a documentation id names it (P, F, M or E), reachable from the
+/// project's own code; and where a person goes to it in the type's own files (<paramref name="Path"/>, <paramref name="At"/>):
+/// the field or method of the type marked for the generator that the member's code uses, else the type's own declaration.</summary>
+public sealed record GeneratedMember(
+    [property: JsonPropertyName("name")] string Name,
+    [property: JsonPropertyName("kind")] string Kind,
+    [property: JsonPropertyName("type")] MemberType Type,
+    [property: JsonPropertyName("static")] bool IsStatic,
+    [property: JsonPropertyName("writable")] bool CanWrite,
+    [property: JsonPropertyName("parameters")] IReadOnlyList<MemberType> Parameters,
+    [property: JsonPropertyName("parameterNames")] IReadOnlyList<string> ParameterNames,
+    [property: JsonPropertyName("attributes")] IReadOnlyList<MemberAttribute> Attributes,
+    [property: JsonPropertyName("path")] string Path,
+    [property: JsonPropertyName("at")] Place At);
+
+/// <summary>A type as metadata names it (<c>System.Collections.Generic.List`1</c>), with its generic arguments; an array of
+/// it; or a generic parameter by its name.</summary>
+public sealed record MemberType(
+    [property: JsonPropertyName("name")] string Name,
+    [property: JsonPropertyName("arguments")] IReadOnlyList<MemberType> Arguments,
+    [property: JsonPropertyName("array")] bool IsArray,
+    [property: JsonPropertyName("parameter")] bool IsParameter);
+
+/// <summary>An attribute on a generated member by its class's full name, with its constructor's arguments written as text
+/// (a <c>typeof</c> as the type's full name), null for one that is not a constant.</summary>
+public sealed record MemberAttribute(
+    [property: JsonPropertyName("name")] string Name,
+    [property: JsonPropertyName("arguments")] IReadOnlyList<string?> Arguments);
+
 /// <summary>Where a use of a member the MVVM Toolkit makes is written, and the name it takes.</summary>
 public sealed record ToolkitUse(
     [property: JsonPropertyName("path")] string Path,
@@ -837,6 +1038,107 @@ public static class RouteKinds
 public sealed record RoutesFound(
     [property: JsonPropertyName("routes")] IReadOnlyList<WebRoute> Routes,
     [property: JsonPropertyName("projects")] IReadOnlyList<string> Projects);
+
+/// <summary>The projects whose Reqnroll or SpecFlow bindings are asked for, by their project files' paths (none asks for every
+/// project's), with the assemblies beside a project's own its configuration names (<c>bindingAssemblies</c>), by project.</summary>
+public sealed record StepsRequest(
+    [property: JsonPropertyName("projects")] IReadOnlyList<string> Projects,
+    [property: JsonPropertyName("bindingAssemblies")] IReadOnlyDictionary<string, IReadOnlyList<string>>? BindingAssemblies = null);
+
+/// <summary>A place in a file and the length written there.</summary>
+public sealed record StepPlace(
+    [property: JsonPropertyName("path")] string Path,
+    [property: JsonPropertyName("at")] Place At,
+    [property: JsonPropertyName("length")] int Length);
+
+/// <summary>A step definition's or hook's parameter: its name, its type's full metadata name (a nullable value type's
+/// underlying type's, with <c>nullable</c> set), an enum's members and the integer type under them, and whether Reqnroll's
+/// converter makes none of its type from text (a class or struct of the solution's code with no type converter, which only a
+/// transformation makes).</summary>
+public sealed record StepParameterFound(
+    [property: JsonPropertyName("name")] string Name,
+    [property: JsonPropertyName("type")] string Type,
+    [property: JsonPropertyName("members")] IReadOnlyList<string>? Members = null,
+    [property: JsonPropertyName("nullable")] bool Nullable = false,
+    [property: JsonPropertyName("underlying")] string? Underlying = null,
+    [property: JsonPropertyName("unconverted")] bool Unconverted = false);
+
+/// <summary>A member a table helper may set from a table's column: its name, whether it is a property (else a field), and
+/// the regular expressions of its <c>[TableAliases]</c>.</summary>
+public sealed record StepMemberFound(
+    [property: JsonPropertyName("name")] string Name,
+    [property: JsonPropertyName("property")] bool Property,
+    [property: JsonPropertyName("aliases")] IReadOnlyList<string> Aliases);
+
+/// <summary>A table a binding's code reads into a type through Reqnroll's table helpers (<c>CreateSet</c>,
+/// <c>CreateInstance</c>): the parameter it reads, the helper, the type and the members it may set.</summary>
+public sealed record StepTableReadFound(
+    [property: JsonPropertyName("parameter")] int Parameter,
+    [property: JsonPropertyName("helper")] string Helper,
+    [property: JsonPropertyName("type")] string Type,
+    [property: JsonPropertyName("members")] IReadOnlyList<StepMemberFound> Members);
+
+/// <summary>A <c>[Scope]</c>'s tag, feature title and scenario title, those given.</summary>
+public sealed record StepScopeFound(
+    [property: JsonPropertyName("tag")] string? Tag,
+    [property: JsonPropertyName("feature")] string? Feature,
+    [property: JsonPropertyName("scenario")] string? Scenario);
+
+/// <summary>A step definition as its code declares it: its kind (Given, When, Then or StepDefinition), expression (none
+/// where the method's name is its step) and its expression type when the attribute names one (CucumberExpression,
+/// RegularExpression), its method, type and parameters, its scopes, why Reqnroll would refuse it, where its method's name
+/// and its expression's string literal are written, and its documentation comment's summary as words.</summary>
+public sealed record StepDefinitionFound(
+    [property: JsonPropertyName("kind")] string Kind,
+    [property: JsonPropertyName("expression")] string? Expression,
+    [property: JsonPropertyName("expressionType")] string? ExpressionType,
+    [property: JsonPropertyName("method")] string Method,
+    [property: JsonPropertyName("type")] string Type,
+    [property: JsonPropertyName("parameters")] IReadOnlyList<StepParameterFound> Parameters,
+    [property: JsonPropertyName("scopes")] IReadOnlyList<StepScopeFound> Scopes,
+    [property: JsonPropertyName("error")] string? Error,
+    [property: JsonPropertyName("methodAt")] StepPlace? MethodAt,
+    [property: JsonPropertyName("expressionAt")] StepPlace? ExpressionAt,
+    [property: JsonPropertyName("summary")] string? Summary = null,
+    [property: JsonPropertyName("tables")] IReadOnlyList<StepTableReadFound>? Tables = null);
+
+/// <summary>A hook: its kind (its attribute's name: BeforeScenario), method, type, scopes (its tags among them) and order.</summary>
+public sealed record StepHookFound(
+    [property: JsonPropertyName("kind")] string Kind,
+    [property: JsonPropertyName("method")] string Method,
+    [property: JsonPropertyName("type")] string Type,
+    [property: JsonPropertyName("scopes")] IReadOnlyList<StepScopeFound> Scopes,
+    [property: JsonPropertyName("order")] int Order,
+    [property: JsonPropertyName("methodAt")] StepPlace? MethodAt);
+
+/// <summary>A <c>[StepArgumentTransformation]</c>: its regular expression, name and return type's full metadata name (a
+/// task's result's, a nullable value type's underlying type's with a <c>?</c>), its parameters' types, the tables its code
+/// reads, and its method as shown (<c>Transforms.ToMoney</c>).</summary>
+public sealed record StepTransformationFound(
+    [property: JsonPropertyName("regex")] string? Regex,
+    [property: JsonPropertyName("name")] string? Name,
+    [property: JsonPropertyName("returnType")] string ReturnType,
+    [property: JsonPropertyName("methodAt")] StepPlace? MethodAt,
+    [property: JsonPropertyName("parameters")] IReadOnlyList<string>? Parameters = null,
+    [property: JsonPropertyName("tables")] IReadOnlyList<StepTableReadFound>? Tables = null,
+    [property: JsonPropertyName("method")] string? Method = null);
+
+/// <summary>A Reqnroll or SpecFlow project's bindings: those its own code and the projects and binding assemblies it
+/// references declare, each with the project file it is written in.</summary>
+public sealed record ProjectStepsFound(
+    [property: JsonPropertyName("project")] string Project,
+    [property: JsonPropertyName("specFlow")] bool SpecFlow,
+    [property: JsonPropertyName("steps")] IReadOnlyList<ProjectStep> Steps,
+    [property: JsonPropertyName("hooks")] IReadOnlyList<StepHookFound> Hooks,
+    [property: JsonPropertyName("transformations")] IReadOnlyList<StepTransformationFound> Transformations);
+
+/// <summary>A step definition and the project whose code declares it (none for a binding assembly's).</summary>
+public sealed record ProjectStep(
+    [property: JsonPropertyName("definition")] StepDefinitionFound Definition,
+    [property: JsonPropertyName("declaredIn")] string? DeclaredIn);
+
+/// <summary>The Reqnroll and SpecFlow projects of those asked for, each read even when it declares no binding.</summary>
+public sealed record StepsFound([property: JsonPropertyName("projects")] IReadOnlyList<ProjectStepsFound> Projects);
 
 /// <summary>The AppHost whose proven project resources and source locations are read.</summary>
 public sealed record AspireResourcesRequest(string AppHost);
@@ -974,3 +1276,13 @@ public sealed record MembersMove(
     [property: JsonPropertyName("target")] string Target,
     [property: JsonPropertyName("members")] IReadOnlyList<string> Members,
     [property: JsonPropertyName("abstract")] IReadOnlyList<string> Abstract);
+
+/// <summary>The end of the name of a method a completion just wrote: whether it is called where it stands is asked.</summary>
+public sealed record CallAsked([property: JsonPropertyName("end")] Place End);
+
+/// <summary>Whether the name a completion writes is a method called where it goes, so its call's parentheses follow it,
+/// and whether any of its overloads takes arguments, so the caret goes between them.</summary>
+public sealed record CallFound([property: JsonPropertyName("call")] bool Call, [property: JsonPropertyName("arguments")] bool Arguments)
+{
+    public static readonly CallFound None = new(false, false);
+}

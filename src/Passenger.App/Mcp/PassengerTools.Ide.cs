@@ -28,10 +28,18 @@ public sealed partial class PassengerTools
 
     [McpServerTool(Name = McpTools.Settings, Title = "The IDE's settings", ReadOnly = true), Description(
         "Every setting the Settings dialog has, by its settings.json name (editorFontSize, theme...), with its value, kind, " +
-        "choices and range; kept is false for an --mcp Passenger's own defaults, kept nowhere.")]
+        "choices, range and what the folder's .editorconfig files set over it; kept is false for an --mcp Passenger's own, kept " +
+        "nowhere (it opens on the settings.json of the folder PASSENGER_SETTINGS names).")]
     public Task<SettingsInfo> GetSettings(CancellationToken cancel = default) => OnUi(cancel, async () =>
     {
-        JsonObject values = SettingsNode(window.Settings);
+        // Looked at every 50 ms: the .editorconfig files are those the folder's walk lists.
+        await Until(() => !Session.Index.IsWalking, IndexLimit, cancel);
+        EditorConfigLines said = await Session.EditorConfigs.ReadAsync();
+        Dictionary<string, IReadOnlyList<string>> over = Declared.All.Where(s => s.Row?.Over is not null).GroupBy(s => s.Member)
+            .Select(g => (g.Key, Lines: g.SelectMany(s => said.Of(s.Row!.Over!)).Distinct(StringComparer.Ordinal).ToArray()))
+            .Where(g => g.Lines.Length > 0).ToDictionary(g => g.Key, g => (IReadOnlyList<string>)g.Lines, StringComparer.Ordinal);
+        JsonObject own = SettingsNode(window.Settings);
+        JsonObject values = SettingsNode(Declared.InForce(window.Settings));
         // A font's own names alone: the families installed (hundreds) are said by their count, each taken by its name.
         Dictionary<string, (IReadOnlyList<string> Choices, string? Note)> fonts = [];
         foreach (FontSetting font in Declared.All.OfType<FontSetting>())
@@ -45,8 +53,13 @@ public sealed partial class PassengerTools
             Type type = Nullable.GetUnderlyingType(p.Value.PropertyType) ?? p.Value.PropertyType;
             (double Min, double Max)? range = SettingRange(p.Key, p.Value);
             (IReadOnlyList<string> Choices, string? Note)? font = fonts.TryGetValue(p.Value.Name, out (IReadOnlyList<string>, string?) offered) ? offered : null;
-            IReadOnlyList<string>? choices = type.IsEnum ? Enum.GetNames(type) : font?.Choices;
-            return new SettingInfo(p.Key, JsonSerializer.SerializeToElement(values[p.Key]), SettingKind(p.Value), choices, range?.Min, range?.Max) { Note = font?.Note };
+            bool vimKeys = p.Value.Name == Declared.VimKeysToKeymap.Property;
+            IReadOnlyList<string>? choices = type.IsEnum ? Enum.GetNames(type) : vimKeys ? VimKeysSetting.Keys : font?.Choices;
+            return new SettingInfo(p.Key, JsonSerializer.SerializeToElement(values[p.Key]), SettingKind(p.Value), choices, range?.Min, range?.Max)
+            {
+                Note = font?.Note ?? ThemeNote(p.Value.Name) ?? (vimKeys ? VimKeysNote() : null) ?? ThemesUntilSet(own[p.Key], values[p.Key]),
+                EditorConfig = over.GetValueOrDefault(p.Key),
+            };
         })]);
     });
 
@@ -54,19 +67,51 @@ public sealed partial class PassengerTools
         "Changes settings as the Settings dialog's OK does: changes maps each name settings lists to a JSON value of its kind " +
         "({\"editorFontSize\": 15, \"theme\": \"Dark\"}): a number brought into its range, text (null for none), a choice by " +
         "name, an object's members to change. Anything Settings lacks or refuses is refused, changing nothing. On a person's window the " +
-        "change is theirs, kept; Enable MCP Server and agentFolders are theirs alone. Returns each as it was and is now.")]
+        "change is theirs, kept; Enable MCP Server, agentFolders and each setting naming a program Passenger runs are theirs alone. Returns each as it was and is now.")]
     public Task<IReadOnlyList<SettingChange>> SetSettings(
         Dictionary<string, JsonElement> changes,
-        CancellationToken cancel = default) => OnUi(cancel, () =>
+        CancellationToken cancel = default) => OnUi(cancel, async () =>
     {
         if (changes is not { Count: > 0 })
         {
             throw new ArgumentException("Name at least one setting to change, with its new value; settings lists them");
         }
+        // A theme is taken from its source first, as choosing it in Settings takes it, so the change below wears it at once.
+        AppSettings first = window.Settings;
+        AppSettings themed = Asked(first, changes, []);
+        foreach ((SourcedTheme? theme, SourcedTheme? worn, bool code) in ((SourcedTheme?, SourcedTheme?, bool)[])[(themed.Look, first.Look, false), (themed.ColourScheme, first.ColourScheme, true)])
+        {
+            if (theme is not null && theme != worn && await ThemeListing.TakeAsync(theme, code) is { } unlisted)
+            {
+                throw new ArgumentException($"{unlisted}; nothing changed");
+            }
+        }
         AppSettings before = window.Settings;
-        JsonObject was = SettingsNode(before);
-        JsonObject next = SettingsNode(before);
+        JsonObject was = SettingsNode(Declared.InForce(before));
         List<string> named = [];
+        AppSettings asked = Asked(before, changes, named);
+        if (Declared.All.Select(s => s.Refused(before, asked)).FirstOrDefault(r => r is not null) is { } refused)
+        {
+            throw new ArgumentException($"{refused}; Settings refuses it too, and nothing changed");
+        }
+        window.ApplySettings(asked);
+        JsonObject now = SettingsNode(window.Settings);
+        JsonObject shown = SettingsNode(Declared.InForce(window.Settings));
+        JsonObject wanted = SettingsNode(asked);
+        return (IReadOnlyList<SettingChange>)[.. named.Distinct().Select(name =>
+        {
+            (double Min, double Max)? range = SettingRange(name, SettingProperties[name]);
+            string? note = JsonNode.DeepEquals(now[name], wanted[name]) ? null
+                : range is { } bounds ? string.Create(System.Globalization.CultureInfo.InvariantCulture, $"brought into its range, {bounds.Min} to {bounds.Max}") : "set back to what Settings allows";
+            return new SettingChange(name, JsonSerializer.SerializeToElement(was[name]), JsonSerializer.SerializeToElement(shown[name]), note ?? ThemesUntilSet(now[name], shown[name]));
+        })];
+    });
+
+    /// <summary>The settings an agent's changes make of <paramref name="before"/>, each setting changed added to
+    /// <paramref name="named"/>; one Settings lacks, or the person's alone, refused.</summary>
+    private static AppSettings Asked(AppSettings before, Dictionary<string, JsonElement> changes, List<string> named)
+    {
+        JsonObject next = SettingsNode(before);
         foreach ((string given, JsonElement value) in changes)
         {
             string name = SettingProperties.Keys.FirstOrDefault(k => k == given) ?? SettingProperties.Keys.FirstOrDefault(k => k.Equals(given, StringComparison.OrdinalIgnoreCase))
@@ -80,25 +125,33 @@ public sealed partial class PassengerTools
             {
                 throw new InvalidOperationException("The folders agents join unasked are the person's to change, by the window's question and in Settings, never an agent's");
             }
+            if (AppSettings.NamingPrograms.Contains(property.Name))
+            {
+                throw new InvalidOperationException($"{name} names a program Passenger runs, or code it loads: the person sets it in Settings, never an agent; nothing changed");
+            }
             next[name] = SettingValue(name, property, next[name], value);
             named.Add(name);
         }
-        AppSettings asked = SettingsOf(next);
-        if (Declared.All.Select(s => s.Refused(before, asked)).FirstOrDefault(r => r is not null) is { } refused)
-        {
-            throw new ArgumentException($"{refused}; Settings refuses it too, and nothing changed");
-        }
-        window.ApplySettings(asked);
-        JsonObject now = SettingsNode(window.Settings);
-        JsonObject wanted = SettingsNode(asked);
-        return Task.FromResult<IReadOnlyList<SettingChange>>([.. named.Distinct().Select(name =>
-        {
-            (double Min, double Max)? range = SettingRange(name, SettingProperties[name]);
-            string? note = JsonNode.DeepEquals(now[name], wanted[name]) ? null
-                : range is { } bounds ? string.Create(System.Globalization.CultureInfo.InvariantCulture, $"brought into its range, {bounds.Min} to {bounds.Max}") : "set back to what Settings allows";
-            return new SettingChange(name, JsonSerializer.SerializeToElement(was[name]), JsonSerializer.SerializeToElement(now[name]), note);
-        })]);
-    });
+        return SettingsOf(next);
+    }
+
+    /// <summary>How the Ctrl keys Vim mode shares with the keymap are given, and what each does on either side.</summary>
+    private string VimKeysNote() =>
+        "the keys the keymap takes from Vim mode, any of choices with a space between each, the rest Vim mode's: "
+        + VimKeysSetting.Described(stroke => SettingsDialog.KeymapDoes(window.Actions, stroke));
+
+    /// <summary>What says a value in force is the theme's, where the person's own is unset.</summary>
+    private static string? ThemesUntilSet(JsonNode? own, JsonNode? inForce) =>
+        own is null && inForce is not null ? "the theme's until set; null follows the theme again" : null;
+
+    /// <summary>How a theme or code colour scheme is named, with some of Passenger's themes repository's.</summary>
+    private static string? ThemeNote(string property) => property switch
+    {
+        nameof(AppSettings.Look) => $"null for Passenger's own, or {{\"source\", \"name\"}}: {ThemeSource.BuiltIn.Name} holds {Plural.Listed(ThemeSource.Carried)}, "
+            + $"carried with Passenger; {ThemeSource.RepositoryName} holds {string.Join(", ", ThemeSource.FormerlyCarried)} among others; themeSources lists the person's sources",
+        nameof(AppSettings.ColourScheme) => $"null for the theme's own, or {{\"source\", \"name\"}}: {ThemeSource.RepositoryName} holds {ThemeSource.FormerScheme} among others",
+        _ => null,
+    };
 
     /// <summary>Every setting by its name in settings.json, as the settings store writes them.</summary>
     private static readonly IReadOnlyDictionary<string, PropertyInfo> SettingProperties = typeof(AppSettings)
@@ -126,7 +179,8 @@ public sealed partial class PassengerTools
     /// setting it leaves be.</summary>
     private static (double Min, double Max)? SettingRange(string name, PropertyInfo property)
     {
-        if (property.PropertyType != typeof(int) && property.PropertyType != typeof(double))
+        Type type = Nullable.GetUnderlyingType(property.PropertyType) ?? property.PropertyType;
+        if (type != typeof(int) && type != typeof(double))
         {
             return null;
         }
@@ -184,7 +238,7 @@ public sealed partial class PassengerTools
     [McpServerTool(Name = McpTools.FindInFiles, Title = "Find in Files", ReadOnly = true), Description(
         "Every match of text in the folder's files, as Find in Files finds them: an open file as the editor has it, every " +
         "other text file on disk (binary and very large files left out, and build output, dependencies and version control " +
-        "unless the directory scope is inside one), each with its line's text, at most limit (1000; capped says so); stopped names the files a regex ran too long in. scope: solution (the default), project (project's name or .csproj), " +
+        "unless the directory scope is inside one), each with its line's text, at most limit (1000; capped says so); stopped names the files a regex ran too long in. scope: solution (the default), project (project's name, .csproj or .shproj), " +
         "directory (directory, its subdirectories unless recursive is false), openFiles, currentFile or recentlyViewed. mask: " +
         "names by * and ?, comma-separated, ! leaving one out (\"*.cs, !*.g.cs\").")]
     public Task<FindInFilesResult> FindInFiles(string text, bool matchCase = false, bool wholeWords = false, bool regex = false,
@@ -198,11 +252,17 @@ public sealed partial class PassengerTools
         (SearchQuery query, SearchScope chosen) = Search(text, matchCase, wholeWords, regex, scope, project, directory, recursive, mask);
         // Looked at every 50 ms: an index cleared as its folder closes, or another folder's, says nothing to this wait.
         await Until(() => !Session.Index.IsWalking, IndexLimit, cancel);
-        FilesFound searched = await window.FindInFilesAsync(query, chosen, cancel);
+        (FilesFound searched, _) = Reached(await window.FindInFilesAsync(query, chosen, cancel), changes: false);
         IReadOnlyList<SearchMatch> found = searched.Matches;
-        return new FindInFilesResult(found.Count, found.Count >= FileSearch.MostMatches,
-            [.. found.Take(Math.Clamp(limit, 1, FileSearch.MostMatches)).Select(m => new Place(Relative(m.Path), m.Line + 1, m.Column + 1, m.LineText.Trim()))],
-            searched.Stopped.Count == 0 ? null : [.. searched.Stopped.Select(Relative)]);
+        FindInFilesResult result = new(found.Count, found.Count >= FileSearch.MostMatches, [], searched.Stopped.Count == 0 ? null : [.. searched.Stopped.Select(Relative)]);
+        List<Place> asked = [.. found.Take(Math.Clamp(limit, 1, FileSearch.MostMatches)).Select(m => new Place(Relative(m.Path), m.Line + 1, m.Column + 1, AgentAnswers.Line(m.LineText, m.Column + 1)))];
+        int kept = AgentAnswers.Fitting(asked, Size, Room(result));
+        return result with
+        {
+            Matches = kept == asked.Count ? asked : [.. asked.Take(kept)],
+            More = kept == found.Count ? null : AgentAnswers.More(found.Count - kept, "match", kept < asked.Count ? "directory, mask or a narrower text lists fewer at once"
+                : string.Create(System.Globalization.CultureInfo.InvariantCulture, $"a larger limit lists them, at most {FileSearch.MostMatches:N0}"), "matches"),
+        };
     });
 
     [McpServerTool(Name = McpTools.ReplaceInFiles, Title = "Replace in Files", Destructive = true), Description(
@@ -223,11 +283,13 @@ public sealed partial class PassengerTools
         // Looked at every 50 ms: an index cleared as its folder closes, or another folder's, says nothing to this wait.
         await Until(() => !Session.Index.IsWalking, IndexLimit, cancel);
         (FilesFound? every, string? why) = await window.FindEveryMatchAsync(query, chosen, cancel);
-        FilesFound searched = every ?? throw new InvalidOperationException(why);
+        (FilesFound searched, IReadOnlyList<string> unreached) = Reached(every ?? throw new InvalidOperationException(why), changes: true);
         IReadOnlyList<SearchMatch> found = searched.Matches;
+        string? outside = unreached.Count == 0 ? null : $"not replaced: {string.Join("; ", unreached.Select(p => Refusals.OutOfReach(p, Session.Folder, changes: true)))}";
         if (found.Count == 0)
         {
-            return searched.StoppedIn(Relative) is { } stopped ? $"Nothing was replaced: {stopped}" : "Nothing matches, so nothing was replaced";
+            return searched.StoppedIn(Relative) is { } stopped ? $"Nothing was replaced: {stopped}"
+                : outside is not null ? $"Nothing was replaced: {outside}" : "Nothing matches, so nothing was replaced";
         }
         List<string> files = [.. searched.Replaceable.Select(m => m.Path).Distinct()];
         if (await Editors.ClearAsync(files) is { } held)
@@ -235,7 +297,7 @@ public sealed partial class PassengerTools
             throw new InvalidOperationException(held);
         }
         FilesReplaced done = await window.ReplaceInFilesAsync(query, replacement, searched);
-        List<string> said = [.. done.Converted];
+        List<string> said = [.. done.Converted, .. outside is null ? [] : new[] { outside }];
         // The open files' saves are the replace's, in its change set; what the person saves meanwhile stays theirs.
         using (done.Named?.Own())
         {
@@ -260,7 +322,7 @@ public sealed partial class PassengerTools
         {
             throw new InvalidOperationException($"Nothing was replaced; {string.Join("; ", said)}");
         }
-        string replaced = $"Replaced {FilesReplaced.Count(changed)}: {AgentAnswers.Named([.. changed.Select(m => m.Path).Distinct().Select(Relative)], "file", "local_history of a folder within names those there")}";
+        string replaced = $"Replaced {FilesReplaced.Count(changed)}: {AgentAnswers.Named([.. changed.Select(m => m.Path).Distinct().Select(Relative)], "file", FilesOfTheChange)}";
         return said.Count == 0 ? replaced : $"{replaced}; {string.Join("; ", said)}";
     });
 
@@ -281,6 +343,7 @@ public sealed partial class PassengerTools
         {
             throw new ArgumentException("Give oldText, the text to replace as the file has it; to add text, give the line before it as oldText and that line with the new text after it as newText");
         }
+        Resolve(path, changes: true);
         OpenDocument document = await TextualAsync(path, cancel);
         TextSnapshot text = document.Text.Snapshot;
         string eol = document.Text.LineEnding;
@@ -365,6 +428,20 @@ public sealed partial class PassengerTools
 
     private static string Shorter(string text) => text.Length > 120 ? text[..120] + "…" : text;
 
+    /// <summary>A search's matches in the files the agent may read, or with <paramref name="changes"/> change (<see
+    /// cref="AgentReach"/>), and the files left out: one the person has open outside the folder, or one a link
+    /// in it leads out to, is none of the agent's.</summary>
+    private (FilesFound Kept, IReadOnlyList<string> LeftOut) Reached(FilesFound searched, bool changes)
+    {
+        List<string> left = [.. searched.Matches.Select(m => m.Path).Concat(searched.Stopped).Distinct(StringComparer.Ordinal).Where(p => !Reaches(p, changes))];
+        return left.Count == 0 ? (searched, left) : (searched with
+        {
+            Matches = [.. searched.Matches.Where(m => !left.Contains(m.Path))],
+            Stopped = [.. searched.Stopped.Where(p => !left.Contains(p))],
+            Outside = [.. searched.Outside.Where(p => !left.Contains(p))],
+        }, left);
+    }
+
     /// <summary>Find in Files' query and scope as an agent names them, refused as the popup refuses them.</summary>
     private (SearchQuery Query, SearchScope Scope) Search(string text, bool matchCase, bool wholeWords, bool regex, string scope, string? project, string? directory,
         bool recursive, string? mask)
@@ -385,7 +462,7 @@ public sealed partial class PassengerTools
         SearchScope chosen = scope switch
         {
             "solution" => new SearchScope(SearchScopeKind.Solution, null, null, recursive, null, mask),
-            "project" => new SearchScope(SearchScopeKind.Project, Project(project ?? throw new ArgumentException("The project scope names its project")).Path, null, recursive, null, mask),
+            "project" => new SearchScope(SearchScopeKind.Project, SearchedProject(project ?? throw new ArgumentException("The project scope names its project")), null, recursive, null, mask),
             "directory" => new SearchScope(SearchScopeKind.Directory, null, Resolve(directory ?? throw new ArgumentException("The directory scope names its directory")), recursive, null, mask),
             "openFiles" => new SearchScope(SearchScopeKind.Scope, null, null, recursive, MainWindow.OpenFilesScope, mask),
             "currentFile" => new SearchScope(SearchScopeKind.Scope, null, null, recursive, MainWindow.CurrentFileScope, mask),
@@ -403,9 +480,13 @@ public sealed partial class PassengerTools
         "change, a refactoring's, a Git operation's, a label's...) and files (at most 10). With set, what was there before it, which " +
         "local_history_revert puts back: a file's text (exists false where there was none), or the folder's files that differ " +
         "now.")]
-    public Task<LocalHistoryInfo> LocalHistoryOf(string? path = null, long? set = null, CancellationToken cancel = default) =>
+    public Task<LocalHistoryInfo> LocalHistoryOf(string? path = null, long? set = null, int? from = null, CancellationToken cancel = default) =>
         OnUi(cancel, async () =>
     {
+        if (from is not null && set is null)
+        {
+            throw new ArgumentException("from reads on a file's text before a change set: give set too", nameof(from));
+        }
         (History.LocalHistory history, string full) = HistoryOf(path);
         history.LookAgain();
         // Looked at every 50 ms: Local History's queue, drained off the UI thread, raises nothing as it empties.
@@ -419,9 +500,12 @@ public sealed partial class PassengerTools
         }
         if (set is not long chosen)
         {
-            (IReadOnlyList<HistoryRow> newest, string? older) = AgentAnswers.Listed(rows, MostHistoryRows, "change set",
-                "local_history of a file or folder within lists its own");
-            return new LocalHistoryInfo(Relative(full), [.. newest.Select(Row)]) { More = older };
+            List<HistoryRowInfo> newest = [.. rows.Take(MostHistoryRows).Select(Row)];
+            int kept = AgentAnswers.Fitting(newest, Size, Room(new LocalHistoryInfo(Relative(full), [])));
+            return new LocalHistoryInfo(Relative(full), [.. newest.Take(kept)])
+            {
+                More = kept == rows.Count ? null : AgentAnswers.More(rows.Count - kept, "change set", "local_history of a file or folder within lists its own"),
+            };
         }
         HistoryRow row = rows.FirstOrDefault(r => r.Set == chosen)
             ?? throw new ArgumentException($"No change set {chosen} is in the history of {Relative(full)}; local_history lists those there are");
@@ -442,7 +526,20 @@ public sealed partial class PassengerTools
         }
         byte[] bytes = await BackgroundWork.Run(() => history.Content(version), cancel)
             ?? throw new InvalidOperationException($"What {Relative(full)} held before change set {chosen} is no longer kept");
-        return new LocalHistoryInfo(Relative(full), [Row(row)]) { Exists = true, Text = FileText.FromBytes(bytes)?.Text ?? string.Empty };
+        LocalHistoryInfo before = new(Relative(full), [Row(row)]) { Exists = true };
+        string[] lines = (FileText.FromBytes(bytes)?.Text ?? string.Empty).Split('\n');
+        int first = (from ?? 1) - 1;
+        if (first < 0 || first >= lines.Length)
+        {
+            throw new ArgumentException($"from {from} is not a line of the text {Relative(full)} held before change set {chosen}, which has {Plural.Of(lines.Length, "line")}", nameof(from));
+        }
+        // A line takes its JSON's characters, its quotes standing for the escaped line break after it.
+        int shown = Math.Max(1, AgentAnswers.Fitting(lines[first..], Size, Room(before)));
+        return before with
+        {
+            Text = JsonWithin(string.Join('\n', lines[first..(first + shown)]), Room(before)),
+            More = first + shown == lines.Length ? null : AgentAnswers.More(lines.Length - first - shown, "line", $"from {first + shown + 1} reads on"),
+        };
 
         HistoryRowInfo Row(HistoryRow r)
         {
@@ -489,7 +586,9 @@ public sealed partial class PassengerTools
         history.Label(label);
         // Looked at every 50 ms: Local History's queue, drained off the UI thread, raises nothing as it empties.
         await Until(() => !history.IsRecording, HistoryLimit, cancel);
-        return $"Label {label} put";
+        return !history.IsRecording ? $"Label {label} put"
+            : history.WaitsForAnother ? $"Label {label} waits for another Passenger on the same state, which holds Local History: it is kept once that one lets go, and local_history lists it then"
+            : $"Label {label} is still being kept: local_history lists it once it is";
     });
 
     /// <summary>The open folder's Local History and a path in the folder an agent named (the folder itself when none).</summary>
@@ -505,9 +604,12 @@ public sealed partial class PassengerTools
 
     // Problems and the Build window
 
-    /// <summary>What the Problems window lists beyond a file's diagnostics, as diagnostics with no path answers it.</summary>
-    private Task<ProblemsInfo> Problems(CancellationToken cancel) => OnUi(cancel, async () =>
+    /// <summary>What the Problems window lists beyond a file's diagnostics, as diagnostics with no path or a folder's answers
+    /// it: within the folder, of the severity and project asked, each list's severest first, by file and place, held to
+    /// <see cref="AgentAnswers.MostFindings"/> in all, saying what it left out.</summary>
+    private Task<ProblemsInfo> Problems(string? within, string? severity, string? project, CancellationToken cancel) => OnUi(cancel, async () =>
     {
+        global::Passenger.Workspace.ProjectModel? named = project is null ? null : Project(project);
         if (Session.CSharp is { SolutionWide: true })
         {
             // Its first answers come once the server has loaded the solution and analysed it.
@@ -516,10 +618,27 @@ public sealed partial class PassengerTools
             await Until(() => Session.CSharp is not { IsAnalysing: true }, ServerLimit, cancel);
         }
         ToolWindows.ProblemsModel view = window.BottomPanel.Problems;
-        return new ProblemsInfo([.. view.ToolsetProblems.Select(Found)], [.. view.Problems.Select(Found)],
-            Session.CSharp?.SolutionProblems is { } solution ? [.. solution.Where(p => p.Diagnostic.Severity is Lsp.DiagnosticSeverity.Error or Lsp.DiagnosticSeverity.Warning)
+        List<Finding> toolset = Asked(view.ToolsetProblems.Where(p => Within(p.Path, p.Project)).Select(Found));
+        List<Finding> build = Asked(view.Problems.Where(p => Within(p.Path, p.Project)).Select(Found));
+        List<Finding>? solution = Session.CSharp?.SolutionProblems is { } all
+            ? Asked(all.Where(p => p.Diagnostic.Severity is Lsp.DiagnosticSeverity.Error or Lsp.DiagnosticSeverity.Warning && Within(p.Path, null))
                 .Select(p => new Finding(p.Diagnostic.Severity == Lsp.DiagnosticSeverity.Error ? "error" : "warning", p.Diagnostic.Code,
-                p.Diagnostic.Message, Relative(p.Path), p.At.Line + 1, p.At.Column + 1))] : null);
+                p.Diagnostic.Message, Relative(p.Path), p.At.Line + 1, p.At.Column + 1)))
+            : null;
+        (IReadOnlyList<Finding>[] kept, int[] left) = AgentAnswers.Severest<Finding>([toolset, build, .. solution is null ? [] : (IReadOnlyList<Finding>[])[solution]],
+            f => Rank(f.Severity) ?? 2, 4, AgentAnswers.MostFindings, Size, Room(new ProblemsInfo([], [], solution is null ? null : [])));
+        int leftOut = left.Sum();
+        string? more = leftOut == 0 ? null : AgentAnswers.More(leftOut, "finding",
+            $"{LeftOut(left)}; diagnostics with severity, project or a folder's path lists fewer at once, with a file's path that file's own");
+        return new ProblemsInfo(kept[0], kept[1], solution is null ? null : kept[2]) { More = more };
+
+        bool Within(string? path, string? owner) =>
+            (within is null || (path is not null && PathNames.Within(path, within)))
+            && (named is null || (path is not null ? PathNames.Same(path, named.Path) || (Session.ProjectOf(path) is { } owning && PathNames.Same(owning.Path, named.Path)) : owner == named.Name));
+
+        // Of the severity asked, the severest first, then by file and place.
+        List<Finding> Asked(IEnumerable<Finding> found) => [.. found.Where(f => severity is null || f.Severity == severity)
+            .OrderBy(f => Rank(f.Severity) ?? 2).ThenBy(f => f.Path, StringComparer.Ordinal).ThenBy(f => f.Line).ThenBy(f => f.Column)];
 
         Finding Found(Problem p) => new(p.Severity switch { ProblemSeverity.Error => "error", ProblemSeverity.Warning => "warning", _ => "info" }, p.Code, p.Message,
             p.Path is { } at ? Relative(at) : p.Project, p.Position.Line + 1, p.Position.Column + 1);
@@ -532,8 +651,12 @@ public sealed record SettingsInfo(bool Kept, IReadOnlyList<SettingInfo> Settings
 /// <summary>A setting by its name in settings.json: its value, its kind, the choices it takes or the range it is brought into.</summary>
 public sealed record SettingInfo(string Name, JsonElement Value, string Kind, IReadOnlyList<string>? Choices, double? Min, double? Max)
 {
-    /// <summary>What its choices leave out and how to ask for it: a font's installed families.</summary>
+    /// <summary>What its choices leave out and how to ask for it: a font's installed families, how a theme is named.</summary>
     public string? Note { get; init; }
+
+    /// <summary>What the folder's .editorconfig files set over it, for the files each section's glob names, which take that
+    /// rather than the setting: "./.editorconfig sets max_line_length = 120 for *.gd".</summary>
+    public IReadOnlyList<string>? EditorConfig { get; init; }
 }
 
 /// <summary>A setting an agent changed: as it was, as it is now in force, and why that is not what was asked, when it is not.</summary>
@@ -541,7 +664,11 @@ public sealed record SettingChange(string Name, JsonElement Before, JsonElement 
 
 /// <summary>Find in Files' matches: how many it found (at most 1000, capped then), those returned, and the files a regex
 /// ran too long in, whose search stopped there.</summary>
-public sealed record FindInFilesResult(int Count, bool Capped, IReadOnlyList<Place> Matches, IReadOnlyList<string>? Stopped);
+public sealed record FindInFilesResult(int Count, bool Capped, IReadOnlyList<Place> Matches, IReadOnlyList<string>? Stopped)
+{
+    /// <summary>How many matches found were left out, and how to read them.</summary>
+    public string? More { get; init; }
+}
 
 /// <summary>A file's or folder's Local History; with a change set chosen, what was there before it.</summary>
 public sealed record LocalHistoryInfo(string Path, IReadOnlyList<HistoryRowInfo> Rows)
@@ -555,7 +682,7 @@ public sealed record LocalHistoryInfo(string Path, IReadOnlyList<HistoryRowInfo>
     /// <summary>A folder's files that are not now what they were before the set: added, deleted or modified since.</summary>
     public IReadOnlyList<VcsChange>? Files { get; init; }
 
-    /// <summary>How many more change sets, or files before the set, were left out, and how to read them.</summary>
+    /// <summary>How many more change sets, files before the set, or lines of its text were left out, and how to read them.</summary>
     public string? More { get; init; }
 }
 
@@ -568,4 +695,8 @@ public sealed record HistoryRowInfo(long Set, string Time, string Title, bool La
 
 /// <summary>What the Problems window lists beyond a file's diagnostics: the projects' load problems, the last build's, and the
 /// solution's with solution-wide analysis on (null while it is off).</summary>
-public sealed record ProblemsInfo(IReadOnlyList<Finding> Toolset, IReadOnlyList<Finding> Build, IReadOnlyList<Finding>? Solution);
+public sealed record ProblemsInfo(IReadOnlyList<Finding> Toolset, IReadOnlyList<Finding> Build, IReadOnlyList<Finding>? Solution)
+{
+    /// <summary>How many findings past those listed were left out, of which severities, and how to read them.</summary>
+    public string? More { get; init; }
+}

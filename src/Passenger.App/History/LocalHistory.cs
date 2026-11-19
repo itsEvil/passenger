@@ -62,8 +62,8 @@ public sealed class LocalHistory
     /// same folder may have written it for a line it is about to add.</summary>
     private static readonly TimeSpan Orphaned = TimeSpan.FromMinutes(10);
 
-    /// <summary>How long a change to the history waits for another Passenger keeping it in the same state to let go of it:
-    /// past that an append goes on all the same, and a prune waits for its next turn.</summary>
+    /// <summary>How long a prune waits for another Passenger keeping the history in the same state to let go of it before it
+    /// leaves it for its next turn, and how often a change, which waits on however long that takes, says it is waiting.</summary>
     private static readonly TimeSpan HeldFor = TimeSpan.FromSeconds(10);
 
     /// <summary>How long after a change another Passenger on the same state may hear it and keep it as an external change
@@ -87,7 +87,8 @@ public sealed class LocalHistory
     private long readTo;
     private byte[] readLine = [];
 
-    /// <summary>The lines this store appended without the hold, on the queue: passed over when a read of the log meets them.</summary>
+    /// <summary>The lines this store appended where the log could not be read first, on the queue: passed over when a read
+    /// of the log meets them.</summary>
     private readonly HashSet<string> unread = new(StringComparer.Ordinal);
 
     /// <summary>The saves of each path queued and not yet recorded, whose new content the disk may already hold.</summary>
@@ -104,6 +105,7 @@ public sealed class LocalHistory
     private readonly string stateFolder;
     private readonly DateTime openedUtc = DateTime.UtcNow;
     private bool draining;
+    private volatile bool heldElsewhere;
     private bool changed;
     private int users;
     private long lastSet;
@@ -116,6 +118,10 @@ public sealed class LocalHistory
     /// <summary>When each named activity's moment ended (its end, and <see cref="Lingering"/> after), by its set: a change
     /// written to a file after it is no longer that activity's, however early the watcher heard the file.</summary>
     private readonly Dictionary<long, DateTime> endedAt = [];
+
+    /// <summary>The activities over files alone (<see cref="Over"/>), under way or just ended, on the gate.</summary>
+    private readonly List<Claim> claims = [];
+
     /// <summary>The change set the saves made on this flow are kept under, whatever activity is under way (<see cref="Activity.Own"/>).</summary>
     private readonly AsyncLocal<(long Set, string Name)?> own = new();
 
@@ -150,9 +156,12 @@ public sealed class LocalHistory
     public event Action<string>? Reading;
 
     /// <summary>A folder's history, shared by every window of this process that has the folder open with the same state
-    /// folder; let go with <see cref="Release"/>.</summary>
+    /// folder, however each names it; let go with <see cref="Release"/>. The state folder is made canonical, as the paths
+    /// noticed are, so the history keeps nothing written there: its own writes, heard where the state folder lies inside
+    /// the open folder, would each be kept by another.</summary>
     public static LocalHistory Open(string folder, string stateFolder, HistoryKeeping keeping)
     {
+        stateFolder = PathNames.Canonical(stateFolder);
         string key = State.ProjectState.FolderOf(stateFolder, folder);
         lock (Stores)
         {
@@ -213,18 +222,70 @@ public sealed class LocalHistory
         }
     }
 
-    /// <summary>An activity under way until disposed (<see cref="During"/>), whose change set also names the saves made
-    /// within <see cref="Own"/> on any thread, before it ends or after.</summary>
-    public sealed class Activity(LocalHistory history, (long Set, string Name) named) : IDisposable
+    /// <summary>Names one change set until disposed, and a moment after, as <see cref="During"/> does, but of
+    /// <paramref name="files"/> alone: what the folder watcher sees written to them by then, however late it hears it,
+    /// and the saves made within its <see cref="Activity.Own"/>. The person's saves meanwhile, and every other file's
+    /// changes, stay their own (a package change, which another program writes for a while). One <paramref name="joining"/>
+    /// an earlier activity names its files in that one's set, so a change made in steps is one set.</summary>
+    public Activity Over(string name, IEnumerable<string> files, Activity? joining = null)
     {
+        lock (gate)
+        {
+            Claim claim = new(joining?.Named ?? (NewSet(), name), new HashSet<string>(files.Select(PathNames.Canonical), PathNames.Comparer));
+            claims.Add(claim);
+            return new Activity(this, claim.Named, claim);
+        }
+    }
+
+    /// <summary>An activity over files alone ended: what the watcher sees of them a moment after is still its.</summary>
+    private void End(Claim claim)
+    {
+        lock (gate)
+        {
+            DateTime until = DateTime.UtcNow + Lingering;
+            claim.Until = until;
+            endedAt[claim.Named.Set] = endedAt.TryGetValue(claim.Named.Set, out DateTime later) && later > until ? later : until;
+            claims.RemoveAll(c => c.Until < DateTime.UtcNow - HeardWithin);
+        }
+    }
+
+    /// <summary>The activity over files that names what the watcher saw of a file now, if any: one ended a while ago still
+    /// does, heard late, unless another activity names what is seen now, its notice taking only what was written before its
+    /// moment ended (<see cref="NamedUntil"/>).</summary>
+    private (long Set, string Name)? Claimed(string path)
+    {
+        lock (gate)
+        {
+            DateTime now = DateTime.UtcNow;
+            bool another = activity is not null || (lingering is { } after && now < after.Until);
+            return claims.LastOrDefault(c => c.Files.Contains(path) && (c.Until == DateTime.MaxValue || (!another && now - HeardWithin < c.Until)))?.Named;
+        }
+    }
+
+    /// <summary>An activity under way until disposed (<see cref="During"/>, or <see cref="Over"/> its files alone), whose
+    /// change set also names the saves made within <see cref="Own"/> on any thread, before it ends or after.</summary>
+    public sealed class Activity : IDisposable
+    {
+        private readonly LocalHistory history;
+        private readonly Claim? over;
         private int ended;
+
+        internal Activity(LocalHistory history, (long Set, string Name) named, Claim? over = null)
+        {
+            this.history = history;
+            this.over = over;
+            Named = named;
+        }
+
+        /// <summary>The change set it names and its name.</summary>
+        internal (long Set, string Name) Named { get; }
 
         /// <summary>Names the saves made on the calling flow until disposed, and nothing else: a change's own writes made
         /// off the window's thread while the person saves other files.</summary>
         public IDisposable Own()
         {
             (long Set, string Name)? outer = history.own.Value;
-            history.own.Value = named;
+            history.own.Value = Named;
             return new Owning(history, outer);
         }
 
@@ -232,9 +293,26 @@ public sealed class LocalHistory
         {
             if (Interlocked.Exchange(ref ended, 1) == 0)
             {
-                history.End();
+                if (over is null)
+                {
+                    history.End();
+                }
+                else
+                {
+                    history.End(over);
+                }
             }
         }
+    }
+
+    /// <summary>The files an activity over files alone names, until when (none while it is under way).</summary>
+    internal sealed class Claim((long Set, string Name) named, HashSet<string> files)
+    {
+        public (long Set, string Name) Named { get; } = named;
+
+        public HashSet<string> Files { get; } = files;
+
+        public DateTime Until { get; set; } = DateTime.MaxValue;
     }
 
     private sealed class Owning(LocalHistory history, (long Set, string Name)? outer) : IDisposable
@@ -253,21 +331,27 @@ public sealed class LocalHistory
         }
     }
 
-    /// <summary>Paths the folder watcher saw change: a file the history knows is read and compared with what it knew, a
-    /// change kept under the activity under way, else as an external change; one it does not know is read and kept only
-    /// as <see cref="BulkArrivals"/> says. A folder made is looked in for its files, one deleted takes what the history knew
-    /// under it, and a file gone whose content another just made has is a move.</summary>
-    public void Noticed(IReadOnlyCollection<string> paths)
+    /// <summary>Paths the folder watcher saw change, with those that <paramref name="came"/> (made, moved in): a file
+    /// the history knows is read and compared with what it knew, a change kept under the activity over that file
+    /// (<see cref="Over"/>), else the activity under way, else as an external change; one it does not know is read and kept
+    /// only as <see cref="BulkArrivals"/> says. A folder that came is looked in for its files, one deleted takes what the
+    /// history knew under it, and a file gone whose content another just made has is a move.</summary>
+    public void Noticed(IReadOnlyCollection<string> paths, IReadOnlyCollection<string> came)
     {
         List<string> kept = [.. paths.Where(Keeps)];
         if (kept.Count == 0)
         {
             return;
         }
-        (long set, string name) = Seen();
         DateTimeOffset time = Keeping.Clock();
         DateTime heard = DateTime.UtcNow;
-        Enqueue(() => RecordNotice(kept, set, name, time, heard));
+        HashSet<string> come = new(came.Where(c => kept.Contains(c, PathNames.Comparer)), PathNames.Comparer);
+        foreach (IGrouping<(long Set, string Name)?, string> named in kept.GroupBy(Claimed))
+        {
+            (long set, string name) = named.Key ?? Seen();
+            List<string> these = [.. named];
+            Enqueue(() => RecordNotice(these, come, set, name, time, heard));
+        }
     }
 
     /// <summary>Reads what a delete is about to take, off the UI thread: the file, or every text file under the folder.</summary>
@@ -342,6 +426,10 @@ public sealed class LocalHistory
             }
         }
     }
+
+    /// <summary>Whether a change waits for another Passenger on the same state to let go of the history
+    /// (<see cref="HoldToChange"/>).</summary>
+    public bool WaitsForAnother => heldElsewhere;
 
     /// <summary>Everything kept so far, oldest first, and the content each path is known to have now (null for deleted).</summary>
     public (IReadOnlyList<HistoryEvent> Events, IReadOnlyDictionary<string, string?> Known) Snapshot()
@@ -512,6 +600,16 @@ public sealed class LocalHistory
 
     private void Load()
     {
+        try
+        {
+            // Its copies of the folder's files (a .env, appsettings) are the person's alone, a store an earlier Passenger made put right.
+            Containers.OwnFiles.Made(Root);
+            Containers.OwnFiles.Tree(Root);
+        }
+        catch (Exception error) when (error is IOException or UnauthorizedAccessException)
+        {
+            IdeErrors.Write($"Local History of {Folder} could not be made the person's alone: {error.Message}");
+        }
         using (Hold())
         {
             TakeLog();
@@ -723,6 +821,10 @@ public sealed class LocalHistory
         return logged;
     }
 
+    /// <summary>Keeps a save: its change, after an external change where the disk held what the history did not know. A
+    /// save whose bytes a notice read before this record came (the watcher's word of an earlier change, read as this save
+    /// wrote) is held already as an external change from the same bytes to the same, whose place it takes (<see cref="TakeIn"/>),
+    /// so it is kept once, with no external change back to what it wrote over.</summary>
     private void RecordWrite(string path, byte[]? before, byte[] after, long set, string? name, DateTimeOffset time)
     {
         if (!IsText(after))
@@ -737,14 +839,18 @@ public sealed class LocalHistory
             return;
         }
         string? beforeHash = before is null ? null : Hash(before);
+        HistoryEvent? change = beforeHash == afterHash ? null
+            : new HistoryEvent(set, time, before is null ? HistoryKind.Created : HistoryKind.Changed, path, null, beforeHash, afterHash, name);
         List<HistoryEvent> made = [];
         bool isKnown;
         string? was;
+        bool heard;
         lock (gate)
         {
             isKnown = known.TryGetValue(path, out was);
+            heard = change is not null && Twice(change) is { Name: ExternalChange };
         }
-        if (isKnown && was != beforeHash)
+        if (isKnown && was != beforeHash && !heard)
         {
             // The disk held something else than the history knew: changed elsewhere, and not seen yet.
             if (before is not null)
@@ -757,10 +863,10 @@ public sealed class LocalHistory
         {
             Store(before);
         }
-        if (beforeHash != afterHash)
+        if (change is not null)
         {
             Store(after);
-            made.Add(new HistoryEvent(set, time, before is null ? HistoryKind.Created : HistoryKind.Changed, path, null, beforeHash, afterHash, name));
+            made.Add(change);
         }
         Append(made);
     }
@@ -790,7 +896,7 @@ public sealed class LocalHistory
     private HistoryEvent External(string path, string? was, string? now, DateTimeOffset time) =>
         new(NewSet(), time, was is null ? HistoryKind.Created : now is null ? HistoryKind.Deleted : HistoryKind.Changed, path, null, was, now, ExternalChange);
 
-    private void RecordNotice(IReadOnlyList<string> paths, long set, string name, DateTimeOffset time, DateTime heard)
+    private void RecordNotice(IReadOnlyList<string> paths, IReadOnlySet<string> came, long set, string name, DateTimeOffset time, DateTime heard)
     {
         // What another Passenger on the same state made and kept is known, not a change made elsewhere.
         CatchUp();
@@ -816,13 +922,13 @@ public sealed class LocalHistory
             }
             if (Directory.Exists(path))
             {
-                // A folder whose files it knows has their changes already; a link holds nothing new.
+                // A folder whose files it knows has their changes; a link, or one Windows names as a file in it is first read, nothing new.
                 bool knownUnder;
                 lock (gate)
                 {
                     knownUnder = known.Keys.Any(k => PathNames.IsUnder(k, path));
                 }
-                if (!knownUnder && new DirectoryInfo(path).LinkTarget is null)
+                if (!knownUnder && came.Contains(path) && new DirectoryInfo(path).LinkTarget is null)
                 {
                     folders.Add(path);
                 }
@@ -873,7 +979,7 @@ public sealed class LocalHistory
                 continue;
             }
             Store(bytes);
-            bool late = until is { } limit && WrittenAt(path) > limit;
+            bool late = until is { } limit && FileStamp.WrittenAt(path) > limit;
             (long Set, DateTimeOffset Time, string Name) named = late ? (laterSet ??= NewSet(), Keeping.Clock(), ExternalChange) : (set, time, name);
             made.Add(!isKnown
                 ? new HistoryEvent(isNew ? named.Set : NewSet(), named.Time, isNew ? HistoryKind.Created : HistoryKind.Seen, path, null, null, hash, isNew ? named.Name : null)
@@ -886,7 +992,7 @@ public sealed class LocalHistory
         Append(made);
         if (later.Count > 0)
         {
-            Enqueue(() => RecordNotice(later, set, name, time, heard));
+            Enqueue(() => RecordNotice(later, came, set, name, time, heard));
         }
 
         // Whether the files it does not know are already a bulk arrival's, so the folders come need no more looking in.
@@ -939,20 +1045,9 @@ public sealed class LocalHistory
     {
         lock (gate)
         {
-            return name == ExternalChange ? null : activity?.Set == set ? DateTime.MaxValue : endedAt.TryGetValue(set, out DateTime until) ? until : null;
-        }
-    }
-
-    /// <summary>When a file was last written, as the system has it; the earliest time where it cannot say.</summary>
-    private static DateTime WrittenAt(string file)
-    {
-        try
-        {
-            return File.GetLastWriteTimeUtc(file);
-        }
-        catch (Exception error) when (error is IOException or UnauthorizedAccessException)
-        {
-            return DateTime.MinValue;
+            return name == ExternalChange ? null
+                : activity?.Set == set || claims.Any(c => c.Named.Set == set && c.Until == DateTime.MaxValue) ? DateTime.MaxValue
+                : endedAt.TryGetValue(set, out DateTime until) ? until : null;
         }
     }
 
@@ -1000,8 +1095,8 @@ public sealed class LocalHistory
         {
             return;
         }
-        Directory.CreateDirectory(Root);
-        using FileStream? holding = Hold();
+        Containers.OwnFiles.Made(Root);
+        using FileStream holding = HoldToChange();
         bool caughtUp = TryTakeLog();
         List<HistoryEvent> taken = [];
         lock (gate)
@@ -1023,12 +1118,12 @@ public sealed class LocalHistory
         {
             lines.Append(Line(kept)).Append('\n');
         }
-        using (FileStream appending = new(log, FileMode.Append, FileAccess.Write, FileShare.Read))
+        using (FileStream appending = Containers.OwnFiles.Append(log, FileShare.Read))
         {
             appending.Write(Encoding.UTF8.GetBytes(lines.ToString()));
-            if (holding is not null && caughtUp)
+            if (caughtUp)
             {
-                // Held, nothing else was appended since the log was read: these lines are read.
+                // Nothing else was appended since the log was read, held all along: these lines are read.
                 (readTo, readLine) = (appending.Position, Encoding.UTF8.GetBytes(Line(taken[^1]) + "\n"));
             }
             else
@@ -1154,7 +1249,7 @@ public sealed class LocalHistory
                 changed = true;
             }
             List<string> lines = [.. left];
-            AtomicFile.Write(log, Encoding.UTF8.GetBytes(string.Concat(lines.Select(line => line + "\n"))));
+            Containers.OwnFiles.Write(log, Encoding.UTF8.GetBytes(string.Concat(lines.Select(line => line + "\n"))));
             readTo = lines.Count == 0 ? 0 : new FileInfo(log).Length;
             readLine = lines.Count == 0 ? [] : Encoding.UTF8.GetBytes(lines[^1] + "\n");
             unread.Clear();
@@ -1223,7 +1318,7 @@ public sealed class LocalHistory
         string file = BlobPath(hash);
         if (File.Exists(file))
         {
-            using (Hold())
+            using (HoldToChange())
             {
                 try
                 {
@@ -1237,22 +1332,22 @@ public sealed class LocalHistory
                 }
             }
         }
-        Directory.CreateDirectory(Path.GetDirectoryName(file)!);
+        Containers.OwnFiles.Made(Path.GetDirectoryName(file)!);
         using MemoryStream compressed = new();
         using (BrotliStream brotli = new(compressed, CompressionLevel.Fastest, leaveOpen: true))
         {
             brotli.Write(bytes);
         }
-        AtomicFile.Write(file, compressed.GetBuffer().AsSpan(0, (int)compressed.Length));
+        Containers.OwnFiles.Write(file, compressed.GetBuffer().AsSpan(0, (int)compressed.Length));
         return hash;
     }
 
     private string BlobPath(string hash) => Path.Combine(blobs, hash[..2], hash[2..]);
 
     /// <summary>The history held against every other Passenger keeping it in the same state (an agent's, over --mcp) while
-    /// this one changes it: the log appended to or written again, content taken up again or deleted. Its lock file
-    /// (<see cref="State.StateFile.Hold"/>), waited for on the queue (never the UI thread) up to <see cref="HeldFor"/>; null when
-    /// not had.</summary>
+    /// this one reads its log or writes it again: its lock file (<see cref="State.StateFile.Hold"/>), waited for on the queue
+    /// (never the UI thread) up to <see cref="HeldFor"/>; null when not had, a read then going on without it and a prune
+    /// waiting for its next turn. A change waits for it however long it is held (<see cref="HoldToChange"/>).</summary>
     private FileStream? Hold()
     {
         try
@@ -1261,8 +1356,30 @@ public sealed class LocalHistory
         }
         catch (IOException refused)
         {
-            IdeErrors.Write($"Local History of {Folder}: another Passenger on the same state held {held}.lock past {HeldFor.TotalSeconds:0} s: {refused.Message}");
+            IdeErrors.Write($"Local History of {Folder}: another Passenger on the same state held {held}.lock past {Durations.Said(HeldFor)}: {refused.Message}");
             return null;
+        }
+    }
+
+    /// <summary>The history held for a change to it, a line appended or content named again, however long another Passenger
+    /// on the same state holds it (said each <see cref="HeldFor"/>): a line written beside that one's rewrite of the log (its
+    /// prune) goes with the log it replaces, and content named beside its clearing of old content may be deleted. On the queue.</summary>
+    private FileStream HoldToChange()
+    {
+        long began = System.Diagnostics.Stopwatch.GetTimestamp();
+        while (true)
+        {
+            try
+            {
+                FileStream holding = State.StateFile.Hold(held, HeldFor);
+                heldElsewhere = false;
+                return holding;
+            }
+            catch (IOException refused) when (State.StateFile.HeldElsewhere(refused))
+            {
+                heldElsewhere = true;
+                IdeErrors.Write($"Local History of {Folder}: another Passenger on the same state has held {held}.lock for {Durations.Said(System.Diagnostics.Stopwatch.GetElapsedTime(began))}, and what this one keeps waits for it");
+            }
         }
     }
 
@@ -1277,16 +1394,14 @@ public sealed class LocalHistory
                 return null;
             }
             using Stream stream = FileText.OpenRead(file);
-            byte[] start = new byte[FileText.BinaryProbe];
+            Span<byte> start = stackalloc byte[FileText.BinaryProbe];
             int probed = stream.ReadAtLeast(start, start.Length, throwOnEndOfStream: false);
-            if (FileText.LooksBinary(start.AsSpan(0, probed)))
+            if (FileText.LooksBinary(start[..probed]))
             {
                 return null;
             }
-            using MemoryStream bytes = new();
-            bytes.Write(start, 0, probed);
-            stream.CopyTo(bytes);
-            return bytes.Length <= FileText.KeptLimit ? bytes.ToArray() : null;
+            byte[] bytes = FileText.ReadRest(stream, start[..probed]);
+            return bytes.Length <= FileText.KeptLimit ? bytes : null;
         }
         catch (Exception error) when (error is IOException or UnauthorizedAccessException)
         {
@@ -1361,7 +1476,7 @@ public sealed class LocalHistory
         }
     }
 
-    private string Relative(string path) => Path.GetRelativePath(Folder, path).Replace('\\', '/');
+    private string Relative(string path) => PathNames.Relative(path, Folder) ?? path;
 
     private string Full(string relative) => Path.Combine(Folder, relative.Replace('/', Path.DirectorySeparatorChar));
 }

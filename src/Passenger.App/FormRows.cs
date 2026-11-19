@@ -6,14 +6,18 @@ using Avalonia.Media;
 
 namespace Passenger.App;
 
-/// <summary>A form's rows of a label and what it names (Run Configurations, Publish, New Project, Live Templates), written
+/// <summary>A form's rows of a label and what it names (Run Configurations, Publish, a feed, Clone, a breakpoint), written
 /// one way: the labels in one column at the rows' left, as wide as the form's longest and wrapping past
-/// <see cref="LabelWidth"/>, and each field filling the rest; a label beside a tall field (a list, several lines) stands at
-/// its top. The form is the control <see cref="Scope"/> marks, whose rows share the column.</summary>
+/// <see cref="LabelWidth"/>, and each field filling the rest, named by its label for a screen reader; a label beside a tall
+/// field (a list, several lines) stands at its top. The form is the control <see cref="Scope"/> marks, whose rows share the
+/// column. UiRulesTests fails label rows laid out by hand.</summary>
 public static class FormRows
 {
     /// <summary>The widest a label grows before it wraps.</summary>
     public const double LabelWidth = 170;
+
+    /// <summary>The room between a form's rows, a fold's rows too.</summary>
+    public const double Between = Gaps.Wide;
 
     /// <summary>The labels' column, shared by every row in the form.</summary>
     private const string Labels = "FormLabels";
@@ -30,7 +34,7 @@ public static class FormRows
         {
             Text = label ?? string.Empty,
             MaxWidth = LabelWidth,
-            Margin = new Thickness(0, top ? 4 : 0, 12, 0),
+            Margin = new Thickness(0, top ? Gaps.Tight : 0, Gaps.Wide, 0),
             TextWrapping = TextWrapping.Wrap,
             VerticalAlignment = top ? VerticalAlignment.Top : VerticalAlignment.Center,
         };
@@ -38,7 +42,7 @@ public static class FormRows
         if (!string.IsNullOrEmpty(label))
         {
             row.Children.Add(name);
-            AutomationProperties.SetLabeledBy(field, name);
+            AutomationProperties.SetLabeledBy(field is BrowseRow browse ? browse.Field : field, name);
         }
         Grid.SetColumn(field, 1);
         row.Children.Add(field);

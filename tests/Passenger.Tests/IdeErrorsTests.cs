@@ -1,5 +1,3 @@
-using System.Diagnostics;
-using System.Runtime.InteropServices;
 using System.Text.RegularExpressions;
 using Avalonia.Controls;
 using Avalonia.Headless;
@@ -228,8 +226,8 @@ public sealed class IdeErrorsTests : IDisposable
 
     /// <summary>Every place src's code lets go of a task it started (DroppedTasks): a discard, a call as a statement, a
     /// lambda for a delegate that returns nothing, a continuation that only marks a fault seen among them (that is
-    /// UnawaitedWork.Dismiss's). Passed over: a project not built, the container tools (only the solution's build and the
-    /// release make them).</summary>
+    /// UnawaitedWork.Dismiss's). Passed over: a folder of no .NET project (the debugger's relay is C), a project not built,
+    /// the container tools (only the solution's build and the release make them).</summary>
     [Gate]
     [AvaloniaFact]
     public void Nothing_in_src_leaves_a_fault_in_the_work_it_starts_for_the_garbage_collector_to_find()
@@ -240,7 +238,12 @@ public sealed class IdeErrorsTests : IDisposable
         foreach (string project in Directory.GetDirectories(Path.Combine(root, "src")).Order(StringComparer.Ordinal))
         {
             string name = Path.GetFileName(project);
-            Match named = Regex.Match(File.ReadAllText(Path.Combine(project, $"{name}.csproj")), "<AssemblyName>([^<]+)</AssemblyName>");
+            string projectFile = Path.Combine(project, $"{name}.csproj");
+            if (!File.Exists(projectFile))
+            {
+                continue;
+            }
+            Match named = Regex.Match(File.ReadAllText(projectFile), "<AssemblyName>([^<]+)</AssemblyName>");
             string assembly = Path.Combine(root, "artifacts", "bin", name, "debug", $"{(named.Success ? named.Groups[1].Value : name)}.dll");
             if (!File.Exists(assembly))
             {
@@ -362,7 +365,7 @@ public sealed class IdeErrorsTests : IDisposable
         foreach (string time in (string[])["once", "a second time"])
         {
             int server = window.CSharpService!.Session!.Server.ProcessId;
-            Process.GetProcessById(server).Kill();
+            OwnProcess.Of(server).Kill(alone: true);
             Ui.WaitFor(() => window.CSharpService.Session is { IsLoaded: true } session && session.Server.ProcessId != server,
                 $"the language server to be started again after it ended {time} ({window.CSharpService.State})");
             Assert.Contains($"process {server}) ended", Ui.IdeLog());
@@ -449,6 +452,40 @@ public sealed class IdeErrorsTests : IDisposable
         Assert.True(Core.BackgroundWork.Pending == 0, $"{Core.BackgroundWork.Pending} pieces of the failed test's work were still held for the next test to wait out");
     }
 
+    /// <summary>A window closed while its C# file's parse after a key has yet to land lets go of that parse with the file, as
+    /// nothing draws it again, so a window opened after it is quiet at once rather than waiting for good on its colours.</summary>
+    [AvaloniaFact]
+    public void A_window_closed_while_a_C_sharp_files_parse_after_a_key_is_held_leaves_the_next_window_quiet()
+    {
+        File.WriteAllText(Path.Combine(folder, "Program.cs"), "class Program\n{\n}\n");
+        TaskCompletionSource parse = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        MainWindow window = Ui.OpenFolder(folder, languageServer: false);
+        try
+        {
+            window.OpenFile("Program.cs");
+            Ui.Settle();
+            Languages.CSharp.CSharpHighlighter syntax = window.EditorArea.Active!.Syntax!;
+            int parses = syntax.Worked.Parses;
+            window.EditorArea.CodeEditor.Focus();
+            Languages.CSharp.CSharpHighlighter.HeldParses = parse.Task;
+            window.KeyTextInput("x");
+            Languages.CSharp.CSharpHighlighter.HeldParses = null;
+            window.Close();
+
+            MainWindow next = new() { Width = 1200, Height = 800, StartsLanguageServer = false };
+            next.Show();
+            Assert.True(Ui.Quiet(TimeSpan.FromSeconds(90)),
+                $"The parse under way as the window closed still held the IDE's quiet, so every window after it waits for good on colours nothing draws:\n{Ui.Busy()}");
+            Assert.True(syntax.Worked.Parses == parses, "The key's parse ran though it was held, so the window closed with no parse under way to let go of");
+            next.Close();
+        }
+        finally
+        {
+            Languages.CSharp.CSharpHighlighter.HeldParses = null;
+            parse.TrySetResult();
+        }
+    }
+
     /// <summary>A window test that closes its own window, as most do, is over only once what that window started has ended,
     /// as one it left open is: here a language server that answers nothing, which the window's end kills at its limit. On
     /// Windows a program still ending holds the DLLs it loaded, which the next test's reset of a shared project deletes.</summary>
@@ -457,7 +494,8 @@ public sealed class IdeErrorsTests : IDisposable
     {
         MainWindow window = OpenProgram();
         int server = window.CSharpService!.Session!.Server.ProcessId;
-        Processes.Suspend(server, "The language server");
+        OwnProcess stopped = OwnProcess.Of(server);
+        stopped.Suspend("The language server");
         try
         {
             window.Close();
@@ -474,7 +512,7 @@ public sealed class IdeErrorsTests : IDisposable
         finally
         {
             // Stopped, it never ends by itself, whatever failed above.
-            Processes.Kill(server);
+            stopped.Kill();
         }
     }
 
@@ -487,7 +525,8 @@ public sealed class IdeErrorsTests : IDisposable
         // Its 5 s and 10 s, shortened for this server alone: on any other a slow answer would end it.
         (server.SlowRequest, server.ResponseLimit) = (TimeSpan.FromSeconds(1), TimeSpan.FromSeconds(2));
 
-        Processes.Suspend(first, "The language server");
+        OwnProcess stopped = OwnProcess.Of(first);
+        stopped.Suspend("The language server");
         bool replaced = false;
         try
         {
@@ -502,17 +541,101 @@ public sealed class IdeErrorsTests : IDisposable
         {
             if (!replaced)
             {
-                End(first);
+                stopped.Kill(alone: true);
             }
         }
         Assert.Equal("Find Usages failed: the language server stopped responding, so it was ended", window.Status);
         string[] said = [.. Ui.IdeLog().Split('\n').Where(l => l.Contains($"process {first})", StringComparison.Ordinal))];
-        Assert.True(said.Any(l => l.Contains($"process {first}) is not responding: {Passenger.Lsp.LspMethods.References} waited", StringComparison.Ordinal)),
-            $"The log did not say the server stopped answering Find Usages; of process {first} it said: {string.Join(" | ", said)}");
+        // The first request past its limit is named, which may be one the window asked just before the stop (a refresh's colours).
+        Assert.True(said.Any(l => l.Contains($"process {first}) is not responding: ", StringComparison.Ordinal) && l.Contains(" waited ", StringComparison.Ordinal)),
+            $"The log did not say the server stopped answering; of process {first} it said: {string.Join(" | ", said)}");
         Ui.WaitFor(() => !Running(first), "the server that stopped answering to be ended, not left behind");
 
         TypeAnErrorAndSeeItReported(window);
         window.Close();
+    }
+
+    /// <summary>The check that a language server still answers asks of a document the server takes for no file, on any
+    /// system: it answers that it found none and logs nothing of it. A file's URI had it make a loose file of the check's
+    /// each time, and on Windows, where that URI names no drive, log an error.</summary>
+    [AvaloniaFact]
+    public void The_check_that_a_language_server_still_answers_asks_of_no_file_it_would_load()
+    {
+        MainWindow window = OpenProgram();
+        Passenger.Lsp.RoslynSession session = window.CSharpService!.Session!;
+        Passenger.Lsp.LanguageServer server = session.Server;
+        int process = server.ProcessId;
+        // Checked once a request has waited a second, on this server alone.
+        server.SlowRequest = TimeSpan.FromSeconds(1);
+        Lock reading = new();
+        List<string> failures = [];
+        string? asked = null;
+        string? answer = null;
+        server.Logged += (_, said) =>
+        {
+            if (said.Type is Passenger.Lsp.MessageType.Error or Passenger.Lsp.MessageType.Warning)
+            {
+                lock (reading)
+                {
+                    failures.Add(said.Message);
+                }
+            }
+        };
+        Passenger.Lsp.LanguageServer.Trace = (from, message) =>
+        {
+            lock (reading)
+            {
+                if (from != process || answer is not null)
+                {
+                    return;
+                }
+                if (asked is null && message.StartsWith("-->", StringComparison.Ordinal)
+                    && message.Contains($"\"method\":\"{Passenger.Lsp.LspMethods.FoldingRange}\"", StringComparison.Ordinal))
+                {
+                    asked = Regex.Match(message, "\"id\":(\\d+)").Groups[1].Value;
+                }
+                else if (asked is not null && message.StartsWith($"<-- {{\"jsonrpc\":\"2.0\",\"id\":{asked},", StringComparison.Ordinal)
+                    && !message.Contains("\"method\"", StringComparison.Ordinal))
+                {
+                    answer = message;
+                }
+            }
+        };
+        TaskCompletionSource checkedOnce = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        Task<IReadOnlyList<Passenger.Lsp.SymbolInformation>> held;
+        try
+        {
+            // Held unsent, as by a server slow to answer it, until a check has been answered.
+            Task holding = server.HoldNext(Passenger.Lsp.LspMethods.WorkspaceSymbol, _ => true, checkedOnce.Task);
+            held = session.SymbolsAsync("Main");
+            Ui.PumpUntil(() => holding.IsCompleted, "the request for symbols to be held");
+            Ui.PumpUntil(() =>
+            {
+                lock (reading)
+                {
+                    return answer is not null;
+                }
+            }, "the server to answer Passenger's check while a request waited on it");
+        }
+        finally
+        {
+            Passenger.Lsp.LanguageServer.Trace = null;
+            checkedOnce.TrySetResult();
+        }
+        Ui.AwaitPumped(held, "the request held to be answered once let go");
+        lock (reading)
+        {
+            Assert.True(answer is { } said && said.EndsWith("\"result\":null}", StringComparison.Ordinal),
+                $"The server made a document of Passenger's check, as of a file to load, to answer it: {answer}");
+        }
+        string log = Assert.Single(ServerLogs(), l => ServerOf(l) == process);
+        window.Close();
+        // Its log closed, the server has ended, and nothing more of what it logged is to come.
+        Ui.WaitFor(() => LetGo(log), $"the server's log {Path.GetFileName(log)} to be closed with the server");
+        lock (reading)
+        {
+            Assert.True(failures.Count == 0, $"The server logged a failure while Passenger checked it: {string.Join(" | ", failures)}");
+        }
     }
 
     /// <summary>A request cancelled as its language server's connection goes is said to no one: the word of the
@@ -539,7 +662,8 @@ public sealed class IdeErrorsTests : IDisposable
             }
         };
         Task<IReadOnlyList<Passenger.Lsp.SymbolInformation>> asked;
-        Processes.Suspend(first, "The language server");
+        OwnProcess stopped = OwnProcess.Of(first);
+        stopped.Suspend("The language server");
         try
         {
             asked = session.SymbolsAsync("Main", asking.Token);
@@ -549,7 +673,7 @@ public sealed class IdeErrorsTests : IDisposable
         finally
         {
             Passenger.Lsp.LanguageServer.Trace = null;
-            End(first);
+            stopped.Kill(alone: true);
         }
         Ui.PumpUntil(() => asked.IsCompleted, "the request to end with its server");
         Assert.True(asked.IsCanceled, $"The request cancelled as its server ended came to {asked.Status}: {asked.Exception?.InnerException?.Message}");
@@ -597,17 +721,13 @@ public sealed class IdeErrorsTests : IDisposable
                     return;
                 }
                 int endedBefore = Said($"The C# language server (process {server}) ended");
-                using (Process ending = Process.GetProcessById(server))
-                {
-                    ending.Kill();
-                    ending.WaitForExit();
-                }
+                OwnProcess.Of(server).Kill(alone: true, waited: true);
                 if (!Waiting.Until(() => Said($"The C# language server (process {server}) ended") > endedBefore, TimeSpan.FromMinutes(1), every: TimeSpan.FromMilliseconds(50)))
                 {
                     missed = $"the end of the server (process {server}) was never heard";
                 }
             });
-            Process.GetProcessById(first).Kill();
+            OwnProcess.Of(first).Kill(alone: true);
             Ui.WaitFor(() => missed is not null || (next != 0 && !Running(next)), "the server started again to be ended as its start came back");
             Assert.True(missed is null, $"The window's thread was let go before its server's start and end had both come: {missed}");
             Ui.WaitFor(() => csharp.Session is { IsLoaded: true } session && session.Server.ProcessId != first && session.Server.ProcessId != next,
@@ -731,7 +851,8 @@ public sealed class IdeErrorsTests : IDisposable
         Assert.Contains("Helper", caller.Node.Item.Name, StringComparison.Ordinal);
         int first = window.CSharpService!.Session!.Server.ProcessId;
 
-        Processes.Suspend(first, "The language server");
+        OwnProcess stopped = OwnProcess.Of(first);
+        stopped.Suspend("The language server");
         Task<string?> asked;
         try
         {
@@ -741,7 +862,7 @@ public sealed class IdeErrorsTests : IDisposable
         }
         finally
         {
-            End(first);
+            stopped.Kill(alone: true);
         }
         Assert.Equal("Call Hierarchy failed: the language server stopped before it answered", Ui.AwaitPumped(asked, "Call Hierarchy to give up on the server that ended"));
 
@@ -994,28 +1115,7 @@ public sealed class IdeErrorsTests : IDisposable
         Ui.WaitFor(() => window.EditorArea.Active!.Markers.Any(m => m.Kind == Editor.MarkerKind.Error), "the new server's diagnostics");
     }
 
-    /// <summary>Kills a server the IDE never replaced, so a failed test leaves none stopped behind.</summary>
-    private static void End(int id)
-    {
-        if (!OperatingSystem.IsWindows())
-        {
-            Signal(id, 9);
-            return;
-        }
-        try
-        {
-            using Process process = Process.GetProcessById(id);
-            process.Kill();
-        }
-        catch (Exception error) when (error is ArgumentException or InvalidOperationException)
-        {
-        }
-    }
-
     private static bool Running(int id) => Passenger.Core.DotnetProcesses.Runs(id);
-
-    [DllImport("libc", EntryPoint = "kill", SetLastError = true)]
-    private static extern int Signal(int process, int signal);
 
     private static void Tick() => throw new InvalidOperationException("The timer went wrong");
 }

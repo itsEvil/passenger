@@ -37,15 +37,7 @@ public sealed class ContainerFilesPane : DockPanel
             Classes = { StyleClasses.Tree },
         };
         ReusedRows.Use(list, Row);
-        list.DoubleTapped += (_, _) => IdeErrors.Observe(ActivateAsync(list.SelectedItem as ContainerFile));
-        list.KeyDown += (_, e) =>
-        {
-            if (e.Key == Key.Enter)
-            {
-                IdeErrors.Observe(ActivateAsync(list.SelectedItem as ContainerFile));
-                e.Handled = true;
-            }
-        };
+        ListKeys.Act(list, new ListActs { Open = () => IdeErrors.Observe(ActivateAsync(list.SelectedItem as ContainerFile)) });
         Children.Add(new Panel { Children = { list, said } });
     }
 
@@ -327,7 +319,7 @@ public sealed class ContainerFilesPane : DockPanel
                 }
             }
             // A rename puts the file where a link may stand, never through it.
-            File.Move(partial, copy, overwrite: true);
+            AtomicFile.Move(partial, copy);
             return null;
         }
         finally
@@ -348,7 +340,7 @@ public sealed class ContainerFilesPane : DockPanel
     /// path on hover.</summary>
     private Control Row()
     {
-        RowIcon icon = new() { Width = 14, Height = 14, Margin = new Thickness(0, 0, 6, 0) };
+        RowIcon icon = new() { Width = 14, Height = 14, Margin = new Thickness(0, 0, Gaps.Small, 0) };
         icon.ForegroundKey = TokenKeys.TextMuted;
         TextBlock name = new() { VerticalAlignment = VerticalAlignment.Center, TextTrimming = TextTrimming.CharacterEllipsis };
         StackPanel row = new() { Orientation = Orientation.Horizontal, Height = ListRow.Height, Children = { icon, name } };
@@ -357,7 +349,7 @@ public sealed class ContainerFilesPane : DockPanel
             icon.DataKey = file.IsFolder ? open.Contains(file.Path) ? IconKeys.FolderOpen : IconKeys.Explorer : IconKeys.DocumentText;
             name.Text = file.Name;
             ToolTip.SetTip(name, file.Path);
-            row.Margin = new Thickness(8 + (file.Depth * 16), 0, 8, 0);
+            row.Margin = new Thickness(Gaps.Normal + (file.Depth * Gaps.Indent), 0, Gaps.Normal, 0);
         });
     }
 }

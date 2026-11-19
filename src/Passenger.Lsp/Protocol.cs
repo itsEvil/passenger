@@ -99,19 +99,95 @@ public sealed record OpenProjectParams(IReadOnlyList<string> Projects);
 
 public sealed record CompletionContext(CompletionTriggerKind TriggerKind, string? TriggerCharacter = null);
 
-public sealed record CompletionParams(TextDocumentIdentifier TextDocument, LspPosition Position, CompletionContext Context);
+public sealed record CompletionParams(TextDocumentIdentifier TextDocument, LspPosition Position, CompletionContext Context)
+{
+    /// <summary>Whether Passenger's extension answers the list in parts (<see cref="Roslyn.Extension.CompletionParts"/>):
+    /// null for any other server.</summary>
+    [JsonPropertyName(Roslyn.Extension.CompletionParts.Asked)]
+    public bool? Parts { get; init; }
+}
 
 public sealed class CompletionList
 {
     public bool IsIncomplete { get; init; }
     public List<CompletionItem> Items { get; init; } = [];
     public CompletionItemDefaults? ItemDefaults { get; init; }
+
+    /// <summary>How well each item fits where the list was asked for, as runs (<see cref="Roslyn.Extension.CompletionPriorities"/>),
+    /// which <see cref="WithPriorities"/> gives each item; only Passenger's extension to Roslyn's server says them.</summary>
+    [JsonPropertyName(Roslyn.Extension.CompletionPriorities.Member)]
+    public int[]? MatchPriorities { get; init; }
+
+    /// <summary>The id the list's later part is asked by, where it was asked in parts and one may come
+    /// (<see cref="Roslyn.Extension.CompletionParts"/>).</summary>
+    [JsonPropertyName(Roslyn.Extension.CompletionParts.Later)]
+    public long? LaterId { get; init; }
+
+    /// <summary>The list's later part, asked for as soon as this part came: the items of namespaces not imported, which
+    /// go after all of this part's; null where none comes.</summary>
+    [JsonIgnore]
+    public Task<CompletionList?>? Later { get; internal set; }
+
+    /// <summary>Each item given what the list's defaults say of it and it does not say itself
+    /// (<see cref="CompletionItem.TakeDefaults"/>), as though the server had sent it whole.</summary>
+    public CompletionList WithDefaults()
+    {
+        if (ItemDefaults is { } defaults && (defaults.EditRange is not null || defaults.InsertTextFormat is not null || defaults.Data is not null || defaults.CommitCharacters is not null))
+        {
+            foreach (CompletionItem item in Items)
+            {
+                item.TakeDefaults(defaults);
+            }
+        }
+        return this;
+    }
+
+    /// <summary>Each item given how well it fits (<see cref="CompletionItem.MatchPriority"/>), as the list's runs say.</summary>
+    public CompletionList WithPriorities()
+    {
+        if (Roslyn.Extension.CompletionPriorities.Each(MatchPriorities, Items.Count) is { } each)
+        {
+            for (int i = 0; i < each.Length; i++)
+            {
+                Items[i].MatchPriority = each[i];
+            }
+        }
+        return this;
+    }
 }
 
-/// <summary>The commit characters alone: the one item default the client's capabilities say it reads.</summary>
+/// <summary>A completion answer read as it comes, once, as either of the protocol's shapes: a list, or its items alone.</summary>
+[JsonConverter(typeof(CompletionAnswerConverter))]
+public sealed record CompletionAnswer(CompletionList? List);
+
+internal sealed class CompletionAnswerConverter : JsonConverter<CompletionAnswer>
+{
+    public override CompletionAnswer Read(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options) => reader.TokenType switch
+    {
+        JsonTokenType.StartArray => new(new CompletionList { Items = JsonSerializer.Deserialize<List<CompletionItem>>(ref reader, options) ?? [] }),
+        JsonTokenType.StartObject => new(JsonSerializer.Deserialize<CompletionList>(ref reader, options)?.WithDefaults().WithPriorities()),
+        _ => Skipped(ref reader),
+    };
+
+    public override void Write(Utf8JsonWriter writer, CompletionAnswer value, JsonSerializerOptions options) =>
+        JsonSerializer.Serialize(writer, value.List, options);
+
+    private static CompletionAnswer Skipped(ref Utf8JsonReader reader)
+    {
+        reader.Skip();
+        return new(null);
+    }
+}
+
+/// <summary>The item defaults the client's capabilities say it reads: the commit characters, and what Roslyn's server
+/// says once for a list rather than for each item (the range an item's text replaces, the text's format, the data that
+/// resolving an item sends back), which <see cref="CompletionList.WithDefaults"/> gives each item.</summary>
 public sealed class CompletionItemDefaults
 {
     public List<string>? CommitCharacters { get; init; }
+    public LspRange? EditRange { get; init; }
+    public InsertTextFormat? InsertTextFormat { get; init; }
+    public JsonElement? Data { get; init; }
 }
 
 public sealed class CompletionItem
@@ -124,14 +200,46 @@ public sealed class CompletionItem
     public string? SortText { get; init; }
     public string? FilterText { get; init; }
     public string? InsertText { get; init; }
-    public InsertTextFormat? InsertTextFormat { get; init; }
-    public LspTextEdit? TextEdit { get; init; }
+    public InsertTextFormat? InsertTextFormat { get => insertTextFormat; init => insertTextFormat = value; }
+    public LspTextEdit? TextEdit { get => textEdit; init => textEdit = value; }
     public string? TextEditText { get; init; }
     public List<LspTextEdit>? AdditionalTextEdits { get; init; }
-    public List<string>? CommitCharacters { get; init; }
+    public List<string>? CommitCharacters { get => commitCharacters; init => commitCharacters = value; }
     public bool? Preselect { get; init; }
     public LspCommand? Command { get; init; }
-    public JsonElement? Data { get; init; }
+    public JsonElement? Data { get => data; init => data = value; }
+
+    /// <summary>How well the item fits where its list was asked for, as the server's matching says: higher fits better,
+    /// 0 where it says nothing (<see cref="CompletionList.WithPriorities"/>). Never sent back.</summary>
+    [JsonIgnore]
+    public int MatchPriority { get; internal set; }
+
+    private InsertTextFormat? insertTextFormat;
+    private LspTextEdit? textEdit;
+    private JsonElement? data;
+    private List<string>? commitCharacters;
+
+    /// <summary>Whether two items are one, however many answers apart: the same label, kind, label details (where a server
+    /// tells two of one name apart, by a namespace or a module) and detail. Each answer gives an item anew, its sort text,
+    /// range and data that answer's own.</summary>
+    public static bool Same(CompletionItem? one, CompletionItem? other) =>
+        ReferenceEquals(one, other)
+        || (one is not null && other is not null && one.Label == other.Label && one.Kind == other.Kind
+            && one.LabelDetails == other.LabelDetails && one.Detail == other.Detail);
+
+    /// <summary>What a list's defaults say of the item that it does not say itself: its edit over the default range,
+    /// putting in its own edit text or its label, its text's format, its data, which resolving it sends back, and the
+    /// characters that commit it, so an item keeps its own list's among another's (a list's later part).</summary>
+    internal void TakeDefaults(CompletionItemDefaults defaults)
+    {
+        if (textEdit is null && defaults.EditRange is { } range)
+        {
+            textEdit = new LspTextEdit(range, TextEditText ?? Label);
+        }
+        insertTextFormat ??= defaults.InsertTextFormat;
+        data ??= defaults.Data;
+        commitCharacters ??= defaults.CommitCharacters;
+    }
 }
 
 public sealed record CompletionItemLabelDetails(string? Detail, string? Description);
@@ -243,23 +351,38 @@ public sealed record FoldingRangeParams(TextDocumentIdentifier TextDocument);
 /// <summary>A symbol found by name across the workspace.</summary>
 public sealed record SymbolInformation(string Name, SymbolKind Kind, LspLocation Location, string? ContainerName = null)
 {
-    /// <summary>The type it is in, from Roslyn's container ("in Type (project P (tfm))") without the project, which its place
-    /// says; null for a type's own ("project P (tfm)").</summary>
+    /// <summary>The type it is in, as Roslyn's container names it before the file or project it adds, which its place says
+    /// ("in Type (File.cs - P (tfm))" for a partial member, "in Type (project P (tfm))"); null for a type in no other, whose
+    /// container names only those ("project P (tfm)", a partial type's "File.cs - P (tfm)").</summary>
     [JsonIgnore]
     public string? Owner
     {
         get
         {
-            if (ContainerName is not { } container)
+            if (ContainerName is not { } container || !container.StartsWith("in ", StringComparison.Ordinal))
             {
                 return null;
             }
-            int project = container.LastIndexOf(" (project ", StringComparison.Ordinal);
-            string within = project >= 0 ? container[..project] : container.StartsWith("project ", StringComparison.Ordinal) ? string.Empty : container;
-            within = within.StartsWith("in ", StringComparison.Ordinal) ? within[3..] : within;
+            int added = container.IndexOf(" (", 3, StringComparison.Ordinal);
+            string within = added > 3 ? container[3..added] : container[3..];
             return within.Length == 0 ? null : within;
         }
     }
+}
+
+/// <summary>What workspace/symbol answers, as Passenger lists it.</summary>
+public static class WorkspaceSymbols
+{
+    /// <summary>The symbols found, but a source generator's declaration of one the solution's own files declare too (a partial
+    /// type's or member's other part), whose place is the person's.</summary>
+    public static IEnumerable<SymbolInformation> Kept(IReadOnlyList<SymbolInformation> found)
+    {
+        HashSet<(string, SymbolKind, string?)> own = [.. found.Where(s => !Generated(s)).Select(s => (s.Name, s.Kind, s.Owner))];
+        return found.Where(s => !Generated(s) || !own.Contains((s.Name, s.Kind, s.Owner)));
+    }
+
+    /// <summary>Whether a symbol's place is in a source generator's document, which no file on disk holds.</summary>
+    public static bool Generated(SymbolInformation symbol) => DocumentUris.GeneratedName(symbol.Location.Uri) is not null;
 }
 
 /// <summary>A symbol in a document's outline, its members as children. Range is the whole
@@ -675,10 +798,14 @@ public sealed class DiagnosticConverter : JsonConverter<Diagnostic>
 public sealed record DocumentDiagnosticParams(TextDocumentIdentifier TextDocument, string? Identifier = null, string? PreviousResultId = null);
 
 /// <summary>A workspace diagnostics request for one source, with the result each document last had, so documents that
-/// have not changed come back as unchanged; its reports streamed as <c>$/progress</c> of the token as they are found.</summary>
-public sealed record WorkspaceDiagnosticParams(string? Identifier, IReadOnlyList<PreviousResultId> PreviousResultIds, string? PartialResultToken = null);
+/// have not changed come back as unchanged; its reports streamed as <c>$/progress</c> of the token as they are found. Asked
+/// of Passenger's extension (<see cref="Roslyn.Extension.ExtensionMethods.WorkspaceDiagnostic"/>), it names the framework
+/// solution-wide analysis takes each multi-targeted project in, by its project file.</summary>
+public sealed record WorkspaceDiagnosticParams(string? Identifier, IReadOnlyList<PreviousResultId> PreviousResultIds, string? PartialResultToken = null,
+    IReadOnlyDictionary<string, string>? Frameworks = null);
 
-public sealed record PreviousResultId(string Uri, string Value);
+/// <summary>The result a document last had, and the project it had it in where the report named one.</summary>
+public sealed record PreviousResultId(string Uri, string Value, [property: JsonPropertyName("_vs_projectContext")] ProjectContext? ProjectContext = null);
 
 public sealed class WorkspaceDiagnosticReport
 {
@@ -693,6 +820,10 @@ public sealed class WorkspaceDocumentDiagnosticReport
     public List<Diagnostic>? Items { get; init; }
     public string Uri { get; init; } = string.Empty;
     public int? Version { get; init; }
+
+    /// <summary>The project the document was analysed in, where the server names it.</summary>
+    [JsonPropertyName("_vs_projectContext")]
+    public ProjectContext? ProjectContext { get; init; }
 }
 
 public sealed class DocumentDiagnosticReport

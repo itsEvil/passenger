@@ -6,8 +6,9 @@ using Passenger.Workspace;
 namespace Passenger.App.Run;
 
 /// <summary>A folder's run configurations: those its projects generate, each with the person's changes put over it, then
-/// the person's own (kept with the folder's state, their projects relative to the folder there), and the one chosen in the
-/// toolbar, which Run, Debug and Profile launch. A UI-thread object of its <see cref="ProjectSession"/>.</summary>
+/// its solution's multi-project launch profiles (read from the files beside it, <see cref="SolutionLaunch"/>, the files
+/// their store), then the person's own (kept with the folder's state, their projects relative to the folder there), and the
+/// one chosen in the toolbar, which Run, Debug and Profile launch. A UI-thread object of its <see cref="ProjectSession"/>.</summary>
 public sealed class RunConfigurations(string? folder, Func<WorkspaceModel?>? workspace = null)
 {
     private List<RunConfiguration> own = [];
@@ -31,6 +32,15 @@ public sealed class RunConfigurations(string? folder, Func<WorkspaceModel?>? wor
     /// <summary>The person's own, in their order.</summary>
     public IReadOnlyList<RunConfiguration> Own => own;
 
+    /// <summary>The solution's multi-project launch profiles, the team's file's then the person's, as last read.</summary>
+    public IReadOnlyList<RunConfiguration> Profiles { get; private set; } = [];
+
+    /// <summary>Why a file of the solution's launch profiles could not be read as it was last, each; none when each read.</summary>
+    public IReadOnlyList<string> ProfileProblems { get; private set; } = [];
+
+    /// <summary>The solution whose launch profiles are read beside it (a solution filter's own solution), or null with none open.</summary>
+    public string? Solution => workspace?.Invoke()?.Solution?.Path;
+
     /// <summary>The configuration chosen in the toolbar.</summary>
     public RunConfiguration? Chosen { get; private set; }
 
@@ -41,6 +51,17 @@ public sealed class RunConfigurations(string? folder, Func<WorkspaceModel?>? wor
     {
         UiThread.Check();
         SingleFileAppHosts = paths;
+        Configure(projects, picked ? preferred : null);
+    }
+
+    /// <summary>The folder's Node packages, whose scripts are configurations (<see cref="Web.NodeFiles"/>).</summary>
+    public IReadOnlyList<NodePackage> Packages { get; private set; } = [];
+
+    /// <summary>Takes the folder's Node packages as last read.</summary>
+    public void ConfigurePackages(IReadOnlyList<NodePackage> packages)
+    {
+        UiThread.Check();
+        Packages = packages;
         Configure(projects, picked ? preferred : null);
     }
 
@@ -72,10 +93,87 @@ public sealed class RunConfigurations(string? folder, Func<WorkspaceModel?>? wor
     private void Configure(IReadOnlyList<ProjectModel> projects, string? keep)
     {
         this.projects = projects;
-        All = [.. RunConfiguration.Generate(projects, workspace?.Invoke(), SingleFileAppHosts).Select(Edited), .. own];
+        IReadOnlyList<RunConfiguration> generated = [.. RunConfiguration.Generate(projects, workspace?.Invoke(), SingleFileAppHosts, Packages).Select(Edited)];
+        (Profiles, ProfileProblems) = Solution is { } solution ? Read(solution, [.. generated.Select(g => g.Name), .. own.Select(o => o.Name)]) : ([], []);
+        All = [.. generated, .. Profiles, .. own];
         // With none picked, an AppHost's before its services', which it runs as the person means.
         Chosen = All.FirstOrDefault(c => string.Equals(c.Name, keep, StringComparison.OrdinalIgnoreCase)) ?? All.FirstOrDefault(c => c.Aspire) ?? All.FirstOrDefault();
         Changed?.Invoke(this, EventArgs.Empty);
+    }
+
+    /// <summary>A solution's launch profiles as configurations, each named as its file names it unless another configuration
+    /// is (<paramref name="taken"/>), which its file's name for it stays; with the problems of files that do not read.</summary>
+    private static (IReadOnlyList<RunConfiguration> Profiles, IReadOnlyList<string> Problems) Read(string solution, IEnumerable<string> taken)
+    {
+        (IReadOnlyList<SolutionLaunchProfile> read, IReadOnlyList<string> problems) = SolutionLaunch.Read(solution);
+        HashSet<string> names = new(taken, StringComparer.OrdinalIgnoreCase);
+        List<RunConfiguration> profiles = [];
+        foreach (SolutionLaunchProfile profile in read)
+        {
+            string name = RunConfiguration.UniqueName(profile.Name, names);
+            names.Add(name);
+            profiles.Add(OfProfile(profile) with { Name = name });
+        }
+        return (profiles, problems);
+    }
+
+    /// <summary>A launch profile as the configuration that starts its projects.</summary>
+    public static RunConfiguration OfProfile(SolutionLaunchProfile profile) => new()
+    {
+        Name = profile.Name,
+        Kind = RunKind.Projects,
+        LaunchProfile = profile.Name,
+        Starts = [.. profile.Projects.Select(p => new ProjectStart(p.Project, p.Action, p.DebugTarget ?? string.Empty) { Launch = p })],
+        Shared = profile.Shared,
+        Launch = profile,
+    };
+
+    /// <summary>A multi-project configuration as its file is to hold it: under its file's name for it unless renamed since it
+    /// was read (<paramref name="shown"/>, the name it was listed by then), each project with what its file held of it, and
+    /// its place in the file it was read from where it stays in that file.</summary>
+    public static SolutionLaunchProfile ToProfile(RunConfiguration configuration, string? shown) => new(
+        configuration.Launch is { } read && configuration.Name == shown ? read.Name : configuration.Name,
+        [.. configuration.Starts.Select(s => new SolutionLaunchProject(s.Project, s.Action, s.LaunchProfile.Length > 0 ? s.LaunchProfile : null)
+        {
+            Read = s.Launch?.Read,
+            ActionWritten = s.Launch?.ActionWritten,
+        })],
+        configuration.Shared)
+    {
+        Read = configuration.Launch?.Read,
+        Index = configuration.Launch is { } was && was.Shared == configuration.Shared ? was.Index : -1,
+    };
+
+    /// <summary>The configuration a multi-project configuration starts one of its projects as: its launch profile's (the
+    /// person's changes to it put over it), or for none named the first of the project's own that runs here, as dotnet run
+    /// takes its first; null with why where there is none.</summary>
+    public (RunConfiguration? Configuration, string? WhyNot) ProjectOf(ProjectStart start)
+    {
+        string name = Path.GetFileNameWithoutExtension(start.Project);
+        if (projects.FirstOrDefault(p => p.Exists && PathNames.Same(p.Path, start.Project)) is not { } project)
+        {
+            return (null, $"{name} is not loaded");
+        }
+        List<RunConfiguration> made = [.. All.Where(c => c is { Generated: true, Kind: RunKind.Project, GodotEditor: false } && PathNames.Same(c.Project, project.Path))];
+        if (start.LaunchProfile.Length == 0)
+        {
+            return made.FirstOrDefault(c => c.Unsupported is null) is { } first ? (first, null)
+                : (null, project.IsRunnable ? $"none of {name}'s launch profiles runs here" : $"{name} is no executable project");
+        }
+        if (made.FirstOrDefault(c => c.LaunchProfile == start.LaunchProfile) is { } named)
+        {
+            return named.Unsupported is { } unsupported ? (null, $"its launch profile {start.LaunchProfile} cannot run here: {unsupported}") : (named, null);
+        }
+        LaunchProfile? profile = LaunchProfile.Read(project).FirstOrDefault(p => p.Name == start.LaunchProfile);
+        if (profile is { Unsupported: null, RunsInContainer: false })
+        {
+            // A profile tied to a platform makes no configuration of its own (DeviceTargets.OwnProfiles), but runs as named.
+            return (RunConfiguration.From(project, profile) with { Name = RunConfiguration.NameOf(project, profile.Name), Generated = true }, null);
+        }
+        return profile is not null
+            ? (null, profile.RunsInContainer ? $"its launch profile {start.LaunchProfile} runs a container, which a configuration of its own runs"
+                : $"its launch profile {start.LaunchProfile} cannot run here: {profile.Unsupported}")
+            : (null, $"{name}'s {LaunchProfile.SettingsName(project.Path)} has no launch profile named {start.LaunchProfile}");
     }
 
     /// <summary>A generated configuration with the person's changes to it put over what its source makes.</summary>
@@ -95,6 +193,25 @@ public sealed class RunConfigurations(string? folder, Func<WorkspaceModel?>? wor
         Changed?.Invoke(this, EventArgs.Empty);
         Write();
         return true;
+    }
+
+    /// <summary>The choice as it stands: the one chosen, and whether the person picked it.</summary>
+    public RunChoice Held => new(Chosen?.Name, preferred, picked);
+
+    /// <summary>Puts back a choice held before another was made for a launch that never began, as it stood, unless it
+    /// stands so still.</summary>
+    public void PutBack(RunChoice held)
+    {
+        UiThread.Check();
+        if (Held == held)
+        {
+            return;
+        }
+        preferred = held.Preferred;
+        picked = held.Picked;
+        Chosen = All.FirstOrDefault(c => string.Equals(c.Name, held.Chosen, StringComparison.OrdinalIgnoreCase)) ?? Chosen;
+        Changed?.Invoke(this, EventArgs.Empty);
+        Write();
     }
 
     /// <summary>Takes the folder's own as Edit Configurations leaves them, and the one chosen there.</summary>
@@ -120,17 +237,27 @@ public sealed class RunConfigurations(string? folder, Func<WorkspaceModel?>? wor
     /// <summary>Turns a configuration's Collect logs and traces on or off, kept as Edit Configurations keeps its box (a
     /// generated one's as its change, the folder's own in place), the choice of configuration left as it was; false where
     /// none has the name.</summary>
-    public bool Collect(string name, bool on)
+    public bool Collect(string name, bool on) => Alter(name, found => found.Telemetry == on ? null : found with { Telemetry = on });
+
+    /// <summary>Has a configuration's program run in a tab of the Terminal window or the Run and Debug windows' consoles, kept
+    /// as Edit Configurations keeps its Use external console, the choice of configuration left as it was; false where none
+    /// has the name.</summary>
+    public bool UseConsole(string name, ConsoleKind console) => Alter(name, found => found.Console == console ? null : found with { Console = console });
+
+    /// <summary>A configuration changed as Edit Configurations keeps a change (a generated one's as its change, the folder's
+    /// own in place), the choice of configuration left as it was: <paramref name="change"/> gives it changed, or null where
+    /// it stands so already; false where none has the name.</summary>
+    private bool Alter(string name, Func<RunConfiguration, RunConfiguration?> change)
     {
         UiThread.Check();
         if (All.FirstOrDefault(c => string.Equals(c.Name, name, StringComparison.OrdinalIgnoreCase)) is not { } found)
         {
             return false;
         }
-        if (found.Telemetry != on)
+        if (change(found) is { } made)
         {
             // A generated one changed for the first time has no source yet: what it is now is what its project makes.
-            RunConfiguration changed = found with { Telemetry = on, Source = found.Generated ? found.Source ?? found : null };
+            RunConfiguration changed = made with { Source = found.Generated ? found.Source ?? found : null };
             Set(found.Generated ? own : [.. own.Select(c => string.Equals(c.Name, name, StringComparison.OrdinalIgnoreCase) ? changed : c)],
                 found.Generated ? [changed] : [], null, projects);
         }
@@ -253,9 +380,11 @@ public sealed class RunConfigurations(string? folder, Func<WorkspaceModel?>? wor
         ServiceProjects = configuration.ServiceProjects.ToDictionary(p => p.Key, p => Full(p.Value)),
     };
 
-    private string Relative(string path) => folder is not null && path.Length > 0 && (PathNames.IsUnder(path, folder) || PathNames.Same(path, folder))
-        ? Path.GetRelativePath(folder, path).Replace('\\', '/')
-        : path;
+    private string Relative(string path) => folder is not null && path.Length > 0 && PathNames.Relative(path, folder) is { } relative ? relative : path;
 
     private string Full(string path) => folder is null || path.Length == 0 ? path : PathNames.Canonical(Path.Combine(folder, path));
 }
+
+/// <summary>The run configuration chosen at a moment (<see cref="RunConfigurations.Held"/>): its name, the name kept as the
+/// person's, and whether they picked it.</summary>
+public sealed record RunChoice(string? Chosen, string? Preferred, bool Picked);

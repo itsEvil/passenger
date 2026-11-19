@@ -13,7 +13,7 @@ using Passenger.Inspector;
 
 namespace Passenger.App.Mcp;
 
-/// <summary>The Avalonia or WPF app Passenger runs or debugs, as an agent tests it: its windows, pictures the app draws
+/// <summary>The Avalonia, WPF or MAUI app Passenger runs or debugs, as an agent tests it: its windows, pictures the app draws
 /// of them, its visual tree, clicks, typing, keys and scrolling given as a person's are, and its failed bindings, all
 /// through the Live Visual Tree's inspector (<see cref="LiveApp"/>), loaded into Passenger too for its own
 /// windows.</summary>
@@ -25,11 +25,14 @@ public sealed partial class PassengerTools
     /// an app that runs, or using it, asks nothing of them.</summary>
     private Task<T> OnApp<T>(CancellationToken cancel, Func<Task<T>> work) => OnUi(cancel, work, projects: false);
 
+    /// <summary>An app_ tool's app naming Passenger's own windows, every one of this process's.</summary>
+    internal const string OwnWindows = "ide";
+
     /// <summary>How long a tool waits for an app launched a moment ago to show its UI.</summary>
     private static readonly TimeSpan AppUiLimit = TimeSpan.FromSeconds(60);
 
     [McpServerTool(Name = McpTools.AppWindows, Title = "The app's windows", ReadOnly = true), Description(
-        "The windows of the app (an Avalonia 12 app Run or Debug started, a WPF one on Windows, a Godot game; one starting is waited for): " +
+        "The windows of the app (an Avalonia 12 app Run or Debug started, a WPF one on Windows, a MAUI one on Android, a Godot game; one starting is waited for): " +
         "each one's @N, type, title, size in units, pixels a unit, whether active and shown, and a popup's owner. Every app_ " +
         "tool's app is run, debug, profile, a debugged program's or an AppHost service's name, or ide for Passenger's own windows, by default the one running; " +
         "its window @N, type or \"title\", by default the first.")]
@@ -85,7 +88,7 @@ public sealed partial class PassengerTools
         "up a level) unless templates is true, and what a hidden element holds is counted unless hidden is true. control " +
         "starts the tree at an element, depth levels deep; filter lists only the elements a query finds, each with where it " +
         "is. Every window, unless one is named.\n" +
-        "Every app_ tool names an element (control, filter) by @N, an id shown here, or by a query: a type, #name, .class and " +
+        "Every app_ tool names an element (control, filter) by @N, an id shown here, or by a query: a type (or one it derives from), #name, .class and " +
         "\"text\" it shows (Button#Save, \"Save\", TextBlock.title), steps joined by / for one inside another (#Panel/Button), " +
         "[n] for the nth match; a template's part only by its #name or @N.")]
     public Task<string> AppTree(
@@ -112,7 +115,7 @@ public sealed partial class PassengerTools
             tree = await live!.AgentTreeAsync(properties ?? []);
         }
         string name = game?.Name ?? live!.Name;
-        List<AppNode> nodes = AppQuery.Flatten(tree.Roots);
+        List<AppNode> nodes = AppQuery.Flatten(tree);
         if (nodes.Count == 0)
         {
             return $"{name} has no window open";
@@ -289,8 +292,9 @@ public sealed partial class PassengerTools
     [McpServerTool(Name = McpTools.AppKey, Title = "Press keys in the app", Destructive = true), Description(
         "Presses keys as a keyboard would, chords split by spaces, a chord's keys joined by + (\"Enter\", \"Tab Tab Space\", " +
         "\"ctrl+A Delete\", \"primary+S\"), into control, given the focus first, else what has it. Keys by Avalonia's names, " +
-        "which WPF shares (Escape, Back, PageDown, F5, A, D1 or 1); modifiers ctrl, shift, alt, cmd (meta), primary (Cmd on " +
-        "macOS, Ctrl elsewhere). Key bindings and commands run; a printable key nothing takes types its character.")]
+        "which WPF shares (Escape, Back, PageDown, F5, A, D1 or 1), or as a US keyboard types them (/, ?); modifiers ctrl, " +
+        "shift, alt, cmd (meta), primary (the command key of the app's system: Cmd on macOS and iOS, Ctrl elsewhere). Key " +
+        "bindings and commands run; a printable key nothing takes types its character.")]
     public Task<string> AppKey(
         string keys,
         string? app = null,
@@ -302,13 +306,13 @@ public sealed partial class PassengerTools
         {
             return await GameKeyAsync(game, keys, control, window);
         }
-        IReadOnlyList<Chord> chords = Chords(keys);
+        List<Pressed> chords = Chords(keys);
         (LiveApp live, AppNode? element, AppNode target) = await Target(app, control, window, needsPoint: false, null, null, cancel);
         (InputDone? sent, string? paused) = await SendAsync(live, new InputAction(InputKinds.Key)
         {
             Window = target.Window.Id,
             Element = element?.Element.Id,
-            Keys = chords,
+            Keys = [.. chords.Select(c => c.Chord)],
         }, cancel);
         if (sent is not { } done)
         {
@@ -372,20 +376,20 @@ public sealed partial class PassengerTools
         IEnumerable<LiveApp> apps = app switch
         {
             null => Session.InspectedApps,
-            "run" => [RunApp() ?? throw new InvalidOperationException("Run has started no Avalonia or WPF app in this folder")],
-            "debug" => [DebugApp() ?? throw new InvalidOperationException("Debug has started no Avalonia or WPF app in this folder")],
-            "ide" => [LiveApp.Own()],
+            "run" => [RunApp() ?? throw new InvalidOperationException("Run has started no Avalonia, WPF or MAUI app in this folder")],
+            "debug" => [DebugApp() ?? throw new InvalidOperationException("Debug has started no Avalonia, WPF or MAUI app in this folder")],
+            OwnWindows => [LiveApp.Own()],
             _ => [NamedApp(app)],
         };
         List<LiveApp> chosen = [.. apps];
         if (chosen.Count == 0)
         {
             throw new InvalidOperationException(Session.Game is { } game ? $"{game.Name} is a Godot game, which has no bindings: app_tree and app_details read its nodes"
-                : "No Avalonia or WPF app has been run or debugged in this folder; run or debug_start one");
+                : "No Avalonia, WPF or MAUI app has been run or debugged in this folder; run or debug_start one");
         }
         return Task.FromResult<IReadOnlyList<AppBindingError>>([.. chosen.SelectMany(live =>
         {
-            string which = Session.Inspecting.FirstOrDefault(a => a.App == live) is { } inspected ? AppName(inspected) : "ide";
+            string which = Session.Inspecting.FirstOrDefault(a => a.App == live) is { } inspected ? AppName(inspected) : OwnWindows;
             IEnumerable<AppBindingError> listed = live.Bindings.Select(failure =>
             {
                 BindingProblem placed = Builds.Placed(live, failure);
@@ -408,11 +412,11 @@ public sealed partial class PassengerTools
             null => Running(),
             "run" => RunApp() ?? throw new InvalidOperationException(Runs(RunningKind.Run)
                 ? $"What Run started is not {Inspectable}, or Hot Reload runs it"
-                : "Run has started no Avalonia or WPF app; run starts one"),
+                : "Run has started no Avalonia, WPF or MAUI app; run starts one"),
             "debug" => DebugApp() ?? throw new InvalidOperationException(Runs(RunningKind.Debug)
                 ? $"What is being debugged is not {Inspectable}"
-                : "Debug has started no Avalonia or WPF app; debug_start starts one"),
-            "ide" => LiveApp.Own(),
+                : "Debug has started no Avalonia, WPF or MAUI app; debug_start starts one"),
+            OwnWindows => LiveApp.Own(),
             _ => NamedApp(app),
         };
         if (Session.Debug.SessionOf(chosen) is { State: DebugState.Paused })
@@ -420,13 +424,49 @@ public sealed partial class PassengerTools
             throw new InvalidOperationException($"{chosen.Name} is paused in the debugger, and its UI answers nothing until it runs: debug_continue");
         }
         await When(() => chosen.State != LiveAppState.Waiting, AppUiLimit, cancel, On(h => chosen.StateChanged += h, h => chosen.StateChanged -= h));
+        if (chosen is { State: LiveAppState.Connected, Device: not null })
+        {
+            await ViewShownAsync(chosen, cancel);
+        }
         return chosen.State switch
         {
             LiveAppState.Connected => chosen,
-            LiveAppState.Waiting => throw new TimeoutException($"{chosen.Name} has not shown its UI in {AppUiLimit.TotalSeconds:0} s"),
+            LiveAppState.Waiting => throw new TimeoutException($"{chosen.Name} has not shown its UI in {Durations.Said(AppUiLimit)}"),
             LiveAppState.Refused => throw new InvalidOperationException(chosen.Problem ?? $"{chosen.Name} cannot be inspected"),
             _ => throw new InvalidOperationException($"{chosen.Name} has ended"),
         };
+    }
+
+    /// <summary>An app on a device says hello as its Application starts, before its activity makes the view it shows: waited
+    /// for, within the limit, until it has a top level, its tree asked again each time it says its controls changed.</summary>
+    private async Task ViewShownAsync(LiveApp live, CancellationToken cancel)
+    {
+        if ((await live.WindowsAsync()).Count > 0)
+        {
+            return;
+        }
+        int changes = 0;
+        void Changed(object? sender, EventArgs e) => changes++;
+        live.TreeChanged += Changed;
+        try
+        {
+            Deadline until = Deadline.In(AppUiLimit);
+            // Asking for the tree is what has the app say when its controls next change.
+            while (live.State == LiveAppState.Connected && (await live.TreeAsync()).Roots.Count == 0)
+            {
+                int seen = changes;
+                await When(() => changes != seen || live.State != LiveAppState.Connected, until.Left, cancel,
+                    On(h => live.TreeChanged += h, h => live.TreeChanged -= h), On(h => live.StateChanged += h, h => live.StateChanged -= h));
+                if (changes == seen && live.State == LiveAppState.Connected)
+                {
+                    throw new TimeoutException($"{live.Name} has not shown its UI in {Durations.Said(AppUiLimit)}");
+                }
+            }
+        }
+        finally
+        {
+            live.TreeChanged -= Changed;
+        }
     }
 
     /// <summary>Whether the folder runs a program of that kind now (<see cref="ProjectSession.Running"/>).</summary>
@@ -508,20 +548,20 @@ public sealed partial class PassengerTools
         }
         return apps.FirstOrDefault() is { } ended
             ? Ended(ended.App)
-            : "No Avalonia or WPF app or Godot game is running: run or debug_start one (Avalonia 12, WPF on Windows, a Godot 4 game in C# or GDScript), or name app ide for Passenger's own windows";
+            : "No Avalonia, WPF or MAUI app or Godot game is running: run or debug_start one (Avalonia 12, WPF on Windows, MAUI on Android or an iOS simulator, a Godot 4 game in C# or GDScript), or name app ide for Passenger's own windows";
 
         static string Ended(LiveApp app) => $"{app.Name} has ended: run or debug_start starts it again, or name app ide for Passenger's own windows";
     }
 
     /// <summary>What Passenger inspects, as a refusal says it.</summary>
-    private const string Inspectable = "an app Passenger inspects (an Avalonia 12 app, Avalonia.Base.dll beside it, or a WPF app on Windows)";
+    private const string Inspectable = "an app Passenger inspects (an Avalonia 12 app, Avalonia.Controls.dll beside it, a WPF app on Windows, or a MAUI app on Android)";
 
     /// <summary>The app's tree, flattened, and the window named (else the app's first, or for Passenger's own the window this
     /// agent works in).</summary>
     private async Task<(List<AppNode> Nodes, AppNode Window)> TreeOf(LiveApp live, string? window, CancellationToken cancel)
     {
         cancel.ThrowIfCancellationRequested();
-        List<AppNode> nodes = AppQuery.Flatten((await live.AgentTreeAsync([])).Roots);
+        List<AppNode> nodes = AppQuery.Flatten(await live.AgentTreeAsync([]));
         if (nodes.Count == 0)
         {
             throw new InvalidOperationException($"{live.Name} has no window open");
@@ -587,47 +627,56 @@ public sealed partial class PassengerTools
         },
     };
 
-    /// <summary>Chords as an agent writes them, "ctrl+shift+S Enter", as Avalonia's keys and modifiers.</summary>
-    private static List<Chord> Chords(string keys)
+    /// <summary>Chords as an agent writes them ("ctrl+shift+S Enter", "ctrl+/"), each one's modifiers before its key, which
+    /// is read as every key written as text is (<see cref="Keystroke.Parse"/>): by its name, or as the character a US keyboard
+    /// types, with the Shift that takes.</summary>
+    private static List<Pressed> Chords(string keys)
     {
-        List<Chord> chords = [];
+        List<Pressed> chords = [];
         foreach (string written in keys.Split(' ', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
         {
-            // The plus key is a chord's last + when it ends in two, or the whole chord.
-            string[] parts = written == "+" ? ["+"] : written.EndsWith("++", StringComparison.Ordinal) ? [.. written[..^2].Split('+'), "+"] : written.Split('+');
+            string[] parts = Keystroke.JoinedParts(written);
             List<Modifier> held = [.. parts[..^1].Select(ModifierNamed)];
-            chords.Add(new Chord(KeyName(parts[^1]), held));
+            Keystroke key = KeyNamed(parts[^1]);
+            held.AddRange(HeldWith(key.Modifiers));
+            // Primary is Ctrl or Cmd wherever the app runs, either typing nothing.
+            KeyModifiers holding = held.Aggregate(KeyModifiers.None, (all, one) => all | one switch
+            {
+                Modifier.Shift => KeyModifiers.Shift,
+                Modifier.Alt => KeyModifiers.Alt,
+                Modifier.Meta => KeyModifiers.Meta,
+                _ => KeyModifiers.Control,
+            });
+            chords.Add(new Pressed(key.Key, [.. held.Distinct()], new Keystroke(key.Key, holding).Types));
         }
         return chords.Count > 0 ? chords : throw new ArgumentException("Name the keys to press");
     }
 
-    /// <summary>A key as Avalonia names it, from what an agent writes: Enter, esc, 1, a, PageDown, F5, +.</summary>
-    private static string KeyName(string key)
+    /// <summary>A chord's key, or an error naming the ways a key is written.</summary>
+    private static Keystroke KeyNamed(string written)
     {
-        string name = key.ToLowerInvariant() switch
+        try
         {
-            "esc" => "Escape",
-            "return" => "Enter",
-            "backspace" => "Back",
-            "del" => "Delete",
-            "ins" => "Insert",
-            "pgup" => "PageUp",
-            "pgdn" => "PageDown",
-            "up" => "Up",
-            "down" => "Down",
-            "left" => "Left",
-            "right" => "Right",
-            "space" or " " => "Space",
-            "+" or "plus" => "OemPlus",
-            "-" or "minus" => "OemMinus",
-            "," or "comma" => "OemComma",
-            "." or "period" => "OemPeriod",
-            _ when key.Length == 1 && char.IsAsciiDigit(key[0]) => "D" + key,
-            _ => key,
-        };
-        return Enum.TryParse(name, ignoreCase: true, out Avalonia.Input.Key parsed) && !int.TryParse(name, out _) && parsed != Avalonia.Input.Key.None
-            ? parsed.ToString()
-            : throw new ArgumentException($"No key '{key}': keys are Avalonia's names (Enter, Escape, Back, Delete, Left, PageDown, F5, A, 1)");
+            return Keystroke.Parse(written);
+        }
+        catch (FormatException)
+        {
+            throw new ArgumentException($"No key '{written}': keys are Avalonia's names (Enter, Escape, Back, Delete, Left, PageDown, F5, A, 1) or the character a US keyboard types (/, ?, [)");
+        }
+    }
+
+    /// <summary>The modifiers a key read alone holds: Shift for a character typed with it, a modifier's own for its key.</summary>
+    private static IEnumerable<Modifier> HeldWith(KeyModifiers modifiers) => KeyModifiersHeld.Where(m => modifiers.HasFlag(m.Of)).Select(m => m.Held);
+
+    /// <summary>Each of Avalonia's modifiers as the inspectors' wire holds it.</summary>
+    private static readonly (KeyModifiers Of, Modifier Held)[] KeyModifiersHeld =
+        [(KeyModifiers.Control, Modifier.Control), (KeyModifiers.Shift, Modifier.Shift), (KeyModifiers.Alt, Modifier.Alt), (KeyModifiers.Meta, Modifier.Meta)];
+
+    /// <summary>A chord as an agent wrote it: its key, the modifiers held with it (primary as written, read where the input is
+    /// given) and the text it types (<see cref="Keystroke.Types"/>).</summary>
+    private sealed record Pressed(Key Key, IReadOnlyList<Modifier> Held, string? Text)
+    {
+        public Chord Chord => new(Key.ToString(), Held) { Text = Text };
     }
 
     private static string Id(long id) => "@" + id.ToString(CultureInfo.InvariantCulture);
@@ -683,7 +732,7 @@ public sealed partial class PassengerTools
         (done.Shows is { } shows ? $"; it shows \"{shows}\"" : string.Empty) + (done.Focused is { } focused ? $"; {focused} has the focus" : "; nothing has the focus");
 }
 
-/// <summary>An app's windows, with what the app is: its run configuration's name, its framework ("Avalonia 12.1.5", "WPF
+/// <summary>An app's windows, with what the app is: its run configuration's name, its framework ("Avalonia 12.1.6", "WPF
 /// 10.0.1"), its Avalonia's version (null for WPF) and its process.</summary>
 public sealed record AppWindows(string App, string Framework, string? Avalonia, int? ProcessId, IReadOnlyList<AppWindowInfo> Windows);
 

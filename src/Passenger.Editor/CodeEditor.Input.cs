@@ -2,6 +2,7 @@ using Avalonia;
 using Avalonia.Controls.Primitives;
 using Avalonia.Input;
 using Avalonia.Input.TextInput;
+using Avalonia.Interactivity;
 using Avalonia.Media;
 using Avalonia.Media.TextFormatting;
 using Avalonia.VisualTree;
@@ -23,18 +24,35 @@ public sealed partial class CodeEditor
     private bool hovering;
     private Drag drag;
     private EditorInputMethod? inputMethod;
-    private string preedit = string.Empty;
-
-    /// <summary>Where in the composition the input method's cursor is; null at its end.</summary>
-    private int? preeditCursor;
 
     private EditorInputMethod InputMethod => inputMethod ??= new EditorInputMethod(this);
+
+    /// <summary>The text the input method is composing, at the primary caret or on Vim's command line; empty when it is
+    /// composing none.</summary>
+    private string Composition => inputMethod?.Composition ?? string.Empty;
+
+    /// <summary>The text the input method is composing at the primary caret, drawn there; empty when it is composing none
+    /// or composes on Vim's command line.</summary>
+    private string Preedit => vim?.CommandLine is null ? Composition : string.Empty;
+
+    /// <summary>Where in the composition the input method's cursor is; null at its end.</summary>
+    private int? PreeditCursor => inputMethod?.CompositionCursor;
 
     protected override void OnKeyDown(KeyEventArgs e)
     {
         base.OnKeyDown(e);
         if (e.Handled || ownKeys is null)
         {
+            return;
+        }
+        if (!ownKeys.IsPending && PressVim(e, out string? asked, out int repeat))
+        {
+            ownKeys.Heard(e);
+            for (int i = 0; asked is not null && i < repeat; i++)
+            {
+                TryExecute(asked);
+            }
+            e.Handled = true;
             return;
         }
         string? action = ownKeys.Press(e, out bool consumed, out bool shifted);
@@ -51,8 +69,34 @@ public sealed partial class CodeEditor
     protected override void OnTextInput(TextInputEventArgs e)
     {
         base.OnTextInput(e);
-        if (e.Handled || IsReadOnly || string.IsNullOrEmpty(e.Text))
+        if (e.Handled || string.IsNullOrEmpty(e.Text))
         {
+            return;
+        }
+        if (vim is { CommandLine: not null })
+        {
+            // What is typed (a key's, an input method's, a dead key's) goes on the command line, whatever the file allows.
+            e.Handled = true;
+            if (Printable(e.Text) is { Length: > 0 } onLine)
+            {
+                TypeOnVimCommandLine(onLine);
+            }
+            return;
+        }
+        if (IsReadOnly)
+        {
+            // Outside Vim's insert mode the text is a command's, taken at the key press.
+            if (vim is not { Mode: not Editor.VimMode.Insert } && Printable(e.Text).Length > 0)
+            {
+                RefuseTyping();
+                e.Handled = true;
+            }
+            return;
+        }
+        if (vim is { Mode: not Editor.VimMode.Insert })
+        {
+            // Keys outside insert mode are commands, taken at the key press; their text must not type.
+            e.Handled = true;
             return;
         }
         string typed = Printable(e.Text);
@@ -60,8 +104,7 @@ public sealed partial class CodeEditor
         {
             return;
         }
-        preedit = string.Empty;
-        preeditCursor = null;
+        inputMethod?.Committed();
         e.Handled = true;
         if (PassesEndTag(typed))
         {
@@ -81,6 +124,19 @@ public sealed partial class CodeEditor
             return;
         }
         Typed?.Invoke(this, typed);
+    }
+
+    /// <summary>Text typed while the editor refuses changes: a composition it ended is drawn no more, and the window hears
+    /// of it (<see cref="TypingRefusedEvent"/>).</summary>
+    private void RefuseTyping()
+    {
+        if (Composition.Length > 0)
+        {
+            inputMethod!.Committed();
+            RedrawChanged();
+            FollowInputMethod();
+        }
+        RaiseEvent(new RoutedEventArgs(TypingRefusedEvent, this));
     }
 
     private static readonly System.Buffers.SearchValues<char> ControlCharacters = System.Buffers.SearchValues.Create(
@@ -142,6 +198,8 @@ public sealed partial class CodeEditor
             e.Handled = true;
             return;
         }
+        // A drag the press may begin is no gesture held over a stretch.
+        DropReach();
         MouseShortcut gesture = MouseShortcut.Of(e);
         Keymap? gestures = point.Position.X >= GutterWidth ? GesturesKeymap : null;
         string? clicked = gestures?.ActionFor(gesture);
@@ -273,6 +331,8 @@ public sealed partial class CodeEditor
         RestartHover(position);
         Cursor = position.X < GutterWidth || drag.Mode == DragMode.Gutter ? Cursor.Default : IbeamCursor;
         FollowLinks(position, drag.Mode != DragMode.None && e.GetCurrentPoint(this).Properties.IsLeftButtonPressed);
+        pointer = position;
+        FollowGesture(e.KeyModifiers);
         bool inGutter = position.X < GutterWidth;
         if (inGutter != overGutter)
         {
@@ -364,6 +424,8 @@ public sealed partial class CodeEditor
         hoverAt = new Point(double.NaN, double.NaN);
         HideFoldPreview();
         hovered.Release();
+        pointer = null;
+        DropReach();
     }
 
     /// <summary>Whether Ctrl+wheel (Cmd+wheel on macOS) asks for a bigger or smaller font rather than scrolling.</summary>
@@ -548,23 +610,14 @@ public sealed partial class CodeEditor
 
     /// <summary>Drops a composition under way, the platform's input method's too, so it is never finished into a
     /// document it was not begun in.</summary>
-    private void EndComposition()
-    {
-        if (preedit.Length == 0)
-        {
-            return;
-        }
-        preedit = string.Empty;
-        preeditCursor = null;
-        inputMethod?.Discard();
-    }
+    private void EndComposition() => inputMethod?.Discard();
 
     /// <summary>Where a caret is drawn: its row, and its x on it; the primary's, while a composition shows there, at the
     /// input method's cursor in it.</summary>
     private (int Row, double X) CaretPlace(TextSnapshot text, int caret)
     {
         (int row, double x) = Place(text, caret, LeansBack(caret));
-        if (preedit.Length > 0 && preeditCursor is { } at && at < preedit.Length && caret == selections.Primary.Caret)
+        if (Preedit.Length > 0 && PreeditCursor is { } at && at < Preedit.Length && caret == selections.Primary.Caret)
         {
             TextLine composed = PreeditLabel();
             x += composed.GetDistanceFromCharacterHit(new CharacterHit(at)) - composed.WidthIncludingTrailingWhitespace;
@@ -603,15 +656,27 @@ public sealed partial class CodeEditor
 
     /// <summary>What the platform's input method (accents, CJK composition) reads and writes: the
     /// caret's line as the surrounding text, the selection in it, which it may set to type over (press and hold's accents
-    /// replace the letter held), and its composition drawn inline at the caret.</summary>
-    private sealed class EditorInputMethod(CodeEditor editor) : TextInputMethodClient
+    /// replace the letter held), and its composition drawn inline at the caret; while Vim's command line is open, its
+    /// text, its end and the stretch at its end to type over, the composition shown on it.</summary>
+    private sealed class EditorInputMethod(CodeEditor editor) : ViewInputMethod(editor)
     {
-        /// <summary>What the input method was last told, so it hears of each change once.</summary>
-        private (string Text, TextSelection Selection, Rect Cursor)? told;
+        /// <summary>Where on the command line's text the input method chose to type over from, with the text it chose in;
+        /// null for nowhere.</summary>
+        private (int From, string Text)? commandLineChoice;
 
-        public override Visual TextViewVisual => editor;
-        public override bool SupportsPreedit => true;
         public override bool SupportsSurroundingText => true;
+
+        /// <summary>The text typed on Vim's command line after its prompt; null while none is open.</summary>
+        private string? CommandLineText => editor.vim?.CommandLine is { } line ? line[1..] : null;
+
+        /// <summary>Where on the command line's text the next committed text begins, typing over what is after it, and
+        /// forgotten; -1 to type at its end, as where the line changed since the choice.</summary>
+        public int TakeCommandLineChoice()
+        {
+            int choice = commandLineChoice is { } chosen && chosen.Text == CommandLineText ? chosen.From : -1;
+            commandLineChoice = null;
+            return choice;
+        }
 
         /// <summary>How much of the caret's line either side of it the input method is given: the whole of a line of
         /// code, a stretch around the caret of a long one.</summary>
@@ -621,6 +686,10 @@ public sealed partial class CodeEditor
         {
             get
             {
+                if (CommandLineText is { } typed)
+                {
+                    return typed;
+                }
                 (TextSnapshot text, LineSpan line, int start) = Surrounding();
                 int end = Math.Min(line.End, Math.Max(start, editor.selections.Primary.Caret) + Around);
                 return text.GetText(start, end - start);
@@ -631,6 +700,10 @@ public sealed partial class CodeEditor
         {
             get
             {
+                if (CommandLineText is not null && editor.VimCommandLineEnd?.Invoke() is { } end)
+                {
+                    return end;
+                }
                 (int row, double at) = editor.CaretPlace(editor.document.Snapshot, editor.selections.Primary.Caret);
                 double x = editor.TextLeft - editor.scroll.X + at;
                 double y = (row * editor.metrics.LineHeight) - editor.scroll.Y;
@@ -642,12 +715,22 @@ public sealed partial class CodeEditor
         {
             get
             {
+                if (CommandLineText is { } typed)
+                {
+                    return new TextSelection(commandLineChoice is { } chosen && chosen.Text == typed ? chosen.From : typed.Length, typed.Length);
+                }
                 (_, _, int start) = Surrounding();
                 Selection primary = editor.selections.Primary;
                 return new TextSelection(Math.Max(0, primary.Anchor - start), primary.Caret - start);
             }
             set
             {
+                if (CommandLineText is { } typed)
+                {
+                    int from = Math.Clamp(Math.Min(value.Start, value.End), 0, typed.Length);
+                    commandLineChoice = from < typed.Length && Math.Max(value.Start, value.End) >= typed.Length ? (from, typed) : null;
+                    return;
+                }
                 (TextSnapshot text, _, int start) = Surrounding();
                 Selection primary = editor.selections.Primary;
                 int anchor = Math.Clamp(start + value.Start, 0, text.Length) - primary.Caret;
@@ -663,39 +746,15 @@ public sealed partial class CodeEditor
             }
         }
 
-        public override void SetPreeditText(string? preeditText) => SetPreeditText(preeditText, null);
-
-        public override void SetPreeditText(string? preeditText, int? cursorPos)
+        protected override void Composed()
         {
-            editor.preedit = preeditText ?? string.Empty;
-            editor.preeditCursor = cursorPos;
+            if (CommandLineText is not null)
+            {
+                editor.VimModeChanged?.Invoke(editor, EventArgs.Empty);
+            }
             editor.RedrawChanged();
             editor.FollowInputMethod();
         }
-
-        /// <summary>Raises what changed since the input method was last told: the surrounding text, the selection in it,
-        /// the caret's rectangle.</summary>
-        public void Follow()
-        {
-            (string Text, TextSelection Selection, Rect Cursor) now = (SurroundingText, Selection, CursorRectangle);
-            (string Text, TextSelection Selection, Rect Cursor)? before = told;
-            told = now;
-            if (before?.Text != now.Text)
-            {
-                RaiseSurroundingTextChanged();
-            }
-            if (before?.Selection != now.Selection)
-            {
-                RaiseSelectionChanged();
-            }
-            if (before?.Cursor != now.Cursor)
-            {
-                RaiseCursorRectangleChanged();
-            }
-        }
-
-        /// <summary>Asks the platform's input method to throw its composition away.</summary>
-        public void Discard() => RequestReset();
 
         /// <summary>The text, the caret's line, and where the stretch of it the input method is given begins.</summary>
         private (TextSnapshot Text, LineSpan Line, int Start) Surrounding()

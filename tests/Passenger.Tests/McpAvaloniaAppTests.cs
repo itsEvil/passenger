@@ -2,6 +2,7 @@ using System.Buffers.Binary;
 using System.Globalization;
 using System.Text.Json;
 using Avalonia.Controls;
+using Avalonia.Headless;
 using Avalonia.Headless.XUnit;
 using ModelContextProtocol.Client;
 using ModelContextProtocol.Protocol;
@@ -157,6 +158,31 @@ public sealed class McpAvaloniaAppTests : McpRig, IClassFixture<AgentAppFolder>
             $"The longest frame is not the one the frames say: {frames}");
     }
 
+    /// <summary>An agent presses each key a US keyboard types other than a letter or digit by the character it types, as the
+    /// keymap and a screenshot's --key read one: into the app's text box each types its character, a shifted one Shift's, and
+    /// held with Ctrl the app hears Ctrl with the key that character is on, ctrl+/ the slash key.</summary>
+    [Fact]
+    public async Task An_agent_presses_each_punctuation_key_by_its_character_typing_it_and_held_with_ctrl_the_app_hears_ctrl_with_that_key()
+    {
+        await using McpClient client = await Start(["--mcp", appFolder], languageServer: false);
+        JsonElement built = await Call(client, McpTools.Build);
+        Assert.True(built.GetProperty("succeeded").GetBoolean(), $"The app did not build: {built}");
+        JsonElement ran = await Call(client, McpTools.Run, new() { ["waitSeconds"] = 3600 });
+        Assert.True(ran.GetProperty("stillRunning").GetBoolean(), $"The app ended as it started: {ran}");
+
+        const string Typed = "/;'[]\\=`,.-?:\"{}|+~<>_";
+        string pressed = Text(await Call(client, McpTools.AppKey, new() { ["control"] = "#NameBox", ["keys"] = string.Join(' ', Typed.Select(c => c.ToString())) }));
+        Assert.True(pressed.Contains($"it shows \"{Typed}\"", StringComparison.Ordinal), $"The punctuation keys pressed by their characters typed something else: {pressed}");
+
+        (string Key, string Physical)[] keys = [("/", "Slash"), (";", "Semicolon"), ("'", "Quote"), ("[", "BracketLeft"), ("]", "BracketRight"),
+            ("\\", "Backslash"), ("=", "Equal"), ("`", "Backquote"), (",", "Comma"), (".", "Period"), ("-", "Minus")];
+        string held = Text(await Call(client, McpTools.AppKey, new() { ["control"] = "#NameBox", ["keys"] = string.Join(' ', keys.Select(k => "ctrl+" + k.Key)) }));
+        string heard = Text(await Call(client, McpTools.AppTree, new() { ["control"] = "#Greeting" }));
+        string expected = "Pressed " + string.Join(' ', keys.Select(k => "Control+" + k.Physical));
+        Assert.True(heard.Contains($"\"{expected}\"", StringComparison.Ordinal), $"Ctrl with each punctuation key ({held}) reached the app as other keys: {heard}");
+        await Call(client, McpTools.Stop);
+    }
+
     /// <summary>What the Live Visual Tree and the editor give a person debugging the app, given an agent: debug_start back
     /// once the app's UI is up; a click into a breakpoint told at once where it stopped; a button's properties with where each
     /// value came from and its styles with why each applies or not; Break When Value Changes on the counter's text, which a
@@ -175,16 +201,17 @@ public sealed class McpAvaloniaAppTests : McpRig, IClassFixture<AgentAppFolder>
         Assert.Single((await Call(client, McpTools.AppWindows)).GetProperty("windows").EnumerateArray());
 
         // Set while the app runs; the click must say where it stopped, as the paused app cannot say what the click did.
-        await Call(client, McpTools.BreakpointSet, new() { ["path"] = "MainWindow.axaml.cs", ["line"] = 23 });
+        int counted = Debuggees.Line("AgentApp", "MainWindow.axaml.cs", "clicks++;");
+        await Call(client, McpTools.BreakpointSet, new() { ["path"] = "MainWindow.axaml.cs", ["line"] = counted });
         string clicked = Text(await Call(client, McpTools.AppClick, new() { ["control"] = "#Count" }));
-        Assert.Contains("and that paused the program (breakpoint) at MainWindow.axaml.cs:23:", clicked, StringComparison.Ordinal);
+        Assert.Contains($"and that paused the program (breakpoint) at MainWindow.axaml.cs:{counted}:", clicked, StringComparison.Ordinal);
         JsonElement stopped = await Call(client, McpTools.DebugState);
         Assert.Equal("paused", stopped.GetProperty("state").GetString());
         string[] frames = [.. stopped.GetProperty("frames").EnumerateArray().Select(f => f.GetString()!)];
-        Assert.True(frames[0].Contains("MainWindow.axaml.cs:23", StringComparison.Ordinal) && frames.Length < 8
+        Assert.True(frames[0].Contains($"MainWindow.axaml.cs:{counted}", StringComparison.Ordinal) && frames.Length < 8
             && frames.Any(f => f.Contains(" frames outside the folder's code (", StringComparison.Ordinal) && f.Contains("Avalonia.", StringComparison.Ordinal)),
             $"The stop's frames, for an agent:\n{string.Join('\n', frames)}");
-        await Call(client, McpTools.BreakpointSet, new() { ["path"] = "MainWindow.axaml.cs", ["line"] = 23, ["remove"] = true });
+        await Call(client, McpTools.BreakpointSet, new() { ["path"] = "MainWindow.axaml.cs", ["line"] = counted, ["remove"] = true });
         await Call(client, McpTools.DebugContinue, new() { ["waitSeconds"] = 1 });
         Assert.Contains("\"Clicked once\"", Text(await Call(client, McpTools.AppTree, new() { ["control"] = "#Counter" })), StringComparison.Ordinal);
 
@@ -204,7 +231,7 @@ public sealed class McpAvaloniaAppTests : McpRig, IClassFixture<AgentAppFolder>
             .Any(p => p.GetProperty("name").GetString() == "Text" && p.TryGetProperty("breakpoint", out JsonElement marked) && marked.GetBoolean()),
             "The counter's details do not mark its watched text");
         clicked = Text(await Call(client, McpTools.AppClick, new() { ["control"] = "#Count" }));
-        Assert.True(clicked.Contains("and that paused the program", StringComparison.Ordinal) && clicked.Contains("at MainWindow.axaml.cs:24:", StringComparison.Ordinal),
+        Assert.True(clicked.Contains("and that paused the program", StringComparison.Ordinal) && clicked.Contains($"at MainWindow.axaml.cs:{counted + 1}:", StringComparison.Ordinal),
             $"The click did not stop where the code-behind sets the watched text: {clicked}");
 
         await Call(client, McpTools.Open, new() { ["path"] = "MainWindow.axaml" });
@@ -238,11 +265,63 @@ public sealed class McpAvaloniaAppTests : McpRig, IClassFixture<AgentAppFolder>
         await Call(client, McpTools.Stop);
     }
 
-    /// <summary>On the person's window an agent asks before its first click or key in their app or in Passenger itself, and
-    /// once allowed both still never answers the questions Passenger asks the person for it, nor reaches Settings. Passenger's
-    /// own windows are inspected once a process, so this is the run's one test of them in the test process itself.</summary>
+    /// <summary>An agent stopped in the app's click handler by its breakpoint steps over, deletes the breakpoint and steps on
+    /// out of the handler: the app runs on, the click's handling done, never stopped in Passenger's inspector, whose code made
+    /// the click and which is never the app's own code to Just My Code (#1891).</summary>
+    [Fact]
+    public async Task An_agent_stepping_out_of_a_click_handler_it_clicked_into_is_never_stopped_in_passengers_inspector()
+    {
+        await using McpClient client = await Start(["--mcp", appFolder], languageServer: false);
+        JsonElement built = await Call(client, McpTools.Build);
+        Assert.True(built.GetProperty("succeeded").GetBoolean(), $"The app did not build: {built}");
+        JsonElement started = await Call(client, McpTools.DebugStart, new() { ["waitSeconds"] = 3600 });
+        Assert.True(started.GetProperty("status").GetString()!.Contains("its UI up", StringComparison.Ordinal), $"debug_start came back from an app that never stops saying: {started}");
+        int counted = Debuggees.Line("AgentApp", "MainWindow.axaml.cs", "clicks++;");
+        await Call(client, McpTools.BreakpointSet, new() { ["path"] = "MainWindow.axaml.cs", ["line"] = counted });
+        string clicked = Text(await Call(client, McpTools.AppClick, new() { ["control"] = "#Count" }));
+        Assert.Contains($"and that paused the program (breakpoint) at MainWindow.axaml.cs:{counted}:", clicked, StringComparison.Ordinal);
+        JsonElement stepped = await Call(client, McpTools.DebugStep);
+        Assert.StartsWith($"MainWindow.axaml.cs:{counted + 1}:", stepped.GetProperty("location").GetString(), StringComparison.Ordinal);
+        await Call(client, McpTools.BreakpointSet, new() { ["path"] = "MainWindow.axaml.cs", ["line"] = counted, ["remove"] = true });
+
+        // To the handler's closing brace, then out of it.
+        stepped = await Call(client, McpTools.DebugStep);
+        Assert.StartsWith($"MainWindow.axaml.cs:{counted + 2}:", stepped.GetProperty("location").GetString(), StringComparison.Ordinal);
+        stepped = await Call(client, McpTools.DebugStep, new() { ["waitSeconds"] = 2 });
+        Assert.True(stepped.GetProperty("state").GetString() == "running", $"The step out of the click handler stopped the app again: {stepped}\n{StepsLogged()}");
+        Assert.Contains("\"Clicked once\"", Text(await Call(client, McpTools.AppTree, new() { ["control"] = "#Counter" })), StringComparison.Ordinal);
+        await Call(client, McpTools.Stop);
+    }
+
+    /// <summary>The engine's log from the last step it was asked for on: what its steppers did.</summary>
+    private string StepsLogged()
+    {
+        string log = Ui.Shared(EngineLog);
+        return $"The engine's log from the last step on:\n{log[Math.Max(0, log.LastIndexOf("StepOver on thread", StringComparison.Ordinal))..]}";
+    }
+
+    /// <summary>On the person's window an agent asks before its first click or key in their app, and apart before its first
+    /// in Passenger itself, which the app's Allow for This Session never covers; once allowed both still never answers the
+    /// questions Passenger asks the person for it, nor reaches Settings; the window,
+    /// closed, goes at once, held by nothing the inspector of Passenger's own windows started in the agent's call (#1445).
+    /// Passenger's own windows are inspected once a process, so this is the run's one test of them in the test process itself.</summary>
     [AvaloniaFact]
     public void An_agent_on_the_persons_window_is_asked_before_it_first_clicks_or_presses_keys_in_their_avalonia_app_or_in_passenger()
+    {
+        WeakReference<MainWindow> weak = AskedAndAnswered();
+        // Avalonia's tooltip service keeps the last control it showed a tip over (the agent clicked one) until the pointer moves on.
+        Window elsewhere = new() { Width = 200, Height = 100 };
+        elsewhere.Show();
+        elsewhere.MouseMove(new Avalonia.Point(50, 50));
+        Ui.Settle();
+        elsewhere.Close();
+        Ui.Collected(weak, "the window an agent inspected Passenger's own windows in to be let go once closed: held by the inspection the agent's call "
+            + "started, which lasts the process, that window would be kept for as long as the process ran", TimeSpan.FromSeconds(30));
+    }
+
+    /// <summary>The test's window, an agent's clicks and keys asked of the person and answered, then closed: held only weakly here.</summary>
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
+    private WeakReference<MainWindow> AskedAndAnswered()
     {
         MainWindow window = AgentsWindow(appFolder, languageServer: false);
         McpClient? client = null;
@@ -254,12 +333,12 @@ public sealed class McpAvaloniaAppTests : McpRig, IClassFixture<AgentAppFolder>
             McpClient agent = client;
 
             Assert.Contains("Button#Count", Text(Await(Waiting.Apart(() => Call(agent, McpTools.AppTree, new() { ["filter"] = "#Count" })), "the app's tree")), StringComparison.Ordinal);
-            Assert.Empty(window.OwnedWindows.OfType<ConfirmDialog>());
+            Assert.Empty(Questions(window));
 
             Task<JsonElement> clicking = Waiting.Apart(() => Call(agent, McpTools.AppClick, new() { ["control"] = "#Count" }));
-            ConfirmDialog asked = Question(window, "the question for the agent's click");
+            Window asked = Question(window, "the question for the agent's click");
             Assert.Contains("Allow app_click?", Texts(asked));
-            Press(asked, "Allow");
+            Press(asked, AgentToolDialog.AllowForSession);
             Assert.StartsWith("Clicked Button#Count", Text(Await(clicking, "the click")), StringComparison.Ordinal);
             Assert.Contains("\"Clicked once\"", Text(Await(Waiting.Apart(() => Call(agent, McpTools.AppTree, new() { ["control"] = "#Counter" })), "the counter")), StringComparison.Ordinal);
 
@@ -267,22 +346,28 @@ public sealed class McpAvaloniaAppTests : McpRig, IClassFixture<AgentAppFolder>
             // The tree names an element by its type, #name, any .classes, then its text.
             Assert.Matches($"TextBlock#ProjectName(\\.[\\w-]+)* \"{System.Text.RegularExpressions.Regex.Escape(project.Text!)}\"",
                 Text(Await(Waiting.Apart(() => Call(agent, McpTools.AppTree, new() { ["app"] = "ide", ["filter"] = "#ProjectName" })), "Passenger's tree")));
-            Await(Waiting.Apart(() => Call(agent, McpTools.AppClick, new() { ["app"] = "ide", ["control"] = "#RunConfigButton" })), "the click on Passenger's run configurations");
+            // Input to Passenger's own windows is asked apart from the app's, which the session allows.
+            Task<JsonElement> clickingOwn = Waiting.Apart(() => Call(agent, McpTools.AppClick, new() { ["app"] = "ide", ["control"] = "#RunConfigButton" }));
+            Window own = Question(window, "the question for the agent's click in Passenger's windows");
+            Assert.Contains("Allow app_click in Passenger's windows?", Texts(own));
+            Press(own, AgentToolDialog.AllowForSession);
+            Await(clickingOwn, "the click on Passenger's run configurations");
             Dictionary<string, object?> menu = new() { ["app"] = "ide", ["filter"] = "MenuItem \"AgentApp\"" };
             Assert.Contains("MenuItem \"AgentApp\"", Text(Await(Waiting.Apart(() => Call(agent, McpTools.AppTree, menu)), "the run configurations' menu")), StringComparison.Ordinal);
             Task<JsonElement> escaping = Waiting.Apart(() => Call(agent, McpTools.AppKey, new() { ["app"] = "ide", ["keys"] = "Escape" }));
-            Press(Question(window, "the question for the agent's keys"), "Allow");
+            Press(Question(window, "the question for the agent's keys"), AgentToolDialog.AllowForSession);
             string escaped = Text(Await(escaping, "the Escape"));
             string after = Text(Await(Waiting.Apart(() => Call(agent, McpTools.AppTree, menu)), "the menu closed"));
             Assert.True(after.StartsWith("Nothing in Passenger matches", StringComparison.Ordinal), $"Escape ({escaped}) left the menu open: {after}");
 
             Task<CallToolResult> building = Waiting.Apart(() => Result(agent, McpTools.Build));
-            ConfirmDialog question = Question(window, "the question for the agent's build");
-            CallToolResult clicked = Await(Waiting.Apart(() => Result(agent, McpTools.AppClick, new() { ["app"] = "ide", ["window"] = "ConfirmDialog", ["control"] = "Button \"Allow\"" })),
-                "the agent's click on the question's Allow");
+            Window question = Question(window, "the question for the agent's build");
+            CallToolResult clicked = Await(Waiting.Apart(() => Result(agent, McpTools.AppClick,
+                new() { ["app"] = "ide", ["window"] = nameof(AgentToolDialog), ["control"] = $"Button \"{AgentToolDialog.AllowOnce}\"" })),
+                "the agent's click on the question's Allow Once");
             Assert.True(clicked.IsError == true && Text(clicked).Contains("only they answer it", StringComparison.Ordinal),
                 $"The agent's click on the question its own build waits on was answered: {Text(clicked)}");
-            CallToolResult entered = Await(Waiting.Apart(() => Result(agent, McpTools.AppKey, new() { ["app"] = "ide", ["window"] = "ConfirmDialog", ["keys"] = "Enter" })),
+            CallToolResult entered = Await(Waiting.Apart(() => Result(agent, McpTools.AppKey, new() { ["app"] = "ide", ["window"] = nameof(AgentToolDialog), ["keys"] = "Enter" })),
                 "the agent's Enter in the question");
             Assert.True(entered.IsError == true && Text(entered).Contains("only they answer it", StringComparison.Ordinal),
                 $"The agent's Enter in the question its own build waits on was answered: {Text(entered)}");
@@ -308,6 +393,8 @@ public sealed class McpAvaloniaAppTests : McpRig, IClassFixture<AgentAppFolder>
             WaitFor(() => !window.Runner.IsRunning, "the app stopped");
             window.Close();
         }
+        Ui.Settle();
+        return new WeakReference<MainWindow>(window);
     }
 
     /// <summary>Where some text begins in the app's window XAML as a tool names a place: "MainWindow.axaml:line:column", from

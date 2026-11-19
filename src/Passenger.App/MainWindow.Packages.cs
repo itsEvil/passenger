@@ -1,5 +1,6 @@
 using Passenger.App.Packages;
 using Passenger.App.Workspace;
+using Passenger.Core;
 using Passenger.Packages;
 
 namespace Passenger.App;
@@ -20,16 +21,36 @@ public partial class MainWindow
             ToolWindows.NuGetView view = nuget = new ToolWindows.NuGetView(session.Packages);
             view.LinkClicked += (_, link) => Browse(link);
             view.ActionRequested += (_, action) => Request(action);
-            // The NuGet window's update of one of EF Core's packages is weighed against the project's provider first.
+            // The NuGet window's update of one of EF Core's packages moves its set, weighed against the project's provider first.
             view.BeforeInstall = migrations is { } weighs ? weighs.WeighUpdateAsync : null;
             return view;
         }, Docking.ToolAnchor.BottomLeft)
         {
+            Serves = ToolWindowServes.EveryFolder,
             Action = AppActions.ShowNuGet,
             Tools = () => nuget?.Tabs,
             Menus = [new MenuPlace("Tools", 0, 0)],
         });
         actions!.Add(new IdeAction(AppActions.NuGetRefresh, "Refresh NuGet", "NuGet", _ => IdeErrors.Observe(NuGet.RefreshAskedAsync())) { WhyNot = NeedsFolder });
+        actions.Add(new IdeAction(AppActions.NuGetUpdateAll, "Update All NuGet Packages", "NuGet", _ => IdeErrors.Observe(NuGet.UpdateAllAsync()))
+        {
+            WhyNot = c => NeedsFolder(c) ?? NuGet.UpdateAllWhyNot,
+        });
+    }
+
+    /// <summary>Manage NuGet Packages for Solution: the NuGet window shown (behind, for an agent) on its Packages tab over
+    /// every project, a project it was narrowed to let go.</summary>
+    private void ManageSolutionPackages(ActionContext context)
+    {
+        if (context.ByAgent)
+        {
+            Dock.ShowBehind(ToolWindowIds.NuGet);
+        }
+        else
+        {
+            Dock.Show(ToolWindowIds.NuGet);
+        }
+        NuGet.ShowSolution();
     }
 
     /// <summary>The session's packages followed while it is the window's: a change's end said in the status bar, its files
@@ -37,6 +58,7 @@ public partial class MainWindow
     /// the Sources tab wrote taken too, wherever they are; and the NuGet window, once built, shows them.</summary>
     private void BindPackages(ProjectSession next)
     {
+        next.Packages.EvaluationProperties = project => Passenger.App.Workspace.ProjectModels.Properties(next.Workspace, project);
         next.Packages.Changed += (_, outcome) =>
         {
             if (session != next)
@@ -78,6 +100,50 @@ public partial class MainWindow
             Say($"{outcome.Name} failed{(outcome.Left is { } left ? $", {left}" : string.Empty)}; the NuGet window's log says why",
                 StatusPlace.Window(Dock, ToolWindowIds.NuGet));
         }
+    }
+
+    /// <summary>On a project file's mark of a vulnerable version it gets only through others, the fix Show Context Actions and
+    /// an agent's code_actions find: a reference of the project's own at the least version that fixes it, in the frameworks
+    /// that get it (<see cref="FolderPackages.TransitiveFixAsync"/>), written as the NuGet window's Fix writes it.</summary>
+    private IReadOnlyList<CSharp.EditorFix> PackageFixes(OpenDocument file, int offset)
+    {
+        if (session.MSBuild.For(file) is not { } document || session.Projects.FirstOrDefault(p => PathNames.Same(p.Path, file.Path)) is not { } project)
+        {
+            return [];
+        }
+        ProjectSession at = session;
+        return [.. document.ExposedAt(offset).Select(e => new CSharp.EditorFix($"Reference {e.Id}'s fixed version"
+            + TransitiveFix.Within(TransitiveFix.FrameworksOf(e.Uses, [.. FolderPackages.References(project).Where(r => r.Id.Equals(e.Id, StringComparison.OrdinalIgnoreCase))
+                .Select(r => r.Version)], project.TargetFrameworks)),
+            $"{Plural.Listed([.. e.Uses.Select(u => u.Version).Distinct(StringComparer.OrdinalIgnoreCase)])} brought in by "
+            + $"{Plural.Listed([.. e.Uses.SelectMany(u => u.BroughtBy).Distinct(StringComparer.OrdinalIgnoreCase)])} has a known vulnerability",
+            new Text.TextRange(offset, 0), string.Empty)
+        {
+            Elsewhere = async (_, _) =>
+            {
+                if (at != session)
+                {
+                    return CSharp.RefactorOutcome.Refused(Refusals.SolutionClosed);
+                }
+                TransitiveFix? fix;
+                try
+                {
+                    fix = await at.Packages.TransitiveFixAsync(project, e.Id, CancellationToken.None);
+                }
+                catch (Exception failed) when (FeedSet.IsFeedFailure(failed))
+                {
+                    return CSharp.RefactorOutcome.Refused($"The versions of {e.Id} that may fix it could not be read: {failed.Message}");
+                }
+                if (fix is null)
+                {
+                    return CSharp.RefactorOutcome.Refused($"No version of {e.Id} without a known vulnerability is offered");
+                }
+                PackageOutcome outcome = await at.Packages.InstallAsync(project, fix.Id, fix.Version, frameworks: fix.Frameworks);
+                return outcome.Done
+                    ? new CSharp.RefactorOutcome($"{outcome.Name}: done", null, [.. outcome.Changed.Select(f => new CSharp.RefactoredFile(f, CSharp.RefactoredChange.Changed, []))], [])
+                    : CSharp.RefactorOutcome.Refused(outcome.Failure($"{outcome.Name} failed") ?? $"{outcome.Name} failed");
+            },
+        })];
     }
 
     /// <summary>A nuget.config written, made or deleted on disk: the folder's sources read again, once they have been, and

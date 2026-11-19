@@ -38,9 +38,9 @@ public sealed class WarmServer : IAsyncDisposable
         (RoslynSession, IReadOnlyList<ProjectLoadProblem>, bool, ServerWatches?) taken;
         lock (gate)
         {
-            // One that loads its projects itself cannot be had to load them again: it is no use once files came.
+            // Not one whose solution's projects changed since it loaded them, nor one loading its own projects once files came.
             if (kept is not { IsLoaded: true } session || session.Server.HasExited || session.Folder != folder || session.Solution != solution
-                || (solution is null && !session.Projects.SequenceEqual(projects, StringComparer.Ordinal)) || (unloaded && !session.Fed))
+                || !session.Projects.SequenceEqual(projects, StringComparer.Ordinal) || (unloaded && !session.Fed))
             {
                 return null;
             }
@@ -186,7 +186,7 @@ public sealed class WarmServer : IAsyncDisposable
         }
         // By the canonical paths the server's documents have.
         Dictionary<string, string> wanted = texts.ToDictionary(text => PathNames.Canonical(text.Key), text => Roslyn.Extension.TextHash.Of(text.Value), PathNames.Comparer);
-        DateTime until = DateTime.UtcNow + limit;
+        Deadline until = Deadline.In(limit);
         while (true)
         {
             try
@@ -205,7 +205,7 @@ public sealed class WarmServer : IAsyncDisposable
             {
                 return false;
             }
-            if (DateTime.UtcNow >= until)
+            if (until.Passed)
             {
                 return false;
             }

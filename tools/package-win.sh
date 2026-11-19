@@ -49,10 +49,10 @@ version=$(release_version "$root")
 rm -rf "$work" "$installer"
 publish_app "$root" "$rid" "$version" -o "$publish" -nologo -v quiet
 
-# The pack id is not Passenger: the uninstaller empties its folder, and %LocalAppData%\Passenger is the person's state.
+# Not Passenger as pack id (its uninstaller empties %LocalAppData%\Passenger, the person's state); --aumid is the process's own, so a pinned button shows the jump list.
 set -- --packId PassengerIDE --packVersion "$version" --packTitle Passenger --packAuthors Passenger \
     --packDir "$publish" --mainExe Passenger.exe --icon "$root/src/Passenger.App/Assets/Passenger.ico" \
-    --runtime "$rid" --channel "$rid" --shortcuts StartMenuRoot --noPortable \
+    --runtime "$rid" --channel "$rid" --shortcuts StartMenuRoot --aumid velopack.PassengerIDE --noPortable \
     --exclude 'lib(SkiaSharp|HarfBuzzSharp)\.pdb$' --outputDir "$release"
 if [ -n "$signtool_params" ]; then
     set -- "$@" --signParams "$signtool_params"

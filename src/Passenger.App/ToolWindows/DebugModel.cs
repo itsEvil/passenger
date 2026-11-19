@@ -67,12 +67,22 @@ public sealed class DebugTab(string name, OutputView console) : Observable, IHot
     /// <summary>The SDK's browser refresh of its program's pages, a web app's debugged with Hot Reload; null for any other.</summary>
     internal Debugging.BrowserRefresh? Browser { get; set; }
 
+    /// <summary>Lets go of what Hot Reload holds open for its program (its update handlers' hook, its pages' refresh) once
+    /// its session has ended or the tab has gone, however that came; again, nothing.</summary>
+    internal void LetGoOfHooks()
+    {
+        Handlers?.Dispose();
+        Handlers = null;
+        Browser?.Dispose();
+        Browser = null;
+    }
+
     /// <summary>The programs it is debugged with (a container run's services, by its configuration's name): Hot Reload's
     /// changes go to each of them together.</summary>
     public string? Group { get; internal set; }
 
-    /// <summary>Whether it debugs one of the copies of a game its configuration (its <see cref="Group"/>) starts side by side
-    /// (<see cref="Run.GameCopies"/>): Stop on any of them ends them all.</summary>
+    /// <summary>Whether it debugs one of the programs its configuration (its <see cref="Group"/>) starts side by side, a game's
+    /// copies (<see cref="Run.GameCopies"/>) or a multi-project configuration's projects: Stop on any of them ends them all.</summary>
     public bool Copy { get; internal set; }
 
     /// <summary>Whether Stop lets its program go, running on, as another program started it and keeps it (a game Godot's
@@ -85,6 +95,10 @@ public sealed class DebugTab(string name, OutputView console) : Observable, IHot
 
     /// <summary>What follows its program's output from outside into its console (a container's log), while it does.</summary>
     internal System.Diagnostics.Process? Following { get; set; }
+
+    /// <summary>Whether what it follows (<see cref="Following"/>) started its program, which ends with it (func, which starts a
+    /// Functions app's worker): Stop and the session's end end it, and its program is never let go to run on alone.</summary>
+    internal bool FollowedStarts { get; set; }
 
     /// <summary>Whether it is the tab shown: its frames, values, console and toolbar are the window's.</summary>
     public bool IsChosen
@@ -119,6 +133,7 @@ public sealed class DebugModel
     {
         first = NewConsole();
         shown = first;
+        shown.OfferChanged += OnOffer;
     }
 
     /// <summary>A toolbar button pressed: the app action it runs.</summary>
@@ -191,6 +206,9 @@ public sealed class DebugModel
 
     /// <summary>What Variables says over its rows changed (<see cref="Moved"/>).</summary>
     internal event EventHandler? MovedChanged;
+
+    /// <summary>What the chosen program's console offers over its output changed, which the Debugger tab offers too.</summary>
+    internal event EventHandler? OfferChanged;
 
     /// <summary>What Set Data Breakpoint offers on a row, the debugger asked: the menu's item says so once it answers.</summary>
     public Func<VariableNode, Task<DataWatchOffer>>? DataWatch { get; set; }
@@ -268,10 +286,14 @@ public sealed class DebugModel
     {
         if (shown != console)
         {
+            shown.OfferChanged -= OnOffer;
             shown = console;
+            shown.OfferChanged += OnOffer;
             TabShown?.Invoke(this, EventArgs.Empty);
         }
     }
+
+    private void OnOffer(object? sender, EventArgs e) => OfferChanged?.Invoke(this, EventArgs.Empty);
 
     /// <summary>Lets a session's console go, its tab closed or replaced; the first stays, for the next.</summary>
     public void ForgetConsole(OutputView console)
@@ -348,6 +370,11 @@ public sealed class DebugModel
     /// which is shown.</summary>
     public void ForgetSessions()
     {
+        // A session still ending as another folder's debugger takes the window ends where no tab hears it.
+        foreach (DebugTab tab in Sessions)
+        {
+            tab.LetGoOfHooks();
+        }
         Sessions.Clear();
         consoles.RemoveAll(c => c != first);
         ShowConsole(first);

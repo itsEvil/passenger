@@ -1,5 +1,6 @@
 using System.Text.Json.Nodes;
 using Passenger.App.State;
+using Passenger.Core;
 using Passenger.Host;
 
 namespace Passenger.App.Workspace;
@@ -14,12 +15,44 @@ public sealed record ProjectModelCache : IStateDocument<ProjectModelCache>
     /// <summary>The folder of the SDK whose MSBuild evaluated them.</summary>
     public string? Sdk { get; init; }
 
+    /// <summary>The build configuration they were evaluated under (Release|Any CPU), null for the one MSBuild takes given none.</summary>
+    public string? Configured { get; init; }
+
     /// <summary>Each project's evaluation, complete, by its path.</summary>
     public Dictionary<string, EvaluatedProject> Projects { get; init; } = [];
 
     public static IReadOnlyList<Action<JsonObject>> Upgrades { get; } = [StateStore.Unversioned, ForgetWindowsTargeted, ForgetAll, ForgetUncarried, ForgetUnpublishable, ForgetAll,
         ForgetUnrestored, ForgetUndefined, ForgetUnversioned, ForgetUnserved, ForgetUncentral, ForgetGodotless,
-        ForgetUnfoldered, ForgetUnbundled, ForgetGodotFoldered];
+        ForgetUnfoldered, ForgetUnbundled, ForgetGodotFoldered, ForgetUnconfigured, ForgetUndeclared, ForgetFunctionless, ForgetUnshared];
+
+    /// <summary>The evaluations of projects importing a shared project's items, kept before each item said whether a shared
+    /// project brings it in, by which the shared files show under the shared project rather than among the project's own.</summary>
+    private static void ForgetUnshared(JsonObject document)
+    {
+        if (document["projects"] is not JsonObject projects)
+        {
+            return;
+        }
+        foreach (string path in projects.Where(p => p.Value?["inputs"] is JsonArray inputs && inputs.Any(i => i?["path"] is JsonValue named
+            && named.GetValueKind() == System.Text.Json.JsonValueKind.String
+            && named.GetValue<string>().EndsWith(EvaluatedItem.SharedItemsExtension, StringComparison.OrdinalIgnoreCase)))
+            .Select(p => p.Key).ToList())
+        {
+            projects.Remove(path);
+        }
+    }
+
+    /// <summary>Every evaluation, kept before they carried the Azure Functions version a Functions app sets, by which func
+    /// runs it.</summary>
+    private static void ForgetFunctionless(JsonObject document) => document.Remove("projects");
+
+    /// <summary>Every evaluation, kept before they carried the configurations and platforms a project declares, which a
+    /// folder with no solution chooses its builds' from.</summary>
+    private static void ForgetUndeclared(JsonObject document) => document.Remove("projects");
+
+    /// <summary>Every evaluation, kept before they stamped the .editorconfig and .globalconfig files looked for over a
+    /// project's sources, whose coming or going since would leave the language server loading the project as it was.</summary>
+    private static void ForgetUnconfigured(JsonObject document) => document.Remove("projects");
 
     /// <summary>The evaluations of projects naming a Godot folder, kept before they carried whether Godot.NET.Sdk builds a
     /// project, by which Godot runs only its game and a plain .NET project naming one runs as itself, are evaluated again.</summary>
@@ -86,7 +119,7 @@ public sealed record ProjectModelCache : IStateDocument<ProjectModelCache>
             return;
         }
         foreach (string path in projects.Where(p => p.Value?["targetFrameworks"] is JsonArray frameworks
-            && frameworks.Any(f => f?.GetValueKind() == System.Text.Json.JsonValueKind.String && f.GetValue<string>().Contains("-windows", StringComparison.OrdinalIgnoreCase)))
+            && frameworks.Any(f => f?.GetValueKind() == System.Text.Json.JsonValueKind.String && FrameworkNames.PlatformOf(f.GetValue<string>()) == FrameworkNames.Windows))
             .Select(p => p.Key).ToList())
         {
             projects.Remove(path);

@@ -7,8 +7,9 @@ namespace Passenger.UnitTests.Mcp;
 
 /// <summary>What an agent's answer holds of what runs long: a debugged value cut at a few thousand characters, saying its
 /// length and the debug_evaluate that reads on, a string's literal never cut inside an escape; a list of thousands of files
-/// held to its first ones, saying how many more and how to read them; and a folder of untracked files one entry, as git's
-/// status shows it, from the repository's root or a folder in it.</summary>
+/// held to its first ones, or to a size, saying how many more and how to read them; groups held to a size, every one counted
+/// and the first whole; a long line shown around its column; and a folder of untracked files one entry, as git's status
+/// shows it, from the repository's root or a folder in it.</summary>
 public sealed class AgentAnswersTests : IDisposable
 {
     private readonly string root = PathNames.Canonical(Directory.CreateTempSubdirectory("passenger-unit-").FullName);
@@ -23,6 +24,25 @@ public sealed class AgentAnswersTests : IDisposable
         Assert.Equal("179 more installed families left out: by name", AgentAnswers.More(179, "installed family", "by name", "installed families"));
         Assert.Equal("1 more installed family left out: by name", AgentAnswers.More(1, "installed family", "by name", "installed families"));
         Assert.Equal("1,200 more files left out: read on", AgentAnswers.More(1200, "file", "read on"));
+    }
+
+    /// <summary>Lists of findings held to a total keep every list's errors before any list's warnings, each list in its own
+    /// order, and count what each severity left out: two errors of the second list come before the first list's warnings.</summary>
+    [Fact]
+    public void Lists_of_findings_held_to_a_total_keep_every_lists_errors_before_any_warning_and_count_what_was_left_out()
+    {
+        string[] build = ["error a", "warning b", "warning c"];
+        string[] solution = ["error d", "error e", "warning f", "message g"];
+        (IReadOnlyList<string>[] kept, int[] left) = AgentAnswers.Severest<string>([build, solution], Rank, 3, 4);
+        Assert.Equal(["error a", "warning b"], kept[0]);
+        Assert.Equal(["error d", "error e"], kept[1]);
+        Assert.Equal([0, 2, 1], left);
+
+        (kept, left) = AgentAnswers.Severest<string>([build, solution], Rank, 3, 100);
+        Assert.Equal([build, solution], kept);
+        Assert.Equal([0, 0, 0], left);
+
+        static int Rank(string finding) => finding.Split(' ')[0] switch { "error" => 0, "warning" => 1, _ => 2 };
     }
 
     [Fact]
@@ -147,6 +167,67 @@ public sealed class AgentAnswersTests : IDisposable
             && said.EndsWith($"many/file-with-a-longish-name-{AgentAnswers.MostNamed - 1}.txt; 4,900 more files left out: local_history of a folder within names those there", StringComparison.Ordinal),
             $"5,000 files were named in {said.Length:N0} characters: {said[..Math.Min(said.Length, 300)]}…{said[^Math.Min(said.Length, 200)..]}");
         Assert.Equal("a.txt, b.txt", AgentAnswers.Named(["a.txt", "b.txt"], "file", "never said"));
+    }
+
+    /// <summary>A list held to a size keeps its first entries while they fit, each with its separator, and says how many
+    /// more it left out; one that fits is kept whole, saying nothing.</summary>
+    [Fact]
+    public void A_list_held_to_a_size_keeps_its_first_entries_that_fit_and_says_how_many_more()
+    {
+        string[] entries = [.. Enumerable.Range(0, 1_000).Select(i => $"row {i:D6}")];
+        (IReadOnlyList<string> kept, string? more) = AgentAnswers.Within(entries, e => e.Length, 100, "row", "a filter narrows them");
+        Assert.Equal(entries.Take(9), kept);
+        Assert.Equal("991 more rows left out: a filter narrows them", more);
+        Assert.Equal(((IReadOnlyList<string>)entries, (string?)null), AgentAnswers.Within(entries, e => e.Length, 11_000, "row", "never said"));
+    }
+
+    /// <summary>Groups held to a size are whole where they all fit; else every group that fits is named with its count, the
+    /// first of them whole while the room left takes them, and the rest left out.</summary>
+    [Fact]
+    public void Groups_held_to_a_size_name_every_group_that_fits_and_give_the_first_whole()
+    {
+        int[] groups = [50, 50, 50, 50, 50];
+        Assert.Equal((5, 0), AgentAnswers.Grouped(groups, g => g, _ => 10, 1_000));
+        Assert.Equal((2, 3), AgentAnswers.Grouped(groups, g => g, _ => 10, 150));
+        Assert.Equal((0, 3), AgentAnswers.Grouped(groups, g => g, _ => 10, 33));
+    }
+
+    /// <summary>Room shared among lists gives each that needs no more than an equal share of what the smaller ones leave all
+    /// it needs, and splits the rest equally among those needing more; two lists needing more than half take half each.</summary>
+    [Fact]
+    public void Room_shared_among_lists_gives_the_small_ones_all_they_need_and_splits_the_rest_among_those_needing_more()
+    {
+        Assert.Equal([40_000, 50, 300, 10_000], AgentAnswers.Shares([70_000, 50, 300, 10_000], 50_350));
+        Assert.Equal([10_000, 50, 300, 10_000], AgentAnswers.Shares([70_000, 50, 300, 60_000], 20_350));
+        Assert.Equal([500, 500], AgentAnswers.Shares([2_000, 3_000], 1_000));
+        Assert.Equal([200, 800], AgentAnswers.Shares([200, 3_000], 1_000));
+        Assert.Equal([0, 0, 0], AgentAnswers.Shares([10, 20, 30], -5));
+        Assert.Equal([333, 333, 334], AgentAnswers.Shares([1_000, 1_000, 1_000], 1_000));
+    }
+
+    /// <summary>A place's line past the length an answer shows is cut around its column, "…" where cut, never between a
+    /// pair's surrogates; a short one is shown trimmed.</summary>
+    [Fact]
+    public void A_long_line_is_shown_around_its_column_and_a_short_one_trimmed()
+    {
+        Assert.Equal("int x = 1;", AgentAnswers.Line("    int x = 1;   ", 5));
+        string minified = $"    {new string('a', 5_000)}needle{new string('b', 5_000)}";
+        string shown = AgentAnswers.Line(minified, minified.IndexOf("needle", StringComparison.Ordinal) + 1);
+        Assert.True(shown.Length <= AgentAnswers.LineLength + 2 && shown.StartsWith('…') && shown.EndsWith('…') && shown.Contains("needle", StringComparison.Ordinal),
+            $"A minified line's match was shown as {shown.Length} characters: {shown}");
+        Assert.Equal("ab…", AgentAnswers.Cut("ab\U0001F600cd", 3));
+    }
+
+    /// <summary>Findings held to a size as well as a count keep the severest first while they fit, every one after the
+    /// first that did not fit left out.</summary>
+    [Fact]
+    public void Findings_held_to_a_size_keep_the_severest_first_that_fit()
+    {
+        string[] found = ["warning one", "error two", "warning three", "error four"];
+        (IReadOnlyList<string>[] kept, int[] left) = AgentAnswers.Severest<string>([found], f => f.StartsWith("error", StringComparison.Ordinal) ? 0 : 1, 2, 100,
+            f => f.Length, 34);
+        Assert.Equal(["error two", "error four", "warning one"], kept[0]);
+        Assert.Equal([0, 1], left);
     }
 
     private string At(params string[] names) => Path.Combine([root, .. names]);

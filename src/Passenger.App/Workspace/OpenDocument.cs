@@ -99,10 +99,10 @@ public sealed class OpenDocument : Observable
     }
 
     /// <summary>Opens a supported image or font as a read-only asset with an empty text placeholder, otherwise as text.
-    /// An asset's tab shows it loading until its decode lands off the UI thread; a missing, empty or oversized one is
-    /// refused at once. Other binary content opens as its bytes' text, read-only and never written
-    /// (<see cref="FileText.Bytes"/>), or, unless <paramref name="asBytes"/> (for what would edit it), is refused with an
-    /// <see cref="IOException"/>, as is one past <see cref="LargestText"/>. C# is parsed with its project's symbols.</summary>
+    /// An asset's tab shows it loading until its decode lands off the UI thread; one missing, empty or oversized, or whose
+    /// decode failed before this returns, is refused at once. Other binary content opens as its bytes' text, read-only and
+    /// never written (<see cref="FileText.Bytes"/>), or, unless <paramref name="asBytes"/> (for what would edit it), is
+    /// refused with an <see cref="IOException"/>, as is one past <see cref="LargestText"/>. C# is parsed with its project's symbols.</summary>
     public static OpenDocument Load(string path, bool asBytes = true, CSharpParseOptions? options = null)
     {
         if (AssetPreview.KindOf(path) is { } kind)
@@ -113,6 +113,12 @@ public sealed class OpenDocument : Observable
                 Language = kind == AssetKind.Font ? Language.Font : Language.Image,
             };
             asset.Decode();
+            // The thread pool may end the decode before its await, which then said PreviewFailed with nobody yet listening.
+            if (asset.PreviewFailure is { } failure)
+            {
+                asset.Close();
+                throw new IOException(failure);
+            }
             return asset;
         }
         // A workbook's tab holds no text, since its table is read from the file itself.
@@ -145,11 +151,36 @@ public sealed class OpenDocument : Observable
     /// <summary>The diff this tab shows in the editor's place, for a diff's tab (<see cref="OfDiff"/>); null for a file's.</summary>
     public Vcs.DiffTab? Diff { get; private init; }
 
+    /// <summary>A tool window's tab among the editors (<see cref="Editors.ToolTab"/>): named by the window's id, as plain
+    /// text with no text of its own, which its group shows as the window in the editor's place.</summary>
+    public static OpenDocument OfTool(Editors.ToolTab tool) =>
+        new(tool.Window.Id, new FileText(string.Empty, new UTF8Encoding(false), false), Language.PlainText, null) { Tool = tool };
+
+    /// <summary>The tool window this tab shows in the editor's place, for a tool window's tab (<see cref="OfTool"/>); null
+    /// for a file's.</summary>
+    public Editors.ToolTab? Tool { get; private init; }
+
     /// <summary>What Save saves with this tab shown: the file, or the open file a diff's tab edits (itself where it edits none).</summary>
     public OpenDocument Saves => Diff?.Shown.File ?? this;
 
-    /// <summary>The diff its tab shows was asked for again, for its groups to show what it is now.</summary>
-    internal void DiffChanged() => Raise(nameof(Diff));
+    /// <summary>The diff its tab shows was asked for again, or another file's taken in its place, for its groups to show
+    /// what it is now and its tab to name the file it is of.</summary>
+    internal void DiffChanged()
+    {
+        if (Diff is { } diff && Path != diff.Shown.Path)
+        {
+            Path = diff.Shown.Path;
+            Raise(nameof(Path));
+            Raise(nameof(Name));
+        }
+        Raise(nameof(Diff));
+    }
+
+    /// <summary>Whether its diff's tab follows the file chosen in the Commit window (<see cref="Vcs.DiffTab.Follows"/>).</summary>
+    public bool Follows => Diff?.Follows == true;
+
+    /// <summary>Its diff's tab was kept, for the tab to be drawn as one that follows no more.</summary>
+    internal void FollowsChanged() => Raise(nameof(Follows));
 
     /// <summary>The file's length and last write time as found just before the editor last read all of it, with the version of
     /// the text it then held: while both hold, the editor holds what the disk does (<see cref="TakeDiskTextAsync"/>).</summary>
@@ -362,18 +393,35 @@ public sealed class OpenDocument : Observable
     public DocumentDecorations Decorations { get; }
 
     /// <summary>The language service's markers (diagnostics), in this text's offsets: set when a service reports, and
-    /// carried with the text between reports (<see cref="DocumentDecorations.Markers"/>).</summary>
+    /// carried with the text between reports (<see cref="DocumentDecorations.Markers"/>). A report of the markers the text
+    /// carries already, marker for marker, changes nothing, so nothing that lists them lists them again.</summary>
     public IReadOnlyList<Marker> Markers
     {
         get => Decorations.Markers;
         set
         {
-            if (!ReferenceEquals(Decorations.Markers, value))
+            if (!ReferenceEquals(Decorations.Markers, value) && !SameMarkers(Decorations.Markers, value))
             {
                 Decorations.SetMarkers(value);
                 Raise();
             }
         }
+    }
+
+    private static bool SameMarkers(IReadOnlyList<Marker> carried, IReadOnlyList<Marker> reported)
+    {
+        if (carried.Count != reported.Count)
+        {
+            return false;
+        }
+        for (int i = 0; i < carried.Count; i++)
+        {
+            if (carried[i] != reported[i])
+            {
+                return false;
+            }
+        }
+        return true;
     }
 
     private int checks;
@@ -467,6 +515,15 @@ public sealed class OpenDocument : Observable
         set => Set(ref noticeAction, value);
     }
 
+    private bool inConflict;
+
+    /// <summary>Whether Git has the file in conflict, as its last status read it: the banner says so, offering its merge.</summary>
+    public bool InConflict
+    {
+        get => inConflict;
+        set => Set(ref inConflict, value);
+    }
+
     /// <summary>The projects the language server compiles the file in (a target framework of a multi-targeted project
     /// each), by the server's names for them; none while it has not said, or for a file it does not know.</summary>
     public IReadOnlyList<string> ProjectContexts
@@ -496,6 +553,22 @@ public sealed class OpenDocument : Observable
         get => testMarks;
         set => Set(ref testMarks, value);
     }
+
+    /// <summary>How each step of a feature went in the run that last took it (<see cref="Bdd.StepRuns"/>), beside its line,
+    /// a failure's words after it.</summary>
+    public IReadOnlyList<Testing.StepMark> StepMarks
+    {
+        get => stepMarks;
+        set
+        {
+            if (Set(ref stepMarks, value))
+            {
+                Decorations.SetLineAnnotations(ShownAnnotations);
+            }
+        }
+    }
+
+    private IReadOnlyList<Testing.StepMark> stepMarks = [];
 
     /// <summary>The run icons beside what a run configuration runs from it: a program's entry point, a launch profile, a
     /// compose file's services, a Dockerfile's image.</summary>
@@ -700,9 +773,11 @@ public sealed class OpenDocument : Observable
         return moved ?? annotations;
     }
 
-    /// <summary>What its editors show after its lines: the debugger's annotations, then the app's live values.</summary>
-    public IReadOnlyList<LineAnnotation> ShownAnnotations => liveValues.Count == 0 && errorPins.Count == 0 ? lineAnnotations
-        : [.. lineAnnotations, .. liveValues, .. errorPins.Select(p => new LineAnnotation(p.Line, p.Last, p.Warnings ? LineAnnotationLook.Muted : LineAnnotationLook.Error))];
+    /// <summary>What its editors show after its lines: the debugger's annotations, then the app's live values, a run's errors
+    /// and its failed steps' words.</summary>
+    public IReadOnlyList<LineAnnotation> ShownAnnotations => liveValues.Count == 0 && errorPins.Count == 0 && stepMarks.Count == 0 ? lineAnnotations
+        : [.. lineAnnotations, .. liveValues, .. errorPins.Select(p => new LineAnnotation(p.Line, p.Last, p.Warnings ? LineAnnotationLook.Muted : LineAnnotationLook.Error)),
+            .. stepMarks.Where(m => m.Failure is not null).Select(m => new LineAnnotation(m.Line, m.Failure!, LineAnnotationLook.Error))];
 
     private IReadOnlyList<Editors.ErrorPin> errorPins = [];
 
@@ -737,13 +812,18 @@ public sealed class OpenDocument : Observable
     }
 
     /// <summary>Lets go of the file's asset (one still decoding as it lands), colours and folds after its last view or hold
-    /// closes.</summary>
+    /// closes: the language server's colours and the parse beneath them, a parse under way among them.</summary>
     public void Close()
     {
         closed = true;
         Diff?.LetGo();
+        Tool?.LetGo();
         Asset?.Dispose();
         (Highlighter as IDisposable)?.Dispose();
+        if (!ReferenceEquals(parser, Highlighter))
+        {
+            (parser as IDisposable)?.Dispose();
+        }
         (finder as FoldScan)?.Dispose();
     }
 
@@ -752,7 +832,7 @@ public sealed class OpenDocument : Observable
 
     /// <summary>What its tab is called: its name, a diff's title ("Shop.cs: HEAD and your version"), or for release notes the
     /// app carries what they are ("What's New in 0.2.0").</summary>
-    public string Title => Diff?.Shown.Title ?? (Updates.ReleaseNotes.VersionOf(Path) is { } version ? Updates.ReleaseNotes.TitleOf(version) : Name);
+    public string Title => Tool?.Window.Title ?? Diff?.Shown.Title ?? (Updates.ReleaseNotes.VersionOf(Path) is { } version ? Updates.ReleaseNotes.TitleOf(version) : Name);
 
     /// <summary>Whether this is release notes the app carries, which its tab shows rendered (What's New), read-only.</summary>
     public bool IsReleaseNotes => Updates.ReleaseNotes.VersionOf(Path) is not null;
@@ -970,7 +1050,7 @@ public sealed class OpenDocument : Observable
         {
             return;
         }
-        IReadOnlyList<TextEdit> edits = TextEditing.Saving(Text.Snapshot.ToString(), Selections, false, false, to.Held(), Text.LineEnding)?.Edits ?? [];
+        IReadOnlyList<TextEdit> edits = TextEditing.Saving(Text.Snapshot.ToString(), Selections, false, null, to.Held(), Text.LineEnding)?.Edits ?? [];
         Change(edits, Current with { Separator = to, SeparatorChosen = true }, write: true);
     }
 
@@ -1189,7 +1269,7 @@ public sealed class OpenDocument : Observable
         {
             return;
         }
-        HashSet<int>? folded = null;
+        List<int>? folded = null;
         IReadOnlyList<FoldRegion> regions = FoldRegions;
         for (int i = 0; i < regions.Count; i++)
         {
@@ -1198,19 +1278,7 @@ public sealed class OpenDocument : Observable
                 (folded ??= []).Add(regions[i].Start);
             }
         }
-        if (folded is null)
-        {
-            FoldRegions = found;
-        }
-        else
-        {
-            FoldRegion[] kept = new FoldRegion[found.Count];
-            for (int i = 0; i < kept.Length; i++)
-            {
-                kept[i] = found[i] with { Folded = folded.Contains(found[i].Start) };
-            }
-            FoldRegions = kept;
-        }
+        FoldRegions = folded is null ? found : FoldList.Of(found).FoldedAt(folded);
     }
 
     /// <summary>The first regions, folded as the file opens: as <see cref="FoldsAtFirst"/> says, but for one hiding a caret.</summary>
@@ -1257,7 +1325,7 @@ public sealed class OpenDocument : Observable
     /// notes the app carries, a workbook, an asset preview, a diff's tab, a binary file shown as its bytes, an MSBuild file of the .NET
     /// SDK or any file of a package as NuGet restored it, a copy of a container's file or of what the engine says of one, a
     /// copy of a source generator's code, or a stylesheet a page links on the web as it was downloaded.</summary>
-    public bool IsReadOnly => Asset is not null || Diff is not null || IsDecompiled || IsWorkbook || IsBinary || Product.Carries(Path) || IsReleaseNotes
+    public bool IsReadOnly => Asset is not null || Diff is not null || Tool is not null || IsDecompiled || IsWorkbook || IsBinary || Product.Carries(Path) || IsReleaseNotes
         || MSBuild.MSBuildFiles.IsInstalled(Path) || Packages.PackageFolders.Holds(Path) || Containers.ContainerFilesPane.IsCopy(Path)
         || Endpoints.RequestLog.IsCommandCopy(Path) || CSharp.GeneratedCode.IsCopy(Path) || Web.RemoteStylesheets.IsCopy(Path);
 
@@ -1285,7 +1353,7 @@ public sealed class OpenDocument : Observable
     /// <summary>Whether its tab holds the file's text: an asset preview's and a workbook's hold an empty stand-in, a
     /// binary file's its bytes drawn as signs, release notes' their Markdown shown rendered and a diff's none, so nothing searches, reads,
     /// edits or writes it as the file's (<see cref="ShownAs"/> says what the file is instead).</summary>
-    public bool HoldsText => Asset is null && Diff is null && !IsWorkbook && !IsBinary && !IsReleaseNotes;
+    public bool HoldsText => Asset is null && Diff is null && Tool is null && !IsWorkbook && !IsBinary && !IsReleaseNotes;
 
     /// <summary>What a file whose tab holds no text is shown as, for what refuses its text to say; null for text.</summary>
     public string? ShownAs => Asset is { Kind: AssetKind.Image } ? "an image, shown as a read-only preview"
@@ -1324,7 +1392,9 @@ public sealed class OpenDocument : Observable
 
     /// <summary>Whether text has unsaved changes; a read-only asset is never considered modified.</summary>
     public bool IsModified => Asset is null && Text.IsModified;
-    public Avalonia.Media.Geometry Icon => Diff is not null ? Explorer.FileIcons.ForDiff : Explorer.FileIcons.ForFile(Path);
+    public Avalonia.Media.Geometry Icon => Tool is { } tool && Avalonia.Application.Current is { } app
+        && app.TryGetResource(tool.Window.Icon, app.ActualThemeVariant, out object? found) && found is Avalonia.Media.Geometry glyph ? glyph
+        : Diff is not null ? Explorer.FileIcons.ForDiff : Explorer.FileIcons.ForFile(Path);
     public Avalonia.Media.IBrush IconBrush => Explorer.FileIcons.BrushForFile(Path);
 
     /// <summary>The carets: the editor's while the file is shown there, as left otherwise, moved by every change to the text.</summary>
@@ -1489,10 +1559,14 @@ public sealed class OpenDocument : Observable
         return true;
     }
 
-    /// <summary>Writes the file, first doing to its text what its .editorconfig asks of a save (trailing whitespace off
-    /// every line without one of <paramref name="carets"/>, a final line break, every break its <c>end_of_line</c>, as
-    /// one undoable step) and in its <c>charset</c>; a line separator or encoding the person chose stays. Its folder, once
-    /// another program moved or deleted it, is made again only when <paramref name="makeFolder"/> (the person's Save). A
+    /// <summary>Whether a save ends the file with a line break where no .editorconfig sets <c>insert_final_newline</c> for
+    /// it (Settings' Ensure a final line break on save).</summary>
+    public Func<bool>? EnsuresFinalLineBreak { get; set; }
+
+    /// <summary>Writes the file, first doing to its text what its .editorconfig asks of a save (trailing whitespace off every
+    /// line without one of <paramref name="carets"/>, a final line break or none, else <see cref="EnsuresFinalLineBreak"/>'s,
+    /// every break its <c>end_of_line</c>, as one undoable step) and in its <c>charset</c>; a line separator or encoding the
+    /// person chose stays. Its folder, moved or deleted elsewhere, is made again only when <paramref name="makeFolder"/>. A
     /// file with no changes is written only <paramref name="overDisk"/>; a read-only one never, refused with why.</summary>
     public void Save(SelectionSet? carets = null, bool makeFolder = false, bool overDisk = false)
     {
@@ -1522,7 +1596,8 @@ public sealed class OpenDocument : Observable
         string text = Text.Snapshot.ToString();
         SelectionSet kept = carets ?? Selections;
         LineSeparator? asked = separatorChosen ? null : Conventions.EndOfLine;
-        if (TextEditing.Saving(text, kept, Conventions.TrimTrailingWhitespace, Conventions.InsertFinalNewline, asked?.Held(), Text.LineEnding) is { } plan)
+        bool? finalLineBreak = Conventions.FinalNewline ?? (EnsuresFinalLineBreak?.Invoke() == true ? true : null);
+        if (TextEditing.Saving(text, kept, Conventions.TrimTrailingWhitespace, finalLineBreak, asked?.Held(), Text.LineEnding) is { } plan)
         {
             Text.BreakUndoGroup();
             Text.Edit(plan.Edits, kept, plan.Selections);

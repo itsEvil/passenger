@@ -37,6 +37,23 @@ public static class TextSearch
     /// whole number of milliseconds above 0 is fatal.</summary>
     public static TimeSpan Apart => EnvironmentValues.Milliseconds(ApartVariable, TimeSpan.FromSeconds(5));
 
+    /// <summary>Whether a text holds a match of a regex a person or a program wrote (an expectation, a schema's pattern): on
+    /// the linear engine where its constructs allow, else held to <paramref name="within"/> (<see cref="AtOnce"/> on the
+    /// UI thread, <see cref="Apart"/> off it), past which it throws a <see cref="RegexMatchTimeoutException"/>. A pattern
+    /// that does not parse throws an <see cref="ArgumentException"/>.</summary>
+    public static bool IsWrittenMatch(string text, string pattern, RegexOptions options, TimeSpan within)
+    {
+        try
+        {
+            return System.Text.RegularExpressions.Regex.IsMatch(text, pattern, options | RegexOptions.NonBacktracking, within);
+        }
+        catch (NotSupportedException)
+        {
+            // A backreference, a lookaround or an atomic group, which only backtracking reads.
+            return System.Text.RegularExpressions.Regex.IsMatch(text, pattern, options, within);
+        }
+    }
+
     /// <summary>Every match of a query, a regex's search stopping past <paramref name="within"/> (<see cref="AtOnce"/> on
     /// the UI thread, <see cref="Apart"/> off it).</summary>
     public static SearchResult FindAll(TextSnapshot snapshot, SearchQuery query, TimeSpan within, int limit = MaxMatches)
@@ -100,16 +117,17 @@ public static class TextSearch
     }
 
     /// <summary>A plain query's matches, each as long as its text, found a block at a time in a window from the shared pool
-    /// that holds a character either side of the block's (all Words' lookarounds read) and its last match's end: one a
-    /// block's end cuts, or one the window's end took for a word's, is found again whole in the next.</summary>
+    /// that holds what Words' lookarounds read either side of the block's (<see cref="Behind"/> before, a character
+    /// after) and its last match's end: one a block's end cuts, or one the window's end took for a word's, is found
+    /// again whole in the next.</summary>
     private static SearchResult Blocks(TextSnapshot snapshot, SearchPattern pattern, int limit, bool crlf)
     {
         int length = snapshot.Length;
         int needle = pattern.Length;
         List<TextRange> matches = [];
-        char[] window = ArrayPool<char>.Shared.Rent(Math.Min(length, Math.Max(1 << 14, 2 * (needle + 1))));
-        // As much as the window holds beside a match cut at its end and the character after it.
-        int block = Math.Max(1, window.Length - needle - 1);
+        char[] window = ArrayPool<char>.Shared.Rent(Math.Min(length, Math.Max(1 << 14, 2 * (needle + Behind))));
+        // The whole text where the window holds it, else what it holds beside the lookbehind's read and a cut match.
+        int block = window.Length >= length ? length : Math.Max(1, window.Length - needle - Behind);
         try
         {
             int next = 0;
@@ -120,7 +138,7 @@ public static class TextSearch
                 {
                     continue;
                 }
-                int from = Math.Max(start - 1, 0);
+                int from = Math.Max(start - Behind, 0);
                 Span<char> read = window.AsSpan(0, Math.Min(end + needle, length) - from);
                 snapshot.CopyTo(from, read);
                 foreach (ValueMatch match in pattern.Regex.EnumerateMatches(read, Math.Max(start, next) - from))
@@ -289,8 +307,12 @@ public static class TextSearch
         }
     }
 
+    /// <summary>How many characters before a match Words' lookbehind reads: a word's character and the marks carrying it.</summary>
+    private const int Behind = WordCharacters.Reach + 1;
+
     /// <summary>The regex a query finds with; a pattern that does not parse throws an <see cref="ArgumentException"/> whose
-    /// message says why. Plain text takes no time limit: a literal between one-character lookarounds never backtracks.</summary>
+    /// message says why. Plain text takes no time limit: a literal between lookarounds of a few characters each never
+    /// backtracks further than they reach.</summary>
     internal static Regex Build(SearchQuery query, TimeSpan within)
     {
         RegexOptions options = RegexOptions.CultureInvariant | RegexOptions.Multiline | (query.MatchCase ? RegexOptions.None : RegexOptions.IgnoreCase);
@@ -298,7 +320,7 @@ public static class TextSearch
         if (query.WholeWords)
         {
             // A group of its own, so both ends of an alternation are whole words: cat|dog finds no "catalog" or "hotdog".
-            pattern = $@"(?<!\w)(?:{pattern})(?!\w)";
+            pattern = $"{WordCharacters.NotAfterWord}(?:{pattern}){WordCharacters.NotBeforeWord}";
         }
         if (query.Regex && pattern != query.Text)
         {

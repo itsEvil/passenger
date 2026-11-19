@@ -5,6 +5,7 @@ extends Node
 
 const SAID := "passenger:said"
 const GONE := "passenger:gone"
+const HERE := "passenger:here"
 const SHIFT := 1
 const CTRL := 2
 const ALT := 4
@@ -33,6 +34,12 @@ var _keys_back_modifiers := 0
 var _letting_go := false
 ## The last member, so it is set only once every other member's default is (members are made in the order written).
 var _made = true
+
+
+## Said as this script is set on the helper's node, which Godot took into the game's tree, so no refusal raised after is
+## the helper's.
+func _init() -> void:
+    EngineDebugger.send_message(HERE, [])
 
 
 ## Every call Passenger makes, by its name, its ask and its other arguments. Godot reads the debugger's messages between a
@@ -188,14 +195,19 @@ func _read_named(node: Node, property: String) -> Array:
     return [node.get(property)] if property in node else []
 
 
-## Each node's id, box, text and flags, and the values of those of its properties named.
+## Each node's id, box, text and flags, and the values of those of its properties named; then each class or script the
+## nodes are of, and those they derive from, by what it derives from directly ([derived, base] pairs, a script by its path).
 func layout(ask: int, names: Array) -> void:
     var nodes: Array = []
-    _walk(get_tree().root, nodes, names)
-    _say(ask, true, [nodes])
+    var bases: Dictionary = {}
+    _walk(get_tree().root, nodes, names, bases)
+    var derived: Array = []
+    for each in bases:
+        derived.append([each, bases[each]])
+    _say(ask, true, [nodes, derived])
 
 
-func _walk(node: Node, nodes: Array, names: Array) -> void:
+func _walk(node: Node, nodes: Array, names: Array, bases: Dictionary) -> void:
     if node == self:
         return
     var box := _box(node)
@@ -204,9 +216,30 @@ func _walk(node: Node, nodes: Array, names: Array) -> void:
         var read := _read_named(node, property)
         if not read.is_empty():
             named.append([property, read[0]])
+    _derived(node, bases)
     nodes.append([node.get_instance_id(), box[0], box[1], box[2], box[3], box[4], _text(node), _flags(node), named])
     for child in node.get_children():
-        _walk(child, nodes, names)
+        _walk(child, nodes, names, bases)
+
+
+## What a node's scripts and engine classes derive from directly, each script by its path.
+func _derived(node: Node, bases: Dictionary) -> void:
+    var script = node.get_script()
+    while script is Script and not String(script.resource_path).is_empty() and not bases.has(script.resource_path):
+        var above = script.get_base_script()
+        var path: String = script.resource_path
+        if above is Script and not String(above.resource_path).is_empty():
+            bases[path] = above.resource_path
+        else:
+            bases[path] = node.get_class()
+        script = above
+    var named: String = node.get_class()
+    while not bases.has(named):
+        var parent: String = ClassDB.get_parent_class(named)
+        if parent.is_empty():
+            break
+        bases[named] = parent
+        named = parent
 
 
 func windows(ask: int) -> void:
@@ -456,6 +489,7 @@ func _keyed(viewport: Viewport, holding: Window) -> Array:
     return _after(holding if holds else viewport, Vector2.ZERO, null, null, false) + [1 if holds and holding.exclusive else 0]
 
 
+## Each chord pressed as a keyboard gives it: [its key as Godot names it, the modifiers held, the character it types or none].
 func key(ask: int, id: int, window: int, chords: Array) -> void:
     if _gone(ask, id):
         return
@@ -468,13 +502,14 @@ func key(ask: int, id: int, window: int, chords: Array) -> void:
             _say(ask, false, ["Godot has no key %s" % chord[0]])
             return
         var modifiers: int = chord[1]
+        var typed: String = chord[2]
         var press := InputEventKey.new()
         press.keycode = code
         press.physical_keycode = code
         press.pressed = true
         _modifiers(press, modifiers)
-        if modifiers & (CTRL | ALT | META) == 0 and code >= KEY_SPACE and code <= KEY_ASCIITILDE:
-            press.unicode = code + 32 if code >= KEY_A and code <= KEY_Z and modifiers & SHIFT == 0 else code
+        if not typed.is_empty():
+            press.unicode = typed.unicode_at(0)
         _send(press, viewport)
         await _frames(1)
         var release := press.duplicate() as InputEventKey

@@ -47,7 +47,7 @@ public partial class MainWindow
     {
         TitleBarMerged = merged;
         ExtendClientAreaToDecorationsHint = merged;
-        ExtendClientAreaTitleBarHeightHint = merged ? Toolbar.Height : -1;
+        ExtendClientAreaTitleBarHeightHint = merged ? Toolbar.Height * settings.DisplayScale : -1;
         // Windows handles a caption's press itself; X11 would take it first, so Linux's goes through OnToolbarPressed.
         WindowDecorationProperties.SetElementRole(Toolbar, merged && OperatingSystem.IsWindows() ? WindowDecorationsElementRole.TitleBar : WindowDecorationsElementRole.None);
         // What shows of the window round its content: Linux's edge where Passenger draws the frame.
@@ -62,6 +62,7 @@ public partial class MainWindow
         {
             MergeTitleBar(!TitleBarMerged);
         }
+        ExtendClientAreaTitleBarHeightHint = TitleBarMerged ? Toolbar.Height * next.DisplayScale : -1;
     }
 
     /// <summary>Whether macOS's traffic lights stand on the bar: but in full screen, where macOS hides them.</summary>
@@ -73,7 +74,7 @@ public partial class MainWindow
     {
         bool fullScreen = WindowState == WindowState.FullScreen;
         WindowButtons.IsVisible = TitleBarMerged && !OperatingSystem.IsMacOS() && !fullScreen;
-        ToolbarContent.Margin = new Thickness(ShowsTrafficLights ? MacWindowButtons : 8, 0, WindowButtons.IsVisible ? 0 : 8, 0);
+        ToolbarContent.Margin = new Thickness(ShowsTrafficLights ? MacWindowButtons : Gaps.Normal, 0, WindowButtons.IsVisible ? 0 : Gaps.Normal, 0);
         bool maximized = WindowState == WindowState.Maximized;
         MaximizeGlyph.Data = Geometry.Parse(maximized ? "M0.5,2.5 H7.5 V9.5 H0.5 Z M2.5,2.5 V0.5 H9.5 V7.5 H7.5" : "M0.5,0.5 H9.5 V9.5 H0.5 Z");
         AutomationProperties.SetName(MaximizeButton, maximized ? "Restore" : "Maximize");

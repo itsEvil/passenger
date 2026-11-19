@@ -1,4 +1,3 @@
-using System.Xml.Linq;
 using Passenger.App.Run;
 using Passenger.App.Workspace;
 using Passenger.Core;
@@ -42,7 +41,7 @@ public static class ContainerConfigurations
                 continue;
             }
             covered.UnionWith(files);
-            string relative = Path.GetRelativePath(workspace.Folder, file).Replace('\\', '/');
+            string relative = PathNames.Relative(file, workspace.Folder) ?? file;
             made.Add(new RunConfiguration
             {
                 Name = $"Compose: {relative}",
@@ -148,32 +147,16 @@ public static class ContainerConfigurations
     /// debugs or leaves, the Compose profiles it turns on).</summary>
     public static IReadOnlyList<RunConfiguration> FromComposeProject(string dcproj)
     {
-        if (Text(dcproj) is not { } text)
-        {
-            return [];
-        }
-        XElement root;
-        try
-        {
-            root = XDocument.Parse(text).Root!;
-        }
-        catch (System.Xml.XmlException)
+        if (Text(dcproj) is not { } text || ComposeProjectFile.Read(text) is not { } read)
         {
             return [];
         }
         string folder = Path.GetDirectoryName(dcproj)!;
-        string? Property(string name) => root.Descendants().FirstOrDefault(e => e.Name.LocalName == name && e.Parent?.Name.LocalName == "PropertyGroup")?.Value.Trim();
-        string basis = Property(MSBuildNames.DockerComposeBaseFilePath) is { Length: > 0 } named ? named : "docker-compose";
-        string file = new[] { ".yml", ".yaml" }.Select(e => Path.Combine(folder, basis + e)).FirstOrDefault(File.Exists) ?? Path.Combine(folder, basis + ".yml");
-        List<string> files = [PathNames.Canonical(file), .. ((string?[])[Override(file)]).OfType<string>().Select(PathNames.Canonical)];
-        foreach (string more in (Property(MSBuildNames.AdditionalComposeFilePaths) ?? string.Empty).Split(';', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
-        {
-            files.Add(PathNames.Canonical(Path.Combine(folder, more.Replace('\\', '/'))));
-        }
+        List<string> files = ComposeFilesOf(folder, read);
         string name = Path.GetFileNameWithoutExtension(dcproj);
-        string service = Property(MSBuildNames.DockerServiceName) ?? string.Empty;
-        string url = Property(MSBuildNames.DockerServiceUrl) ?? string.Empty;
-        bool browser = string.Equals(Property(MSBuildNames.DockerLaunchAction), "LaunchBrowser", StringComparison.OrdinalIgnoreCase);
+        string service = read.ServiceName;
+        string url = read.ServiceUrl;
+        bool browser = read.LaunchesBrowser;
         RunConfiguration own = new()
         {
             Name = name,
@@ -202,13 +185,55 @@ public static class ContainerConfigurations
                 ServiceActions = actions,
                 Profiles = [.. profile.ComposeProfiles],
                 LaunchService = profile.ComposeLaunchService ?? service,
-                LaunchBrowser = action.Length > 0 ? string.Equals(action, "LaunchBrowser", StringComparison.OrdinalIgnoreCase) : browser,
+                LaunchBrowser = action.Length > 0 ? string.Equals(action, ComposeProjectFile.LaunchBrowserAction, StringComparison.OrdinalIgnoreCase) : browser,
                 BrowserUrl = profile.ComposeLaunchUrl ?? own.BrowserUrl,
                 Origin = $"Generated from the launch profile {profile.Name} of the Docker Compose project {Path.GetFileName(dcproj)}",
             });
         }
         return made;
     }
+
+    /// <summary>A Docker Compose project's compose files, as its runs take them: its base file (DockerComposeBaseFilePath's,
+    /// .yml else .yaml), the override beside it where there is one, then its AdditionalComposeFilePaths.</summary>
+    private static List<string> ComposeFilesOf(string folder, ComposeProjectFile read)
+    {
+        string file = new[] { ".yml", ".yaml" }.Select(e => Path.Combine(folder, read.BaseFilePath.Replace('\\', '/') + e)).FirstOrDefault(File.Exists)
+            ?? Path.Combine(folder, read.BaseFilePath.Replace('\\', '/') + ".yml");
+        List<string> files = [PathNames.Canonical(file), .. ((string?[])[Override(file)]).OfType<string>().Select(PathNames.Canonical)];
+        files.AddRange(read.AdditionalFiles.Select(more => PathNames.Canonical(Path.Combine(folder, more.Replace('\\', '/')))));
+        return files;
+    }
+
+    /// <summary>What a Docker Compose project holds as the Solution view shows it, by path: the files its ItemGroups name, and
+    /// those its runs read that it names not, as Visual Studio's SDK adds them: its compose files, the override under the
+    /// file it overrides, and its launch profiles' file; none for one that is not there or does not read.</summary>
+    public static IReadOnlyList<EvaluatedItem> ItemsOf(string dcproj)
+    {
+        if (Text(dcproj) is not { } text || ComposeProjectFile.Read(text) is not { } read)
+        {
+            return [];
+        }
+        string folder = Path.GetDirectoryName(dcproj)!;
+        List<EvaluatedItem> items = [.. read.Items.Select(i => new EvaluatedItem(i.Type, PathNames.Canonical(Path.Combine(folder, i.Include.Replace('\\', '/'))), i.Link, i.DependentUpon))];
+        List<string> files = ComposeFilesOf(folder, read);
+        string? overriding = Override(files[0]) is { } beside ? PathNames.Canonical(beside) : null;
+        foreach (string file in files.Append(LaunchProfile.SettingsIn(folder)).Where(File.Exists))
+        {
+            if (!items.Any(i => PathNames.Same(i.Path, file)))
+            {
+                bool over = overriding is not null && PathNames.Same(file, overriding);
+                items.Add(new EvaluatedItem("None", PathNames.Canonical(file), DependentUpon: over ? Path.GetFileName(files[0]) : null));
+            }
+        }
+        return items;
+    }
+
+    /// <summary>The name a Docker Compose project's configuration gives its Compose project (its DockerComposeProjectName),
+    /// read as it runs; null for any other configuration, and for one whose .dcproj names none.</summary>
+    public static string? ProjectNameOf(RunConfiguration configuration) =>
+        configuration.Kind == RunKind.Compose && IsComposeProject(configuration.Project) && Text(configuration.Project) is { } text
+            ? ComposeProjectFile.Read(text)?.ProjectName
+            : null;
 
     /// <summary>A Docker Compose project's override beside its base file, as Visual Studio pairs them: the base's name
     /// with <c>.override.yml</c> (docker-compose.override.yml for docker-compose.yml), else <c>.override.yaml</c>; null

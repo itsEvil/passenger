@@ -15,7 +15,7 @@ namespace Passenger.App.Settings;
 /// editor on the right (Shortcut, Description, Options, Availability, Use in, Mnemonic, Edit variables, then its text).
 /// Each row's check box turns a template off or on again. Every change goes back to the settings being edited at once,
 /// kept as differences from the built-in templates.</summary>
-public sealed class LiveTemplatesPane : DockPanel
+public sealed class LiveTemplatesPane : ListPane
 {
     /// <summary>The names of the places a template is offered: short in its editor's Availability, long in its
     /// Availability configuration.</summary>
@@ -33,8 +33,8 @@ public sealed class LiveTemplatesPane : DockPanel
     private readonly List<LiveTemplate> templates;
     private readonly ListBox list = new() { Classes = { StyleClasses.Tree } };
     private readonly Control form;
-    private readonly TextBlock nothing = new() { Classes = { StyleClasses.Muted }, Text = "No template is chosen", Margin = new Thickness(16, 10) };
-    private readonly TextBlock mnemonicSaid = new() { VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(8, 0, 0, 0) };
+    private readonly TextBlock nothing = new() { Classes = { StyleClasses.Muted }, Text = "No template is chosen", Margin = new Thickness(0, Gaps.Wide) };
+    private readonly TextBlock mnemonicSaid = new() { VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(Gaps.Normal, 0, 0, 0) };
     private readonly TextBlock variablesSaid = new() { Classes = { StyleClasses.Muted }, VerticalAlignment = VerticalAlignment.Center, TextTrimming = TextTrimming.CharacterEllipsis };
 
     /// <summary>Set while the fields show a template, so what they hold then is no edit of it.</summary>
@@ -45,7 +45,6 @@ public sealed class LiveTemplatesPane : DockPanel
         FormRows.Scope(this);
         this.templates = [.. templates];
         this.changed = changed;
-        Height = 560;
         NewButton = ToolButtons.Of(IconKeys.Add, "New Template");
         CloneButton = ToolButtons.Of(IconKeys.Copy, "Clone And Edit Template");
         DeleteButton = ToolButtons.Of(IconKeys.Minimize, "Delete Template");
@@ -65,7 +64,7 @@ public sealed class LiveTemplatesPane : DockPanel
         ToolTip.SetTip(ReformatBox, "Its lines indented as the code it goes in, a tab in its text the file's indentation; otherwise it goes in as written");
         ReformatBox.IsCheckedChanged += (_, _) => Edit(t => t with { Reformat = ReformatBox.IsChecked == true });
         AvailabilityText = new TextBlock { VerticalAlignment = VerticalAlignment.Center, TextTrimming = TextTrimming.CharacterEllipsis };
-        AvailabilityButton = new Button { Content = "…", Padding = new Thickness(8, 1), Margin = new Thickness(8, 0, 0, 0) };
+        AvailabilityButton = new Button { Content = "…", Padding = new Thickness(Gaps.Normal, 0), Margin = new Thickness(Gaps.Normal, 0, 0, 0) };
         ToolButtons.Tip(AvailabilityButton, "Availability configuration");
         AvailabilityButton.Click += (_, _) => IdeErrors.Observe(ConfigureAvailability());
         GenerationButton = Use("Generation", TemplateUse.Generation);
@@ -83,40 +82,41 @@ public sealed class LiveTemplatesPane : DockPanel
             FontSize = 12.5,
             VerticalContentAlignment = VerticalAlignment.Top,
             Classes = { StyleClasses.Search },
-            Margin = new Thickness(0, 10, 0, 0),
+            Margin = new Thickness(0, Gaps.Wide, 0, 0),
         }.InCodeFont();
         TextBox.TextChanged += (_, _) => Edit(t => WithText(t, (TextBox.Text ?? string.Empty).Replace("\r\n", "\n", StringComparison.Ordinal)));
 
         StackPanel rows = new()
         {
-            Spacing = 8,
+            Spacing = Gaps.Normal,
             Children =
             {
                 Row("Shortcut:", ShortcutBox),
                 Row("Description:", DescriptionBox),
                 Row("Options:", ReformatBox),
                 Row("Availability:", new DockPanel { Children = { Docked(AvailabilityButton, Dock.Right), AvailabilityText } }),
-                Row("Use in:", new StackPanel { Orientation = Orientation.Horizontal, Spacing = 14, Children = { GenerationButton, SurroundButton, BothButton } }),
+                Row("Use in:", new WrapPanel { ItemSpacing = Gaps.Group, LineSpacing = Gaps.Tight, Children = { GenerationButton, SurroundButton, BothButton } }),
                 Row("Mnemonic:", new StackPanel { Orientation = Orientation.Horizontal, Children = { MnemonicBox, mnemonicSaid } }),
                 Row(string.Empty, new DockPanel { Children = { Docked(EditVariablesButton, Dock.Left), variablesSaid } }),
             },
         };
-        variablesSaid.Margin = new Thickness(10, 0, 0, 0);
-        DockPanel editor = new() { Margin = new Thickness(16, 0, 0, 0) };
+        variablesSaid.Margin = new Thickness(Gaps.Normal, 0, 0, 0);
+        DockPanel editor = new();
         SetDock(rows, Dock.Top);
         editor.Children.Add(rows);
         editor.Children.Add(TextBox);
         form = editor;
 
-        StackPanel tools = new() { Orientation = Orientation.Horizontal, Spacing = 2, Margin = new Thickness(0, 0, 0, 4), Children = { NewButton, CloneButton, DeleteButton, RestoreButton } };
+        StackPanel tools = new() { Orientation = Orientation.Horizontal, Spacing = Gaps.Hair, Margin = new Thickness(0, 0, 0, Gaps.Tight), Children = { NewButton, CloneButton, DeleteButton, RestoreButton } };
         Border framed = new() { Classes = { StyleClasses.Framed }, Child = list };
-        DockPanel left = new() { Width = 260 };
+        DockPanel left = new();
         SetDock(tools, Dock.Top);
         left.Children.Add(tools);
         left.Children.Add(framed);
-        SetDock(left, Dock.Left);
+        Panel chosen = new() { Children = { form, nothing } };
         Children.Add(left);
-        Children.Add(new Panel { Children = { form, nothing } });
+        Children.Add(chosen);
+        Lay(left, chosen, 260, 560);
         List();
         list.SelectedIndex = 0;
         ShowChosen();
@@ -415,7 +415,7 @@ public sealed class LiveTemplatesPane : DockPanel
     {
         CheckBox enabled = new() { VerticalAlignment = VerticalAlignment.Center };
         TextBlock name = new() { VerticalAlignment = VerticalAlignment.Center, TextTrimming = TextTrimming.CharacterEllipsis };
-        StackPanel line = new() { Orientation = Orientation.Horizontal, Spacing = 6, Children = { enabled, name } };
+        StackPanel line = new() { Orientation = Orientation.Horizontal, Spacing = Gaps.Small, Children = { enabled, name } };
         bool setting = false;
         enabled.IsCheckedChanged += (_, _) =>
         {

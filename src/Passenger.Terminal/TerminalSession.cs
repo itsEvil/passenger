@@ -1,6 +1,7 @@
 using System.Buffers;
 using System.Collections.Concurrent;
 using System.Diagnostics;
+using System.Runtime.InteropServices;
 using System.Text;
 using Avalonia.Threading;
 using Passenger.Core;
@@ -8,11 +9,12 @@ using Porta.Pty;
 
 namespace Passenger.Terminal;
 
-/// <summary>A shell in a pseudo-terminal (Porta.Pty's): the user's login shell in the folder, its output read off the
-/// window's thread and fed to the <see cref="TerminalScreen"/> on it a slice at a time, keys and pastes written to it
-/// off the window's thread, its size kept to the view's. Its reads and writes block, so each has a thread of its own:
-/// on the thread pool, a pool every thread of which a build or a debugger holds would hold the shell too.</summary>
-public sealed class TerminalSession : IAsyncDisposable
+/// <summary>A shell in a pseudo-terminal (<see cref="IPseudoTerminal"/>): the user's login shell in the folder, its
+/// output read off the window's thread and fed to the <see cref="TerminalScreen"/> on it a slice at a time, keys and
+/// pastes written to it off the window's thread, its size kept to the view's. Its reads and writes block, so each has a
+/// thread of its own: on the thread pool, a pool every thread of which a build or a debugger holds would hold the shell
+/// too.</summary>
+public sealed partial class TerminalSession : IAsyncDisposable
 {
     /// <summary>Output read but not yet on the screen past which reading waits, so a program writing faster than the
     /// window draws is held in its own write, as on a slow terminal, instead of its output piling up in memory.</summary>
@@ -27,7 +29,11 @@ public sealed class TerminalSession : IAsyncDisposable
     private readonly ConcurrentQueue<Piece> arrived = new();
     private readonly SemaphoreSlim room = new(0);
     private readonly BlockingCollection<byte[]> outgoing = new(new ConcurrentQueue<byte[]>());
-    private IPtyConnection? pty;
+    private IPseudoTerminal? pty;
+
+    /// <summary>The pseudo-terminal's own end on macOS and Linux, which tells whether every other end has closed
+    /// (<see cref="HungUp"/>); null on Windows, whose ConPTY stays open until it is closed.</summary>
+    private SafeHandle? controller;
 
     /// <summary>The piece the screen is taking, and how much of it it has taken.</summary>
     private Piece feeding;
@@ -51,13 +57,15 @@ public sealed class TerminalSession : IAsyncDisposable
     /// <summary>The shell's end and its pseudo-terminal's close, once asked for (<see cref="End"/>).</summary>
     private Task? ending;
 
-    /// <summary>Whether the shell's end has been told: Porta.Pty's watcher and the start's own look may both find it.</summary>
+    /// <summary>Whether the shell's end has been told: the pseudo-terminal's watcher and the start's own look may both find it.</summary>
     private int endTold;
 
-    /// <summary>How long output must have stopped, after the shell has exited, for its end to be told.</summary>
+    /// <summary>How long output must have stopped, after the shell has exited, for its end to be told where its
+    /// pseudo-terminal stays open.</summary>
     private static readonly TimeSpan Quiet = TimeSpan.FromMilliseconds(150);
 
-    /// <summary>The longest the end is told after the shell has exited, its output still coming.</summary>
+    /// <summary>The longest the end is told after the shell has exited, its output still coming, where its
+    /// pseudo-terminal stays open.</summary>
     private static readonly TimeSpan LastOutputLimit = TimeSpan.FromSeconds(2);
 
     /// <summary>How long a shell killed has to go, what it wrote read out, before its pseudo-terminal closes on it all the
@@ -89,7 +97,7 @@ public sealed class TerminalSession : IAsyncDisposable
     public event EventHandler? Output;
 
     /// <summary>Raised on the window's thread when the shell has ended and its last output is on the screen, with its exit
-    /// code: Porta.Pty's, which is 0 for one a signal ended on macOS and Linux.</summary>
+    /// code, which is 0 for one a signal ended on macOS and Linux.</summary>
     public event EventHandler<int>? Exited;
 
     public bool IsRunning { get; private set; }
@@ -102,11 +110,13 @@ public sealed class TerminalSession : IAsyncDisposable
 
     /// <summary>Starts the shell in a folder. <paramref name="shell"/> names one other than the user's own, or a program
     /// to run in the terminal in place of a shell; <paramref name="variables"/> are set over the IDE's environment, an
-    /// empty value taking one away, and the outer terminal's are taken out (<see cref="WithoutOuterTerminal"/>).</summary>
-    public async Task StartAsync(string folder, string? shell = null, IReadOnlyList<string>? arguments = null, IReadOnlyDictionary<string, string>? variables = null)
+    /// empty value taking one away, and the outer terminal's are taken out (<see cref="WithoutOuterTerminal"/>);
+    /// <paramref name="first"/> is a folder the shell finds programs in before any other, its startup files' say aside.</summary>
+    public async Task StartAsync(string folder, string? shell = null, IReadOnlyList<string>? arguments = null, IReadOnlyDictionary<string, string>? variables = null,
+        FirstOnPath? first = null)
     {
         (string app, string[] args) = shell is null ? DefaultShell() : (shell, [.. arguments ?? []]);
-        Shell = ShellWords.KindOf(app);
+        Shell = ShellKinds.Of(app);
         Dictionary<string, string> environment = new(variables ?? new Dictionary<string, string>())
         {
             ["TERM"] = "xterm-256color",
@@ -119,39 +129,45 @@ public sealed class TerminalSession : IAsyncDisposable
             environment["LANG"] = "en_US.UTF-8";
         }
         WithoutOuterTerminal(environment, Environment.GetEnvironmentVariable);
+        first?.Give(app, environment, Inherited().ToDictionary(OperatingSystem.IsWindows() ? StringComparer.OrdinalIgnoreCase : StringComparer.Ordinal));
         string cwd = Directory.Exists(folder) ? folder : Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
         if (!OperatingSystem.IsWindows())
         {
             // A shell keeps an inherited PWD naming its folder through a link, and a build there by it undoes the IDE's.
             environment.TryAdd("PWD", cwd);
-            IReadOnlyDictionary<string, string> loader = OperatingSystem.IsMacOS() ? LoaderVariables(environment, Inherited()) : new Dictionary<string, string>();
-            (app, args) = Unsetting([.. environment.Where(v => v.Value.Length == 0).Select(v => v.Key)], app, args, environment, loader);
+            if (OperatingSystem.IsLinux())
+            {
+                // macOS's pseudo-terminal takes them away itself, as it starts the program (MacPseudoTerminal).
+                (app, args) = Unsetting([.. environment.Where(v => v.Value.Length == 0).Select(v => v.Key)], app, args, environment, new Dictionary<string, string>());
+            }
         }
+        bool batch = OperatingSystem.IsWindows() && WindowsCommandLine.IsBatch(app);
         PtyOptions options = new()
         {
             Name = "Passenger",
             Cols = Screen.Columns,
             Rows = Screen.Rows,
             Cwd = cwd,
-            App = app,
-            // On Windows, quoted as the C runtime splits a command line back, and given whole.
-            CommandLine = OperatingSystem.IsWindows() ? [WindowsCommandLine.Of(args)] : args,
+            App = batch ? WindowsCommandLine.Cmd : app,
+            // On Windows, quoted as the C runtime splits a command line back, or a batch file's as cmd.exe does, and given whole.
+            CommandLine = batch ? [WindowsCommandLine.ThroughCmd(app, args)] : OperatingSystem.IsWindows() ? [WindowsCommandLine.Of(args)] : args,
             VerbatimCommandLine = OperatingSystem.IsWindows(),
             Environment = environment,
         };
-        pty = await PtyProvider.SpawnAsync(options, CancellationToken.None);
+        pty = await PseudoTerminals.StartAsync(options);
         IsRunning = true;
-        IPtyConnection started = pty;
-        started.ProcessExited += (_, e) => Ended(e.ExitCode);
-        // Porta.Pty watches from the spawn on, so a program that ends at once may have ended unheard before the line above.
-        if (started.WaitForExit(0))
+        IPseudoTerminal started = pty;
+        started.Exited += (_, code) => Ended(code);
+        // Watched from its start on, a program that ends at once may have ended unheard before the line above.
+        if (started.HasExited)
         {
             Ended(started.ExitCode);
         }
         Stream reader = pty.ReaderStream;
+        controller = OperatingSystem.IsWindows() ? null : (reader as FileStream)?.SafeFileHandle;
         Stream writer = pty.WriterStream;
-        new Thread(() => Read(reader)) { IsBackground = true, Name = "Terminal output" }.Start();
-        new Thread(() => Send(writer)) { IsBackground = true, Name = "Terminal input" }.Start();
+        ApartThreads.Start("Terminal output", () => Read(reader, started));
+        ApartThreads.Start("Terminal input", () => Send(writer));
     }
 
     /// <summary>Puts the IDE's own words on the screen, as if the shell had written them: why a program did not start, or
@@ -238,7 +254,7 @@ public sealed class TerminalSession : IAsyncDisposable
             closed = true;
             outgoing.CompleteAdding();
             room.Release();
-            IPtyConnection? connection = pty;
+            IPseudoTerminal? connection = pty;
             pty = null;
             bool running = IsRunning;
             // Unheld: a shell that will not go holds it for EndingLimit, and nothing the window shows waits for it.
@@ -251,7 +267,7 @@ public sealed class TerminalSession : IAsyncDisposable
     /// it exits for the terminal to take what it wrote, and the close waits for a write still going (a paste the program
     /// never read), which only the shell's going ends. ConPTY keeps its output open until it closes, so Windows waits for
     /// none of it.</summary>
-    private void End(IPtyConnection connection, bool running)
+    private void End(IPseudoTerminal connection, bool running)
     {
         if (running)
         {
@@ -285,34 +301,39 @@ public sealed class TerminalSession : IAsyncDisposable
         }
     }
 
-    /// <summary>A program run on macOS or Linux with these variables taken out of what it inherits: its pseudo-terminal
-    /// starts it from the process's own environment, setting over it only what has a value, so env unsets them before it
-    /// runs the program. The <paramref name="loader"/>'s variables, which env would lose, go into the environment under
-    /// <see cref="KeptPrefix"/> for sh to set again before its exec, their values on no command line; a program whose name
-    /// holds '=', which env would take for a variable, is run by sh's exec too.</summary>
+    /// <summary>A program run with these variables taken out of what it inherits, which env unsets before it runs it. The
+    /// <paramref name="loader"/>'s variables, which env would lose, go into the environment under <see cref="KeptPrefix"/>
+    /// for sh to set again before its exec, their values on no command line; a program whose name holds '=', which env
+    /// would take for a variable, is run by sh's exec too. Given a <paramref name="terminal"/>, the program is always run
+    /// by a shell that first takes that terminal as its session's controlling one.</summary>
     public static (string App, string[] Arguments) Unsetting(IReadOnlyList<string> variables, string app, string[] arguments,
-        IDictionary<string, string> environment, IReadOnlyDictionary<string, string> loader)
+        IDictionary<string, string> environment, IReadOnlyDictionary<string, string> loader, string? terminal = null)
     {
         // No environment holds a name with '=' in it, and env refuses to unset one.
         string[] names = [.. variables.Where(name => name.Length > 0 && !name.Contains('=', StringComparison.Ordinal))];
-        if (names.Length == 0)
+        if (names.Length == 0 && terminal is null)
         {
             return (app, arguments);
         }
-        List<string> words = [.. names.SelectMany(name => (string[])["-u", name]), "--"];
+        List<string> words = names.Length == 0 ? [] : [.. names.SelectMany(name => (string[])["-u", name]), "--"];
         // sh sets only a name that is an identifier, as each the loader reads is.
         string[] kept = [.. loader.Keys.Where(IsIdentifier).Order(StringComparer.Ordinal)];
-        if (kept.Length > 0 || app.Contains('=', StringComparison.Ordinal))
+        if (kept.Length > 0 || app.Contains('=', StringComparison.Ordinal) || terminal is not null)
         {
             foreach (string name in kept)
             {
                 environment[KeptPrefix + name] = loader[name];
             }
             string setAgain = string.Concat(kept.Select(name => $"{name}=\"${KeptPrefix}{name}\"; export {name}; unset {KeptPrefix}{name}; "));
-            words.AddRange(["/bin/sh", "-c", setAgain + "exec \"$0\" \"$@\""]);
+            // dash opens a redirection's file as open does, which a session leader with no terminal takes as its own; zsh's does not.
+            string taken = terminal is null ? string.Empty : $"exec 0<>'{terminal}' 1>&0 2>&0; ";
+            words.AddRange([terminal is null ? "/bin/sh" : TakingShell, "-c", taken + setAgain + "exec \"$0\" \"$@\""]);
         }
-        return ("/usr/bin/env", [.. words, app, .. arguments]);
+        return names.Length > 0 ? ("/usr/bin/env", [.. words, app, .. arguments]) : (words[0], [.. words.Skip(1), app, .. arguments]);
     }
+
+    /// <summary>The shell that takes a terminal for the program it runs (<see cref="Unsetting"/>).</summary>
+    private const string TakingShell = "/bin/dash";
 
     /// <summary>The variables of macOS's loader a program started with this environment is to have: each one Passenger
     /// inherited, set over by the start's own, less each the start takes away (an empty value).</summary>
@@ -361,7 +382,7 @@ public sealed class TerminalSession : IAsyncDisposable
         return (ShellEnvironment.LoginShell(), ["-l"]);
     }
 
-    /// <summary>The shell has ended, as Porta.Pty tells or as its start found: told on the window's thread once.</summary>
+    /// <summary>The shell has ended, as its pseudo-terminal tells or as its start found: told on the window's thread once.</summary>
     private void Ended(int exitCode)
     {
         if (Interlocked.Exchange(ref endTold, 1) == 0)
@@ -370,9 +391,10 @@ public sealed class TerminalSession : IAsyncDisposable
         }
     }
 
-    /// <summary>Tells of the shell's end once what it wrote last is on the screen: when the pseudo-terminal closes, or,
-    /// where it stays open (ConPTY keeps it until it is closed, and a program the shell left behind may hold it), once
-    /// nothing more has come for a moment, two seconds at the most.</summary>
+    /// <summary>Tells of the shell's end once what it wrote last is on the screen: once its read has ended, however long
+    /// that takes where the pseudo-terminal has hung up (the shell's end hangs it up on macOS, and on Linux unless what
+    /// the shell left behind holds it); where it stays open (ConPTY keeps it until it is closed), once nothing more has
+    /// come for a moment, two seconds at the most.</summary>
     private void AfterLastOutput(int exitCode)
     {
         long exited = Stopwatch.GetTimestamp();
@@ -392,8 +414,9 @@ public sealed class TerminalSession : IAsyncDisposable
         };
         waiting.Start();
 
-        bool Done() => closed || readEnded || Stopwatch.GetElapsedTime(exited) >= LastOutputLimit
-            || Stopwatch.GetElapsedTime(Math.Max(exited, Interlocked.Read(ref lastRead))) >= Quiet;
+        bool Done() => closed || readEnded
+            || (!HungUp() && (Stopwatch.GetElapsedTime(exited) >= LastOutputLimit
+                || Stopwatch.GetElapsedTime(Math.Max(exited, Interlocked.Read(ref lastRead))) >= Quiet));
 
         void End()
         {
@@ -401,6 +424,39 @@ public sealed class TerminalSession : IAsyncDisposable
             IsRunning = false;
             Exited?.Invoke(this, exitCode);
         }
+    }
+
+    /// <summary>Whether every other end of the pseudo-terminal has closed, as poll says of its own end: its read then
+    /// ends once all it holds is read, the reader's hand-over of the last of it included. Window's thread, the session
+    /// open.</summary>
+    private bool HungUp()
+    {
+        if (controller is null)
+        {
+            return false;
+        }
+        PollDescriptor polled = new() { Descriptor = (int)controller.DangerousGetHandle(), Events = PollIn };
+        return Poll(ref polled, 1, 0) > 0 && (polled.Returned & PollHangUp) != 0;
+    }
+
+    /// <summary>poll's POLLIN, alike on macOS and Linux.</summary>
+    private const short PollIn = 0x1;
+
+    /// <summary>poll's POLLHUP, alike on macOS and Linux.</summary>
+    private const short PollHangUp = 0x10;
+
+    /// <summary>poll: how many of the descriptors have something to say within the timeout (milliseconds, 0 asking only
+    /// what holds now); -1 on a failure.</summary>
+    [LibraryImport("libc", EntryPoint = "poll")]
+    private static partial int Poll(ref PollDescriptor descriptor, nuint count, int timeout);
+
+    /// <summary>poll's struct pollfd, alike on macOS and Linux.</summary>
+    [StructLayout(LayoutKind.Sequential)]
+    private struct PollDescriptor
+    {
+        public int Descriptor;
+        public short Events;
+        public short Returned;
     }
 
     /// <summary>Puts all the output read so far on the screen at once, as the shell ends.</summary>
@@ -437,10 +493,11 @@ public sealed class TerminalSession : IAsyncDisposable
 
     /// <summary>Reads the shell's output as it comes and hands it to the window's thread, each read in an array of the
     /// pool's about its size, waiting while the screen has <see cref="MostHeld"/> still to take; once the session is
-    /// closed, to the end, the shell's end waiting for it (<see cref="End"/>).</summary>
-    private void Read(Stream reader)
+    /// closed, to the end, the shell's end waiting for it (<see cref="End"/>). The shell runs only once this reads.</summary>
+    private void Read(Stream reader, IPseudoTerminal shell)
     {
         byte[] buffer = new byte[64 * 1024];
+        shell.LetRun();
         try
         {
             while (true)
@@ -469,9 +526,9 @@ public sealed class TerminalSession : IAsyncDisposable
                 }
             }
         }
-        catch (Exception failed) when (failed is IOException or ObjectDisposedException)
+        catch (Exception failed) when (failed is IOException or ObjectDisposedException or UnauthorizedAccessException)
         {
-            // The pseudo-terminal closed with the shell.
+            // The pseudo-terminal closed with the shell; Windows refuses a read of a ConPTY pipe closed under it as denied.
         }
         finally
         {
@@ -491,9 +548,9 @@ public sealed class TerminalSession : IAsyncDisposable
                 writer.Flush();
             }
         }
-        catch (Exception failed) when (failed is IOException or ObjectDisposedException)
+        catch (Exception failed) when (failed is IOException or ObjectDisposedException or UnauthorizedAccessException)
         {
-            // The shell has gone; its exit says so.
+            // The shell has gone, its pipe closed (on Windows refused as denied); its exit says so.
         }
     }
 

@@ -182,10 +182,10 @@ internal sealed partial class CSharpAssist
         }
         csharp.For(file)?.RefreshDiagnostics();
         string where = secret ? "the AppHost's user secrets" : $"the AppHost's {Path.GetFileName(path)}";
-        List<RefactoredFile> files = [new RefactoredFile(path, made ? "created" : "changed", [])];
+        List<RefactoredFile> files = [new RefactoredFile(path, made ? RefactoredChange.Created : RefactoredChange.Changed, [])];
         if (changes.Count > 1)
         {
-            files.Add(new RefactoredFile(host.AppHost, "changed", []));
+            files.Add(new RefactoredFile(host.AppHost, RefactoredChange.Changed, []));
         }
         return new RefactorOutcome($"Set {name} in {where}" + (changes.Count > 1 ? ", giving it a UserSecretsId" : string.Empty), null, files, []);
     }
@@ -210,29 +210,8 @@ internal sealed partial class CSharpAssist
         {
             return false;
         }
-        int at = lsp.OffsetOf(new LspPosition(start.Line, start.Character));
-        RenameBox box = new(old);
-        ChangeTracker opened = new(context.Editor.Document);
-        popups.ShowModal(box, at, async name =>
-        {
-            int now = opened.MapOffset(at);
-            if (name is null || name == old)
-            {
-                return;
-            }
-            // Held on the name through what is typed while the rename is out, however often it is worked out.
-            Anchor held = actions.HeldAt(document, now);
-            try
-            {
-                RefactorOutcome made = await context.PatientlyAsync(AppActions.Rename, patience => RenameResourceAsync(document, held.Offset, old, name, patience));
-                context.Say(made.Problem ?? made.Said);
-            }
-            finally
-            {
-                held.Remove();
-            }
-        });
-        popups.WhenClosed(opened.Dispose);
+        actions.AskRename(document, lsp.OffsetOf(new LspPosition(start.Line, start.Character)), old,
+            (held, name, patience) => RenameResourceAsync(document, held.Offset, old, name, patience));
         return true;
     }
 
@@ -254,11 +233,11 @@ internal sealed partial class CSharpAssist
     internal Task<RefactorOutcome> RenameResourceAsync(OpenDocument document, int offset, string old, string name, Patience? patience) =>
         actions.MakeAsync($"Rename {old} to {name}", document, offset,
             async current => (await current.ExtensionAsync<AspireRenaming>(Handlers.AspireRename, new AspireRenameRequest(current.PlaceOf(offset), name))).Made
-                ?? new Refactored($"{old} was not renamed: no resource is named there any longer", []),
+                ?? new Refactored(Refusals.NotRenamed(old, "no resource is named there any longer"), []),
             files => $"Renamed {old} to {name} in {Passenger.Core.Plural.Of(files, "file")}", patience);
 
-    /// <summary>Aspire's Go to Declaration, in an AppHost's or a service's file: AddProject's project file, not its generated
-    /// metadata type, and from a service's connection string or service-discovery name the AppHost's line that declares the
+    /// <summary>Aspire's Go to Declaration, in an AppHost's or a service's file: the project file a service is added by (its
+    /// path, or its generated metadata type), and from a service's connection string or service-discovery name the AppHost's line that declares the
     /// resource; null elsewhere, or without Passenger's extension, for the server's own.</summary>
     private async Task<Declared?> AspireDeclaredAsync(LspDocument lsp, OpenDocument document, int offset)
     {

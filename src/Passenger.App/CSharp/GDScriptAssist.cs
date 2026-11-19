@@ -34,21 +34,43 @@ internal sealed partial class GDScriptAssist(AssistContext context, CodeCompleti
             return false;
         }
         char last = text[^1];
-        int caret = context.Caret;
+        int caret = Math.Min(context.Caret, shown.Text.Snapshot.Length);
         TextSnapshot snapshot = shown.Text.Snapshot;
-        char before = caret >= 2 && caret - 2 < snapshot.Length ? snapshot[caret - 2] : '\0';
+        int name = NameStart(snapshot, caret);
+        char before = name > 0 ? snapshot[name - 1] : '\0';
         // A member's dot, a name's first letter, an annotation's @, a node path's $, % or /, and a string's quote.
         if (last is '.' or '@' or '$' or '%' or '/' or '"' or '\'')
         {
             IdeErrors.Observe(completion.Start(last.ToString()));
         }
-        else if (AssistContext.IsIdentifierChar(last) && !char.IsDigit(last) && context.WordStart(caret) == caret - 1 && before is not ('$' or '%' or '@'))
+        else if (name < caret && GDScriptTokenizer.IdentifierWidth(snapshot[name], name + 1 < caret ? snapshot[name + 1] : '\0', start: true) == caret - name
+            && before is not ('$' or '%' or '@'))
         {
             IdeErrors.Observe(completion.Start(null));
         }
         // A call's signature after its bracket or comma; gone after its closing bracket.
         parameters.AfterTyped(last);
         return true;
+    }
+
+    /// <summary>Where the name that ends at an offset of a script starts, read back by Godot's identifier rule.</summary>
+    internal static int NameStart(TextSnapshot text, int end)
+    {
+        while (end > 0 && GDScriptTokenizer.IdentifierWidthBefore(text[end - 1], end > 1 ? text[end - 2] : '\0') is > 0 and int width)
+        {
+            end -= width;
+        }
+        return end;
+    }
+
+    /// <summary>Where the name that goes on from an offset of a script ends, read on by Godot's identifier rule.</summary>
+    internal static int NameEnd(TextSnapshot text, int start)
+    {
+        while (start < text.Length && GDScriptTokenizer.IdentifierWidth(text[start], start + 1 < text.Length ? text[start + 1] : '\0', start: false) is > 0 and int width)
+        {
+            start += width;
+        }
+        return start;
     }
 
     internal static CompletionItem ItemOf(GodotCSharpMember member) => new()
@@ -104,13 +126,15 @@ internal sealed partial class GDScriptAssist(AssistContext context, CodeCompleti
     }
 
     /// <summary>Where a C# member's name is written, for Go to Declaration.</summary>
-    internal static async Task<(string Path, TextPosition Position)> PlaceOfAsync(AssistContext context, GodotCSharpMember member)
+    internal static Task<(string Path, TextPosition Position)> PlaceOfAsync(AssistContext context, GodotCSharpMember member) =>
+        PlaceOfAsync(context.Editors.Texts(), member.Path, member.Start);
+
+    /// <summary>Where an offset Passenger's reading gave in a file lies, in the text that reading read: an open file's as the
+    /// editor has it, unsaved lines and all, else the disk's (<see cref="OpenTexts.TextOf"/>).</summary>
+    private static async Task<(string Path, TextPosition Position)> PlaceOfAsync(OpenTexts texts, string path, int offset)
     {
-        OpenTexts texts = context.Editors.Texts();
-        TextSnapshot snapshot = await BackgroundWork.Run(() => texts.TextOf(member.Path) ?? TextSnapshot.From(string.Empty));
-        int at = Math.Min(member.Start, snapshot.Length);
-        int line = snapshot.GetLineFromOffset(at);
-        return (member.Path, new TextPosition(line, at - snapshot.GetLineStart(line)));
+        TextSnapshot text = await BackgroundWork.Run(() => texts.TextOf(path) ?? TextSnapshot.From(string.Empty));
+        return (path, text.GetPosition(Math.Clamp(offset, 0, text.Length)));
     }
 
     public override void Commit(CompletionItem item, int start)
@@ -123,12 +147,12 @@ internal sealed partial class GDScriptAssist(AssistContext context, CodeCompleti
         Replacing replaces = made?.Replaces ?? Replacing.Name;
         while (end < text.Length && (replaces switch
         {
-            Replacing.String => text[end] is not ('"' or '\'' or '\n'),
-            Replacing.Path => AssistContext.IsIdentifierChar(text[end]) || text[end] == '/',
-            _ => AssistContext.IsIdentifierChar(text[end]),
-        }))
+            Replacing.String => text[end] is not ('"' or '\'' or '\n') ? 1 : 0,
+            Replacing.Path when text[end] == '/' => 1,
+            _ => GDScriptTokenizer.IdentifierWidth(text[end], end + 1 < text.Length ? text[end + 1] : '\0', start: false),
+        }) is > 0 and int width)
         {
-            end++;
+            end += width;
         }
         // A call's parentheses written after the name already are its own.
         if (insert.EndsWith("()", StringComparison.Ordinal) && end < text.Length && text[end] == '(')
@@ -213,14 +237,18 @@ internal sealed partial class GDScriptAssist(AssistContext context, CodeCompleti
         GodotScriptTypes.IsScript(document.Path) ? ReformatAsync(document, within, "Reformat Code") : Task.FromResult<CodeActions.Reformatted?>(null);
 
     /// <summary>What a save does first to a changed script, as Settings ask: Reformat Code's layout, one undoable edit,
-    /// saying only why it was not applied.</summary>
-    public async Task BeforeSave(OpenDocument document)
+    /// saying only why it was not applied. Whether the file was a script this took.</summary>
+    public async Task<bool> BeforeSave(OpenDocument document)
     {
-        if (FormatsOnSave && GodotScriptTypes.IsScript(document.Path) && !document.IsReadOnly
-            && await ReformatAsync(document, null, "Reformat on save") is { Applied: false } refused)
+        if (!FormatsOnSave || !GodotScriptTypes.IsScript(document.Path) || document.IsReadOnly)
+        {
+            return false;
+        }
+        if (await ReformatAsync(document, null, "Reformat on save") is { Applied: false } refused)
         {
             context.Say(refused.Said);
         }
+        return true;
     }
 
     /// <summary>A script laid out by Godot's style guide as one undoable edit, by <see cref="Format"/> with the file's
@@ -228,9 +256,9 @@ internal sealed partial class GDScriptAssist(AssistContext context, CodeCompleti
     /// <paramref name="what"/>.</summary>
     private async Task<CodeActions.Reformatted?> ReformatAsync(OpenDocument document, TextRange? within, string what)
     {
-        if (document.IsReadOnly)
+        if (CodeActions.Reformatted.ReadOnly(document, what) is { } refused)
         {
-            return new CodeActions.Reformatted(false, false, $"{what} was not applied: {Refusals.ReadOnly(document.Name)}");
+            return refused;
         }
         using ChangeTracker asked = new(document.Text);
         TextSnapshot snapshot = asked.Snapshot;
@@ -247,7 +275,7 @@ internal sealed partial class GDScriptAssist(AssistContext context, CodeCompleti
         });
         if (formatted.Refused is { } why)
         {
-            return new CodeActions.Reformatted(false, false, $"{what} was not applied: {why}");
+            return CodeActions.Reformatted.Refused(what, why);
         }
         IEnumerable<TextEdit> kept = formatted.Edits;
         if (within is { } range)
@@ -261,18 +289,9 @@ internal sealed partial class GDScriptAssist(AssistContext context, CodeCompleti
         if (within is not null && fitted.Count > 0
             && await BackgroundWork.Run(() => GDScriptFormatter.Differs(snapshot.ToString(), snapshot.Apply(fitted).ToString())) is { } partly)
         {
-            return new CodeActions.Reformatted(false, false, $"{what} was not applied: laying out only the selection would change what the script says ({partly}); reformat the whole file");
+            return CodeActions.Reformatted.Refused(what, $"laying out only the selection would change what the script says ({partly}); reformat the whole file");
         }
-        if (fitted.Count == 0 || !context.Editors.Documents.Contains(document))
-        {
-            return new CodeActions.Reformatted(true, false, "Already formatted");
-        }
-        if (asked.Map(fitted) is not { } edits)
-        {
-            return new CodeActions.Reformatted(false, false, $"{what} was not applied: the code it changes was edited meanwhile");
-        }
-        WorkspaceEdits.ApplyTo(context.Editors, document, edits);
-        return new CodeActions.Reformatted(true, true, "Reformatted");
+        return CodeActions.Reformatted.Apply(context.Editors, document, asked, fitted, what);
     }
 
     /// <summary>A script's top-level parts put in the style guide's Code order (<see cref="GDScriptFormatter.OrderParts"/>) off
@@ -387,7 +406,9 @@ internal sealed partial class GDScriptAssist(AssistContext context, CodeCompleti
             return true;
         }
         TextSnapshot text = shown.Text.Snapshot;
-        string name = text.GetText(TextNavigation.WordAt(text, Math.Min(asked.MapOffset(offset), text.Length)));
+        int at = Math.Min(asked.MapOffset(offset), text.Length);
+        int start = NameStart(text, at);
+        string name = text.GetText(start, NameEnd(text, at) - start);
         string? note = unsure.Count == 0 ? null
             : $"{Plural.Of(unsure.Count, "place")} may use it where Passenger can't see whose member is read: {GDScriptRefactorings.Places(unsure)}";
         context.ShowUsages($"Usages of {(name.Length > 0 ? name : "symbol")}", places, inPopup ? asked.MapOffset(offset) : null, note);
@@ -429,9 +450,7 @@ internal sealed partial class GDScriptAssist(AssistContext context, CodeCompleti
         {
             return null;
         }
-        TextSnapshot snapshot = path == document.Path ? document.Text.Snapshot : TextSnapshot.From(await File.ReadAllTextAsync(path));
-        int line = snapshot.GetLineFromOffset(Math.Min(declared.Start, snapshot.Length));
-        return new Declared(Declared.Served([(path, new TextPosition(line, declared.Start - snapshot.GetLineStart(line)))], ServerPlaces.Texts(context.Editors)),
+        return new Declared(Declared.Served([await PlaceOfAsync(context.Editors.Texts(), path, declared.Start)], ServerPlaces.Texts(context.Editors)),
             Refusals.NoDeclaration);
     }
 }

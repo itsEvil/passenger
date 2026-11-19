@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
-# The site's pictures, site/images/<scene>-<dark|light>.webp, retaken from the sample solutions beside this script:
-# just site-shots [SCENE...] (every headless scene when none is named), after just build, on macOS with libwebp's cwebp
-# and img2webp; godot-game, taken only when named, runs in a window on the screen (game.py), and html-preview, taken only
-# when named too, in the Windows VM (vm-shots.sh), since neither draws in a window nobody sees. Each sample is copied to
-# a folder of its own under TMPDIR and given a git history there; its tools' state stays under artifacts/site-shots and
-# Passenger's beside the copy, never the person's. SITE_SHOTS_FLAGS (--window-buttons by default, so macOS's are in
-# every main-window picture) is added to every capture's command line; SITE_SHOTS_REUSE=1 takes the pictures in the
-# last run's copy without making it again; SITE_SHOTS_THEMES=dark (or light) takes one theme's. A step's point is in the
-# window's logical units: half the picture's pixels.
+# The site's pictures, site/images/<scene>-<dark|light>.webp, retaken from the sample solutions beside this script: just
+# site-shots [SCENE...] (every headless scene when none is named), after just build, on macOS with libwebp's cwebp and
+# img2webp; godot-game, taken only when named, runs in a window on the screen (game.py), and html-preview, taken only
+# when named too, in the Windows VM (vm-shots.sh), since neither draws in a window nobody sees; first-start, taken only
+# when named as well (just first-start-shots), writes the app's own pictures rather than the site's. Each sample is
+# copied to a folder of its own under TMPDIR and given a git history there; its tools' state stays under
+# artifacts/site-shots and Passenger's beside the copy, never the person's. SITE_SHOTS_FLAGS (--window-buttons by
+# default, so macOS's are in every main-window picture) is added to every capture's command line; SITE_SHOTS_REUSE=1
+# takes the pictures in the last run's copy without making it again; SITE_SHOTS_THEMES=dark (or light) takes one
+# theme's. A step's point is in the window's logical units: half the picture's pixels.
 set -euo pipefail
 
 repo=$(cd "$(dirname "$0")/../.." && pwd -P)
@@ -27,16 +28,18 @@ command -v cwebp > /dev/null || { echo "site-shots: cwebp is not on the PATH (br
 
 all_scenes=(editor debugger git find-in-files profiler xaml project-files web live-tree agent themes aspire requests
     godot-scene godot-values godot-live-tree godot-profile blazor-wasm usages resx gdscript godot-shader godot-tests
-    aspire-metrics)
+    aspire-metrics maui)
 # Taken only when named: a window someone could see, on the screen (game.py) or in the Windows VM (vm-shots.sh).
 windowed_scenes=(godot-game html-preview)
+# Taken only when named (just first-start-shots): the app's own pictures, never the site's.
+app_scenes=(first-start)
 scenes=("$@")
 if [[ ${#scenes[@]} -eq 0 ]]; then
     scenes=("${all_scenes[@]}")
 fi
 for scene in "${scenes[@]}"; do
-    if [[ " ${all_scenes[*]} ${windowed_scenes[*]} " != *" $scene "* ]]; then
-        echo "site-shots: no scene '$scene'; the scenes are ${all_scenes[*]} ${windowed_scenes[*]}" >&2
+    if [[ " ${all_scenes[*]} ${windowed_scenes[*]} ${app_scenes[*]} " != *" $scene "* ]]; then
+        echo "site-shots: no scene '$scene'; the scenes are ${all_scenes[*]} ${windowed_scenes[*]} ${app_scenes[*]}" >&2
         exit 2
     fi
 done
@@ -53,6 +56,10 @@ export npm_config_cache="$work/npm/cache"
 export npm_config_userconfig="$work/npm/npmrc"
 export GIT_CONFIG_GLOBAL="$work/gitconfig"
 export GIT_CONFIG_NOSYSTEM=1
+# A Terminal a picture shows (a theme's layout opens one) prompts with its folder alone, never the person's name.
+mkdir -p "$work/zsh"
+printf "PROMPT='%%1~ %%# '\n" > "$work/zsh/.zshrc"
+export ZDOTDIR="$work/zsh"
 export DOTNET_CLI_TELEMETRY_OPTOUT=1
 export DOTNET_NOLOGO=1
 export AVALONIA_TELEMETRY_OPTOUT=1
@@ -336,6 +343,40 @@ EOF2
     web_app_prepared=1
 }
 
+# The maui scene's app: a page of the greenhouse's plants on a phone.
+maui_app="$tmp/passenger-site-shots/GreenhouseMobile"
+maui_prepared=
+# .NET MAUI's template given maui/'s page, restored and left unbuilt, as the scene's Build for XAML Preview builds it for
+# no platform; for iOS and Mac Catalyst alone, since its Android head would need a JDK, whose lack a banner would say
+# over the picture where none is installed.
+maui_ready() {
+    if [[ -n $maui_prepared ]] || [[ -n ${SITE_SHOTS_REUSE:-} && -d "$maui_app/.git" ]]; then
+        maui_prepared=1
+        return
+    fi
+    rm -rf "$maui_app"
+    mkdir -p "$maui_app"
+    cp "$repo/tools/site-shots/maui/nuget.config" "$maui_app/"
+    dotnet new maui -n Greenhouse.Mobile -o "$maui_app" --no-restore > /dev/null
+    local project="$maui_app/Greenhouse.Mobile.csproj"
+    sed -i '' -e 's|<TargetFrameworks>\(net[0-9.]*\)-android</TargetFrameworks>|<TargetFrameworks>\1-ios;\1-maccatalyst</TargetFrameworks>|' \
+        -e "/IsOSPlatform('linux')/d" "$project"
+    if grep -q -- '-android' "$project"; then
+        echo "site-shots: the MAUI template's frameworks are no longer as the maui scene expects them: $project" >&2
+        exit 1
+    fi
+    dotnet restore "$project" -nologo -v:q
+    cp "$repo/tools/site-shots/maui/"*.xaml "$repo/tools/site-shots/maui/"*.cs "$maui_app/"
+    export GIT_AUTHOR_NAME="Rosa Field" GIT_AUTHOR_EMAIL="rosa@greenhouse.example"
+    export GIT_COMMITTER_NAME="Rosa Field" GIT_COMMITTER_EMAIL="rosa@greenhouse.example"
+    git -C "$maui_app" init -q -b main
+    git -C "$maui_app" add -- .
+    GIT_AUTHOR_DATE="2026-11-02T09:00:00+00:00" GIT_COMMITTER_DATE="2026-11-02T09:00:00+00:00" \
+        git -C "$maui_app" commit -q -m "The greenhouse's plants on a phone"
+    unset GIT_AUTHOR_NAME GIT_AUTHOR_EMAIL GIT_COMMITTER_NAME GIT_COMMITTER_EMAIL
+    maui_prepared=1
+}
+
 # One picture: a fresh state of its own (layout, breakpoints, logs), the window at the site's size, the scene's steps.
 shot() {
     local name=$1 theme=$2
@@ -366,15 +407,22 @@ encode() {
     echo "site-shots: $webp ($(($(wc -c < "$webp") / 1024)) KB)"
 }
 
-# Every look, in Themes.cs' order.
-looks=(Passenger Harbour Sorbet Nocturne Saffron Bonbon Ledger Slate Orbit Nightjar Moss Phosphor)
+# Every look, in the picker's order (passenger-themes' as tests/Passenger.Tests/Themes lists them); those with no light look.
+looks=(Passenger Cubicle Harbour Sorbet Nocturne Saffron Bonbon Ledger Slate Orbit Nightjar Moss Phosphor)
+dark_only=(Nocturne Slate Nightjar)
 # The themes scene: the same window in every look, each over a copy of the solution file named after its look, so its
 # title bar and Solution view name it; then those frames as one animated picture, Passenger's own first, every frame a
 # key frame so each is whole wherever a viewer joins; and Passenger's own look still, for those who ask for less motion.
 themes() {
-    local theme=$1 look lower state
+    local theme=$1 look lower state shown=()
     mkdir -p "$work/png/themes"
     for look in "${looks[@]}"; do
+        if [[ $theme == light && " ${dark_only[*]} " == *" $look "* ]]; then
+            continue
+        fi
+        shown+=("$look")
+    done
+    for look in "${shown[@]}"; do
         lower=$(tr '[:upper:]' '[:lower:]' <<< "$look")
         state="$tmp/passenger-site-shots/state/themes-$lower-$theme"
         rm -rf "$state"
@@ -391,12 +439,41 @@ themes() {
         rm -f "$folder/$look.slnx"
     done
     local frames=()
-    for look in "${looks[@]}"; do
+    for look in "${shown[@]}"; do
         frames+=("$work/png/themes/$(tr '[:upper:]' '[:lower:]' <<< "$look")-$theme.png")
     done
     img2webp -loop 0 -kmin 0 -kmax 1 -lossy -q 78 -m 6 -d 1800 "${frames[@]}" -o "$images/themes-$theme.webp" > /dev/null
     echo "site-shots: $images/themes-$theme.webp ($(($(wc -c < "$images/themes-$theme.webp") / 1024)) KB)"
     encode "$work/png/themes/passenger-$theme.png" "$images/themes-still-$theme.webp"
+}
+
+# The first start's tiles (src/Passenger.App/Assets/FirstStart): the sample's window in Passenger's own theme and in each
+# theme the app carries, at the tiles' size and lossless, with no window buttons, since a tile is no window of any one
+# system; and the version they are of, which the unit tests hold to the app's.
+first_start() {
+    local theme=$1 look state out="$repo/src/Passenger.App/Assets/FirstStart" version
+    mkdir -p "$work/png/first-start" "$out"
+    for look in passenger $(python3 -I - "$repo/src/Passenger.App/Theme/BuiltIn" <<'EOF2'
+import json, os, sys
+folder = sys.argv[1]
+with open(os.path.join(folder, "passenger-themes.json"), encoding="utf-8") as f:
+    for file in json.load(f)["themes"]:
+        with open(os.path.join(folder, file), encoding="utf-8") as theme:
+            print(json.load(theme)["name"].lower())
+EOF2
+    ); do
+        state="$tmp/passenger-site-shots/state/first-start-$look-$theme"
+        rm -rf "$state"
+        mkdir -p "$state"
+        # The class's doc comment, keywords, types, a lambda and numbers in the editor, the theme's own layout round it.
+        PASSENGER_SETTINGS="$state" "$passenger" "$folder/Greenhouse.slnx" --theme "$theme" --look "$look" \
+            --size 936x585 --scale 1.5 --file src/Greenhouse.Core/WateringPlan.cs --caret 4:21 \
+            --screenshot "$work/png/first-start/$look-$theme.png"
+        cwebp -quiet -lossless -z 9 "$work/png/first-start/$look-$theme.png" -o "$out/$look-$theme.webp"
+        echo "site-shots: $out/$look-$theme.webp ($(($(wc -c < "$out/$look-$theme.webp") / 1024)) KB)"
+    done
+    version=$(sed -n 's:.*<Version>\(.*\)</Version>.*:\1:p' "$repo/Directory.Build.props")
+    printf '{\n  "version": "%s"\n}\n' "$version" > "$out/pictures.json"
 }
 
 scene() {
@@ -446,6 +523,8 @@ scene() {
                 --key "meta+control+1" --drag 700,444,700,404 --drag 1155,124,1155,148 --wait 1000 --hover 600,300 ;;
         themes)
             themes "$theme" ;;
+        first-start)
+            first_start "$theme" ;;
         aspire)
             # The AppHost debugged, stopped in the API's handler while the sensors run on, beside the Aspire window.
             services_ready
@@ -489,6 +568,13 @@ scene() {
             # Show Usages of the plant's watering interval, every use in the solution in a popup at the caret.
             shot "$name" "$theme" --file src/Greenhouse.Core/Plant.cs --caret 7:20 \
                 --key "meta+shift+A" --type "Show Usages" --key enter --wait 3000 ;;
+        maui)
+            # A MAUI page beside XAML Preview, built for no platform as a person's Build for XAML Preview builds it.
+            maui_ready
+            solution="$maui_app" shot "$name" "$theme" --file MainPage.xaml --caret 1:1 --key "meta+shift+F12" \
+                $(printf -- '--key down %.0s' {1..15}) --key end \
+                --key "meta+shift+A" --type "XAML Preview" --key enter --wait 1000 --drag 600,500,740,500 \
+                --key "meta+shift+A" --type "Build for XAML Preview" --key enter --wait 60000 ;;
         resx)
             # The app's strings as a table of keys, values and comments.
             shot "$name" "$theme" --file src/Greenhouse.App/Resources/Strings.resx --wait 2000 ;;

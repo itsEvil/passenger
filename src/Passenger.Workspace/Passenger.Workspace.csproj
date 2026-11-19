@@ -24,11 +24,18 @@
   </ItemGroup>
 
   <ItemGroup>
+    <!-- A .feature file read and its steps matched (Gherkin/). -->
+    <PackageReference Include="Gherkin" />
+    <PackageReference Include="Cucumber.CucumberExpressions" />
+  </ItemGroup>
+
+  <ItemGroup>
     <ProjectReference Include="../Passenger.Core/Passenger.Core.csproj" />
     <ProjectReference Include="../Passenger.Text/Passenger.Text.csproj" />
     <!-- The host's messages, one definition for both ends. -->
     <Compile Include="../Passenger.Host/Protocol.cs" Link="HostProtocol.cs" />
     <Compile Include="../Passenger.Host/Stamps.cs" Link="HostStamps.cs" />
     <Compile Include="../Passenger.Host/ProgramFiles.cs" Link="HostProgramFiles.cs" />
+    <Compile Include="../Passenger.Host/AspireHosts.cs" Link="HostAspireHosts.cs" />
   </ItemGroup>
 </Project>

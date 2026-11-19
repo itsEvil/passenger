@@ -1,4 +1,3 @@
-using System.Text.Json;
 using Microsoft.CodeAnalysis.CSharp;
 using Microsoft.CodeAnalysis.CSharp.Syntax;
 using Passenger.App.Workspace;
@@ -6,9 +5,13 @@ using Passenger.Core;
 using Passenger.Lsp;
 using Passenger.Roslyn.Extension;
 using Passenger.Text;
+using Passenger.Workspace;
 using static Microsoft.CodeAnalysis.CSharpExtensions;
 
 namespace Passenger.App.CSharp;
+
+/// <summary>What a warning of a configuration key nothing gives carries for its fix: the key and whether it is a secret's.</summary>
+internal sealed record ConfigurationKeyMark(string Key, bool Secret);
 
 public sealed partial class CSharpDocument
 {
@@ -64,27 +67,14 @@ public sealed partial class CSharpDocument
 
     /// <summary>The keys the file's warnings say nothing gives, on a server's line of the text as it stands (any line for
     /// null): each with where it is read, the key, and whether its name is a secret's, which its fix keeps in user secrets.</summary>
-    internal IReadOnlyList<(TextRange Range, string Key, bool Secret)> ConfigurationMissingOn(int? line)
-    {
-        List<(TextRange, string, bool)> missing = [];
-        foreach ((Diagnostic diagnostic, TextRange range) in diagnostics.PlacedRanges)
-        {
-            if (diagnostic.Source == ConfigurationDiagnosticSource
-                && (line is not { } on || diagnostic.Range.Start.Line <= on && on <= diagnostic.Range.End.Line)
-                && diagnostic.Data is { ValueKind: JsonValueKind.Object } data
-                && JsonMembers.Text(data, "key") is { } named)
-            {
-                missing.Add((range, named, JsonMembers.Text(data, "secret") == "true"));
-            }
-        }
-        return missing;
-    }
+    internal IReadOnlyList<(TextRange Range, string Key, bool Secret)> ConfigurationMissingOn(int? line) =>
+        [.. OwnOn<ConfigurationKeyMark>(ConfigurationDiagnosticSource, line).Select(m => (m.Range, m.Data.Key, m.Data.Secret))];
 
     /// <summary>Whether a configuration key is a secret's by Passenger's one rule (<see cref="Containers.ContainerSecrets.Secret(string)"/>),
     /// its sections read as the words of one name (Payments:ApiKey as Payments_ApiKey).</summary>
     internal static bool SecretKey(string key) => Containers.ContainerSecrets.Secret(key.Replace(':', '_'));
 
-    /// <summary>The file's reads of keys nothing the project runs with gives (<see cref="ConfigurationFiles.Given"/>),
+    /// <summary>The file's reads of keys nothing the programs running its code run with gives (<see cref="ConfiguredCode"/>),
     /// each a warning on its key: a value read (an indexer, GetValue, GetConnectionString, a section's Value) with no
     /// default and its result never checked for null, or a section GetRequiredSection wants; but those
     /// <paramref name="beside"/> warns of and an Aspire service's connection strings. The reads are asked of the
@@ -96,20 +86,20 @@ public sealed partial class CSharpDocument
         {
             await parsing.CurrentAsync();
         }
-        if (service.Session is not { } roslyn || service.ConfigurationOf?.Invoke(document.Path) is not { } project || !MayReadConfiguration)
+        if (service.Session is not { } roslyn || !MayReadConfiguration || service.ConfiguredCodeOf?.Invoke(document.Path) is not { } code)
         {
             return [];
         }
         ConnectionReadsFound found;
         try
         {
-            found = await roslyn.ExtensionAsync<ConnectionReadsFound>(Handlers.ConnectionReads, new ConnectionReadsRequest([project.Project], Keys: true), cancel);
+            found = await roslyn.ExtensionAsync<ConnectionReadsFound>(Handlers.ConnectionReads, new ConnectionReadsRequest([code.Project], Keys: true, File: document.Path), cancel);
         }
         catch (LanguageServerFailed)
         {
             return [];
         }
-        bool aspire = AspireRole == Aspire.AspireRole.Service;
+        bool aspire = AspireRole == Aspire.AspireRole.Service || code.Programs.Any(p => p.AppHostFolders.Count > 0);
         ConfigurationKey[] reads = [.. (found.Keys ?? [])
             .Where(k => !k.Guarded && k.Kind is ConfigurationKinds.Read or ConfigurationKinds.Section && k.Key.Length > 0 && k.At is not null && k.End is not null
                 && k.Path is { } path && PathNames.Same(path, document.Path)
@@ -123,16 +113,16 @@ public sealed partial class CSharpDocument
         }
         Func<string, string?> text = service.OpenTexts().Text;
         (IReadOnlyList<GivenKey> given, IReadOnlyList<string> environments) = await BackgroundWork.Run(() =>
-            (ConfigurationFiles.Given(project, text), ConfigurationFiles.Environments(project, text)));
-        string settings = string.Join(" or ", environments.Select(e => $"appsettings.{e}.json").Prepend("appsettings.json"));
+            ((IReadOnlyList<GivenKey>)[.. code.Given(text).Select(g => g.Given)], code.Environments(text)));
+        string sources = Plural.Either([.. AppSettingsFiles.Read(environments), "a launch profile", $"{Plural.Agreeing(code.Programs.Count, "its", "their")} user secrets",
+            "a compose file", "an AppHost"]);
         return [.. reads.Where(r => !ConfigurationFiles.Gives(given, r.Key, r.Kind == ConfigurationKinds.Section)).Select(r => new Diagnostic
         {
             Range = new LspRange(new LspPosition(r.At!.Line, r.At.Character), new LspPosition(r.End!.Line, r.End.Character)),
             Severity = DiagnosticSeverity.Warning,
             Source = ConfigurationDiagnosticSource,
-            Message = $"Nothing {project.Name} runs with gives the configuration key '{r.Key}': not {settings}, a launch profile, its user secrets, "
-                + "a compose file or an AppHost.",
-            Data = JsonSerializer.SerializeToElement(new Dictionary<string, string> { ["key"] = r.Key, ["secret"] = SecretKey(r.Key) ? "true" : "false" }),
+            Message = $"Nothing {code.Names} runs with gives the configuration key '{r.Key}': not {sources}.",
+            Data = DataOf(new ConfigurationKeyMark(r.Key, SecretKey(r.Key))),
         })];
     }
 }

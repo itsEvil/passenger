@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Text.Json;
 using Passenger.App.Editors;
 using Passenger.App.Workspace;
@@ -12,9 +13,9 @@ namespace Passenger.App.CSharp;
 
 /// <summary>Applies a workspace edit (a rename, a fix) across files: an open file is edited through its document, one undo
 /// step per file and through the editor when it is the one showing; a file not open is edited on disk, keeping its
-/// encoding and line endings; files the edit creates, renames or deletes are made so, an open one's tab going with it. An
-/// open file's edits are carried through what was typed since the request; one whose edited text changed meanwhile, or
-/// that the server answered for another version, is left alone and named in <c>dropped</c>.</summary>
+/// encoding and line endings; files the edit creates, renames or deletes are made so (a delete to the Trash), an open
+/// one's tab going with it. An open file's edits are carried through what was typed since the request; one whose edited
+/// text changed meanwhile, or that the server answered for another version, is left alone and named in <c>dropped</c>.</summary>
 public static class WorkspaceEdits
 {
     /// <summary>Every open document followed from now, for a request about to be sent; disposed once its answer is applied.</summary>
@@ -50,6 +51,15 @@ public static class WorkspaceEdits
         IReadOnlyCollection<string>? made = null, Written? elsewhere = null, IReadOnlyCollection<string>? read = null)
     {
         HashSet<string> edited = [.. Shapes.WorkspaceEdit(edit).Where(c => c.Operation is null).Select(c => DocumentUris.ToPath(c.Uri))];
+        // Gone, however long ago, and neither made nor moved there by the edit: the server holds it as it was.
+        HashSet<string> coming = [.. Shapes.WorkspaceEdit(edit).Where(c => c.Operation is not null).Select(c => Resource.Read(c.Operation!.Value)).Select(r => r.To ?? r.Path)];
+        List<string> gone = [.. edited.Where(p => !coming.Contains(p) && made?.Contains(p) != true && editors.Documents.All(d => d.Path != p) && !File.Exists(p))];
+        if (gone.Count > 0)
+        {
+            string deleted = $"{Path.GetFileName(gone[0])} was deleted, which the language server still held";
+            return patience?.Behind(gone, held, $"{deleted} as it was asked", $"{deleted} after {Durations.Said(Patience.Limit)}, so what it worked out may be from "
+                + "the files as they were: nothing was changed") ?? $"{deleted}, so what it worked out may be from the files as they were: nothing was changed; try again in a moment";
+        }
         // With the files written for the command to wait for, which the server must have read as they are, in the edit or not.
         List<string> closed = [.. edited.Concat(patience?.Awaited ?? []).Distinct()
             .Where(p => editors.Documents.All(d => d.Path != p) && File.Exists(p) && made?.Contains(p) != true)
@@ -66,7 +76,7 @@ public static class WorkspaceEdits
         {
             string name = Path.GetFileName(written[0].Path);
             return patience!.Behind([.. written.Select(f => f.Path)], held, $"{name} changed on disk a moment before the language server was asked",
-                $"{name} changed on disk a moment before the language server was asked, which had not read it after {Patience.Limit.TotalSeconds:0} s, "
+                $"{name} changed on disk a moment before the language server was asked, which had not read it after {Durations.Said(Patience.Limit)}, "
                 + "so the places it gave there may be where they were before: nothing was changed");
         }
         if (patience is not null && since is { } request && await WrittenElsewhereAsync(editors, elsewhere, request - Catching, patience, made) is { Count: > 0 } outside)
@@ -74,7 +84,7 @@ public static class WorkspaceEdits
             Roslyn.Extension.DocumentWritten first = outside[0];
             string what = $"{Path.GetFileName(first.Path)} {(first.Gone ? "was deleted" : "changed on disk")} a moment before the language server was asked";
             return patience.Behind([.. outside.Select(d => d.Path)], held, what, $"{what}, which {(first.Gone ? "still held it" : "had not read it")} after "
-                + $"{Patience.Limit.TotalSeconds:0} s, so what it worked out may be from the files as they were: nothing was changed");
+                + $"{Durations.Said(Patience.Limit)}, so what it worked out may be from the files as they were: nothing was changed");
         }
         if (closed.Count == 0 || held is null)
         {
@@ -101,7 +111,7 @@ public static class WorkspaceEdits
             string so = edited.Contains(unread[0]) ? "so the places it gave there would be the wrong ones" : "so what it worked out from it may be from the text before";
             string said = $"{name} on disk is not the text the language server read, {so}: nothing was changed; try again once the server has read it";
             return patience?.Behind(unread, held, said, $"{name} on disk was still not the text the language server read after "
-                + $"{Patience.Limit.TotalSeconds:0} s, {so}: nothing was changed") ?? said;
+                + $"{Durations.Said(Patience.Limit)}, {so}: nothing was changed") ?? said;
         }
         return null;
     }
@@ -301,11 +311,14 @@ public static class WorkspaceEdits
         return files;
     }
 
-    /// <summary>A file not open's text with a server's edits made in it, in its own line breaks and indentation.</summary>
-    private static string Edited(string path, string text, IReadOnlyList<LspTextEdit> edits)
+    /// <summary>A file not open's text with a server's edits made in it, in its own line breaks (one with none yet, a file
+    /// just made among them, its .editorconfig's <c>end_of_line</c>, as the editor gives it) and indentation. Safe from any
+    /// thread.</summary>
+    internal static string Edited(string path, string text, IReadOnlyList<LspTextEdit> edits)
     {
         TextSnapshot snapshot = TextSnapshot.From(text);
-        return snapshot.Apply([.. Convert(snapshot, edits, TextDocument.DetectLineEnding(text), FileIndent.Of(path, text)).OrderBy(e => e.Start)]).ToString();
+        string eol = text.Contains('\n', StringComparison.Ordinal) ? TextDocument.DetectLineEnding(text) : (EditorConfig.For(path).EndOfLine ?? LineSeparator.LF).Held();
+        return snapshot.Apply([.. Convert(snapshot, edits, eol, FileIndent.Of(path, text)).OrderBy(e => e.Start)]).ToString();
     }
 
     /// <summary>Edits in an open file's text as it is now: through the active editor when it is the file shown there, so
@@ -477,20 +490,16 @@ public static class WorkspaceEdits
         }
     }
 
-    /// <summary>Deletes a file or folder, closing the open files that went with it (saved before, <see cref="Refusal"/>); a
-    /// file's bytes go to the recording, which its Undo writes back.</summary>
+    /// <summary>Moves a file or folder to the Trash, as the Explorer's Delete does, closing the open files that went with it
+    /// (saved before, <see cref="Refusal"/>): the recording keeps where it went, which its Undo moves back. A folder holding
+    /// anything goes only where the edit asks for it <paramref name="recursive"/>ly.</summary>
     private static void Delete(EditorArea editors, string path, bool recursive, CommandHistory.Recording recording)
     {
-        if (Directory.Exists(path))
+        if (!recursive && Directory.Exists(path) && new DirectoryInfo(path).LinkTarget is null && Directory.EnumerateFileSystemEntries(path).Any())
         {
-            Directory.Delete(path, recursive);
+            throw new IOException($"{Path.GetFileName(path)} is a folder that is not empty");
         }
-        else
-        {
-            byte[] held = FileText.Read(path);
-            File.Delete(path);
-            recording.Deleted(path, held);
-        }
+        recording.Deleted(path, Trash.Move(path));
         foreach (OpenDocument document in editors.Documents.Where(d => PathNames.Within(d.Path, path)).ToList())
         {
             editors.CloseDeleted(document);
@@ -510,8 +519,8 @@ public static class WorkspaceEdits
             if (change.Operation is { } operation)
             {
                 Resource resource = Resource.Read(operation);
-                string kind = resource.Kind switch { "create" => "created", "rename" => "moved", _ => "deleted" };
-                if (kind == "created")
+                RefactoredChange kind = resource.Kind switch { "create" => RefactoredChange.Created, "rename" => RefactoredChange.Moved, _ => RefactoredChange.Deleted };
+                if (kind == RefactoredChange.Created)
                 {
                     made.Add(resource.Path);
                 }
@@ -525,13 +534,13 @@ public static class WorkspaceEdits
             }
             TextSnapshot? text = texts(path);
             IReadOnlyList<int> lines = [.. change.Edits.Select(e => ServerPlaces.PositionOf(text, e.Range.Start).Line + 1).Distinct().Order()];
-            if (files.FindIndex(f => f.Path == path && f.Change == "changed") is int at and >= 0)
+            if (files.FindIndex(f => f.Path == path && f.Change == RefactoredChange.Changed) is int at and >= 0)
             {
                 files[at] = files[at] with { Lines = [.. files[at].Lines.Concat(lines).Distinct().Order()] };
             }
             else
             {
-                files.Add(new RefactoredFile(path, "changed", lines));
+                files.Add(new RefactoredFile(path, RefactoredChange.Changed, lines));
             }
         }
         return files;
@@ -571,14 +580,26 @@ public static class WorkspaceEdits
         return paths;
     }
 
-    /// <summary>One of an edit's file operations (create, rename or delete): its paths and its options.</summary>
+    /// <summary>The files and folders an edit's renames move, each where it was.</summary>
+    public static IReadOnlyList<string> Moved(JsonElement edit) => [.. Renames(edit).Select(r => r.From)];
+
+    /// <summary>The files and folders an edit's renames move, each where it was and where it goes.</summary>
+    public static IReadOnlyList<(string From, string To)> Renames(JsonElement edit) =>
+        [.. Shapes.WorkspaceEdit(edit).Where(c => c.Operation is not null).Select(c => Resource.Read(c.Operation!.Value)).Where(r => r.To is not null).Select(r => (r.Path, r.To!))];
+
+    /// <summary>Whether an edit changes a range of a file already.</summary>
+    public static bool Changes(JsonElement edit, string path, LspRange range) =>
+        Shapes.WorkspaceEdit(edit).Any(c => c.Operation is null && c.Edits.Any(e => e.Range == range) && PathNames.Same(DocumentUris.ToPath(c.Uri), path));
+
+    /// <summary>One of an edit's file operations (create, rename or delete): its paths and its options. A rename's new
+    /// name is the server's own spelling (<see cref="DocumentUris.ToNewPath"/>), so one changing only letter case moves.</summary>
     private sealed record Resource(string Kind, string Path, string? To, JsonElement Options)
     {
         public static Resource Read(JsonElement operation)
         {
             string kind = JsonMembers.Text(operation, "kind") ?? string.Empty;
             string path = DocumentUris.ToPath(Named(operation, kind == "rename" ? "oldUri" : "uri"));
-            string? to = kind == "rename" ? DocumentUris.ToPath(Named(operation, "newUri")) : null;
+            string? to = kind == "rename" ? DocumentUris.ToNewPath(Named(operation, "newUri")) : null;
             return new Resource(kind, path, to, JsonMembers.Value(operation, "options") ?? default);
         }
 
@@ -597,6 +618,9 @@ public sealed record RefactorOutcome(string Said, string? Problem, IReadOnlyList
 {
     public IReadOnlyList<UnchangedUse> Unchanged { get; init; } = [];
 
+    /// <summary>Why a file the change takes along could not be moved, the change made all the same; null once each was.</summary>
+    public string? Unmoved { get; init; }
+
     /// <summary>Where the server that made it asked a name it wrote be renamed at once (TypeScript's Extract to function's
     /// new function), in the text as it left it; null where it asked none.</summary>
     public LspLocation? RenameAt { get; init; }
@@ -614,7 +638,16 @@ public sealed record UnchangedUse(string Path, int Line, int Column, string Why)
 
 /// <summary>A file a refactoring changed: created, changed, moved (to <paramref name="To"/>) or deleted, with the lines its
 /// edits start on, from one, as the editor counts the text as it was.</summary>
-public sealed record RefactoredFile(string Path, string Change, IReadOnlyList<int> Lines, string? To = null);
+public sealed record RefactoredFile(string Path, RefactoredChange Change, IReadOnlyList<int> Lines, string? To = null);
+
+/// <summary>What a refactoring did to a file, which an agent reads as its name in lower case ("moved").</summary>
+public enum RefactoredChange
+{
+    Changed,
+    Created,
+    Moved,
+    Deleted,
+}
 
 /// <summary>A file's edits in the server's places, with the text they were found in where Passenger read the file itself (a
 /// Godot scene as its project's index holds it), which they fit only while the file is that text
@@ -634,6 +667,9 @@ public sealed class Asked(Dictionary<OpenDocument, ChangeTracker> trackers) : ID
     /// <summary>When the request was about to be sent: a file not open written after it, or a moment before, may be one
     /// the server answered for as it was (<see cref="WorkspaceEdits.StaleAsync"/>).</summary>
     public DateTime Since { get; } = DateTime.UtcNow;
+
+    /// <summary>The same moment as a timestamp of Stopwatch's, to measure the IDE's own moments from.</summary>
+    public long Sent { get; } = Stopwatch.GetTimestamp();
 
     public void Dispose()
     {
@@ -655,7 +691,7 @@ public sealed class Patience
     /// (<see cref="Waits"/>), as the server it waits on is slower there too.</summary>
     public static TimeSpan Limit => Waits.Of(TimeSpan.FromSeconds(10));
 
-    private readonly DateTime until = DateTime.UtcNow + Limit;
+    private readonly Deadline until = Deadline.In(Limit);
     private readonly Dictionary<string, (FileStamp Stamp, string Hash)> seen = new(StringComparer.Ordinal);
     private readonly List<string> behind = [];
     private readonly HashSet<string> awaited = new(StringComparer.Ordinal);
@@ -738,9 +774,9 @@ public sealed class Patience
     /// <paramref name="said"/>, the files waited for before the next attempt; after it <paramref name="kept"/>.</summary>
     internal string Behind(IReadOnlyList<string> paths, Held? server, string said, string kept)
     {
-        if (DateTime.UtcNow >= until)
+        if (until.Passed)
         {
-            IdeLog.Write(IdeLog.Ide, $"Waited {Limit.TotalSeconds:0} s for the language server to read {Told(paths, session()?.Server.WatchedFiles)}");
+            IdeLog.Write(IdeLog.Ide, $"Waited {Durations.Said(Limit)} for the language server to read {Told(paths, session()?.Server.WatchedFiles)}");
             return kept;
         }
         behind.AddRange(paths);
@@ -753,8 +789,9 @@ public sealed class Patience
     internal static string Told(IEnumerable<string> paths, WatchedFiles? watched)
     {
         DateTime now = DateTime.UtcNow;
-        return string.Join("; ", paths.Select(p => $"{Path.GetFileName(p)}, {(File.Exists(p) ? $"written {(now - File.GetLastWriteTimeUtc(p)).TotalSeconds:0.00} s before" : "deleted")}, "
-            + (watched?.ToldAt(p) is { } at ? $"its change told the server {(now - at).TotalSeconds:0.00} s before" : "no change of it told the server since it started")));
+        long stamp = Stopwatch.GetTimestamp();
+        return string.Join("; ", paths.Select(p => $"{Path.GetFileName(p)}, {(File.Exists(p) ? $"written {Durations.Said(now - File.GetLastWriteTimeUtc(p))} before" : "deleted")}, "
+            + (watched?.ToldAt(p) is { } at ? $"its change told the server {Durations.Said(Stopwatch.GetElapsedTime(at, stamp))} before" : "no change of it told the server since it started")));
     }
 
     /// <summary>Waits until the server holds each file behind as the disk has it, unwritten while it was read, and none
@@ -764,13 +801,13 @@ public sealed class Patience
     {
         HashSet<string> untold = new(StringComparer.Ordinal);
         HashSet<string> dropped = new(StringComparer.Ordinal);
-        if (DateTime.UtcNow < until)
+        if (!until.Passed)
         {
             string first = behind[0];
             waiting(File.Exists(first) ? $"Waiting for the language server to read {Path.GetFileName(first)} as it is on disk"
                 : $"Waiting for the language server to let go of {Path.GetFileName(first)}, deleted");
         }
-        while (DateTime.UtcNow < until)
+        while (!until.Passed)
         {
             List<string> asking = [.. behind.Where(p => !Trusts(p) && !untold.Contains(p) && !dropped.Contains(p))];
             if (held is not null && asking.Count > 0)
@@ -809,22 +846,11 @@ public sealed class Patience
         List<(string Path, FileStamp Stamp, string Hash)> unwritten = [];
         foreach (Roslyn.Extension.TextHeld text in texts)
         {
-            FileStamp stamp = FileStamp.Of(text.Path);
-            if (text.Hash is { } hash && HeldTexts.OnDisk(text.Path, hash) == true && FileStamp.Of(text.Path) == stamp)
+            if (FileStamp.Of(text.Path) is { } stamp && text.Hash is { } hash && HeldTexts.OnDisk(text.Path, hash) == true && FileStamp.Of(text.Path) == stamp)
             {
                 unwritten.Add((text.Path, stamp, hash));
             }
         }
         return unwritten;
-    }
-
-    /// <summary>When a file was last written and how long it was then.</summary>
-    private readonly record struct FileStamp(DateTime Written, long Length)
-    {
-        public static FileStamp Of(string path)
-        {
-            FileInfo file = new(path);
-            return file.Exists ? new FileStamp(file.LastWriteTimeUtc, file.Length) : default;
-        }
     }
 }

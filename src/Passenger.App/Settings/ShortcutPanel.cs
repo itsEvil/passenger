@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using Avalonia;
 using Avalonia.Controls;
 using Avalonia.Input;
@@ -14,10 +15,10 @@ public sealed class ShortcutPanel : StackPanel
 {
     public ShortcutPanel(string secondLabel)
     {
-        Spacing = 6;
+        Spacing = Gaps.Small;
         First = new StrokeField(passesDialogKeys: true);
         Second = new StrokeField(passesDialogKeys: false) { IsEnabled = false };
-        SecondStroke = new CheckBox { Content = secondLabel, VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(0, 0, 8, 0) };
+        SecondStroke = new CheckBox { Content = secondLabel, VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(0, 0, Gaps.Normal, 0) };
         DockPanel second = new();
         DockPanel.SetDock(SecondStroke, Dock.Left);
         second.Children.Add(SecondStroke);
@@ -74,7 +75,8 @@ public sealed class StrokeField : TextBox
     /// <summary>A modifier pressed alone and not yet let go, nothing pressed since.</summary>
     private Keystroke? held;
 
-    /// <summary>A modifier pressed alone and let go, nothing pressed since, and when, a double tap's first.</summary>
+    /// <summary>A modifier pressed alone and let go, nothing pressed since, and when (a timestamp of
+    /// <see cref="Stopwatch.GetTimestamp"/>'s), a double tap's first.</summary>
     private (Keystroke Stroke, long At)? tapped;
 
     public StrokeField(bool passesDialogKeys)
@@ -132,7 +134,7 @@ public sealed class StrokeField : TextBox
         base.OnKeyUp(e);
         if (held is { } alone && Keystroke.Alone(e.Key, KeyModifiers.None) == alone)
         {
-            tapped = (alone, Environment.TickCount64);
+            tapped = (alone, Stopwatch.GetTimestamp());
         }
         held = null;
     }
@@ -151,7 +153,7 @@ public sealed class StrokeField : TextBox
         {
             return;
         }
-        if (tapped is { } tap && tap.Stroke == alone && Environment.TickCount64 - tap.At <= KeymapDispatcher.DoubleTapMs)
+        if (tapped is { } tap && tap.Stroke == alone && Stopwatch.GetElapsedTime(tap.At) <= KeymapDispatcher.DoubleTap)
         {
             tapped = null;
             Stroke = alone;
@@ -169,7 +171,7 @@ public sealed class StrokeField : TextBox
         Keystroke[] keys = [new(Key.Enter, KeyModifiers.None), new(Key.Escape, KeyModifiers.None), new(Key.Tab, KeyModifiers.None), new(Key.Tab, KeyModifiers.Shift)];
         PathIcon plus = new() { Width = 12, Height = 12 };
         plus.Bind(PathIcon.DataProperty, plus.GetResourceObservable(IconKeys.Add));
-        Button set = new() { Classes = { StyleClasses.TabPin }, Content = plus, Focusable = false, Margin = new Thickness(0, 0, 6, 0) };
+        Button set = new() { Classes = { StyleClasses.TabPin }, Content = plus, Focusable = false, Margin = new Thickness(0, 0, Gaps.Small, 0) };
         ToolButtons.Tip(set, $"Set shortcuts with {string.Join(", ", keys.Where(k => k.Modifiers == KeyModifiers.None).Select(k => k.Display()))} keys");
         List<MenuItem> items = [];
         foreach (Keystroke key in keys)

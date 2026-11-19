@@ -54,7 +54,7 @@ public sealed class StateTests : IDisposable
         MainWindow window = Keeping();
         window.KeepSettings();
         Ui.Settle();
-        Assert.Equal(13, window.Settings.EditorFontSize);
+        Assert.Null(window.Settings.EditorFontSize);
         Assert.True(File.Exists(file + ".bad"), "The file that did not read was not set aside: the defaults went over it");
         Assert.Equal(cut, File.ReadAllText(file + ".bad"));
         Assert.False(File.Exists(file), "The defaults were written in place of the file that did not read");
@@ -108,7 +108,7 @@ public sealed class StateTests : IDisposable
         MainWindow window = Keeping();
         window.KeepSettings();
         Ui.Settle();
-        Assert.True((window.Settings.EditorFontSize, window.Settings.TerminalFontSize, window.Settings.EditorLineSpacing) == (13, 15, 1.5),
+        Assert.True((window.Settings.EditorFontSize, window.Settings.TerminalFontSize, window.Settings.EditorLineSpacing) == ((double?)null, 15, 1.5),
             $"A font size written as text took the file's other settings with it: the editor's font {window.Settings.EditorFontSize}, the terminal's {window.Settings.TerminalFontSize}, the line spacing {window.Settings.EditorLineSpacing}");
         Assert.False(File.Exists(file + ".bad"), "settings.json was set aside for one value of the wrong kind");
         Assert.True(window.Status == "settings.json's editorFontSize is \"16\", where a number goes: its default stands",
@@ -216,6 +216,89 @@ public sealed class StateTests : IDisposable
             () => $"the change made while settings.json was held to reach it once let go: it holds font {FontKept(file)}, so the next start comes up without the change");
         window.Close();
         Assert.Equal(16, FontKept(file));
+    }
+
+    /// <summary>Changes written at once (as an update's word kept as the process ends, or Aspire's record of its
+    /// containers) made one after another while another program holds the file: each write is refused, and the change after
+    /// it keeps it, so every change reaches the file once let go.</summary>
+    [AvaloniaFact]
+    public void Changes_written_at_once_while_the_file_is_held_each_reach_it_once_let_go()
+    {
+        StateStore store = StateStore.Open(settings);
+        try
+        {
+            StateDocument<DockLayout> layout = store.Layout;
+            layout.ChangeNow(Docking("first"));
+            using (IDisposable held = Held(layout.Path))
+            {
+                layout.ChangeNow(Docking("refused"));
+                layout.ChangeNow(Docking("next"));
+                Assert.True(Ui.IdeLog().Contains($"{layout.Path} could not be written", StringComparison.Ordinal),
+                    "The changes' writes went ahead while layout.json was held, so nothing here was refused");
+            }
+            Ui.WaitFor(() => Docked(layout.Path).Contains("next"), () => $"the change made after the one refused to reach layout.json once let go: it holds {string.Join(", ", Docked(layout.Path))}");
+            Assert.True(Docked(layout.Path).Contains("refused"),
+                $"The change whose write was refused was dropped by the change made after it, so it never reaches layout.json: it holds {string.Join(", ", Docked(layout.Path))}");
+        }
+        finally
+        {
+            store.Release();
+        }
+    }
+
+    /// <summary>A change made while another program reads the file sharing its deletion (a scanner, an indexer, a backup)
+    /// lands at once, that program reading on in the file it opened, where Windows refused a move over it.</summary>
+    [AvaloniaFact]
+    public void A_change_lands_at_once_while_another_program_reads_the_file_sharing_its_deletion()
+    {
+        StateStore store = StateStore.Open(settings);
+        try
+        {
+            StateDocument<DockLayout> layout = store.Layout;
+            layout.ChangeNow(Docking("first"));
+            using FileStream reading = new(layout.Path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+            layout.ChangeNow(Docking("next"));
+            Assert.True(Docked(layout.Path).Contains("next"),
+                $"The change was refused while another program read layout.json sharing its deletion, so it waits to be tried again: it holds {string.Join(", ", Docked(layout.Path))}");
+            Assert.DoesNotContain($"{layout.Path} could not be written", Ui.IdeLog(), StringComparison.Ordinal);
+            using StreamReader opened = new(reading);
+            Assert.DoesNotContain("\"next\"", opened.ReadToEnd(), StringComparison.Ordinal);
+        }
+        finally
+        {
+            store.Release();
+        }
+    }
+
+    /// <summary>A change refused at the flush as Passenger closes, while another program holds the file a moment sharing no
+    /// deletion, is written again as Passenger ends and lands once that program lets go, where it was lost with the process.</summary>
+    [AvaloniaFact]
+    public void A_change_refused_as_Passenger_closes_lands_as_it_ends_once_the_file_is_let_go()
+    {
+        StateStore store = StateStore.Open(settings);
+        StateDocument<DockLayout> layout = store.Layout;
+        layout.ChangeNow(Docking("first"));
+        IDisposable held = Held(layout.Path);
+        try
+        {
+            layout.Set(Docking("closing")(layout.Value));
+            store.Release();
+            Assert.True(Ui.IdeLog().Contains($"{layout.Path} could not be written as it was flushed", StringComparison.Ordinal),
+                "The flush as Passenger closed went ahead while layout.json was held, so nothing here was refused");
+            Task lettingGo = Waiting.Apart(() =>
+            {
+                Waiting.For(TimeSpan.FromMilliseconds(200), "the holder to let go a moment after Passenger's end began");
+                held.Dispose();
+            });
+            StateStore.LandWaiting();
+            Assert.True(Docked(layout.Path).Contains("closing"),
+                $"Passenger's end did not write again the change refused as it closed, so the next start comes up without it: layout.json holds {string.Join(", ", Docked(layout.Path))}");
+            Ui.Await(lettingGo, "the holder to let go");
+        }
+        finally
+        {
+            held.Dispose();
+        }
     }
 
     [AvaloniaFact]
@@ -546,12 +629,20 @@ public sealed class StateTests : IDisposable
 
     private static JsonObject Read(string file) => (JsonObject)JsonNode.Parse(File.ReadAllText(file))!;
 
+    /// <summary>A layout with a window of a name docked beside the windows it has.</summary>
+    private static Func<DockLayout, DockLayout> Docking(string name) =>
+        layout => layout with { Windows = new(layout.Windows) { [name] = new DockedWindow(ToolAnchor.LeftTop, 0, Shown: true) } };
+
+    /// <summary>The windows a layout file holds, read beside a program holding it; none while it holds none.</summary>
+    private static IReadOnlyCollection<string> Docked(string file) =>
+        Ui.Shared(file) is { Length: > 0 } text && JsonNode.Parse(text)?["windows"] is JsonObject windows ? [.. windows.Select(w => w.Key)] : [];
+
     /// <summary>The editor's font settings.json holds, read beside a program holding it; none while it holds none.</summary>
     private static double? FontKept(string file) =>
         Ui.Shared(file) is { Length: > 0 } text ? (double?)JsonNode.Parse(text)?["editorFontSize"] : null;
 
-    /// <summary>settings.json held as another program holds it: on Windows open without its deletion shared, so a move over
-    /// it is refused; elsewhere, where a move over an open file goes ahead, its folder closed to writes.</summary>
+    /// <summary>A file of the settings folder held as another program holds it: on Windows open, so a move over it is
+    /// refused; elsewhere, where a move over an open file goes ahead, its folder closed to writes.</summary>
     private IDisposable Held(string file)
     {
         return OperatingSystem.IsWindows() ? new FileStream(file, FileMode.Open, FileAccess.Read, FileShare.ReadWrite) : ClosedToWrites(settings);

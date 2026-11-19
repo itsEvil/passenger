@@ -26,7 +26,7 @@ public abstract class McpRig : IDisposable
     /// installer job has an agent debug through the Passenger its Windows installer installed.</summary>
     private static readonly string Passenger = Environment.GetEnvironmentVariable(ExecutableVariable) is { Length: > 0 } installed
         ? installed
-        : Path.Combine(AppContext.BaseDirectory, OperatingSystem.IsWindows() ? "Passenger.exe" : "Passenger");
+        : Product.Program;
 
     private readonly RestoredFolders? folders;
     private string? sum;
@@ -68,6 +68,14 @@ public abstract class McpRig : IDisposable
     /// <summary>A folder a test made for itself, removed with the test once the Passengers that worked in it have gone.</summary>
     protected void DeleteAtEnd(string folder) => made.Add(folder);
 
+    /// <summary>Settings the person kept, which the test's own Passengers read as they start: a program's path among them,
+    /// which settings_set refuses an agent.</summary>
+    protected void KeepSettings(System.Text.Json.Nodes.JsonObject settings)
+    {
+        settings["version"] = global::Passenger.App.Settings.AppSettings.Upgrades.Count;
+        File.WriteAllText(Path.Combine(OwnState, StateStore.SettingsFile), settings.ToJsonString());
+    }
+
     /// <summary>The Passenger the test started last.</summary>
     protected Process LastPassenger()
     {
@@ -94,6 +102,11 @@ public abstract class McpRig : IDisposable
         if (sum is not null)
         {
             TestFolders.Delete(sum);
+        }
+        // The language servers' temporary folders of the test's state, in the person's own temporary folder.
+        if (UserTemporary.Of(Path.Combine(OwnState, "cache"), global::Passenger.Lsp.RoslynServerFolder.TemporariesKind) is var servers && Directory.Exists(servers))
+        {
+            TestFolders.Delete(servers);
         }
         TestFolders.Delete(OwnState);
         foreach (string folder in made)
@@ -273,33 +286,44 @@ public abstract class McpRig : IDisposable
         }
     }
 
-    /// <summary>The window's question to the person, once it is asked.</summary>
-    protected ConfirmDialog Question(MainWindow window, string what)
+    /// <summary>The window's question to the person on an agent's behalf, once it is asked: whether a tool's call may go on
+    /// (<see cref="AgentToolDialog"/>), or another folder open.</summary>
+    protected Avalonia.Controls.Window Question(MainWindow window, string what)
     {
-        WaitFor(() => window.OwnedWindows.OfType<ConfirmDialog>().Any(), what);
-        return window.OwnedWindows.OfType<ConfirmDialog>().Single();
+        WaitFor(() => Questions(window).Any(), what);
+        return Questions(window).Single();
     }
 
+    /// <summary>The questions the window asks the person on an agent's behalf: a tool's call, or another folder opened.</summary>
+    protected static IEnumerable<Avalonia.Controls.Window> Questions(MainWindow window) =>
+        window.OwnedWindows.Where(w => w is AgentToolDialog or ConfirmDialog);
+
     /// <summary>An agent's call the window first asks the person about, its question naming the tool and what it would do;
-    /// allowed, the call's answer.</summary>
+    /// allowed for the session, the call's answer.</summary>
     protected JsonElement Asked(MainWindow window, McpClient client, [IdentifierOf(typeof(McpTools))] string tool, string what, Dictionary<string, object?>? arguments = null)
     {
         Task<JsonElement> calling = Waiting.Apart(() => Call(client, tool, arguments));
-        ConfirmDialog asked = Question(window, $"the question for the agent's {tool}");
+        Avalonia.Controls.Window asked = Question(window, $"the question for the agent's {tool}");
         string[] said = Texts(asked);
         Assert.True(said.Contains($"Allow {tool}?") && said.Any(t => t.Contains($"wants to {what} (its {tool} tool)", StringComparison.Ordinal)),
             $"The question for the agent's {tool} said: {string.Join(" | ", said)}");
-        Press(asked, "Allow");
+        Press(asked, AgentToolDialog.AllowForSession);
         return Await(calling, $"the agent's {tool}");
     }
 
     /// <summary>An agent's call answered without a question to the person.</summary>
-    protected JsonElement Unasked(MainWindow window, McpClient client, [IdentifierOf(typeof(McpTools))] string tool, Dictionary<string, object?>? arguments = null)
+    protected JsonElement Unasked(MainWindow window, McpClient client, [IdentifierOf(typeof(McpTools))] string tool, Dictionary<string, object?>? arguments = null) =>
+        Unasked(window, tool, Waiting.Apart(() => Call(client, tool, arguments)));
+
+    /// <summary>An agent's call answered without a question to the person, its answer whole, an error's included.</summary>
+    protected CallToolResult UnaskedResult(MainWindow window, McpClient client, [IdentifierOf(typeof(McpTools))] string tool, Dictionary<string, object?>? arguments = null) =>
+        Unasked(window, tool, Waiting.Apart(() => Result(client, tool, arguments)));
+
+    private T Unasked<T>(MainWindow window, string tool, Task<T> calling)
     {
-        Task<JsonElement> calling = Waiting.Apart(() => Call(client, tool, arguments));
-        WaitFor(() => calling.IsCompleted || window.OwnedWindows.OfType<ConfirmDialog>().Any(), $"the agent's {tool}", AgentLimit);
-        Assert.True(!window.OwnedWindows.OfType<ConfirmDialog>().Any(),
-            $"The agent's {tool} asked the person: {string.Join(" | ", window.OwnedWindows.OfType<ConfirmDialog>().SelectMany(Texts))}");
+        WaitFor(() => calling.IsCompleted || Questions(window).Any(), $"the agent's {tool}", AgentLimit);
+        Assert.True(!Questions(window).Any(),
+            $"The agent's {tool} asked the person: {string.Join(" | ", Questions(window).SelectMany(Texts))}");
         return Await(calling, $"the agent's {tool}");
     }
 
@@ -311,8 +335,8 @@ public abstract class McpRig : IDisposable
         Ui.Click(Avalonia.VisualTree.VisualExtensions.GetVisualDescendants(dialog).OfType<Avalonia.Controls.Button>().First(b => (string?)b.Content == button));
     }
 
-    /// <summary>A tool's answer, read as the JSON it is; a tool's error fails the test with its words and
-    /// what Passenger said meanwhile.</summary>
+    /// <summary>A tool's answer, read as the JSON it is (a list's, before the words saying what it left out); a tool's
+    /// error fails the test with its words and what Passenger said meanwhile.</summary>
     protected async Task<JsonElement> Call(McpClient client, [IdentifierOf(typeof(McpTools))] string tool, Dictionary<string, object?>? arguments = null)
     {
         CallToolResult result = await Result(client, tool, arguments);
@@ -320,6 +344,10 @@ public abstract class McpRig : IDisposable
         if (result.IsError == true)
         {
             Assert.Fail($"{tool} failed: {text}{Said()}");
+        }
+        if (result.Content is [TextContentBlock { Text: ['[', ..] list }, TextContentBlock, ..])
+        {
+            text = list;
         }
         if (text.StartsWith('[') || text.StartsWith('{'))
         {
@@ -607,9 +635,10 @@ public abstract class McpRig : IDisposable
 
     protected static string Text(CallToolResult result) => string.Concat(result.Content.OfType<TextContentBlock>().Select(t => t.Text));
 
-    /// <summary>usages' places, each file's "line:column text" read apart, in the answer's order.</summary>
+    /// <summary>usages' places listed, each file's "line:column text" read apart, in the answer's order; a file only counted
+    /// (the answer held to its limit) lists none, read on through within.</summary>
     protected static IReadOnlyList<(string Path, int Line, int Column, string Text)> Used(JsonElement usages) =>
-        [.. usages.GetProperty("files").EnumerateArray().SelectMany(file => file.GetProperty("places").EnumerateArray().Select(place =>
+        [.. usages.GetProperty("files").EnumerateArray().Where(file => file.TryGetProperty("places", out _)).SelectMany(file => file.GetProperty("places").EnumerateArray().Select(place =>
         {
             string said = place.GetString()!;
             int space = said.IndexOf(' ', StringComparison.Ordinal);

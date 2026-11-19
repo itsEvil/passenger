@@ -91,7 +91,7 @@ public partial class ManagedDebugger
 
         _logger?.Invoke($"Step-in calls of IL_{start:X4}..IL_{end:X4}, lines {points[at].StartLine}-{points[last].EndLine}: {calls.Count}");
         string? path = ModuleMetadataReader.DocumentOf(points[at]);
-        SyntaxTree? source = path is not null && File.Exists(path)
+        SyntaxTree? source = path is not null && FoundPaths.Askable(path) && File.Exists(path)
             ? CodeBrackets.Parse(SourceText.From(File.ReadAllText(path)), CodeBrackets.Defining(preprocessorSymbols ?? [], languageVersion).WithDocumentationMode(DocumentationMode.None))
             : null;
         List<(StepInPlan Plan, string Label, LinePositionSpan? Place)> found = source is null || CodeBrackets.DeepAt(source) is not null
@@ -473,7 +473,7 @@ public partial class ManagedDebugger
             throw new InvalidOperationException("A step operation is already in progress");
         }
         ICorDebugThread thread = threadInfo.Thread;
-        if (EnumerateFramesForThread(thread).FirstOrDefault() is not ICorDebugILFrame frame || RangeOf(frame) != plan.Frame)
+        if (TopFrame(thread) is not ICorDebugILFrame frame || RangeOf(frame) != plan.Frame)
         {
             throw new InvalidOperationException("The thread is no longer in the frame the call was listed for");
         }
@@ -536,7 +536,7 @@ public partial class ManagedDebugger
             return;
         }
         EndStepForStop();
-        if (GetSourceInfoAtFrame(thread.ActiveFrame, _justMyCode is false) is { } source)
+        if (TopFrame(thread) is { } entered && GetSourceInfoAtFrame(entered, _justMyCode is false) is { } source)
         {
             ReportStop(thread.Id, StopReasons.Step, source.FilePath, source.StartLine, source.StartColumn);
         }
